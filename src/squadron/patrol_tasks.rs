@@ -401,8 +401,19 @@ async fn calculate_positions_value(
             // and the next snapshot all agree.
             let drifted = (c - db_shares).abs() > (db_shares.abs() * dec!(0.05)).max(dec!(0.0001));
             if drifted && persist_chain_correction(c, &pos.ts, chrono::Utc::now(), &pos.status, pos.chain_adopted) {
-                warn!("⚠️ Position drift [{}]: DB says {:.4} shares, chain says {:.4} — correcting the row",
-                      pos.token_id, db_shares, c);
+                // A drop to below the order minimum is a sale the ledger has not
+                // seen, not a share count to adopt: the write preserves the sold
+                // size and its fee (`settled_shares`) for whichever path books it,
+                // the engine's exit or the chain sweep. 2026-09-13: 7.1428 → 0.0028
+                // after a lifted ask, written as a plain correction, left the
+                // sweep a dust row to book.
+                if db_shares >= crate::config::MIN_ORDER_SHARES && c < crate::config::MIN_ORDER_SHARES {
+                    warn!("⚠️ Position drift [{}]: DB says {:.4} shares, chain says {:.4}: the position was sold or settled; recording the remainder and preserving the {:.4}-share size for the booking",
+                          pos.token_id, db_shares, c, db_shares);
+                } else {
+                    warn!("⚠️ Position drift [{}]: DB says {:.4} shares, chain says {:.4} — correcting the row",
+                          pos.token_id, db_shares, c);
+                }
                 let entry = pos.entry_price.parse::<Decimal>().unwrap_or(dec!(0));
                 db::update_position_from_chain(pool, &pos.token_id, c, entry, None).await;
             } else if drifted {
@@ -705,34 +716,6 @@ pub fn spawn_cleanup_task(
                             Arc::clone(&time_decay_positions)
                         ).await;
                         crate::tasks::cleanup::sync_open_positions_with_chain(safe_address).await;
-
-                        // ── Score settled GBoost vetoes ──────────────────────
-                        // Attach real resolution outcomes to the shadow-log of
-                        // gate-rejected signals. Until this runs the table can
-                        // only say what the model BELIEVED, so there is no way to
-                        // tell whether a gate blocked a winner or saved a loss —
-                        // which is the entire question the entry stack turns on.
-                        // Capped per sweep so a long unlabeled backlog cannot
-                        // monopolise the 45s cleanup budget.
-                        if let Some(pool) = crate::helpers::db::pool_for(&asset) {
-                            let http = Arc::clone(&shared_http);
-                            let scored = crate::helpers::db::score_pending_gboost_vetoes(
-                                &pool,
-                                config::GBOOST_VETO_SCORING_BATCH,
-                                |token_id| {
-                                    let http = Arc::clone(&http);
-                                    let pool = pool.clone();
-                                    async move {
-                                        let cid = crate::helpers::db::condition_id_for_veto_token(&pool, &token_id).await?;
-                                        let prices = crate::helpers::market::fetch_resolved_outcome_prices(&http, &cid).await?;
-                                        prices.get(&token_id).copied()
-                                    }
-                                },
-                            ).await;
-                            if scored > 0 {
-                                info!("🏷️ Scored {} settled GBoost veto(es) with real outcomes", scored);
-                            }
-                        }
 
                         // Periodically clean up expired pending order locks
                         {

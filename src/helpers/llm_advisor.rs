@@ -797,9 +797,6 @@ pub fn classify_refusal(strategy: &str, normalized: &str) -> RefusalClass {
     if has(&["edge below required"]) {
         return RefusalClass::Knob("fairvalue_base_edge".into());
     }
-    if has(&["oracle too flat"]) {
-        return RefusalClass::Knob("gboost_min_hist_vol".into());
-    }
     if has(&["entry-side spread too wide"]) {
         return RefusalClass::Knob("basis_max_spread_pct".into());
     }
@@ -821,7 +818,7 @@ pub fn classify_refusal(strategy: &str, normalized: &str) -> RefusalClass {
         "drawdown", "insufficient collateral", "circuit breaker", "cascade guard", "lockout",
         "post-stop", "cooldown", "toxic", "concept drift", "taker_flow", "taker flow",
         "flow contradicts", "moving too fast", "stale", "warmup", "warming up", "debounce",
-        "hold lock", "already open", "pyramiding", "gate_dwell", "shadow mode",
+        "hold lock", "already open", "pyramiding", "gate_dwell",
         "market too young", "counter-trend", "strong trend", "drift too large",
         "no depth data",
     ]) {
@@ -1150,8 +1147,7 @@ fn build_user_prompt(
         dyn_cfg.maker_max_exposure_usdc,
     ));
     lines.push(format!(
-        "GBoost: gboost_shadow_mode={}, gboost_planb_margin={}, gboost_planb_trade_size_usdc=${}, gboost_max_exposure_usdc=${}, gboost_planb_take_profit_pct={:.0}%, gboost_planb_stop_loss_pct={:.0}%",
-        dyn_cfg.gboost_shadow_mode,
+        "GBoost: gboost_planb_margin={}, gboost_planb_trade_size_usdc=${}, gboost_max_exposure_usdc=${}, gboost_planb_take_profit_pct={:.0}%, gboost_planb_stop_loss_pct={:.0}%",
         dyn_cfg.gboost_planb_margin,
         dyn_cfg.gboost_planb_trade_size_usdc,
         dyn_cfg.gboost_max_exposure_usdc,
@@ -2375,9 +2371,10 @@ mod refusal_ledger_tests {
             classify_refusal("FairValueStrategy", "edge below required"),
             RefusalClass::Knob("fairvalue_base_edge".into()),
         );
+        // Plan B's refusals are model verdicts, not knobs the advisor can turn.
         assert_eq!(
-            classify_refusal("GboostStrategy", &normalize_reason("oracle too flat (hist_vol=0.0004 < min=0.0010)")),
-            RefusalClass::Knob("gboost_min_hist_vol".into()),
+            classify_refusal("GboostStrategy", "below break-even plus margin"),
+            RefusalClass::Market,
         );
     }
 
@@ -2435,7 +2432,7 @@ mod refusal_ledger_tests {
                 tally("book_imbalance", 450, "book_imbalance"),
             ]),
             report("GboostStrategy", vec![
-                tally("oracle too flat (hist_vol=0.0004 < min=0.0010)", 1200, "oracle too flat (hist_vol=0.0004 < min=0.0010)"),
+                tally("below break-even plus margin", 1200, "below break-even plus margin"),
             ]),
             ViperRefusalReport {
                 asset: "btc".into(), strategy: "MomentumStrategy".into(), window_secs: 3480,
@@ -2449,7 +2446,7 @@ mod refusal_ledger_tests {
         assert!(text.contains("691× no seller on this leg [arithmetic]"), "{text}");
         assert!(text.contains("450× book_imbalance [guard: maker_max_book_imbalance_ratio, operator-only]"), "{text}");
         assert!(text.contains("latest: \"spread 0.0100 below fee floor 0.0247"), "{text}");
-        assert!(text.contains("1200× oracle too flat (hist_vol=# < min=#) [knob: gboost_min_hist_vol, operator-only]"), "{text}");
+        assert!(text.contains("1200× below break-even plus margin [market]"), "{text}");
         assert!(text.contains("No refusals in window: Momentum (velocity below trigger)"), "{text}");
     }
 
@@ -2472,7 +2469,7 @@ mod refusal_ledger_tests {
             "GboostStrategy", "TrendReversalStrategy", "FairValueStrategy", "ConvergenceStrategy",
         ] {
             reports.push(report(v, vec![
-                tally("oracle too flat (hist_vol=0.0004 < min=0.0010)", 900, "oracle too flat (hist_vol=0.0004 < min=0.0010)"),
+                tally("below break-even plus margin (p=0.5100 need=0.6239)", 900, "below break-even plus margin (p=0.5100 need=0.6239)"),
                 tally("coin-flip guard (|d| below floor)", 300, "coin-flip guard (|d| below floor)"),
                 tally("exposure cap reached", 40, "exposure cap reached"),
             ]));

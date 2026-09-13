@@ -111,6 +111,22 @@ function fmtPnl(n: number | null, prefix = true) {
   return <span className={cls}>{prefix ? `${sign}$${Math.abs(n).toFixed(4)}` : `${sign}$${n.toFixed(4)}`}</span>;
 }
 
+/** P&L as a percent of the capital put in at entry (entry price × shares). */
+function fmtPnlPct(pnl: number | null, entry: number, shares: number) {
+  const cost = entry * shares;
+  if (pnl === null || !Number.isFinite(cost) || cost <= 0) return null;
+  const pct = (pnl / cost) * 100;
+  const cls = pct > 0 ? 'text-green-400' : pct < 0 ? 'text-red-400' : 'text-gray-400';
+  return (
+    <span
+      className={`ml-1 text-[11px] font-normal ${cls}`}
+      title={`P&L as a percent of the entry cost ($${cost.toFixed(4)} = ${entry.toFixed(4)} × ${shares.toFixed(2)} shares).`}
+    >
+      ({pct >= 0 ? '+' : ''}{pct.toFixed(1)}%)
+    </span>
+  );
+}
+
 function fmtUnrealized(entry: number, cur: number | null, shares: number) {
   if (cur === null) return null;
   return (cur - entry) * shares;
@@ -806,7 +822,7 @@ export default function TradelogPage({ availableAssets }: Props) {
                         <div>
                           {isOpen && e.curOrExit === null
                             ? <span className="text-gray-600">—</span>
-                            : fmtPnl(e.pnl)
+                            : <>{fmtPnl(e.pnl)}{fmtPnlPct(e.pnl, e.entry, e.shares)}</>
                           }
                           {isOpen && e.pnl !== null && (
                             <span className="ml-1 text-[10px] font-normal text-gray-600">(unrlzd)</span>

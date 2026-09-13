@@ -38,7 +38,7 @@ def field_const_map() -> dict[str, str]:
     if not m:
         sys.exit("Default impl not found in dynamic_config.rs")
     # A field may wrap its constant in a conversion helper, e.g.
-    # `gboost_min_hist_vol: decimal_from_f64(config::GBOOST_MIN_HIST_VOL)`,
+    # `fairvalue_min_sigma_per_sqrt_sec: decimal_from_f64(config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC)`,
     # when the profile constant's Rust type differs from the field's.
     pairs = re.findall(
         r"^\s+([a-z0-9_]+):\s+(?:[A-Za-z_][A-Za-z0-9_:]*\()?config::([A-Z0-9_]+)",

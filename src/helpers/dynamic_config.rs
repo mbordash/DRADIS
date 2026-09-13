@@ -250,8 +250,6 @@ fn default_event_market_retire_grace_secs() -> i64     { config::EVENT_MARKET_RE
 fn default_deploy_min_liquidity_usd()  -> Decimal { config::DEPLOY_MIN_LIQUIDITY_USD        }
 fn default_collateral_sweep_enabled()       -> bool    { config::COLLATERAL_SWEEP_ENABLED             }
 fn default_collateral_sweep_min_usdc()      -> Decimal { config::COLLATERAL_SWEEP_MIN_USDC            }
-fn default_gboost_budget()                  -> Decimal { config::GBOOST_BUDGET                       }
-fn default_gboost_iteration_limit()         -> u32     { config::GBOOST_ITERATION_LIMIT               }
 fn default_position_quote_ttl_secs()        -> u64     { config::POSITION_QUOTE_TTL_SECS              }
 fn default_obi_use_whole_book()             -> bool    { config::OBI_USE_WHOLE_BOOK                   }
 fn default_book_apply_price_changes()      -> bool    { config::BOOK_APPLY_PRICE_CHANGES             }
@@ -309,21 +307,6 @@ fn default_time_decay_max_slow_drift_pct()         -> Decimal { config::TIME_DEC
 fn default_time_decay_iv_stop_tighten_multiplier() -> Decimal { config::TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER }
 fn default_time_decay_min_hold_secs()              -> i64     { config::TIME_DECAY_MIN_HOLD_SECS              }
 
-fn default_gboost_max_yes_entry_price()     -> Decimal { config::GBOOST_MAX_YES_ENTRY_PRICE            }
-fn default_gboost_max_no_entry_price()      -> Decimal { config::GBOOST_MAX_NO_ENTRY_PRICE             }
-fn default_gboost_min_entry_price()         -> Decimal { config::GBOOST_MIN_ENTRY_PRICE                }
-fn default_gboost_obi_adverse_block()       -> Decimal { config::GBOOST_OBI_ADVERSE_BLOCK              }
-fn default_gboost_obi_exhaustion_block()    -> Decimal { config::GBOOST_OBI_EXHAUSTION_BLOCK           }
-fn default_gboost_min_edge_from_fair()      -> Decimal { config::GBOOST_MIN_EDGE_FROM_FAIR             }
-fn default_gboost_min_hist_vol()            -> Decimal { decimal_from_f64(config::GBOOST_MIN_HIST_VOL) }
-fn default_gboost_min_net_profit_usdc()     -> Decimal { config::GBOOST_MIN_NET_PROFIT_USDC            }
-fn default_gboost_min_secs_to_expiry()      -> i64     { config::GBOOST_MIN_SECS_TO_EXPIRY             }
-fn default_gboost_signal_exit_threshold()   -> Decimal { config::GBOOST_SIGNAL_EXIT_THRESHOLD          }
-fn default_gboost_concept_drift_threshold() -> Decimal { config::GBOOST_CONCEPT_DRIFT_THRESHOLD        }
-fn default_gboost_drift_consecutive_required()  -> i64 { config::GBOOST_DRIFT_CONSECUTIVE_REQUIRED as i64 }
-fn default_gboost_drift_stable_clear_required() -> i64 { config::GBOOST_DRIFT_STABLE_CLEAR_REQUIRED as i64 }
-fn default_gboost_label_max_age_hours()     -> i64     { config::GBOOST_LABEL_MAX_AGE_HOURS             }
-fn default_gboost_shadow_mode()             -> bool    { config::GBOOST_SHADOW_MODE                     }
 fn default_gboost_planb_trade_size_usdc()   -> Decimal { config::GBOOST_PLANB_TRADE_SIZE_USDC           }
 fn default_gboost_planb_margin()            -> Decimal { config::GBOOST_PLANB_MARGIN                    }
 fn default_gboost_planb_take_profit_pct()    -> Decimal { config::GBOOST_PLANB_TAKE_PROFIT_PCT           }
@@ -334,11 +317,8 @@ fn default_gboost_planb_max_ask()            -> Decimal { config::GBOOST_PLANB_M
 fn default_gboost_planb_first_minute()       -> i64     { config::GBOOST_PLANB_FIRST_MINUTE              }
 fn default_gboost_planb_last_minute()        -> i64     { config::GBOOST_PLANB_LAST_MINUTE               }
 fn default_gboost_resting_tp_enabled()       -> bool    { config::GBOOST_RESTING_TP_ENABLED              }
-fn default_gboost_structural_min_trees()    -> i64     { config::GBOOST_STRUCTURAL_MIN_TREES as i64     }
-fn default_gboost_holdout_min_skill()       -> Decimal { config::GBOOST_HOLDOUT_MIN_SKILL               }
-fn default_gboost_holdout_min_independent() -> i64     { config::GBOOST_HOLDOUT_MIN_INDEPENDENT as i64  }
 
-/// Bridge for knobs whose profile constant is an `f64` (`GBOOST_MIN_HIST_VOL`):
+/// Bridge for knobs whose profile constant is an `f64` (`FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC`):
 /// every DynamicConfig knob is a `Decimal`, because the Control Tower edits and
 /// PATCHes them as strings and the LLM patch path treats a JSON number as an
 /// integer field. Rounded so 0.0015f64 becomes 0.0015, not its binary expansion.
@@ -586,14 +566,6 @@ pub struct DynamicConfig {
     /// Smallest stranded USDC.e balance worth a sweep transaction, in dollars.
     #[serde(default = "default_collateral_sweep_min_usdc")]
     pub collateral_sweep_min_usdc:     Decimal,
-    /// How hard `perpetual` works on one GBoost retrain. Higher grows more trees
-    /// and fits the label pool more closely; too high overfits a small pool.
-    #[serde(default = "default_gboost_budget")]
-    pub gboost_budget:                 Decimal,
-    /// Hard iteration ceiling for one retrain, so a fit cannot hold a blocking
-    /// thread indefinitely. Caps whatever the budget would otherwise spend.
-    #[serde(default = "default_gboost_iteration_limit")]
-    pub gboost_iteration_limit:        u32,
     /// Seconds a live position quote is reused before re-asking the venue.
     #[serde(default = "default_position_quote_ttl_secs")]
     pub position_quote_ttl_secs:       u64,
@@ -720,63 +692,7 @@ pub struct DynamicConfig {
     pub basis_extreme_skew_bypass:     bool,
 
     // ── GBoost Viper ──────────────────────────────────────────────────────────
-    pub gboost_entry_threshold:   Decimal,
-    pub gboost_stop_loss_pct:     Decimal,
-    pub gboost_target_profit_pct: Decimal,
     pub gboost_max_exposure_usdc: Decimal,
-    #[serde(default = "default_gboost_max_yes_entry_price")]
-    pub gboost_max_yes_entry_price:   Decimal,
-    #[serde(default = "default_gboost_max_no_entry_price")]
-    pub gboost_max_no_entry_price:    Decimal,
-    #[serde(default = "default_gboost_min_entry_price")]
-    pub gboost_min_entry_price:       Decimal,
-    #[serde(default = "default_gboost_obi_adverse_block")]
-    pub gboost_obi_adverse_block:     Decimal,
-    #[serde(default = "default_gboost_obi_exhaustion_block")]
-    pub gboost_obi_exhaustion_block:  Decimal,
-    #[serde(default = "default_gboost_min_edge_from_fair")]
-    pub gboost_min_edge_from_fair:    Decimal,
-    /// Floor on the oracle's 60-minute realized volatility (the Price raptor's
-    /// normalized `hist_vol`, 0.02 per-tick std-dev = 1.0) below which GBoost
-    /// vetoes entries as "oracle too flat". Was the compile-time
-    /// `GBOOST_MIN_HIST_VOL`, which the conservative profile bakes at 0.0015 —
-    /// roughly the median of normal live BTC — so the only way to test whether
-    /// the quiet-regime veto earns its keep was an AMI rebuild. Hot-tunable now;
-    /// every veto is shadow-logged with its `hist_vol` so the scoreboard can
-    /// score any candidate floor against settled outcomes before it is applied.
-    #[serde(default = "default_gboost_min_hist_vol")]
-    pub gboost_min_hist_vol:          Decimal,
-    #[serde(default = "default_gboost_min_net_profit_usdc")]
-    pub gboost_min_net_profit_usdc:   Decimal,
-    #[serde(default = "default_gboost_min_secs_to_expiry")]
-    pub gboost_min_secs_to_expiry:    i64,
-    #[serde(default = "default_gboost_signal_exit_threshold")]
-    pub gboost_signal_exit_threshold: Decimal,
-    /// Chi-squared drift score above which a retrain counts toward suppression.
-    /// Scale is calibrated against GBOOST_DRIFT_WINDOW=400 live sessions: normal
-    /// BTC intraday vol scores 15–21, genuine regime collapse 22+ (bug #10).
-    #[serde(default = "default_gboost_concept_drift_threshold")]
-    pub gboost_concept_drift_threshold: Decimal,
-    /// Consecutive above-threshold retrains required to activate suppression.
-    #[serde(default = "default_gboost_drift_consecutive_required")]
-    pub gboost_drift_consecutive_required: i64,
-    /// Consecutive below-threshold retrains required to clear suppression.
-    #[serde(default = "default_gboost_drift_stable_clear_required")]
-    pub gboost_drift_stable_clear_required: i64,
-    /// Wall-clock cap (hours) on lookahead label age. The label pool is persisted
-    /// to `logs/` across restarts (B33); samples older than this are pruned at
-    /// every harvest, restored or not, so a pool reloaded after a long stop cannot
-    /// train the model on a regime that is days gone. Values below 1 are clamped.
-    #[serde(default = "default_gboost_label_max_age_hours")]
-    pub gboost_label_max_age_hours: i64,
-    /// Observe-only. While on, a GBoost signal that clears every entry gate is
-    /// shadow-logged ("shadow mode: would enter ..." on the veto scoreboard)
-    /// instead of placed. Ships on (B38): every model before 2026-09-06 was fit
-    /// on a mislaid training matrix, and the corrected model's live behavior has
-    /// never been observed. Turn off only after its shadow entries have been
-    /// scored against settlement on /api/gboost/veto-scores.
-    #[serde(default = "default_gboost_shadow_mode")]
-    pub gboost_shadow_mode: bool,
     // ── GBoost plan-B model (2026-09-13) ─────────────────────────────────────
     /// USDC per plan-B entry, raised to the venue's 5-share minimum when it buys fewer.
     #[serde(default = "default_gboost_planb_trade_size_usdc")]
@@ -808,31 +724,6 @@ pub struct DynamicConfig {
     /// Whether GBoost rests its take-profit as a post-only ask instead of crossing the bid.
     #[serde(default = "default_gboost_resting_tp_enabled")]
     pub gboost_resting_tp_enabled: bool,
-    /// Structural floor on a retrain's tree count (B37). Catches the fit that
-    /// stops at a single stump because the window's labels offered nothing to
-    /// learn (1 to 3 trees); it is not a quality bar, tree count does not track
-    /// holdout quality. Values below 1 are treated as 1.
-    #[serde(default = "default_gboost_structural_min_trees")]
-    pub gboost_structural_min_trees: i64,
-    /// Retrain acceptance bar (B37): the logloss skill a validation fit must
-    /// show on the newest tenth of the pool, held out behind a purge gap of
-    /// twice the label horizon, before the retrain is adopted. Skill is
-    /// 1 - model_logloss / best_constant_logloss: 0 matches a coin weighted at
-    /// the holdout's own base rate, negative is worse than that (usually an
-    /// overconfident fit). A rejected retrain keeps the previous model and
-    /// logs the measured skill, so a run of rejections in the log is the model
-    /// failing to generalize to the latest window, not a fault.
-    #[serde(default = "default_gboost_holdout_min_skill")]
-    pub gboost_holdout_min_skill: Decimal,
-    /// Fewest independent outcomes the holdout must hold before its skill
-    /// score counts (B37 review). Pool rows land about a second apart and
-    /// each label is settled one horizon later, so a holdout of hundreds of
-    /// rows may contain only a few outcomes; measured as non-overlapping
-    /// horizon-length blocks by timestamp. Below this the retrain is deferred
-    /// ("holdout too thin to judge") before anything is fit. Values below 1
-    /// are treated as 1, which disables the guard.
-    #[serde(default = "default_gboost_holdout_min_independent")]
-    pub gboost_holdout_min_independent: i64,
 
     // ── TrendCapture Viper ────────────────────────────────────────────────────
     #[serde(default = "default_trendcapture_min_trade_size")]
@@ -1175,8 +1066,6 @@ impl Default for DynamicConfig {
             deploy_min_liquidity_usd: config::DEPLOY_MIN_LIQUIDITY_USD,
             collateral_sweep_enabled:      config::COLLATERAL_SWEEP_ENABLED,
             collateral_sweep_min_usdc:     config::COLLATERAL_SWEEP_MIN_USDC,
-            gboost_budget:                 config::GBOOST_BUDGET,
-            gboost_iteration_limit:        config::GBOOST_ITERATION_LIMIT,
             position_quote_ttl_secs:       config::POSITION_QUOTE_TTL_SECS,
             llm_max_output_tokens:         config::LLM_MAX_OUTPUT_TOKENS,
             obi_use_whole_book:            config::OBI_USE_WHOLE_BOOK,
@@ -1220,25 +1109,7 @@ impl Default for DynamicConfig {
             basis_loss_lockout_secs:       config::BASIS_LOSS_LOCKOUT_SECS,
             basis_extreme_skew_bypass:     config::BASIS_EXTREME_SKEW_BYPASS,
 
-            gboost_entry_threshold:   config::GBOOST_ENTRY_THRESHOLD,
-            gboost_stop_loss_pct:     config::GBOOST_STOP_LOSS_PERCENT,
-            gboost_target_profit_pct: config::GBOOST_TARGET_PROFIT_PERCENT,
             gboost_max_exposure_usdc: config::GBOOST_MAX_EXPOSURE_USDC,
-            gboost_max_yes_entry_price:   config::GBOOST_MAX_YES_ENTRY_PRICE,
-            gboost_max_no_entry_price:    config::GBOOST_MAX_NO_ENTRY_PRICE,
-            gboost_min_entry_price:       config::GBOOST_MIN_ENTRY_PRICE,
-            gboost_obi_adverse_block:     config::GBOOST_OBI_ADVERSE_BLOCK,
-            gboost_obi_exhaustion_block:  config::GBOOST_OBI_EXHAUSTION_BLOCK,
-            gboost_min_edge_from_fair:    config::GBOOST_MIN_EDGE_FROM_FAIR,
-            gboost_min_hist_vol:          decimal_from_f64(config::GBOOST_MIN_HIST_VOL),
-            gboost_min_net_profit_usdc:   config::GBOOST_MIN_NET_PROFIT_USDC,
-            gboost_min_secs_to_expiry:    config::GBOOST_MIN_SECS_TO_EXPIRY,
-            gboost_signal_exit_threshold: config::GBOOST_SIGNAL_EXIT_THRESHOLD,
-            gboost_concept_drift_threshold: config::GBOOST_CONCEPT_DRIFT_THRESHOLD,
-            gboost_drift_consecutive_required: config::GBOOST_DRIFT_CONSECUTIVE_REQUIRED as i64,
-            gboost_drift_stable_clear_required: config::GBOOST_DRIFT_STABLE_CLEAR_REQUIRED as i64,
-            gboost_label_max_age_hours: config::GBOOST_LABEL_MAX_AGE_HOURS,
-            gboost_shadow_mode:         config::GBOOST_SHADOW_MODE,
             gboost_planb_trade_size_usdc: config::GBOOST_PLANB_TRADE_SIZE_USDC,
             gboost_planb_margin:          config::GBOOST_PLANB_MARGIN,
             gboost_planb_take_profit_pct: config::GBOOST_PLANB_TAKE_PROFIT_PCT,
@@ -1249,9 +1120,6 @@ impl Default for DynamicConfig {
             gboost_planb_first_minute:    config::GBOOST_PLANB_FIRST_MINUTE,
             gboost_planb_last_minute:     config::GBOOST_PLANB_LAST_MINUTE,
             gboost_resting_tp_enabled:    config::GBOOST_RESTING_TP_ENABLED,
-            gboost_structural_min_trees: config::GBOOST_STRUCTURAL_MIN_TREES as i64,
-            gboost_holdout_min_skill:   config::GBOOST_HOLDOUT_MIN_SKILL,
-            gboost_holdout_min_independent: config::GBOOST_HOLDOUT_MIN_INDEPENDENT as i64,
 
             trendcapture_min_trade_size_usdc: config::TRENDCAPTURE_MIN_TRADE_SIZE_USDC,
             trendcapture_max_trade_size_usdc: config::TRENDCAPTURE_MAX_TRADE_SIZE_USDC,
@@ -1867,6 +1735,70 @@ mod tests {
     /// which is exactly what an older row looks like on disk. Only fields added
     /// after the schema settled carry `#[serde(default)]` — the core ones are
     /// required — so an empty object is not a valid stand-in for a legacy row.
+    /// The reverse direction: a persisted row written BEFORE the self-retraining
+    /// GBoost classifier and its shadow mode were removed still carries their
+    /// 23 knobs (production's `dynamic_config` and `squadron_configs` rows do,
+    /// as of 2026-09-13). They must load, with the unknown keys dropped and
+    /// the plan B knobs intact, on both the global and the squadron path
+    /// (`serde_json::from_str::<DynamicConfig>` in each), and through the
+    /// PATCH merge, which re-serializes the current config and inserts the
+    /// patch's keys before deserializing.
+    #[test]
+    fn a_config_row_carrying_the_retired_gboost_knobs_still_loads() {
+        let mut stored = serde_json::to_value(DynamicConfig::default()).unwrap();
+        let obj = stored.as_object_mut().unwrap();
+        obj.insert("gboost_planb_margin".into(), serde_json::json!("0.12"));
+        for (k, v) in [
+            ("gboost_shadow_mode", serde_json::json!(false)),
+            ("gboost_budget", serde_json::json!("0.80")),
+            ("gboost_iteration_limit", serde_json::json!(1000)),
+            ("gboost_entry_threshold", serde_json::json!("0.72")),
+            ("gboost_stop_loss_pct", serde_json::json!("0.075")),
+            ("gboost_target_profit_pct", serde_json::json!("0.12")),
+            ("gboost_max_yes_entry_price", serde_json::json!("0.55")),
+            ("gboost_max_no_entry_price", serde_json::json!("0.45")),
+            ("gboost_min_entry_price", serde_json::json!("0.40")),
+            ("gboost_obi_adverse_block", serde_json::json!("-0.60")),
+            ("gboost_obi_exhaustion_block", serde_json::json!("0.80")),
+            ("gboost_min_edge_from_fair", serde_json::json!("0.04")),
+            ("gboost_min_hist_vol", serde_json::json!("0.0010")),
+            ("gboost_min_net_profit_usdc", serde_json::json!("0.15")),
+            ("gboost_min_secs_to_expiry", serde_json::json!(900)),
+            ("gboost_signal_exit_threshold", serde_json::json!("0.50")),
+            ("gboost_concept_drift_threshold", serde_json::json!("22.0")),
+            ("gboost_drift_consecutive_required", serde_json::json!(3)),
+            ("gboost_drift_stable_clear_required", serde_json::json!(2)),
+            ("gboost_label_max_age_hours", serde_json::json!(48)),
+            ("gboost_structural_min_trees", serde_json::json!(5)),
+            ("gboost_holdout_min_skill", serde_json::json!("0.05")),
+            ("gboost_holdout_min_independent", serde_json::json!(12)),
+        ] {
+            assert!(obj.insert(k.into(), v).is_none(), "{k} must no longer be a DynamicConfig field");
+        }
+        let json = serde_json::to_string(&stored).unwrap();
+
+        // The global and squadron load paths.
+        let cfg: DynamicConfig = serde_json::from_str(&json).expect("a row with retired keys must still load");
+        assert_eq!(cfg.gboost_planb_margin, rust_decimal_macros::dec!(0.12), "the plan B knobs survive beside the retired keys");
+        assert!(cfg.enable_gboost == DynamicConfig::default().enable_gboost);
+        // Nothing retired is written back: the next save drops the keys for good.
+        let saved = serde_json::to_value(&cfg).unwrap();
+        assert!(!saved.as_object().unwrap().contains_key("gboost_shadow_mode"));
+        assert!(!saved.as_object().unwrap().contains_key("gboost_min_hist_vol"));
+
+        // The PATCH merge (`apply_patch_as`): current config re-serialized,
+        // patch keys inserted verbatim, then deserialized. A stale client
+        // patching a retired key is ignored rather than rejected.
+        let mut merged = serde_json::to_value(DynamicConfig::default()).unwrap();
+        for (k, v) in serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+            r#"{"gboost_shadow_mode": true, "gboost_min_hist_vol": "0.0015", "gboost_planb_margin": "0.15"}"#,
+        ).unwrap() {
+            merged.as_object_mut().unwrap().insert(k, v);
+        }
+        let patched: DynamicConfig = serde_json::from_value(merged).expect("a patch naming retired keys still applies");
+        assert_eq!(patched.gboost_planb_margin, rust_decimal_macros::dec!(0.15));
+    }
+
     #[test]
     fn a_config_row_predating_the_newest_knobs_still_loads() {
         let mut legacy = serde_json::to_value(DynamicConfig::default()).unwrap();

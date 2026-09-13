@@ -158,9 +158,11 @@ mod tests {
 /// have never heard of, with advice they cannot act on. It reached a customer's
 /// log on the v1.0.5 Marketplace AMI on 2026-08-29.
 ///
-/// `set_log_iterations(0)` in `gboost_impl` silences that crate's stdout
-/// progress lines but NOT this, which comes through `tracing` — a distinction
-/// the comment there used to get wrong.
+/// The booster's `set_log_iterations(0)` silences its stdout progress lines
+/// but NOT this, which comes through `tracing`. DRADIS no longer trains a
+/// booster in-process (the GBoost model is exported offline and only loaded
+/// here), so the line should not recur; the filter stays so a future fit
+/// cannot bring it back.
 ///
 /// The suppression yields to an explicit request: if `RUST_LOG` mentions
 /// `perpetual` at all, whatever it says stands, so the booster stays debuggable.
@@ -249,7 +251,7 @@ mod env_filter_tests {
     #[test]
     fn dradis_output_is_untouched() {
         let out = emitted("info,dradis=info", || {
-            tracing::warn!(target: "dradis::vipers::gboost_impl", "degenerate retrain");
+            tracing::warn!(target: "dradis::vipers::gboost_planb", "degenerate retrain");
             tracing::info!(target: "dradis::squadron::patrol_impl", "squadron deployed");
         });
         assert!(out.contains("degenerate retrain"), "{out:?}");

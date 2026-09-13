@@ -484,9 +484,9 @@ pub const DEPLOY_MAX_DAYS_TO_CLOSE: u32 = 180;
 // is a large loosening of a risk control to apply to a venue on the strength of
 // another venue's book structure. Turn it on per squadron, compare, then decide.
 //
-// Deliberately does NOT affect the GBoost feature vector: that model is trained
-// on touch-derived features, and changing their meaning underneath it at runtime
-// would leave it predicting from a distribution it never saw.
+// Deliberately a per-squadron, opt-in switch: every viper's OBI gates were
+// calibrated on the touch-derived measure, and changing its meaning underneath
+// them at runtime would move every threshold at once.
 pub const OBI_USE_WHOLE_BOOK: bool = false;
 
 // ── Intl order-book feed (B36) ───────────────────────────────────────────────
@@ -778,53 +778,6 @@ pub const BASIS_MAKER_BUY_PRICE_ADJUSTMENT: Decimal = dec!(0.01);
 
 pub const ENABLE_GBOOST_TRADING: bool = true;
 
-/// Observe-only default for GBoost (B38). Seeds the `gboost_shadow_mode` knob:
-/// while on, a signal that clears every entry gate is shadow-logged as a
-/// would-be entry and no order is placed. Same in every profile; this is
-/// validation state, not risk appetite. Turn it off from the Control Tower once
-/// the corrected model's shadow entries have been scored against settlement.
-pub const GBOOST_SHADOW_MODE: bool = true;
-
-/// Maximum token ask price allowed for GBoost entries (for YES side).
-/// Lowered from 0.60 → 0.55 after 2026-05-08 session analysis:
-///   T3: YES $0.56 on daily (P(UP)=0.889) → SignalRev loss -$0.21 (market already priced 56% UP)
-///   T6: NO  $0.59 on hourly (P(UP)=0.020) → SL -$1.02 (overpriced entry + near expiry)
-/// Entries above $0.55 have compressed upside and larger implied-vol swings on hourly markets.
-pub const GBOOST_MAX_YES_ENTRY_PRICE: Decimal = dec!(0.55);
-/// Minimum token ask price allowed for GBoost entries (for NO side).
-/// For NO entries, we want to buy when the price is low.
-pub const GBOOST_MAX_NO_ENTRY_PRICE: Decimal = dec!(0.45);
-pub const GBOOST_MIN_ENTRY_PRICE: Decimal = dec!(0.38); // Aggressive: allows down to 38¢ (vs 40¢ default)
-
-pub const GBOOST_HISTORY_BUFFER_SIZE: usize = 1000;
-pub const GBOOST_HISTORY_MIN_SPACING_MS: i64 = 500; // time-decimated snapshot buffer
-pub const GBOOST_LABEL_HORIZON_SECS: i64 = 120; // aggressive: shorter horizon, faster-turning signal
-pub const GBOOST_LABEL_MIN_ORACLE_MOVE_FRAC: f64 = 0.0002; // skip flat samples (<2bp move)
-pub const GBOOST_MIN_TRAINING_SAMPLES: usize = 320;
-pub const GBOOST_LABEL_POOL_CAP: usize = 4000; // aggressive: smaller pool — fresher labels, adapts faster
-/// Wall-clock cap on lookahead label age (hours). Samples older than this are
-/// pruned from the pool at every harvest, whether restored from the persisted
-/// pool file (B33) or labeled by this process. Hot-tunable: gboost_label_max_age_hours.
-pub const GBOOST_LABEL_MAX_AGE_HOURS: i64 = 48;
-pub const GBOOST_MIN_RETRAIN_INTERVAL_SECS: u64 = 300;
-pub const GBOOST_RETRAIN_EVERY_N: usize = 200;
-pub const GBOOST_BUDGET: Decimal = dec!(0.80); // raised from 0.65 — gives perpetual room to grow past 1 tree
-// Decimal rather than f32 so it matches every other fractional tunable, is
-// readable by tools/generate-profiles.py, and round-trips through DynamicConfig
-// without a float artifact. Converted to f32 at the booster call site.
-pub const GBOOST_NUM_THREADS: usize = 2;
-
-/// Hard ceiling on boosting iterations for one GBoost retrain.
-///
-/// `perpetual` grows trees until its budget is spent or this limit is hit,
-/// whichever comes first, so this is the wall-clock guard: training runs inside
-/// `spawn_blocking`, and an unbounded fit on a large label pool would hold a
-/// blocking thread long enough to matter. Reaching it is not an error, it means
-/// the budget had more to spend than the limit allowed.
-///
-/// Raise it together with the budget, or the extra budget simply cannot be used.
-pub const GBOOST_ITERATION_LIMIT: u32 = 1000;
-
 /// How long a live position quote is reused before the venue is asked again.
 ///
 /// The Trade Log's mark price came from a 300s chain-sync sweep reading an
@@ -842,53 +795,14 @@ pub const GBOOST_ITERATION_LIMIT: u32 = 1000;
 /// many open positions and do not need second-by-second prices; the saving comes
 /// from viewers overlapping, not from any one of them.
 pub const POSITION_QUOTE_TTL_SECS: u64 = 2;
-pub const GBOOST_ENTRY_THRESHOLD: Decimal = dec!(0.68); // 2026-06-30: lowered (0.88 startup default produced zero trades in 13d)
-pub const GBOOST_PRED_LOG_INTERVAL_SECS: u64 = 120; // periodic P(UP) conviction diagnostic
+/// Cadence of the periodic diagnostic lines shared by the Price raptor's
+/// realized-volatility telemetry and FairValue's calibration log.
+pub const DIAGNOSTIC_LOG_INTERVAL_SECS: u64 = 120;
 
-/// Max `gboost_vetoes` rows labeled with their settled outcome per cleanup sweep.
-///
-/// The veto shadow-log records every entry-eligible signal a gate rejected; the
-/// cleanup task attaches each one's real market resolution so the gate stack can
-/// be scored on outcomes instead of on the model's own probability. Bounded per
-/// sweep because each distinct market costs one Gamma request and the whole
-/// cleanup pass runs under a 45s timeout — a large backlog drains over several
-/// sweeps rather than starving orphan reconciliation, the safety-critical work
-/// in that task.
-pub const GBOOST_VETO_SCORING_BATCH: i64 = 200;
-pub const GBOOST_POST_EXIT_COOLDOWN_SECS: i64 = 300;
-/// Aggressive: loosest OBI gate (2026-08-05: -0.25 strangled all entries; debounce now guards whipsaw).
-pub const GBOOST_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.75);
-/// Entry-signal persistence debounce (2026-08-05): same side must stay eligible this long.
-/// Aggressive: shortest hold — favors trade frequency.
-pub const GBOOST_ENTRY_PERSISTENCE_SECS: u64 = 60;
-pub const GBOOST_SIGNAL_CONTINUITY_GAP_SECS: u64 = 30;
-/// OBI EMA smoothing (2026-07-14). Aggressive: shorter tau reacts faster to book turns.
-pub const GBOOST_OBI_EMA_TAU_SECS: f64 = 30.0;
-pub const GBOOST_OBI_EMA_STALE_SECS: f64 = 30.0;
-/// Minimum fraction of price distance from 0.50 required for a GBoost entry.
-/// Aggressive: lower edge requirement — enters closer to 50/50 for more opportunities.
-pub const GBOOST_MIN_EDGE_FROM_FAIR: Decimal = dec!(0.02);
-/// Minimum net gain fraction required before a signal-reversal exit is allowed.
-/// Aggressive: lower bar — exits on small reversals to capture any available profit.
-pub const GBOOST_SIGNAL_REV_MIN_PROFIT: f64 = 0.02;
-/// Maximum combined ask sum on the TARGET (daily/window) market at entry.
-/// Aggressive: slightly wider tolerance than balanced — still blocks clearly broken books.
-pub const GBOOST_MAX_TARGET_ASK_SUM: Decimal = dec!(1.05);
-/// Hourly OBI adverse block for daily entries — aggressive allows more directional noise.
-pub const GBOOST_HOURLY_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.60);
-/// OBI momentum-exhaustion gate: block entries when |obi| exceeds threshold.
-/// Aggressive: 0.90 — looser than balanced; only blocks near-fully-resolved books.
-pub const GBOOST_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.90);
-/// Minimum historical volatility regime required for a GBoost entry.
-/// Aggressive: 0.001 — slightly more permissive than the default 0.002 to allow entries
-/// in marginally flat-oracle conditions.  Still blocks completely frozen (vol=0) oracles.
-pub const GBOOST_MIN_HIST_VOL: f64 = 0.0007; // Recalibrated from 0.010 (2026-07-10): aggressive — lowest floor, admits even the quietest live BTC (normal 60m realized-vol ~0.0025-0.0035)
-pub const GBOOST_SIGNAL_EXIT_THRESHOLD: Decimal = dec!(0.45);
 pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(4.0);
-pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 300;
 // ── GBoost plan-B model (2026-09-13) ─────────────────────────────────────────
-// An offline-trained, Platt-calibrated perpetual model (research: gboost-holdout-2026-09-12,
-// Path B budget 2.0), loaded from logs/{asset}-GBOOST_PLANB_MODEL_FILENAME. Entry when the calibrated
+// An offline-trained, Platt-calibrated perpetual model, validated on held-out 2026 BTC hourly
+// markets before it shipped, loaded from logs/{asset}-GBOOST_PLANB_MODEL_FILENAME. Entry when the calibrated
 // P(win) clears the plan's break-even win rate plus the margin; exit by resting take-profit, taker
 // stop, or settlement. The plan values below are the ones the model's labels were built with.
 pub const GBOOST_PLANB_MODEL_FILENAME: &str = "gboost_planb_v1.json";
@@ -902,122 +816,7 @@ pub const GBOOST_PLANB_MAX_ASK: Decimal = dec!(0.75);
 pub const GBOOST_PLANB_FIRST_MINUTE: i64 = 5;
 pub const GBOOST_PLANB_LAST_MINUTE: i64 = 45;
 pub const GBOOST_RESTING_TP_ENABLED: bool = true;
-pub const GBOOST_TARGET_PROFIT_PERCENT: Decimal = dec!(0.12);
-pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.080); // aggressive: 8% — widest; model still bootstrapping
-pub const GBOOST_MIN_HOLD_SECS: i64 = 180;
-pub const GBOOST_SL_MIN_HOLD_SECS: i64 = 10;
-/// Structural floor on a retrain's tree count (B37). Seeds the
-/// `gboost_structural_min_trees` knob; the same in every profile because it is
-/// mechanism, not risk appetite. This is NOT a quality bar: tree count is a
-/// byproduct of how much loss structure the pool offers at the learning rate,
-/// and it does not track holdout quality (corr -0.33 on production data). It
-/// only catches the fit that finds nothing to learn: on featureless or
-/// homogeneous data perpetual stops at 1 tree when the labels are exactly
-/// balanced and at 3 when they are slightly off (the extra trees are base
-/// rate nudges, not splits) at any budget up to 1.0, and at 5 at budget 1.5;
-/// real fits on the production pool run 17 to 108. Five sits above that band
-/// at the shipped budget and below any real fit; the old 20-30 floor bisected
-/// the real fits. A nothing-fit that slips past the floor is still rejected
-/// by the holdout test (its skill is 0). Quality is judged by
-/// GBOOST_HOLDOUT_MIN_SKILL.
-pub const GBOOST_STRUCTURAL_MIN_TREES: usize = 5;
-/// Retrain acceptance bar (B37). Seeds the `gboost_holdout_min_skill` knob;
-/// the same in every profile. Before a retrain is adopted, a validation model
-/// fit on the older part of the pool is scored on the newest ten percent
-/// (separated by a purge gap of twice the label horizon), and its logloss skill
-/// over the best constant forecast, 1 - model_logloss / constant_logloss, must
-/// reach this. 0 is "no better than a coin weighted at the holdout's own base
-/// rate"; the margin above 0 is what separates a fit that generalizes from one
-/// that got lucky on a window of a few label runs.
-pub const GBOOST_HOLDOUT_MIN_SKILL: Decimal = dec!(0.05);
-/// Fewest independent outcomes the retrain holdout must hold before its skill
-/// score is treated as evidence (B37 review, 2026-09-07). Seeds the
-/// `gboost_holdout_min_independent` knob; the same in every profile. Pool rows
-/// land about a second apart and each label is settled one horizon later, so
-/// a holdout of 800 rows can hold three or four outcomes, and on such a window
-/// a lucky fit reads as +80% skill with AUC 1.00: production adopted eight
-/// retrains that way in a day while every walk-forward window of the same
-/// pool scored below zero. Measured as non-overlapping horizon-length blocks
-/// across the holdout. Twelve is an hour at the 300 s horizon; with 800-row
-/// holdouts spanning 14 to 60 minutes today this defers nearly every retrain,
-/// which is the honest state until the pool cadence is redesigned (B39).
-pub const GBOOST_HOLDOUT_MIN_INDEPENDENT: usize = 12;
-pub const GBOOST_MODEL_FILENAME: &str = "gboost_model_v30g_o180.json";
-pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v30g_o180.json";
-/// Max fraction of identical labels before skipping a retrain cycle (avoids degenerate storms).
-/// Aggressive: same threshold — label imbalance is a hard data quality issue, not a risk preference.
-pub const GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX: f64 = 0.80;
-/// 60m oracle drift threshold (USD) for the trend-alignment entry gate.
-/// Aggressive: wider at $300 — allows entries in moderate trends; only blocks strong trends.
-/// 60m trend drift block: 0.003 = 0.30% of price. Aggressive: at BTC=$100k → $300.
-pub const GBOOST_TREND_DRIFT_BLOCK_PCT: Decimal = dec!(0.003);
-pub const GBOOST_MAX_HOURLY_ASK_SUM: Decimal = dec!(1.20);
-pub const GBOOST_MIN_HOURLY_BID_SUM: Decimal = dec!(0.70);
-pub const GBOOST_MIN_SECS_TO_EXPIRY: i64 = 900;
-pub const GBOOST_MAX_SNAPSHOT_AGE_SECS: i64 = 10;
 
-/// Minimum hourly YES bid / maximum hourly YES ask allowed at GBoost entry.
-/// Guards against entering a daily position when the hourly market is near-resolved.
-pub const GBOOST_MIN_HOURLY_YES_BID: Decimal = dec!(0.15);
-pub const GBOOST_MAX_HOURLY_YES_ASK: Decimal = dec!(0.95);
-
-/// When trading the DAILY market, block DAILY NO entries if hourly YES bid > threshold
-/// (strong hourly uptrend → daily NO falls) and block DAILY YES entries if hourly YES
-/// ask < (1 − threshold) (strong hourly downtrend → daily YES falls).
-/// 0.72 = aggressive: only blocks near-resolution extremes, accepts more trend risk.
-/// Evidence: 2026-06-17 T1 hourly YES was 0.69 when GBoost entered DAILY NO → −$0.49 loss.
-pub const GBOOST_HOURLY_STRONG_TREND_BLOCK: Decimal = dec!(0.72);
-
-/// Seconds BTC spot must stay below (daily_strike − BASIS_BTC_ORACLE_STRIKE_BUFFER)
-/// before GBoost YES entries are suppressed. 3600s = 60 min sustained below-strike.
-pub const GBOOST_BELOW_STRIKE_SUPPRESS_SECS: i64 = 3600;
-
-// ── GBoost dynamic position sizing ───────────────────────────────────────────
-
-/// Aggressive: higher floor — deploy more capital even at the minimum threshold.
-pub const GBOOST_MIN_EXPOSURE_USDC: Decimal = dec!(2.0);
-
-/// Aggressive: higher vol threshold — tolerate more oracle noise before halving size.
-pub const GBOOST_HIGH_VOL_REGIME_THRESHOLD: f64 = 0.75;
-
-/// Aggressive: less aggressive size reduction in elevated vol (65% vs 50% in balanced).
-pub const GBOOST_HIGH_VOL_SIZE_SCALE: f64 = 0.65;
-
-/// Aggressive: SL cooldown matches standard POST_EXIT_COOLDOWN — faster re-entry allowed.
-pub const GBOOST_SL_POST_EXIT_COOLDOWN_SECS: i64 = 600;
-
-/// Minimum expected net profit (USDC) after round-trip fees required to place a GBoost entry.
-/// Aggressive: $0.10 — lower bar to allow more entries; higher trade frequency.
-pub const GBOOST_MIN_NET_PROFIT_USDC: Decimal = dec!(0.10);
-
-/// Market-level entry hold lock (seconds) before GBoost may flip direction on a market.
-/// Aggressive: 120s — shorter lock allows faster direction changes on strong signals.
-pub const GBOOST_MIN_HOLDING_LOCK_SECS: i64 = 120;
-
-///  When the live data distribution deviates
-/// significantly from the training distribution (as measured by perpetual's leaf-node
-/// chi-squared statistic), GBoost entries are suppressed until the next retrain.
-/// Aggressive: 25.0 — recalibrated to the live-session drift-score scale (22.0
-/// balanced baseline); only suppresses on unmistakable regime collapse, accepting
-/// more regime risk in exchange for more entries.
-/// NOTE: this scale is only valid with GBOOST_DRIFT_WINDOW = 400.
-pub const GBOOST_CONCEPT_DRIFT_THRESHOLD: Decimal = dec!(25.0);
-
-/// Number of recent history snapshots used for the post-retrain drift check.
-/// 400 ticks (~3-4 min at the 500ms decimated cadence) — the drift-score scale
-/// the thresholds above are calibrated against; do not shrink independently.
-pub const GBOOST_DRIFT_WINDOW: usize = 400;
-
-/// Number of consecutive retrains above GBOOST_CONCEPT_DRIFT_THRESHOLD required
-/// before GBoost entries are suppressed.  A single retrain below the threshold
-/// resets the counter and clears suppression.
-/// Aggressive: 3 — with the higher 25.0 threshold, even aggressive keeps the
-/// three-consecutive confirmation; single 25+ spikes still occur on order-flow shocks.
-pub const GBOOST_DRIFT_CONSECUTIVE_REQUIRED: usize = 3;
-
-/// Number of consecutive BELOW-threshold retrains to clear drift suppression.
-/// Aggressive: 2 — clear suppression faster to allow more entries after brief regime shifts.
-pub const GBOOST_DRIFT_STABLE_CLEAR_REQUIRED: usize = 2;
 
 // ============================================================================
 // TRENDCAPTURE STRATEGY PARAMETERS

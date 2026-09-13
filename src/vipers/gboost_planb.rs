@@ -16,15 +16,16 @@
 
 //! GBoost plan B: an offline-trained, calibrated gradient-boosted model (2026-09-13).
 //!
-//! Replaces the self-retraining classifier in `gboost_impl` as the `GboostStrategy`
-//! viper. That model learned "is BTC higher in three minutes" from order-book
-//! snapshots and never showed a tradeable edge. This one is the model the research
-//! harness validated (`~/dradis-research/gboost-holdout-2026-09-12`): perpetual at
-//! budget 2.0 with Platt calibration, trained on June 1 to September 10 2026 BTC
-//! hourly markets to predict whether a trade entered at the ask reaches a 20%
-//! resting take-profit before an 11% stop. On unseen June and July markets that
-//! configuration returned +3.4% per trade before this code existed; the live trial
-//! is the real test.
+//! The `GboostStrategy` viper. It succeeded a self-retraining classifier that
+//! learned "is BTC higher in three minutes" from order-book snapshots and never
+//! showed a tradeable edge; that code is gone. This model is trained and validated
+//! offline: a perpetual booster at budget 2.0 with Platt calibration, fit on June 1
+//! to September 10 2026 BTC hourly markets to predict whether a trade entered at
+//! the ask reaches a 20% resting take-profit before an 11% stop. Validation was a
+//! walk-forward holdout on markets the fit never saw, where the configuration
+//! returned +3.4% per trade before this code existed; the live trial is the real
+//! test. The engine never trains: it loads the exported model file and scores it,
+//! and the exporter parity test below pins the scoring to the exporter's own.
 //!
 //! # Parity with the harness
 //!
@@ -74,6 +75,17 @@ use crate::venues::core::TimeInForce;
 use crate::vipers::is_drawdown_limit_hit;
 
 const STRATEGY_NAME: &str = "GboostStrategy";
+
+/// Fewest trees a loaded model file may have. A calibrated export of a real fit
+/// has dozens; a file with fewer is a nothing-fit or a broken export, and is
+/// refused at load rather than scored. Mechanism, not risk appetite, so it is
+/// not a profile constant.
+const STRUCTURAL_MIN_TREES: usize = 5;
+
+/// Oldest book snapshot from which a minute's mid is recorded. The intl feed
+/// only moves on a book event, so a quiet market can sit on one reading for
+/// minutes; a mid older than this is not that minute's mid.
+const MAX_SNAPSHOT_AGE_SECS: i64 = 10;
 
 /// Number of model inputs.
 pub const N_FEATURES: usize = 29;
@@ -312,6 +324,19 @@ pub enum ExitAction {
 }
 
 /// What a held position should do at this bid.
+///
+/// With `resting` on, the take-profit IS the resting ask: the plan this model
+/// was trained on exits as a maker at the target, and no taker take-profit
+/// ever fires. A bid at or through the target does not change that. Either
+/// the ask has already been lifted (the venue crossed it on the way up, and
+/// the engine's fill sweep books the lift at the exact resting price), or it
+/// never rested; in both cases a taker sell here would pull a filled ask and
+/// send a sell for shares that are gone. 2026-09-13 08:37 ET, real money: the
+/// $0.59 ask filled as the book gapped to $0.60, the taker exit fired on the
+/// same tick, the venue rejected it, and the ledger lost the trade. So above
+/// the target the ask simply re-posts one tick over the bid, where a post-only
+/// order can rest; the engine leaves an existing ask alone within its reprice
+/// deadband and pulls-and-books it otherwise.
 pub fn exit_action(entry: Decimal, bid: Decimal, tp: Decimal, sl: Decimal, ceiling: Decimal, resting: bool) -> ExitAction {
     if entry <= Decimal::ZERO {
         return ExitAction::Hold;
@@ -321,14 +346,22 @@ pub fn exit_action(entry: Decimal, bid: Decimal, tp: Decimal, sl: Decimal, ceili
     }
     let target = take_profit_target(entry, tp, ceiling);
     let tp_possible = target < Decimal::ONE && target > entry;
-    if tp_possible && bid >= target {
-        return ExitAction::TakeProfit;
+    if !tp_possible {
+        return ExitAction::Hold;
     }
-    if resting && tp_possible {
-        return ExitAction::Rest(target);
+    if resting {
+        let ask = if bid >= target { bid + TICK } else { target };
+        return if ask < Decimal::ONE { ExitAction::Rest(ask) } else { ExitAction::Hold };
+    }
+    if bid >= target {
+        return ExitAction::TakeProfit;
     }
     ExitAction::Hold
 }
+
+/// One price tick on the venue; a post-only ask must sit at least this far
+/// above the bid.
+const TICK: Decimal = dec!(0.01);
 
 /// The last mid recorded at or before `at`, if no older than the harness's staleness limit.
 fn mid_at(series: Option<&BTreeMap<i64, [Option<f64>; 2]>>, side: usize, at: i64) -> Option<f64> {
@@ -371,8 +404,8 @@ pub fn load_model(path: &std::path::Path) -> std::result::Result<PlanBModel, Str
     let platt_a = num("platt_a").ok_or("model has no usable platt_a")?;
     let platt_b = num("platt_b").ok_or("model has no usable platt_b")?;
     let trees = booster.get_prediction_trees().len();
-    if trees < config::GBOOST_STRUCTURAL_MIN_TREES {
-        return Err(format!("model has {trees} trees, below the structural minimum {}", config::GBOOST_STRUCTURAL_MIN_TREES));
+    if trees < STRUCTURAL_MIN_TREES {
+        return Err(format!("model has {trees} trees, below the structural minimum {}", STRUCTURAL_MIN_TREES));
     }
     let version = meta("model_version").unwrap_or_else(|| "unversioned".to_string());
     Ok(PlanBModel { booster, platt_a, platt_b, version, trees })
@@ -669,7 +702,7 @@ impl Strategy for GboostPlanBStrategy {
         let minute_start = w + (now_s - w) / 60 * 60;
 
         // Record each minute's mids from the first fresh tick after its boundary.
-        if (now - snap.timestamp).num_seconds() <= config::GBOOST_MAX_SNAPSHOT_AGE_SECS {
+        if (now - snap.timestamp).num_seconds() <= MAX_SNAPSHOT_AGE_SECS {
             let mut mids = lock(&g.mids);
             let series = mids.entry(cid.clone()).or_default();
             series.entry(minute_start).or_insert([book_mid(snap.yes_bid, snap.yes_ask), book_mid(snap.no_bid, snap.no_ask)]);
@@ -789,16 +822,6 @@ impl Strategy for GboostPlanBStrategy {
             return Ok(StrategySignal::NoSignal);
         }
 
-        if dc.gboost_shadow_mode {
-            lock(&g.attempted).insert((cid.clone(), side));
-            info!(
-                "GBoost plan-B [{}] shadow mode: would buy {} at ${:.3} x {:.2} (p={:.4} need={:.4})",
-                market.market_name, label[side], ask[side], shares, preds[side].1, decisions[side].required,
-            );
-            idle("shadow mode: signal logged, not traded");
-            return Ok(StrategySignal::NoSignal);
-        }
-
         // A live side is marked attempted once its position is seen (above, or in the exit
         // pass), not here: an entry the patrol drops (a cooldown, a pending order) or the book
         // kills unfilled stays eligible at the next decision minute.
@@ -906,16 +929,18 @@ impl Strategy for GboostPlanBStrategy {
                         exit_pair: false,
                     });
                 }
-                ExitAction::Rest(target) if target > bid => {
+                ExitAction::Rest(ask) => {
+                    let target = take_profit_target(entry, dc.gboost_planb_take_profit_pct, dc.gboost_planb_tp_ceiling);
                     resting.push(StrategySignal::MakerRestingExit {
-                        params: params(target, TimeInForce::Gtc, true),
+                        params: params(ask, TimeInForce::Gtc, true),
                         reason: format!(
-                            "GBoostPlanBRestingTP: ask=${:.4} entry=${:.4} target={:+.2}%",
-                            target, entry, (target - entry) / entry * dec!(100),
+                            "GBoostPlanBRestingTP: ask=${:.4} entry=${:.4} target={:+.2}%{}",
+                            ask, entry, (ask - entry) / entry * dec!(100),
+                            if ask > target { " (bid through the target: ask a tick over it)" } else { "" },
                         ),
                     });
                 }
-                _ => {}
+                ExitAction::Hold => {}
             }
         }
 
@@ -1032,14 +1057,39 @@ mod tests {
         // $0.50 entry: stop at $0.445, target $0.60.
         assert_eq!(act(dec!(0.50), dec!(0.44), true), ExitAction::Stop);
         assert_eq!(act(dec!(0.50), dec!(0.445), true), ExitAction::Stop);
-        assert_eq!(act(dec!(0.50), dec!(0.61), true), ExitAction::TakeProfit);
+        assert_eq!(act(dec!(0.50), dec!(0.61), false), ExitAction::TakeProfit);
         assert_eq!(act(dec!(0.50), dec!(0.52), true), ExitAction::Rest(dec!(0.60)));
         assert_eq!(act(dec!(0.50), dec!(0.52), false), ExitAction::Hold);
         // No bid is not a stop.
         assert_eq!(act(dec!(0.50), dec!(0), false), ExitAction::Hold);
+        // A rested position with the bid through the target is not a taker sale.
+        assert_eq!(act(dec!(0.50), dec!(0.61), true), ExitAction::Rest(dec!(0.62)));
+        assert_eq!(act(dec!(0.50), dec!(0.60), true), ExitAction::Rest(dec!(0.61)));
+        // ...and a bid at $0.99 leaves nowhere for a post-only ask to sit.
+        assert_eq!(act(dec!(0.80), dec!(0.99), true), ExitAction::Hold);
         // $0.75 entry: 20% would be $0.90, capped at the ceiling.
         assert_eq!(take_profit_target(dec!(0.75), dec!(0.20), dec!(0.90)), dec!(0.90));
         assert_eq!(take_profit_target(dec!(0.43), dec!(0.20), dec!(0.90)), dec!(0.52));
+    }
+
+    /// 2026-09-13 08:37:18 ET, real money. NO entered at $0.4899, the $0.59
+    /// ask resting, and the book gapped to a $0.60 bid: the ask filled as a
+    /// maker and the same tick fired a taker `TakeProfit`, which pulled the
+    /// filled ask and sent a sell the venue rejected. With the ask resting the
+    /// take-profit must never be a taker sale, at any bid.
+    #[test]
+    fn the_resting_take_profit_is_never_doubled_by_a_taker_sale() {
+        let at = |bid| exit_action(dec!(0.4899), bid, dec!(0.20), dec!(0.11), dec!(0.90), true);
+        assert_eq!(take_profit_target(dec!(0.4899), dec!(0.20), dec!(0.90)), dec!(0.59));
+        assert_eq!(at(dec!(0.55)), ExitAction::Rest(dec!(0.59)));
+        for bid in [dec!(0.59), dec!(0.60), dec!(0.67), dec!(0.90), dec!(0.98)] {
+            match at(bid) {
+                ExitAction::Rest(ask) => assert!(ask > bid && ask < Decimal::ONE, "bid {bid}: ask {ask}"),
+                other => panic!("bid {bid}: {other:?} is a taker exit or a hold, not the resting plan"),
+            }
+        }
+        // The stop still outranks the ask.
+        assert_eq!(at(dec!(0.43)), ExitAction::Stop);
     }
 
     #[test]
@@ -1088,68 +1138,6 @@ mod tests {
             r#"[{"symbol":"BTCUSDT","fundingTime":1789056000002,"fundingRate":"0.00007199","markPrice":"77218.5"}]"#,
         ).unwrap();
         assert_eq!(parse_funding(&f).unwrap(), (0.00007199, 1789056000));
-    }
-
-    /// Live smoke run of the path this viper trades on: the real kline fetch and its bar
-    /// alignment, the model loaded through the hot-reload path, the current BTC hourly
-    /// market's book, features and a decision. Needs network access, the model file at
-    /// `GBOOST_PLANB_TEST_MODEL` and a settled funding rate in `GBOOST_PLANB_SMOKE_FUNDING`
-    /// (Binance futures refuse US addresses). Run at minute 1 or later of the hour.
-    #[tokio::test]
-    #[ignore = "needs network, the model file and a settled funding rate"]
-    async fn live_smoke_scores_the_current_market() {
-        let asset = "smoketest";
-        let link = model_path(asset);
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(std::env::var("GBOOST_PLANB_TEST_MODEL").unwrap(), &link).unwrap();
-        let g = globals(asset);
-        let now = Utc::now().timestamp();
-        let t = now.div_euclid(60) * 60;
-        let w = now.div_euclid(3600) * 3600;
-        {
-            let mut d = lock(&g.data);
-            d.funding = Some((std::env::var("GBOOST_PLANB_SMOKE_FUNDING").unwrap().parse().unwrap(), t - 3600));
-            d.funding_fetched = Some(Instant::now());
-        }
-        let deadline = Instant::now() + Duration::from_secs(90);
-        let (model, (bars, funding)) = loop {
-            if let (Some(m), Some(d)) = (ensure_model(g, asset), ensure_minute_data(g, t)) {
-                break (m, d);
-            }
-            assert!(Instant::now() < deadline, "the model or the bars did not arrive");
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        };
-        let _ = std::fs::remove_file(&link);
-        assert_eq!(bars.iter().map(|b| b.open_s).max(), Some(t - 60), "the newest bar kept is the one that closed at t");
-
-        let events = get_json("https://gamma-api.polymarket.com/events?tag_slug=bitcoin&closed=false&limit=100&order=endDate&ascending=true").await.unwrap();
-        let market = events.as_array().unwrap().iter()
-            .flat_map(|e| e["markets"].as_array().cloned().unwrap_or_default())
-            .find(|m| m["slug"].as_str().is_some_and(|s| s.starts_with("bitcoin-up-or-down-"))
-                && m["endDate"].as_str().and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok()).is_some_and(|d| d.timestamp() == w + 3600))
-            .expect("the current BTC hourly market");
-        let tokens: Vec<String> = serde_json::from_str(market["clobTokenIds"].as_str().unwrap()).unwrap();
-        let (mut bid, mut ask) = ([0.0f64; 2], [1.0f64; 2]);
-        for (i, tok) in tokens.iter().enumerate().take(2) {
-            let book = get_json(&format!("https://clob.polymarket.com/book?token_id={tok}")).await.unwrap();
-            let px = |side: &str| book[side].as_array().unwrap().iter().filter_map(|l| l["price"].as_str()?.parse::<f64>().ok()).collect::<Vec<_>>();
-            bid[i] = px("bids").into_iter().fold(0.0, f64::max);
-            ask[i] = px("asks").into_iter().fold(1.0, f64::min);
-        }
-        let mid = |i: usize| (bid[i] > 0.0 && ask[i] < 1.0).then(|| (bid[i] + ask[i]) / 2.0);
-        let inputs = DecisionInputs { w, t, bars: &bars, mid_now: [mid(0), mid(1)], mid_m1: [None; 2], mid_m5: [None; 2], ask, funding };
-        let features = build_features(&inputs).expect("live inputs are complete");
-        let preds = model.predict(&features);
-        println!("{} minute {} model {} ({} trees)", market["slug"], (t - w) / 60, model.version, model.trees);
-        for side in 0..2 {
-            let d = decide_side(ask[side], preds[side].1, 0.07, 0.20, 0.11, 0.10, 0.43, 0.75);
-            println!(
-                "  {} bid {:.3} ask {:.3} raw {:.4} p {:.4} need {:.4} ({})",
-                ["YES", "NO"][side], bid[side], ask[side], preds[side].0, preds[side].1, d.required, d.reason,
-            );
-            println!("  features {}", fmt_features(&features[side]));
-            assert!(preds[side].0.is_finite() && preds[side].1 > 0.0 && preds[side].1 < 1.0);
-        }
     }
 
     /// The engine must score the trained model exactly as the offline exporter does.

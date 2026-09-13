@@ -301,7 +301,7 @@ useful of the two: the process is still alive there, so whatever holds a lock is
 still holding it.
 
 The dump names the phase the loop was in (`SIGNAL_EVAL`, `MARKET_ROTATE`,
-`GBOOST_RETRAIN`, …) and, inside signal evaluation, which viper or setup step.
+`ORDER_PLACE`, …) and, inside signal evaluation, which viper or setup step.
 That alone is often enough. When it is not, the stacks need symbolizing:
 
 - **Release builds carry line tables** (`[profile.release] debug = 1`). Debug
@@ -375,7 +375,7 @@ Raptors are intentionally dumb: **fetch, normalize, broadcast** — no trading l
 | **Tennis Raptor**              | Live Tennis API (REST)  | Live tennis event state: score, serving side, break-point flag, feed staleness — venue-neutral, **observe-only** | `src/raptors/tennis.rs` |
 | *(future)* **Politics Raptor** | Polling aggregators     | Approval drift, event probability shifts                | —                        |
 
-When multiple Raptors are active, the GBoost Viper fuses every signal as model features (funding, OI/CVD, institutional pulse/coherence, TradFi velocity/VIX); Basis, Momentum and TrendCapture use them as confirmation gates; Maker and TrendCapture consume the Horizon macro signal as preventative gates (VIX-spike / coherent-TradFi-flow quote suppression, fade veto — observe-first, enforcement behind config flags); and the **Convergence** Viper opens directional positions only when the institutional + derivatives stack agrees. No single Raptor has veto power alone.
+When multiple Raptors are active, Basis, Momentum and TrendCapture use them as confirmation gates; Maker and TrendCapture consume the Horizon macro signal as preventative gates (VIX-spike / coherent-TradFi-flow quote suppression, fade veto — observe-first, enforcement behind config flags); and the **Convergence** Viper opens directional positions only when the institutional + derivatives stack agrees. No single Raptor has veto power alone.
 
 The **Tide** and **Horizon** Raptors share a single Alpaca IEX WebSocket connection (free tier allows only one per account). Tide tracks BTC-specific institutional flow (ETF premium); Horizon tracks TradFi macro regime (equity velocity, VIX). Together they enable divergence detection — e.g., equities selling off but BTC ETFs at premium suggests institutional flight *into* crypto.
 
@@ -396,7 +396,7 @@ Nine specialized Viper strategy classes. Each Viper is an autonomous tactical un
 | **Arbitrage**    | Window/Daily | Buys both YES+NO when combined asks are < $1.00 (net of fees)                                                                                                                             |
 | **Time Decay**   | Hourly       | Posts resting GTC maker bids during the theta window; settles at $1.00 at 0% fee                                                                                                          |
 | **Basis**        | Window       | Fades retail skew using Binance funding rates as smart-money confirmation                                                                                                                 |
-| **GBoost**       | Window/Daily | Online gradient-boosted ML model retraining continuously on live orderbook + Raptor features                                                                                              |
+| **GBoost**       | Hourly       | Offline-trained, calibrated gradient-boosted model (plan B): scores both sides once a minute from Binance klines and funding, enters as a taker when P(win) clears break-even plus a margin, exits by a resting take-profit or a taker stop |
 | **TrendCapture** | Window/Daily | Exploits sustained multi-minute oracle drift (10m + 60m) before Polymarket reprices; Kelly-fractional sizing, OBI veto, trend-reversal exit                                               |
 | **FairValue**    | Window/Daily | Compare fair value of asset, compare market ask, enter when discount exceeds margin                                                                                                       |
 | **Convergence**  | Hourly       | Macro-conviction directional Viper — opens YES/NO only when the Tide institutional pulse, Derivatives CVD, and OI all agree on a direction. BTC-only, US-cash-hours-only, fixed tiny size |
@@ -753,7 +753,7 @@ ALPACA_API_KEY_ID=your-key-id
 ALPACA_API_SECRET_KEY=your-secret-key
 ```
 
-Tide feeds the GBoost feature vector, the Basis tide veto, and the **Convergence** Viper. Horizon feeds the GBoost feature vector (TradFi velocity, macro coherence, VIX proxy/velocity) and drives preventative gates on **Maker** (VIX-spike / coherent-TradFi-flow quote suppression) and **TrendCapture** (fade veto when TradFi confirms the drift) — the gates run observe-first and enforce once calibrated (`MAKER_HORIZON_GATE_ENFORCE`, `TRENDREVERSAL_HORIZON_VETO_ENFORCE`). Omit the keys and both run idle (neutral snapshots, offline pills).
+Tide feeds the Basis tide veto and the **Convergence** Viper. Horizon (TradFi velocity, macro coherence, VIX proxy/velocity) drives preventative gates on **Maker** (VIX-spike / coherent-TradFi-flow quote suppression) and **TrendCapture** (fade veto when TradFi confirms the drift) — the gates run observe-first and enforce once calibrated (`MAKER_HORIZON_GATE_ENFORCE`, `TRENDREVERSAL_HORIZON_VETO_ENFORCE`). Omit the keys and both run idle (neutral snapshots, offline pills).
 
 ### Sports Raptor (line movement) — optional
 
@@ -917,11 +917,7 @@ setup for why write-capable tools are gated behind future work.
 
 **How do I adjust risk live?** Use the Control Tower Viper cards or `PATCH /api/config`. No restart needed.
 
-**GBoost producing garbage after an update?** The model file is incompatible across feature vector changes. Delete old files and let it cold-start:
-```bash
-rm -f logs/gboost_model_*.json
-```
-The safe pattern: bump the suffix in `GBOOST_MODEL_PATH` (e.g. `v14f` → `v15f`) when adding a new feature in `src/vipers/gboost_impl.rs`.
+**GBoost is idle?** It trades only from an offline-trained model file at `logs/{asset}-gboost_planb_v1.json` (`GBOOST_PLANB_MODEL_FILENAME`). Without the file it logs the reason once and stays idle; there is no in-process training or cold start. A model whose stamped feature names do not match the build is refused at load, with the reason in the log.
 
 **Can I enable a Viper mid-session?** Yes — all nine are always instantiated. Toggle via Control Tower or `PATCH /api/config`. Takes effect on the next 50ms tick.
 

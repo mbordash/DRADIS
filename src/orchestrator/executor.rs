@@ -236,7 +236,7 @@ pub async fn execute_strategies_concurrent(
 
         // Evaluate entry and exit in parallel using tokio::join!, wrapped in a hard timeout.
         // Previously `timeout_ms` was silently ignored (prefixed `_timeout_ms`), meaning a
-        // single hung strategy evaluation (e.g. StdMutex contention during GBoost retrain)
+        // single hung strategy evaluation (e.g. StdMutex contention inside a viper)
         // could freeze the entire tokio::select! loop — including the watchdog ticker.
         let join_result = tokio::time::timeout(
             Duration::from_millis(timeout_ms),

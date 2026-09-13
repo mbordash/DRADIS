@@ -365,61 +365,6 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_entry_signals_strategy_ts ON entry_signals(strategy, ts)")
         .execute(pool).await;
 
-    // gboost_vetoes: shadow-log of every entry-eligible GBoost signal rejected by a
-    // quality gate (2026-08-05). The model matured but the accumulated gate stack was
-    // vetoing 100% of eligible signals (38/38 in one 20h window) — with zero trades
-    // there is no evidence for which gates block winners vs. save losses. Each row
-    // captures the would-be entry so its hypothetical outcome can be scored after
-    // market settlement, turning gate calibration into a data problem.
-    // Score offline by joining market/condition_id to the market's final resolution.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS gboost_vetoes (
-            id             INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts             TEXT    NOT NULL,
-            session_id     TEXT    NOT NULL DEFAULT '',
-            market         TEXT    NOT NULL,
-            condition_id   TEXT    NOT NULL,
-            side           TEXT    NOT NULL,
-            token_id       TEXT    NOT NULL,
-            ask_price      TEXT    NOT NULL,
-            p_up           REAL    NOT NULL,
-            veto_reason    TEXT    NOT NULL,
-            oracle_price   TEXT    NOT NULL,
-            drift_60m      TEXT    NOT NULL,
-            secs_to_expiry INTEGER NOT NULL
-        )"
-    ).execute(pool).await?;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_gboost_vetoes_ts ON gboost_vetoes(ts)")
-        .execute(pool).await;
-
-    // Outcome labels (2026-08-12). The table above was always meant to be scored
-    // "offline by joining market/condition_id to the market's final resolution",
-    // but nothing ever wrote the resolution back — so 316 accumulated rows could
-    // state what the model BELIEVED and never what actually happened. Without a
-    // label the EV of a vetoed signal can only be computed from the model's own
-    // probability, which is the model marking its own homework and cannot say
-    // whether a gate blocked a winner or saved a loss.
-    //
-    // outcome:      1 = the vetoed SIDE would have won, 0 = it would have lost,
-    //               NULL = not yet resolved. Encoded from the strategy's point of
-    //               view (not "did YES win") so scoring needs no side arithmetic.
-    // settle_price: the winning-token price the label was derived from, kept for
-    //               auditability — a mislabeled row should be traceable.
-    let _ = sqlx::query("ALTER TABLE gboost_vetoes ADD COLUMN outcome INTEGER")
-        .execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE gboost_vetoes ADD COLUMN settle_price TEXT")
-        .execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE gboost_vetoes ADD COLUMN scored_at TEXT")
-        .execute(pool).await;
-    // hist_vol (2026-09-05): the oracle's normalized 60m realized volatility at
-    // veto time — the regime the gate fired in. Without it the scoreboard can
-    // say how a gate did overall but not whether its verdict differs between a
-    // quiet and an active market, which is the question the `oracle too flat`
-    // floor turns on. NULL on rows written before the column existed.
-    let _ = sqlx::query("ALTER TABLE gboost_vetoes ADD COLUMN hist_vol REAL")
-        .execute(pool).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_gboost_vetoes_unscored ON gboost_vetoes(outcome, ts)")
-        .execute(pool).await;
 
     // signals_json: per-viper gate/decision state captured at entry (JSON blob).
     // The generic columns above answer "what did the market look like?"; this column
@@ -1157,9 +1102,20 @@ pub async fn record_trade_db(
 /// The fingerprint (strategy, market, side, reason, shares, pnl) is stable across
 /// restarts for the same settlement, so the `WHERE NOT EXISTS` makes recording
 /// idempotent.  Returns true if a NEW row was inserted.
+///
+/// Files the row under `scope` (venue, market class, underlying) exactly as
+/// `record_trade_db` does. This writer predates those columns and never wrote
+/// them: every settlement row's `venue` came from the startup backfill at the
+/// next restart, and `market_class`/`underlying` stayed NULL for good
+/// (production btc shard, 2026-09-13: trade 15, a FairValue settlement booked
+/// after the last restart, had all three NULL; trades 2, 6, 8 and 12 had a
+/// backfilled venue and nothing else). The scope is NOT part of the
+/// fingerprint, so a settlement recorded before this change is still
+/// recognized and not re-booked.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_settlement_trade_idempotent(
     pool: &SqlitePool,
+    scope: &TradeScope,
     strategy: &str,
     market: &str,
     side: &str,
@@ -1173,9 +1129,14 @@ pub async fn record_settlement_trade_idempotent(
 ) -> bool {
     let ts = timestamp.unwrap_or_else(Utc::now).to_rfc3339();
     let sid = current_session_id();
+    let venue = resolved_venue(scope).or_else(|| {
+        let v = venue_for_pool(pool);
+        (!v.is_empty()).then_some(v)
+    });
     match sqlx::query(
-        "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, session_id, fees)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, session_id, fees,
+                             venue, market_class, underlying, ghost)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          WHERE NOT EXISTS (
              SELECT 1 FROM trades
              WHERE strategy = ? AND market = ? AND side = ? AND reason = ?
@@ -1193,6 +1154,10 @@ pub async fn record_settlement_trade_idempotent(
     .bind(reason)
     .bind(sid)
     .bind(fees.to_string())
+    .bind(venue)
+    .bind(scope.market_class.clone())
+    .bind(scope.underlying.clone())
+    .bind(scope.ghost as i32)
     // WHERE NOT EXISTS fingerprint binds:
     .bind(strategy)
     .bind(market)
@@ -1205,6 +1170,42 @@ pub async fn record_settlement_trade_idempotent(
         Ok(r)  => r.rows_affected() > 0,
         Err(e) => { error!("❌ DB settlement idempotent write failed: {}", e); false }
     }
+}
+
+/// The filing dimensions a settlement or reconciliation booking for `market`
+/// should carry, recovered from what the ledger already knows about it.
+///
+/// The open_positions row being closed is the first source (it was written
+/// with the squadron's own scope); when it is already gone, the entries and
+/// trades rows for the same market title carry the same three columns. The
+/// venue falls back to the pool's own, which is exact (one shard, one venue).
+/// Class and underlying stay `None` when nothing recorded them, rather than
+/// being guessed from the title.
+pub async fn filing_scope_for_market(pool: &SqlitePool, market: &str) -> TradeScope {
+    let mut venue: Option<String> = None;
+    let mut class: Option<String> = None;
+    let mut underlying: Option<String> = None;
+    for table in ["open_positions", "entries", "trades"] {
+        let row: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(&format!(
+            "SELECT venue, market_class, underlying FROM {table}
+              WHERE market = ? AND (market_class IS NOT NULL OR venue IS NOT NULL)
+              ORDER BY id DESC LIMIT 1"
+        ))
+        .bind(market)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None);
+        if let Some((v, c, u)) = row {
+            if venue.is_none() { venue = v.filter(|s| !s.is_empty()); }
+            if class.is_none() {
+                class = c;
+                underlying = u;
+            }
+            if venue.is_some() && class.is_some() { break; }
+        }
+    }
+    let venue = venue.unwrap_or_else(|| venue_for_pool(pool));
+    TradeScope::new("", venue, class, underlying)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1309,323 +1310,6 @@ pub async fn record_entry_signal_db(pool: &SqlitePool, row: &EntrySignalRow) {
     }
 }
 
-/// Shadow-log a vetoed (entry-eligible but gate-rejected) GBoost signal.
-/// Fire-and-forget from the veto path — see gboost_vetoes table comment.
-#[allow(clippy::too_many_arguments)]
-pub async fn record_gboost_veto_db(
-    pool: &SqlitePool,
-    market: &str,
-    condition_id: &str,
-    side: &str,
-    token_id: &str,
-    ask_price: &str,
-    p_up: f64,
-    veto_reason: &str,
-    oracle_price: &str,
-    drift_60m: &str,
-    secs_to_expiry: i64,
-    hist_vol: f64,
-) {
-    let ts = Utc::now().to_rfc3339();
-    let sid = current_session_id();
-    if let Err(e) = sqlx::query(
-        "INSERT INTO gboost_vetoes
-            (ts, session_id, market, condition_id, side, token_id, ask_price,
-             p_up, veto_reason, oracle_price, drift_60m, secs_to_expiry, hist_vol)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    )
-    .bind(&ts)
-    .bind(sid)
-    .bind(market)
-    .bind(condition_id)
-    .bind(side)
-    .bind(token_id)
-    .bind(ask_price)
-    .bind(p_up)
-    .bind(veto_reason)
-    .bind(oracle_price)
-    .bind(drift_60m)
-    .bind(secs_to_expiry)
-    .bind(hist_vol)
-    .execute(pool)
-    .await {
-        error!("❌ DB gboost_veto write failed: {}", e);
-    }
-}
-
-/// A resolved binary token settles at $1.00 (won) or $0.00 (lost). Prices at or
-/// beyond these bounds are treated as final; anything between them means the
-/// market has not resolved yet (or the read was unreliable) and the row is left
-/// unlabeled for a later sweep. Deliberately strict — a wrong label is far worse
-/// than a late one, because it silently corrupts the gate-calibration evidence
-/// this table exists to provide.
-const VETO_SETTLE_WON_MIN:  Decimal = rust_decimal_macros::dec!(0.95);
-const VETO_SETTLE_LOST_MAX: Decimal = rust_decimal_macros::dec!(0.05);
-
-/// One row of the GBoost veto scoreboard: how a single gate performed on the
-/// signals it actually blocked.
-#[derive(Debug, Clone, Serialize)]
-pub struct GboostVetoScore {
-    /// Gate family, normalized from the free-text veto reason.
-    pub gate: String,
-    /// Vetoed signals attributable to this gate.
-    pub total: i64,
-    /// Of those, how many have a settled outcome yet.
-    pub scored: i64,
-    /// Scored signals whose side went on to win — i.e. entries this gate blocked
-    /// that would have paid $1.00.
-    pub would_have_won: i64,
-    /// Realised P&L per share had every scored signal been taken:
-    /// `mean(outcome − ask_price)`. Positive means the gate is, on this evidence,
-    /// costing money; negative means it is protecting the wallet. This is the
-    /// number the model's own probability could never supply.
-    pub avg_pnl_per_share: f64,
-    /// Distinct markets the scored signals came from — the REAL sample size.
-    ///
-    /// Signals inside one market are near-perfectly correlated: the model holds a
-    /// view for the whole session, so 40 signals on one daily market that closes
-    /// up are one observation, not 40. Reading `scored` as the sample size makes a
-    /// handful of trending days look like overwhelming evidence (first prod score,
-    /// 2026-08-12: 316 signals looked like a 73% win rate, but 3 of 12 markets
-    /// carried nearly all of it). Always judge significance on this column.
-    pub distinct_markets: i64,
-    /// Mean per-share edge computed per MARKET and then averaged, so one busy
-    /// market cannot outvote the rest. The conservative counterpart to
-    /// `avg_pnl_per_share`; when the two diverge sharply, the raw figure is being
-    /// driven by signal concentration rather than by a repeatable edge.
-    pub avg_pnl_per_market: f64,
-    /// Mean oracle `hist_vol` across this gate's vetoes (all rows, scored or
-    /// not) — where on the quiet/active axis the gate actually fires. `None`
-    /// when every row predates the column.
-    pub avg_hist_vol: Option<f64>,
-}
-
-/// Optional regime slice for the scoreboard: keep only vetoes whose recorded
-/// `hist_vol` lies in `[min_hist_vol, max_hist_vol]`. Either bound alone is
-/// fine. Rows without a `hist_vol` (written before the column existed) are
-/// excluded whenever any bound is set, so a slice never silently mixes in
-/// rows whose regime is unknown.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct VetoRegime {
-    pub min_hist_vol: Option<f64>,
-    pub max_hist_vol: Option<f64>,
-}
-
-impl VetoRegime {
-    /// SQL predicate (always safe to AND onto a WHERE clause). Bounds are
-    /// numbers formatted by Rust, never user text, and non-finite values are
-    /// dropped rather than interpolated.
-    fn sql(&self) -> String {
-        let mut out = String::from("1=1");
-        if let Some(lo) = self.min_hist_vol.filter(|v| v.is_finite()) {
-            out.push_str(&format!(" AND hist_vol IS NOT NULL AND hist_vol >= {lo:.8}"));
-        }
-        if let Some(hi) = self.max_hist_vol.filter(|v| v.is_finite()) {
-            out.push_str(&format!(" AND hist_vol IS NOT NULL AND hist_vol <= {hi:.8}"));
-        }
-        out
-    }
-}
-
-/// SQL CASE mapping a free-text `veto_reason` onto a stable gate family.
-///
-/// Order matters: the `hourly …` reasons are the cross-market confirmation gate
-/// and must be matched BEFORE the generic OBI patterns, or they collapse into the
-/// primary book gate and the scoreboard silently attributes their blocks to the
-/// wrong knob. Defined once and interpolated into both queries below so the two
-/// can never drift apart.
-const VETO_GATE_CASE: &str = "CASE
-    WHEN veto_reason LIKE 'shadow mode%'         THEN 'shadow mode (would have entered)'
-    WHEN veto_reason LIKE 'hourly%'              THEN 'hourly OBI cross-check'
-    WHEN veto_reason LIKE '%price out of range%' THEN 'price band'
-    WHEN veto_reason LIKE '%adverse OBI%'        THEN 'adverse OBI'
-    WHEN veto_reason LIKE '%OBI adverse%'        THEN 'adverse OBI'
-    WHEN veto_reason LIKE '%exhaust%'            THEN 'OBI exhaustion'
-    WHEN veto_reason LIKE '%counter-trend%'      THEN 'counter-trend'
-    WHEN veto_reason LIKE '%oracle too flat%'    THEN 'low volatility'
-    WHEN veto_reason LIKE '%too close to 0.5%'   THEN 'near coin-flip'
-    ELSE 'other' END";
-
-/// Score each GBoost gate against the settled outcomes of the signals it blocked.
-///
-/// Only rows with a resolved `outcome` participate; unscored rows are reported in
-/// `total − scored` so a thin sample is never mistaken for a confident verdict.
-///
-/// `regime` slices the table by the oracle volatility recorded at veto time, so
-/// the same gate can be scored separately in quiet and active markets.
-pub async fn gboost_veto_scoreboard(pool: &SqlitePool, regime: VetoRegime) -> Vec<GboostVetoScore> {
-    let regime_sql = regime.sql();
-    let group_sql = format!(
-        "SELECT {case} AS gate,
-                COUNT(*) AS total,
-                SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END) AS scored,
-                SUM(CASE WHEN outcome IS NOT NULL THEN outcome ELSE 0 END) AS wins,
-                AVG(hist_vol) AS avg_hist_vol
-           FROM gboost_vetoes
-          WHERE {regime}
-          GROUP BY gate",
-        case = VETO_GATE_CASE, regime = regime_sql
-    );
-    let rows: Vec<(String, i64, i64, Option<i64>, Option<f64>)> = match sqlx::query_as(&group_sql)
-        .fetch_all(pool).await {
-        Ok(r) => r,
-        Err(e) => { error!("❌ DB gboost veto scoreboard failed: {}", e); return vec![]; }
-    };
-
-    // Average realised edge is computed separately so the ask price only enters
-    // for rows that actually have a label.
-    let avg_sql = format!(
-        "SELECT AVG(CAST(outcome AS REAL) - CAST(ask_price AS REAL))
-           FROM gboost_vetoes
-          WHERE outcome IS NOT NULL AND {regime} AND {case} = ?",
-        case = VETO_GATE_CASE, regime = regime_sql
-    );
-    // Per-market aggregation first, then a mean over markets — one busy market
-    // must not outvote the rest. See `distinct_markets`.
-    let per_market_sql = format!(
-        "SELECT COUNT(*), AVG(m_avg) FROM (
-             SELECT AVG(CAST(outcome AS REAL) - CAST(ask_price AS REAL)) AS m_avg
-               FROM gboost_vetoes
-              WHERE outcome IS NOT NULL AND {regime} AND {case} = ?
-              GROUP BY market
-         )",
-        case = VETO_GATE_CASE, regime = regime_sql
-    );
-
-    let mut out = Vec::with_capacity(rows.len());
-    for (gate, total, scored, wins, avg_hist_vol) in rows {
-        let avg: Option<f64> = sqlx::query_as::<_, (Option<f64>,)>(&avg_sql)
-        .bind(&gate)
-        .fetch_optional(pool).await.ok().flatten().and_then(|(v,)| v);
-
-        let (markets, per_market): (i64, Option<f64>) =
-            sqlx::query_as::<_, (i64, Option<f64>)>(&per_market_sql)
-            .bind(&gate)
-            .fetch_optional(pool).await.ok().flatten().unwrap_or((0, None));
-
-        out.push(GboostVetoScore {
-            gate,
-            total,
-            scored,
-            would_have_won: wins.unwrap_or(0),
-            avg_pnl_per_share: avg.unwrap_or(0.0),
-            distinct_markets: markets,
-            avg_pnl_per_market: per_market.unwrap_or(0.0),
-            avg_hist_vol,
-        });
-    }
-    out.sort_by(|a, b| b.total.cmp(&a.total));
-    out
-}
-
-/// The `condition_id` recorded alongside a vetoed token — the key the Gamma
-/// resolution lookup needs. Kept next to the scorer so the caller's price-resolver
-/// closure stays a one-liner instead of threading condition ids through the query.
-pub async fn condition_id_for_veto_token(pool: &SqlitePool, token_id: &str) -> Option<String> {
-    sqlx::query_as::<_, (String,)>(
-        "SELECT condition_id FROM gboost_vetoes
-          WHERE token_id = ? AND condition_id <> ''
-          ORDER BY id DESC LIMIT 1"
-    )
-    .bind(token_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()
-    .map(|(c,)| c)
-}
-
-/// Attach resolution outcomes to `gboost_vetoes` rows whose market has settled.
-///
-/// `resolve_price(token_id) -> Option<Decimal>` fetches the token's CURRENT price;
-/// the caller supplies it so this module keeps no dependency on the venue SDK.
-/// Returns the number of rows newly labeled.
-///
-/// Only rows whose market should already have closed are attempted — close time
-/// is reconstructed as `ts + secs_to_expiry`, which is exactly what was recorded
-/// at veto time. A grace period is added on top so a market that resolves a
-/// little late is not read mid-settlement.
-///
-/// The label is written from the VETOED SIDE's point of view: `outcome = 1` means
-/// buying that side at the recorded ask would have paid $1.00, so scoring a gate
-/// is a plain average over `outcome` with no further arithmetic.
-pub async fn score_pending_gboost_vetoes<F, Fut>(
-    pool: &SqlitePool,
-    max_rows: i64,
-    resolve_price: F,
-) -> usize
-where
-    F: Fn(String) -> Fut,
-    Fut: std::future::Future<Output = Option<Decimal>>,
-{
-    /// Extra wait beyond the recorded close time before a price read is trusted.
-    const SETTLE_GRACE_SECS: i64 = 900;
-
-    let rows: Vec<(i64, String, String, String, i64)> = match sqlx::query_as(
-        "SELECT id, ts, token_id, side, secs_to_expiry
-           FROM gboost_vetoes
-          WHERE outcome IS NULL
-          ORDER BY ts ASC
-          LIMIT ?"
-    )
-    .bind(max_rows)
-    .fetch_all(pool)
-    .await {
-        Ok(r) => r,
-        Err(e) => { error!("❌ DB gboost_veto scoring fetch failed: {}", e); return 0; }
-    };
-    if rows.is_empty() { return 0; }
-
-    let now = Utc::now();
-    // One price read per distinct token, not per row: a single market typically
-    // accumulates many vetoes and they all share one resolution.
-    let mut price_cache: std::collections::HashMap<String, Option<Decimal>> =
-        std::collections::HashMap::new();
-    let mut scored = 0usize;
-
-    for (id, ts, token_id, side, secs_to_expiry) in rows {
-        let Ok(recorded_at) = DateTime::parse_from_rfc3339(&ts) else { continue };
-        let closes_at = recorded_at.with_timezone(&Utc)
-            + chrono::Duration::seconds(secs_to_expiry + SETTLE_GRACE_SECS);
-        if now < closes_at { continue; } // not settled yet — try again next sweep
-
-        let price = match price_cache.get(&token_id) {
-            Some(p) => *p,
-            None => {
-                let p = resolve_price(token_id.clone()).await;
-                price_cache.insert(token_id.clone(), p);
-                p
-            }
-        };
-        let Some(price) = price else { continue }; // lookup failed — retry later
-
-        // `price` is the price of the token the veto was ABOUT, so it already
-        // encodes the side: a vetoed NO signal reads the NO token.
-        let outcome = if price >= VETO_SETTLE_WON_MIN {
-            1
-        } else if price <= VETO_SETTLE_LOST_MAX {
-            0
-        } else {
-            continue; // ambiguous — leave unlabeled rather than guess
-        };
-
-        if let Err(e) = sqlx::query(
-            "UPDATE gboost_vetoes SET outcome = ?, settle_price = ?, scored_at = ?
-              WHERE id = ? AND outcome IS NULL"
-        )
-        .bind(outcome)
-        .bind(price.to_string())
-        .bind(now.to_rfc3339())
-        .bind(id)
-        .execute(pool)
-        .await {
-            error!("❌ DB gboost_veto scoring update failed (id={}, side={}): {}", id, side, e);
-        } else {
-            scored += 1;
-        }
-    }
-    scored
-}
 
 /// Look up the most recent entry price for a token_id.
 /// Primary path for reconcile_orphaned_positions — faster than CSV scan.
@@ -3048,8 +2732,10 @@ pub async fn purge_stale_open_positions(
     // `clear_live_open_positions` already preserves ghost rows for the same
     // reason; this path simply never got the same treatment.
 
-    let rows: Vec<(i64, String, Option<String>, String, String, String, String, String, String, Option<String>, Option<String>, Option<String>)> = match sqlx::query_as(
-        "SELECT id, token_id, status, ts, strategy, market, side, entry_price, shares, current_price, entry_fee, settled_shares FROM open_positions WHERE ghost_mode = 0"
+    let rows: Vec<(i64, String, Option<String>, String, String, String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> = match sqlx::query_as(
+        "SELECT id, token_id, status, ts, strategy, market, side, entry_price, shares, current_price, entry_fee, settled_shares,
+                venue, market_class, underlying
+           FROM open_positions WHERE ghost_mode = 0"
     )
     .fetch_all(pool)
     .await {
@@ -3059,16 +2745,33 @@ pub async fn purge_stale_open_positions(
 
     let now = Utc::now();
     let mut purged = 0usize;
-    for (id, token_id, status, ts, strategy, market, side, entry_price, shares, current_price, entry_fee, settled_shares) in rows {
-        // The size that actually settled, when the chain has already zeroed the row.
+    for (id, token_id, status, ts, strategy, market, side, entry_price, shares, current_price, entry_fee, settled_shares, row_venue, row_class, row_underlying) in rows {
+        // File the booking as the position was filed. The row carries the
+        // squadron's own scope; a chain-adopted row may not, in which case the
+        // market's other ledger rows are asked before settling for the shard's venue.
+        let scope = match (&row_venue, &row_class) {
+            (Some(v), Some(_)) if !v.is_empty() => TradeScope::new("", v.clone(), row_class.clone(), row_underlying.clone()),
+            _ => {
+                let looked_up = filing_scope_for_market(pool, &market).await;
+                TradeScope::new(
+                    "",
+                    row_venue.clone().filter(|v| !v.is_empty()).unwrap_or(looked_up.venue),
+                    row_class.clone().or(looked_up.market_class),
+                    row_underlying.clone().or(looked_up.underlying),
+                )
+            }
+        };
+        // The size that actually settled or sold, when the chain has already
+        // written the row down to zero or to dust.
         //
         // `shares` is what the position holds NOW; for a settled position that is
-        // zero, and every booking branch below guards on a positive quantity. The
-        // drift corrector preserves the pre-zero count in `settled_shares` for
-        // exactly this read.
+        // zero, for a lifted one it is the fractional remainder (0.0028 shares on
+        // 2026-09-13), and every booking branch below guards on a positive
+        // quantity or would book the dust. The drift corrector preserves the
+        // pre-transition count in `settled_shares` for exactly this read.
         let shares = {
             let live = shares.parse::<Decimal>().unwrap_or(Decimal::ZERO);
-            if live > Decimal::ZERO {
+            if live >= config::MIN_ORDER_SHARES {
                 shares
             } else {
                 settled_shares.clone().unwrap_or(shares)
@@ -3149,7 +2852,7 @@ pub async fn purge_stale_open_positions(
                         if *chain_size > Decimal::ZERO { "pending redemption" } else { "cash settled" }
                     );
                     let inserted = record_settlement_trade_idempotent(
-                        pool, &strategy, &market, &side, entry, resolved_px, qty, pnl, entry_fee, &reason, None,
+                        pool, &scope, &strategy, &market, &side, entry, resolved_px, qty, pnl, entry_fee, &reason, None,
                     ).await;
                     if inserted {
                         info!(
@@ -3200,40 +2903,58 @@ pub async fn purge_stale_open_positions(
             let entry = entry_price.parse::<Decimal>().unwrap_or(Decimal::ZERO);
             let qty   = shares.parse::<Decimal>().unwrap_or(Decimal::ZERO);
             let exit  = current_price.as_deref().and_then(|s| s.parse::<Decimal>().ok());
-            match exit {
-                Some(exit_px) if entry > Decimal::ZERO && qty > Decimal::ZERO && exit_px > Decimal::ZERO => {
-                    if market_has_matching_trade(pool, &market, qty).await {
-                        // Already booked (strategy close or settlement) — don't double-count.
-                    } else {
-                        // Position is a long outcome token: P&L = (exit − entry) × shares
-                        // for either YES or NO side (both were bought at `entry`).
-                        // Net of the entry leg's fee. The exit leg is unknown on
-                        // this path by construction — the position left outside
-                        // the strategy's exit, so there is no fill to price — and
-                        // the reason string already marks the mark as estimated.
-                        let pnl = (exit_px - entry) * qty - entry_fee;
-                        let reason = format!(
-                            "ChainReconcile: closed off-strategy (est. @ ${:.4} last mark)",
-                            exit_px
-                        );
-                        // Reconciliation knows the book but not the market's class or
-                        // underlying — leave those NULL rather than guessing.
-                        let scope = TradeScope::new("", venue_for_pool(pool), None, None);
-                        record_trade_db(pool, &scope, entry_fee, &strategy, &market, &side, entry, exit_px, qty, pnl, &reason, None).await;
+            if entry > Decimal::ZERO && qty > Decimal::ZERO {
+                if market_has_matching_trade(pool, &market, qty).await {
+                    // Already booked (strategy close or settlement) — don't double-count.
+                } else {
+                    // Position is a long outcome token: P&L = (exit − entry) × shares
+                    // for either YES or NO side (both were bought at `entry`).
+                    // Net of the entry leg's fee. The exit leg is unknown on
+                    // this path by construction — the position left outside
+                    // the strategy's exit, so there is no fill to price — and
+                    // the reason string already marks the mark as estimated.
+                    //
+                    // Without a usable mark the row is STILL booked, at its
+                    // entry and labeled as such, rather than deleted. Deleting
+                    // it was the last of five misses on 2026-09-13: the row for
+                    // a real +$0.59 GBoost round trip reached here with no mark
+                    // and left the ledger with nothing at all, which no later
+                    // pass can repair. A row that says "exit price unknown" can
+                    // be corrected by hand; a missing row cannot.
+                    let (exit_px, reason) = match exit {
+                        Some(px) if px > Decimal::ZERO => (
+                            px,
+                            format!("ChainReconcile: closed off-strategy (est. @ ${:.4} last mark)", px),
+                        ),
+                        _ => (
+                            entry,
+                            "ChainReconcile: closed off-strategy (exit price unknown: no mark; booked at entry)".to_string(),
+                        ),
+                    };
+                    let pnl = (exit_px - entry) * qty - entry_fee;
+                    // Filed as the position was (see `scope` above): trade 7 on
+                    // the production btc shard was a ChainReconcile row with
+                    // class and underlying NULL beside strategy exits that had both.
+                    record_trade_db(pool, &scope, entry_fee, &strategy, &market, &side, entry, exit_px, qty, pnl, &reason, None).await;
+                    if exit.is_some_and(|px| px > Decimal::ZERO) {
                         info!(
                             "🧾 Ledger reconcile: booked off-strategy exit — {} {} {} | {} sh entry=${:.4} exit=${:.4} → pnl=${:.4}",
                             strategy, market, side, qty, entry, exit_px, pnl
                         );
+                    } else {
+                        warn!(
+                            "🧾 Ledger reconcile: booked off-strategy exit WITHOUT a mark: {} {} {} | {} sh entry=${:.4}, exit unknown (booked at entry, pnl=${:.4} = -entry fee); correct the row by hand from the wallet's cash move",
+                            strategy, market, side, qty, entry, pnl
+                        );
                     }
                 }
-                _ => {
-                    // No usable mark (missing/zero current_price) — cannot estimate P&L
-                    // without fabricating. Purge silently; cash move stays in pnl_snapshots.
-                    debug!(
-                        "🧾 Ledger reconcile: skipped {} \"{}\" (no usable mark: entry={} shares={} cur={:?})",
-                        strategy, market, entry_price, shares, current_price
-                    );
-                }
+            } else {
+                // No cost basis at all (entry or size unparseable/zero): there is
+                // nothing to book, and nothing lost by the delete.
+                debug!(
+                    "🧾 Ledger reconcile: skipped {} \"{}\" (no cost basis: entry={} shares={} cur={:?})",
+                    strategy, market, entry_price, shares, current_price
+                );
             }
         }
 
@@ -3274,20 +2995,32 @@ pub async fn update_position_from_chain(
     // genuine $0.55 entry overwritten to $0.00 then mark-to-markets as +100% "profit").
     // When avg_price is non-positive, correct shares + current_price ONLY and keep the
     // existing entry_price.
-    // A chain read of ZERO is a SETTLEMENT, not a correction to nothing.
+    // A chain read of ZERO is a SETTLEMENT, not a correction to nothing, and a
+    // read below the order minimum is a SALE that left dust, not a position of
+    // that size.
     //
     // The scaling expression below multiplies `entry_fee` by `new/old`, which for
     // a zero read is a multiply by zero — so the fee is destroyed alongside the
     // share count, and any later attempt to book the settlement has neither the
-    // quantity nor the cost to book. Capture both before the write. `settled_shares`
-    // is only ever set on the zero transition, so it always holds the size that
-    // actually settled rather than the size of some earlier partial correction.
-    if shares <= rust_decimal::Decimal::ZERO {
+    // quantity nor the cost to book. Capture both before the write. The same
+    // holds a hair above zero: on 2026-09-13 a 7.142858-share GBoost position
+    // whose ask had been lifted read 0.0028 on-chain, the corrector wrote that
+    // over the row and scaled the fee to nothing, and the sweep an hour later
+    // had a dust row to book instead of the trade. So anything below
+    // `MIN_ORDER_SHARES` is the settled transition: the size that was actually
+    // held is preserved, and the fee stays whole. A preserved size is never
+    // overwritten by a smaller one — the dust row's own later transition to
+    // zero (the market resolving) must not replace 7.14 with 0.0028.
+    let is_dust = shares < config::MIN_ORDER_SHARES;
+    if is_dust {
         if let Err(e) = sqlx::query(
             "UPDATE open_positions
-                SET settled_shares = shares
+                SET settled_shares = CASE
+                    WHEN settled_shares IS NULL OR CAST(shares AS REAL) >= ? THEN shares
+                    ELSE settled_shares END
               WHERE token_id = ? AND CAST(shares AS REAL) > 0"
         )
+        .bind(config::MIN_ORDER_SHARES.to_string())
         .bind(token_id)
         .execute(pool)
         .await
@@ -3302,11 +3035,14 @@ pub async fn update_position_from_chain(
         }
     }
 
+    // The fee scales with the size only for a correction that leaves a
+    // sale-sized position; a write to dust or zero keeps it whole for the booking.
     let result = if avg_price > rust_decimal::Decimal::ZERO {
         sqlx::query(
-            "UPDATE open_positions SET entry_fee = CASE WHEN CAST(? AS REAL) <= 0 THEN entry_fee ELSE CAST(COALESCE(entry_fee,'0') AS REAL) * (CAST(? AS REAL) / NULLIF(CAST(shares AS REAL),0)) END, shares = ?, entry_price = ?, chain_adopted = 1, current_price = COALESCE(?, current_price), price_updated_at = CASE WHEN ? IS NULL THEN price_updated_at ELSE ? END WHERE token_id = ?"
+            "UPDATE open_positions SET entry_fee = CASE WHEN CAST(? AS REAL) < ? THEN entry_fee ELSE CAST(COALESCE(entry_fee,'0') AS REAL) * (CAST(? AS REAL) / NULLIF(CAST(shares AS REAL),0)) END, shares = ?, entry_price = ?, chain_adopted = 1, current_price = COALESCE(?, current_price), price_updated_at = CASE WHEN ? IS NULL THEN price_updated_at ELSE ? END WHERE token_id = ?"
         )
         .bind(shares.to_string())
+        .bind(config::MIN_ORDER_SHARES.to_string())
         .bind(shares.to_string())
         .bind(shares.to_string())
         .bind(avg_price.to_string())
@@ -3320,9 +3056,10 @@ pub async fn update_position_from_chain(
         .await
     } else {
         sqlx::query(
-            "UPDATE open_positions SET entry_fee = CASE WHEN CAST(? AS REAL) <= 0 THEN entry_fee ELSE CAST(COALESCE(entry_fee,'0') AS REAL) * (CAST(? AS REAL) / NULLIF(CAST(shares AS REAL),0)) END, shares = ?, chain_adopted = 1, current_price = COALESCE(?, current_price), price_updated_at = CASE WHEN ? IS NULL THEN price_updated_at ELSE ? END WHERE token_id = ?"
+            "UPDATE open_positions SET entry_fee = CASE WHEN CAST(? AS REAL) < ? THEN entry_fee ELSE CAST(COALESCE(entry_fee,'0') AS REAL) * (CAST(? AS REAL) / NULLIF(CAST(shares AS REAL),0)) END, shares = ?, chain_adopted = 1, current_price = COALESCE(?, current_price), price_updated_at = CASE WHEN ? IS NULL THEN price_updated_at ELSE ? END WHERE token_id = ?"
         )
         .bind(shares.to_string())
+        .bind(config::MIN_ORDER_SHARES.to_string())
         .bind(shares.to_string())
         .bind(shares.to_string())
         .bind(&cur_price_str)
@@ -4370,85 +4107,9 @@ pub async fn set_llm_action_outcome(
 
 
 #[cfg(test)]
-mod gboost_veto_tests {
-    use super::*;
-
-    async fn fresh_pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        init_schema(&pool).await.unwrap();
-        run_migrations(&pool).await;
-        pool
-    }
-
-    async fn veto(pool: &SqlitePool, market: &str, reason: &str, ask: &str, hist_vol: f64, outcome: Option<i64>) {
-        record_gboost_veto_db(
-            pool, market, "0xcond", "YES", "tok-yes", ask, 0.9, reason,
-            "100000", "0", 3600, hist_vol,
-        ).await;
-        if let Some(o) = outcome {
-            sqlx::query("UPDATE gboost_vetoes SET outcome = ? WHERE id = (SELECT MAX(id) FROM gboost_vetoes)")
-                .bind(o).execute(pool).await.unwrap();
-        }
-    }
-
-    /// The regime a veto fired in has to reach the table, or the scoreboard can
-    /// never separate a quiet-market verdict from an active-market one.
-    #[tokio::test]
-    async fn a_veto_records_the_oracle_volatility_it_fired_in() {
-        let pool = fresh_pool().await;
-        veto(&pool, "m", "oracle too flat (hist_vol=0.0008 < min=0.0015)", "0.43", 0.0008, None).await;
-        let (hv,): (Option<f64>,) = sqlx::query_as("SELECT hist_vol FROM gboost_vetoes")
-            .fetch_one(&pool).await.unwrap();
-        assert_eq!(hv, Some(0.0008));
-    }
-
-    /// One gate, four vetoes: two in a quiet regime that would have lost, two in
-    /// an active regime that would have won. Unsliced, the gate looks like a
-    /// coin flip; sliced, it is protective when quiet and costly when active —
-    /// the distinction the operator's question depends on. A row with no
-    /// recorded regime must never leak into a slice.
-    #[tokio::test]
-    async fn scoreboard_slices_by_regime_and_excludes_unknown_regimes() {
-        let pool = fresh_pool().await;
-        let flat = "oracle too flat (hist_vol=x < min=y)";
-        veto(&pool, "quiet-1",  flat, "0.45", 0.0008, Some(0)).await;
-        veto(&pool, "quiet-2",  flat, "0.45", 0.0009, Some(0)).await;
-        veto(&pool, "active-1", flat, "0.45", 0.0030, Some(1)).await;
-        veto(&pool, "active-2", flat, "0.45", 0.0040, Some(1)).await;
-        // Legacy row: predates the column.
-        sqlx::query(
-            "INSERT INTO gboost_vetoes (ts, market, condition_id, side, token_id, ask_price, p_up,
-                                        veto_reason, oracle_price, drift_60m, secs_to_expiry, outcome)
-             VALUES ('2026-08-01T00:00:00+00:00', 'legacy', 'c', 'YES', 't', '0.45', 0.9, ?, '1', '0', 60, 1)"
-        ).bind(flat).execute(&pool).await.unwrap();
-
-        let all = gboost_veto_scoreboard(&pool, VetoRegime::default()).await;
-        let row = all.iter().find(|r| r.gate == "low volatility").expect("gate row");
-        assert_eq!((row.total, row.scored, row.would_have_won), (5, 5, 3));
-        assert!((row.avg_pnl_per_share - 0.15).abs() < 1e-9, "unsliced: {}", row.avg_pnl_per_share);
-        let avg_hv = row.avg_hist_vol.expect("four rows carry a regime");
-        assert!((avg_hv - 0.002175).abs() < 1e-9, "avg_hist_vol {avg_hv}");
-
-        let quiet = gboost_veto_scoreboard(&pool, VetoRegime { min_hist_vol: None, max_hist_vol: Some(0.0015) }).await;
-        let row = quiet.iter().find(|r| r.gate == "low volatility").expect("quiet row");
-        assert_eq!((row.total, row.scored, row.would_have_won, row.distinct_markets), (2, 2, 0, 2));
-        assert!((row.avg_pnl_per_share + 0.45).abs() < 1e-9, "quiet: {}", row.avg_pnl_per_share);
-
-        let active = gboost_veto_scoreboard(&pool, VetoRegime { min_hist_vol: Some(0.0015), max_hist_vol: None }).await;
-        let row = active.iter().find(|r| r.gate == "low volatility").expect("active row");
-        assert_eq!((row.total, row.scored, row.would_have_won, row.distinct_markets), (2, 2, 2, 2));
-        assert!((row.avg_pnl_per_share - 0.55).abs() < 1e-9, "active: {}", row.avg_pnl_per_share);
-    }
-}
-
-#[cfg(test)]
 mod reconcile_tests {
     use super::*;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     /// A brand-new database must be able to queue a deployment.
     ///
@@ -4749,6 +4410,175 @@ mod reconcile_tests {
         let expected = 0.07 * 0.75 * 0.25 * 3.04;
         assert!((fee - expected).abs() < 1e-6,
             "fee should rescale to the filled size: got {fee}, expected {expected}");
+    }
+
+    /// 2026-09-13 08:37:28 ET: the drift corrector saw "DB says 7.1428 shares,
+    /// chain says 0.0028" after GBoost's $0.59 ask was lifted, wrote the dust
+    /// over the row and scaled the $0.12495 entry fee to nothing. The sweep
+    /// then had a 0.0028-share row and no cost to book. A write below the
+    /// order minimum is the sold transition: the sold size and its fee must
+    /// survive it, and a later zero write (the dust settling) must not replace
+    /// the preserved size with the dust.
+    #[tokio::test]
+    async fn a_lift_that_leaves_dust_preserves_the_sold_size_and_its_fee() {
+        let pool = mem_pool().await;
+        let sold = dec_of("7.142858");
+        let fee = dec_of("0.12495");
+        record_open_position(&pool, &TradeScope::shard_only("test"), "btc-open", "GboostStrategy", "tok-dust", "mkt", "NO",
+            dec_of("0.4899"), sold, false).await;
+        set_open_position_entry_fee(&pool, "tok-dust", fee).await;
+
+        update_position_from_chain(&pool, "tok-dust", dec_of("0.0028"), dec_of("0.4899"), None).await;
+
+        let (shares, settled, fee_now): (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT shares, settled_shares, entry_fee FROM open_positions WHERE token_id = 'tok-dust'"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(shares.parse::<Decimal>().unwrap(), dec_of("0.0028"), "the row reflects the wallet");
+        assert_eq!(settled.as_deref().map(|s| s.parse::<Decimal>().unwrap()), Some(sold), "the sold size is preserved");
+        let fee_now: f64 = fee_now.expect("fee retained").parse().unwrap();
+        assert!((fee_now - 0.12495).abs() < 1e-9, "the fee stays whole for the booking: {fee_now}");
+
+        // The dust later settles to nothing: still 7.142858, not 0.0028.
+        update_position_from_chain(&pool, "tok-dust", Decimal::ZERO, Decimal::ZERO, None).await;
+        let settled: Option<String> = sqlx::query_scalar(
+            "SELECT settled_shares FROM open_positions WHERE token_id = 'tok-dust'"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(settled.as_deref().map(|s| s.parse::<Decimal>().unwrap()), Some(sold));
+
+        // A correction that leaves a sale-sized position still scales the fee,
+        // as trade 356's partial fill needs.
+        record_open_position(&pool, &TradeScope::shard_only("test"), "btc-open", "GboostStrategy", "tok-partial", "mkt", "NO",
+            dec_of("0.50"), dec_of("10"), false).await;
+        set_open_position_entry_fee(&pool, "tok-partial", dec_of("0.20")).await;
+        update_position_from_chain(&pool, "tok-partial", dec_of("5"), Decimal::ZERO, None).await;
+        let (settled, fee_now): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT settled_shares, entry_fee FROM open_positions WHERE token_id = 'tok-partial'"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(settled, None, "a sale-sized remainder is not a settled transition");
+        assert!((fee_now.unwrap().parse::<f64>().unwrap() - 0.10).abs() < 1e-9);
+    }
+
+    /// The row the 2026-09-13 sweep actually found: 0.0028 shares of dust with
+    /// the 7.142858 sold size preserved, the wallet no longer listing the
+    /// token, the market still open, and a mark on the row. It must book the
+    /// sold size at the mark, not the dust, and net the whole entry fee.
+    #[tokio::test]
+    async fn a_dust_row_the_wallet_no_longer_lists_books_the_sold_size_not_the_dust() {
+        let pool = mem_pool().await;
+        insert_open(&pool, "GboostStrategy", "tok-lifted", "Bitcoin Up or Down - September 13, 8AM ET",
+                    "NO", "0.4899", "7.142858", Some("0.60"), "confirmed").await;
+        set_open_position_entry_fee(&pool, "tok-lifted", dec_of("0.12495")).await;
+        update_position_from_chain(&pool, "tok-lifted", dec_of("0.0028"), dec_of("0.4899"), None).await;
+
+        let purged = purge_stale_open_positions(&pool, &HashSet::new(), &HashMap::new(), &HashSet::new()).await;
+        assert_eq!(purged, 1);
+
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT shares, exit_price, pnl, reason FROM trades WHERE strategy = 'GboostStrategy'"
+        ).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1, "one booking for the sold size");
+        assert_eq!(rows[0].0.parse::<Decimal>().unwrap(), dec_of("7.142858"));
+        assert_eq!(rows[0].1.parse::<Decimal>().unwrap(), dec_of("0.60"));
+        // (0.60 − 0.4899) × 7.142858 − 0.12495 = 0.66163…
+        let pnl: f64 = rows[0].2.parse().unwrap();
+        assert!((pnl - 0.6616).abs() < 0.001, "pnl {pnl}");
+        assert!(rows[0].3.starts_with("ChainReconcile"), "{}", rows[0].3);
+    }
+
+    /// The same row with NO mark on it (a position that never lived through a
+    /// chain-sync pass has none). The old arm deleted it silently, which is
+    /// what finally lost the 2026-09-13 trade. It must still be booked, at the
+    /// entry and labeled unknown, so the record exists to be corrected.
+    #[tokio::test]
+    async fn a_costed_row_with_no_mark_is_booked_at_entry_not_deleted_silently() {
+        let pool = mem_pool().await;
+        insert_open(&pool, "GboostStrategy", "tok-nomark", "Bitcoin Up or Down - September 13, 8AM ET",
+                    "NO", "0.4899", "7.142858", None, "confirmed").await;
+        set_open_position_entry_fee(&pool, "tok-nomark", dec_of("0.12495")).await;
+
+        let purged = purge_stale_open_positions(&pool, &HashSet::new(), &HashMap::new(), &HashSet::new()).await;
+        assert_eq!(purged, 1, "the row is booked and then removed");
+
+        let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+            "SELECT shares, entry_price, exit_price, pnl, reason FROM trades WHERE strategy = 'GboostStrategy'"
+        ).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1, "a costed row must leave a trade row behind");
+        assert_eq!(rows[0].0.parse::<Decimal>().unwrap(), dec_of("7.142858"));
+        assert_eq!(rows[0].2, rows[0].1, "booked at entry");
+        assert!((rows[0].3.parse::<f64>().unwrap() + 0.12495).abs() < 1e-6, "pnl is minus the entry fee: {}", rows[0].3);
+        assert!(rows[0].4.contains("exit price unknown"), "{}", rows[0].4);
+
+        // A row with no cost basis at all has nothing to book and is dropped.
+        insert_open(&pool, "GboostStrategy", "tok-nocost", "mkt-nocost", "NO", "0", "7", None, "confirmed").await;
+        assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &HashMap::new(), &HashSet::new()).await, 1);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE market = 'mkt-nocost'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// Production btc shard, 2026-09-13: trade 15, a FairValue "Settlement
+    /// (won — cash settled)" booked after the last restart, carried venue,
+    /// market_class and underlying all NULL; trades 2, 6, 8 and 12 had a
+    /// venue only because the startup backfill stamped it; trade 7, a
+    /// ChainReconcile row, had class and underlying NULL. Every strategy exit
+    /// beside them read polymarket-intl / crypto / btc. Both bookings must
+    /// file the row as the position was filed, and the settlement fingerprint
+    /// must still recognize the row on the next sweep.
+    #[tokio::test]
+    async fn settlement_and_reconcile_bookings_carry_the_positions_filing_dimensions() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::crypto("test", "polymarket-intl", "btc");
+        let filed = |venue: &Option<String>, class: &Option<String>, und: &Option<String>| {
+            (venue.as_deref(), class.as_deref(), und.as_deref()) == (Some("polymarket-intl"), Some("crypto"), Some("btc"))
+        };
+
+        // A settled winner, still held (redeemable).
+        record_open_position(&pool, &scope, "btc-open", "FairValueStrategy", "tok-won",
+            "Bitcoin Up or Down - September 13, 7AM ET", "YES", dec_of("0.79"), dec_of("4.05"), false).await;
+        sqlx::query("UPDATE open_positions SET status = 'confirmed' WHERE token_id = 'tok-won'").execute(&pool).await.unwrap();
+        let mut marks = HashMap::new();
+        marks.insert("tok-won".to_string(), (Decimal::ONE, dec_of("4.05")));
+        assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &marks, &HashSet::new()).await, 1);
+
+        // A position that left the wallet by a trade, with a mark on its row.
+        record_open_position(&pool, &scope, "btc-open", "GboostStrategy", "tok-sold",
+            "Bitcoin Up or Down - September 13, 8AM ET", "NO", dec_of("0.4899"), dec_of("7.142858"), false).await;
+        sqlx::query("UPDATE open_positions SET status = 'confirmed', current_price = '0.60' WHERE token_id = 'tok-sold'").execute(&pool).await.unwrap();
+        assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &HashMap::new(), &HashSet::new()).await, 1);
+
+        let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT reason, venue, market_class, underlying FROM trades ORDER BY id"
+        ).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[0].0.starts_with("Settlement"), "{}", rows[0].0);
+        assert!(filed(&rows[0].1, &rows[0].2, &rows[0].3), "settlement row filed as {:?}", rows[0]);
+        assert!(rows[1].0.starts_with("ChainReconcile"), "{}", rows[1].0);
+        assert!(filed(&rows[1].1, &rows[1].2, &rows[1].3), "reconcile row filed as {:?}", rows[1]);
+
+        // The fingerprint is unchanged: the same settlement, re-booked by the
+        // auto-settle path with a scope recovered from the ledger, is a no-op.
+        let recovered = filing_scope_for_market(&pool, "Bitcoin Up or Down - September 13, 7AM ET").await;
+        assert_eq!((recovered.venue.as_str(), recovered.market_class.as_deref(), recovered.underlying.as_deref()),
+                   ("polymarket-intl", Some("crypto"), Some("btc")));
+        let pnl = (Decimal::ONE - dec_of("0.79")) * dec_of("4.05");
+        let again = record_settlement_trade_idempotent(
+            &pool, &recovered, "FairValueStrategy", "Bitcoin Up or Down - September 13, 7AM ET", "YES",
+            dec_of("0.79"), Decimal::ONE, dec_of("4.05"), pnl, Decimal::ZERO, "Settlement (won — pending redemption)", None,
+        ).await;
+        assert!(!again, "the fingerprint must still match a row written with filing columns");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 2);
+
+        // A market with no ledger rows at all: the venue is the shard's, and
+        // class/underlying are honestly unknown rather than guessed.
+        let unknown = filing_scope_for_market(&pool, "Devils vs. Flames").await;
+        assert_eq!((unknown.market_class, unknown.underlying), (None, None));
+        // ...while an entries row alone is enough to recover the filing.
+        record_entry_db(&pool, &TradeScope::crypto("test", "polymarket-intl", "eth"), "ArbitrageStrategy", "tok-e",
+            "Ethereum Up or Down - September 13, 9AM ET", "YES", dec_of("0.50"), dec_of("10")).await;
+        let from_entry = filing_scope_for_market(&pool, "Ethereum Up or Down - September 13, 9AM ET").await;
+        assert_eq!((from_entry.venue.as_str(), from_entry.market_class.as_deref(), from_entry.underlying.as_deref()),
+                   ("polymarket-intl", Some("crypto"), Some("eth")));
     }
 
     fn dec_of(s: &str) -> Decimal { s.parse().unwrap() }
@@ -5146,19 +4976,28 @@ mod reconcile_tests {
         assert_eq!(n, 0);
     }
 
-    // A stale position with no usable mark (missing current_price) is purged but NOT
-    // booked — we never fabricate a P&L without a price.
+    // A stale position with no usable mark (missing current_price) is still
+    // purged, and still booked: no P&L is invented (the exit is the entry, so
+    // the row nets to minus the entry fee) but the record of 11.44 shares that
+    // left the wallet exists to be corrected. This pinned the opposite until
+    // 2026-09-13, when the silent delete was the last of five misses on a
+    // real GBoost round trip.
     #[tokio::test]
-    async fn missing_mark_purges_without_booking() {
+    async fn missing_mark_purges_with_a_booking_labeled_unknown() {
         let pool = mem_pool().await;
         insert_open(&pool, "MakerStrategy", "tok4", "MarketD", "YES", "0.33", "11.44", None, "confirmed").await;
 
         let purged = purge_stale_open_positions(&pool, &HashSet::new(), &std::collections::HashMap::new(), &std::collections::HashSet::new()).await;
         assert_eq!(purged, 1);
 
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE market = 'MarketD'")
-            .fetch_one(&pool).await.unwrap();
-        assert_eq!(n, 0);
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT shares, exit_price, pnl, reason FROM trades WHERE market = 'MarketD'"
+        ).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "11.44");
+        assert_eq!(rows[0].1.parse::<Decimal>().unwrap(), Decimal::new(33, 2), "no price is invented: the exit is the entry");
+        assert_eq!(rows[0].2.parse::<Decimal>().unwrap(), Decimal::ZERO, "a Maker fill paid no fee, so the row nets to nothing");
+        assert!(rows[0].3.contains("exit price unknown"), "{}", rows[0].3);
     }
 
     // Resolution-time booking: both legs of a resolved arb pair are booked at their

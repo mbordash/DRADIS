@@ -1562,7 +1562,7 @@ impl Squadron {
                                     // so the sweep's earlier bookings come off first.
                                     let matched = resting_exit::lift_since_booking(
                                         cancel.ask_found, cancel.ask_matched, rest.booked, prior_shares);
-                                    let lifted = (prior_shares - held).max(matched).max(dec!(0));
+                                    let lifted = resting_exit::lift_at_pull(prior_shares, held, matched);
 
                                     if lifted >= config::MIN_ORDER_SHARES {
                                         let (avg_entry, entry_fee) = {
@@ -1600,6 +1600,33 @@ impl Squadron {
                                             p.shares = held;
                                             p.entry_fee = bk.entry_fee_left;
                                         }
+                                    } else if resting_exit::reprice_outcome(cancel.ask_found, lifted)
+                                        == resting_exit::RepriceOutcome::AwaitSweep
+                                    {
+                                        // The ask was NOT on the book to pull and the chain shows
+                                        // no drop. That is what a lift looks like in its first
+                                        // seconds: a filled order leaves the open-orders list and
+                                        // the balance endpoint lags the fill. Forgetting the
+                                        // record here is how the 2026-09-13 08:37 ET GBoost
+                                        // take-profit left the ledger: the $0.59 ask filled as
+                                        // the book gapped to $0.60, this pull read the shares
+                                        // still held, the record was dropped, and the retry five
+                                        // seconds later had no ask to attribute the venue's
+                                        // rejection to. Keep it, exactly as a reprice does: the
+                                        // FAK below is still sent (the ask may have been pulled
+                                        // from outside, in which case the sale is right), a
+                                        // venue that accepts the sell clears the record, and a
+                                        // venue that rejects it for lack of shares books the
+                                        // lift at this price. Either way the fill sweep can
+                                        // still read the wallet and book it.
+                                        info!("🚫 EXIT [{}]: resting ask @ ${:.4} was no longer on the book and the chain shows no lift yet; keeping its record for \"{}\"",
+                                              sn, rest.price, reason);
+                                        let now = Instant::now();
+                                        maker_resting_exits.insert(pos_key.clone(), MakerRestingExit {
+                                            vanished_at: Some(now), last_poll: now,
+                                            short_reads: 0, max_short_read: dec!(0),
+                                            ..rest
+                                        });
                                     } else {
                                         info!("🚫 EXIT [{}]: pulled resting ask to free shares for \"{}\"", sn, reason);
                                         if held >= config::MIN_ORDER_SHARES {
@@ -1716,47 +1743,54 @@ impl Squadron {
                                                     // bid always sits below entry and the "estimate" can only
                                                     // ever book a loss. Trade 377 booked -$0.18 on a +$0.18
                                                     // move that way.
+                                                    //
+                                                    // A resting ask on these exact shares is asked FIRST. A
+                                                    // post-only limit cannot slip, so if the venue says the
+                                                    // shares are gone and our own ask was the only order that
+                                                    // could have taken them, the exit price is that ask,
+                                                    // exactly. Collateral is the fallback, not the other way
+                                                    // round: `live_collateral` refreshes once a minute, so at
+                                                    // this instant it can predate the lift, and the baseline
+                                                    // can predate the entry. 2026-09-13 08:37:23 ET: baseline
+                                                    // $61.46 (pre-entry) against collateral $57.84 (post-entry,
+                                                    // pre-lift) implied a negative price and was rightly
+                                                    // refused, but the ask at $0.59 was the answer all along.
+                                                    // Trade 18, 2026-09-01, was the same shape: the 13.53-share
+                                                    // remainder of a partial lift at $0.63 was booked
+                                                    // "$0.61 → $0.61, pnl 0" here while its own reason string
+                                                    // claimed +9.83%.
                                                     let now_collateral = *live_collateral.lock().await;
-                                                    let implied = reconcile_unverified_exit(
-                                                        fill_baseline, now_collateral, p.shares,
-                                                        p.avg_entry, params.price, exit_reconcile_max_dev,
-                                                    );
                                                     let sid3 = side_of(&tid).to_string();
                                                     let market_open = target_market_close_time.map_or(true, |c| c > Utc::now());
-                                                    let outcome: Option<(Decimal, Decimal, String)> = match implied {
-                                                        Some((px, pnl)) => {
-                                                            warn!(
-                                                                "⚠️ EXIT rejected by exchange [{}] (\"{}\"): position already gone — reconciled from collateral: pnl=${:.4} (implies exit @ ${:.4} against bid ${:.4})",
-                                                                sn, es.chars().take(80).collect::<String>(), pnl, px, params.price
-                                                            );
-                                                            Some((px, pnl, format!("{} (ExitReconciled: pnl taken from collateral movement)", reason)))
-                                                        }
-                                                        // Collateral could not confirm it — but a resting ask on
-                                                        // these exact shares CAN. A post-only limit cannot slip,
-                                                        // so if the venue says the shares are gone and our own
-                                                        // ask was the only order that could have taken them,
-                                                        // the exit price is that ask, exactly. Trade 18,
-                                                        // 2026-09-01: the 13.53-share remainder of a partial
-                                                        // lift at $0.63 was booked "$0.61 → $0.61, pnl 0" here
-                                                        // while its own reason string claimed +9.83%.
-                                                        None => fak_exit::attribute_to_resting_ask(
-                                                            resting_ask_price, market_open, p.avg_entry, p.entry_fee, p.shares,
-                                                        ).map(|(px, pnl)| {
+                                                    let priced = fak_exit::price_unverified_exit(
+                                                        resting_ask_price, market_open, p.avg_entry, p.entry_fee, p.shares,
+                                                        fill_baseline, now_collateral, params.price, exit_reconcile_max_dev,
+                                                    );
+                                                    let outcome: Option<(Decimal, Decimal, Decimal, String)> = match priced {
+                                                        Some((px, pnl, fak_exit::UnverifiedExitSource::RestingAsk)) => {
                                                             info!(
                                                                 "✅ {} filled [{}]: {:.4} shares lifted @ ${:.4} (entry ${:.4}) pnl=${:.4} — attributed: the venue rejected \"{}\" because the ask had already filled",
                                                                 resting_exit::label(&sn), sn, p.shares, px, p.avg_entry, pnl, reason
                                                             );
-                                                            (px, pnl, format!(
+                                                            Some((px, pnl, p.entry_fee, format!(
                                                                 "{} (attributed from the resting ask after the venue rejected the stop)",
                                                                 resting_exit::ledger_reason(&sn, px, p.avg_entry)
-                                                            ))
-                                                        }),
+                                                            )))
+                                                        }
+                                                        Some((px, pnl, fak_exit::UnverifiedExitSource::Collateral)) => {
+                                                            warn!(
+                                                                "⚠️ EXIT rejected by exchange [{}] (\"{}\"): position already gone — reconciled from collateral: pnl=${:.4} (implies exit @ ${:.4} against bid ${:.4})",
+                                                                sn, es.chars().take(80).collect::<String>(), pnl, px, params.price
+                                                            );
+                                                            Some((px, pnl, Decimal::ZERO, format!("{} (ExitReconciled: pnl taken from collateral movement)", reason)))
+                                                        }
+                                                        None => None,
                                                     };
                                                     match outcome {
-                                                        Some((aep3, pnl3, tag)) => {
+                                                        Some((aep3, pnl3, fees3, tag)) => {
                                                             *total_pnl.lock().await += pnl3;
                                                             metrics::record_trade(
-                                                                &scope, Decimal::ZERO, sn.clone(), params.market_name.clone(), sid3,
+                                                                &scope, fees3, sn.clone(), params.market_name.clone(), sid3,
                                                                 p.avg_entry, aep3, p.shares, pnl3, tag,
                                                             ).await;
                                                             if let Some(pool) = db::pool_for(&asset_lc) { db::close_open_position(&pool, &sn, &tid_m.to_string()).await; }
@@ -1811,6 +1845,13 @@ impl Squadron {
                                         continue;
                                     }
                                 }
+                                // The venue accepted a sell for these shares, so they were
+                                // free: whatever ask record survived the pull above (kept
+                                // when the ask had vanished unverified) described an order
+                                // that was pulled from outside, not lifted. Drop it now, or
+                                // the fill sweep would read the wallet drop this FAK causes
+                                // and book it a second time at the resting price.
+                                maker_resting_exits.remove(&pos_key);
 
                                         {
                                             let re_m;
@@ -3852,6 +3893,16 @@ pub(crate) mod resting_exit {
         (ask_matched - booked).max(Decimal::ZERO).min(live.max(Decimal::ZERO))
     }
 
+    /// Shares that verifiably left a position when its ask was pulled ahead
+    /// of a FAK: the wallet drop from the position's own count, or the
+    /// venue's unbooked matched size, whichever is larger. Unlike
+    /// `chain_drop` this trusts a ZERO reading, because the caller has
+    /// already confirmed it with settlement-lag retries and keeps the
+    /// largest reading seen.
+    pub fn lift_at_pull(prior_shares: Decimal, held: Decimal, matched: Decimal) -> Decimal {
+        (prior_shares - held).max(matched).max(Decimal::ZERO)
+    }
+
     /// Shares the chain says left the wallet since the ask was sized to
     /// `baseline`, from ONE balance reading.
     ///
@@ -4097,6 +4148,34 @@ pub(crate) mod resting_exit {
             assert_eq!(lift_since_booking(true, dec!(1), dec!(2), dec!(7.35)), dec!(0));
         }
 
+        /// 2026-09-13 08:37 ET, real money, GBoost: 7.142858 shares with a
+        /// $0.59 ask resting; the book gapped to $0.60 and the ask filled. The
+        /// stop-style exit pulled it: the cancel found no ask (a filled order
+        /// leaves the book), the balance endpoint still read every share held,
+        /// so nothing verified the lift. That pull must NOT forget the ask.
+        /// Five seconds later the wallet had caught up (0.0028 shares) and the
+        /// second pull could book the lift, at the resting price, from the
+        /// record the first one kept.
+        #[test]
+        fn a_pull_that_finds_no_ask_and_no_drop_keeps_the_record_for_the_retry() {
+            let prior = dec!(7.142858);
+            // First attempt: ask gone, chain lagging.
+            let matched = lift_since_booking(false, dec!(0), dec!(0), prior);
+            let lifted = lift_at_pull(prior, prior, matched);
+            assert_eq!(lifted, dec!(0));
+            assert_eq!(reprice_outcome(false, lifted), RepriceOutcome::AwaitSweep,
+                "the record is kept, exactly as a reprice keeps it");
+            // Retry: chain caught up; the kept record's price books the lift.
+            let lifted = lift_at_pull(prior, dec!(0.0028), lift_since_booking(false, dec!(0), dec!(0), prior));
+            assert_eq!(lifted, dec!(7.140058));
+            assert_eq!(reprice_outcome(false, lifted), RepriceOutcome::BookLift);
+            let bk = book_lift(dec!(0.59), dec!(0.4899), dec!(0.12495), lifted, prior);
+            assert!((bk.pnl - dec!(0.5898)).abs() < dec!(0.0002), "pnl {}", bk.pnl);
+            // Our ask found on the book and cancelled with nothing matched: the
+            // shares are free and the FAK is right; the record goes.
+            assert_eq!(reprice_outcome(true, dec!(0)), RepriceOutcome::Repost);
+        }
+
         /// The balance endpoint reads 0 on failure, so 0 proves nothing; a
         /// positive reading below the baseline is a lift; a reading at or above
         /// it (lag reads high) is not.
@@ -4305,6 +4384,43 @@ pub mod fak_exit {
         Some((px, (px - entry) * shares - entry_fee))
     }
 
+    /// Where the price of an exit the venue rejected came from.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum UnverifiedExitSource {
+        /// Our own post-only ask on these shares: exact, and net of the entry fee only.
+        RestingAsk,
+        /// Derived from the collateral move: approximate, and only inside the bid band.
+        Collateral,
+    }
+
+    /// Price an exit the venue rejected because the shares were already gone.
+    ///
+    /// The resting ask is asked first: a post-only limit cannot slip, so when
+    /// one rested on these shares it is the exact price, whereas the collateral
+    /// reconciliation reads a figure that refreshes once a minute and can
+    /// predate the lift (2026-09-13: $57.84 read against a $61.46 pre-entry
+    /// baseline implied a negative price while the $0.59 ask was the answer).
+    /// Collateral is the fallback for a position that had no ask. `None` means
+    /// nothing verifiable: the caller writes no row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn price_unverified_exit(
+        resting_ask: Option<Decimal>,
+        market_open: bool,
+        entry: Decimal,
+        entry_fee: Decimal,
+        shares: Decimal,
+        baseline: Option<Decimal>,
+        now_collateral: Decimal,
+        observed_bid: Decimal,
+        max_dev: Decimal,
+    ) -> Option<(Decimal, Decimal, UnverifiedExitSource)> {
+        if let Some((px, pnl)) = attribute_to_resting_ask(resting_ask, market_open, entry, entry_fee, shares) {
+            return Some((px, pnl, UnverifiedExitSource::RestingAsk));
+        }
+        super::reconcile_unverified_exit(baseline, now_collateral, shares, entry, observed_bid, max_dev)
+            .map(|(px, pnl)| (px, pnl, UnverifiedExitSource::Collateral))
+    }
+
     /// The SAME position, holding only what the venue did not sell. Every
     /// timestamp and link survives; only size and the unbooked entry fee change.
     pub fn retain_remainder(p: &Position, remainder: Decimal, entry_fee_left: Decimal) -> Position {
@@ -4439,6 +4555,35 @@ pub mod fak_exit {
         fn no_resting_ask_or_a_closed_market_is_not_attributable() {
             assert_eq!(attribute_to_resting_ask(None, true, dec!(0.61), dec!(0), dec!(13.53)), None);
             assert_eq!(attribute_to_resting_ask(Some(dec!(0.63)), false, dec!(0.61), dec!(0), dec!(13.53)), None);
+        }
+
+        /// 2026-09-13 08:37:23 ET, exactly as production saw it. GBoost's NO
+        /// (7.142858 shares at $0.4899, $0.12495 entry fee) had its $0.59 ask
+        /// lifted; the retry's sell was rejected. The collateral figures on
+        /// hand were a pre-entry baseline ($61.46) and a post-entry, pre-lift
+        /// reading ($57.8351): they imply a negative price and were rightly
+        /// refused. The ask must be consulted first and books +$0.59 net.
+        #[test]
+        fn the_rejected_retry_books_the_resting_ask_before_asking_collateral() {
+            let (px, pnl, src) = price_unverified_exit(
+                Some(dec!(0.59)), true, dec!(0.4899), dec!(0.12495), dec!(7.142858),
+                Some(dec!(61.460051)), dec!(57.835101), dec!(0.67), dec!(0.10),
+            ).expect("the ask is the sourced price");
+            assert_eq!(src, UnverifiedExitSource::RestingAsk);
+            assert_eq!(px, dec!(0.59));
+            assert!((pnl - dec!(0.5901)).abs() < dec!(0.0002), "pnl {pnl}");
+            // The same collateral figures alone are nothing verifiable...
+            assert_eq!(price_unverified_exit(
+                None, true, dec!(0.4899), dec!(0.12495), dec!(7.142858),
+                Some(dec!(61.460051)), dec!(57.835101), dec!(0.67), dec!(0.10),
+            ), None);
+            // ...and a position that had no ask still reconciles from a clean
+            // collateral move, as trade 377 did.
+            let (px, pnl, src) = price_unverified_exit(
+                None, true, dec!(0.44), dec!(0), dec!(18),
+                Some(dec!(66.82502)), dec!(67.00502), dec!(0.43), dec!(0.10),
+            ).unwrap();
+            assert_eq!((px, pnl, src), (dec!(0.45), dec!(0.18), UnverifiedExitSource::Collateral));
         }
 
         /// The Bug #22 family in this path: the old re-insert built a brand-new

@@ -478,39 +478,11 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              both sides and buys one as a taker when its win probability clears break-even plus the Entry Margin. Exits \
              by a resting take-profit, a taker stop, a flatten just before the hourly market rotates, or settlement. \
              Idle until logs/btc-gboost_planb_v1.json exists."));
-        v.push(F::new(g, e, "gboost_shadow_mode", "Shadow Mode", "bool", false,
-            "Observe-only. When on, the model still scores every decision minute and logs the entry it would take, \
-             marked shadow mode, but places no order. Turn it off to trade real money at Trade Size."));
-        v.push(F::new(g, e, "gboost_budget", "Training Budget", "decimal", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. How hard the model works on each retrain. The booster keeps adding trees until this \
-             budget is spent, so a higher number fits the recorded outcomes more closely and a \
-             lower one stops earlier. Raising it is not free in either direction: more trees on a \
-             small pool of trades learns that pool's noise as if it were signal, and the model \
-             then reports high conviction on setups it has never really seen. Too low is the \
-             sharper failure: a model under 20 trees is discarded as a stump and the strategy \
-             backs off instead of trading, so if the log reports degenerate retrains, raise this \
-             before touching anything else. How many trees a given budget buys depends entirely \
-             on the data — the same setting produced 5 trees on one pool and 390 on another — so \
-             judge it by the tree count in the retrain log, never by the number here.")
-            .range(0.1, 3.0).step(0.05));
-        v.push(F::new(g, e, "gboost_iteration_limit", "Training Iteration Cap", "secs", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. Hard ceiling on boosting rounds per retrain, whichever comes first with the budget. \
-             It exists to bound wall-clock time: training runs on a blocking thread, and an \
-             unbounded fit on a large pool holds that thread long enough to matter. Hitting the \
-             cap is normal and harmless, it just means the budget had more to spend than the cap \
-             allowed — so raise this and the budget together, or the extra budget cannot be used.")
-            .range(50.0, 20_000.0).step(50.0).unit("iter"));
-        v.push(F::new(g, e, "gboost_entry_threshold", "Entry Threshold", "decimal", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. Classifier probability required to enter (0.88 = 88%).").range(0.0, 1.0).step(0.01));
-        v.push(F::new(g, e, "gboost_stop_loss_pct", "Stop Loss", "pct", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. Entry-relative stop loss (0.05 = 5%).").range(0.0, 1.0).step(0.01));
-        v.push(F::new(g, e, "gboost_target_profit_pct", "Take Profit", "pct", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. Entry-relative take profit.").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "gboost_max_exposure_usdc", "Max Exposure", "usd", false,
             "Hard cap on GBoost capital at risk, counting open positions whose market has not yet closed. An \
              entry that would breach it is skipped and logged. With the default sizes this allows one trade at a time.").min(0.0).step(0.5).unit("USDC"));
-        // Plan-B model (2026-09-13). These, with Enabled, Shadow Mode and Max Exposure, are the
-        // settings the offline-trained model reads; every knob marked Retired no longer trades.
+        // Plan-B model (2026-09-13). These, with Enabled and Max Exposure, are the settings the
+        // offline-trained model reads. Enabled is the off switch; there is no observe-only mode.
         v.push(F::new(g, e, "gboost_planb_trade_size_usdc", "Trade Size", "usd", false,
             "USDC per entry, before fee headroom. Polymarket's minimum order on these markets is 5 shares, so a \
              size that buys fewer is raised to 5 shares (about $3.82 at a $0.75 ask) when Max Exposure has room, \
@@ -537,76 +509,6 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(g, e, "gboost_planb_last_minute", "Last Decision Minute", "int", true,
             "Latest minute of each hourly window at which the model decides. Entries also stop two minutes \
              before the flatten that precedes the market rotation, so a setting past 47 adds nothing.").range(0.0, 59.0).step(1.0));
-        // Advanced
-        v.push(F::new(g, e, "gboost_max_yes_entry_price", "Max YES Entry", "price", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. Highest YES-token ask the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
-        v.push(F::new(g, e, "gboost_max_no_entry_price", "Max NO Entry", "price", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. Highest NO-token ask the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
-        v.push(F::new(g, e, "gboost_min_entry_price", "Min Entry", "price", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. Lowest token price the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
-        v.push(F::new(g, e, "gboost_obi_adverse_block", "OBI Adverse Block", "decimal", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. Block entry when order-book imbalance is adverse beyond this (negative).").range(-1.0, 1.0).step(0.05));
-        v.push(F::new(g, e, "gboost_obi_exhaustion_block", "OBI Exhaustion Block", "decimal", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. Block entry when order-book imbalance signals exhaustion above this.").range(0.0, 1.0).step(0.05));
-        v.push(F::new(g, e, "gboost_min_edge_from_fair", "Min Edge from Fair", "price", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. Minimum edge vs classifier fair value required to enter.").range(0.0, 0.5).step(0.005));
-        v.push(F::new(g, e, "gboost_min_hist_vol", "Min Oracle Volatility", "decimal", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. Veto entries while the oracle's 60-minute realized volatility (normalized: 0.02 per-tick std-dev = 1.0) \
-             is below this. Meant to reject a frozen or stale oracle (~0.000). Live BTC normally reads 0.001–0.004, so a \
-             floor at 0.0015 also vetoes genuinely quiet hours. Each veto is logged with its hist_vol; use \
-             GET /api/gboost/veto-scores?max_hist_vol=… to score a candidate floor against settled outcomes first.").range(0.0, 0.05).step(0.0001));
-        v.push(F::new(g, e, "gboost_min_net_profit_usdc", "Min Net Profit", "usd", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. Minimum net expected profit (after fees) required to enter.").min(0.0).step(0.05).unit("USDC"));
-        v.push(F::new(g, e, "gboost_min_secs_to_expiry", "Min Secs to Expiry", "secs", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. Don't enter with fewer than this many seconds left.").min(0.0).step(1.0).unit("s"));
-        v.push(F::new(g, e, "gboost_signal_exit_threshold", "Signal Exit Threshold", "decimal", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. Exit when classifier probability decays to/below this level.").range(0.0, 1.0).step(0.01));
-        v.push(F::new(g, e, "gboost_concept_drift_threshold", "Drift Threshold", "decimal", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. Chi-squared drift score above which a retrain counts toward suppression. Calibrated for drift window 400: normal BTC intraday vol scores 15–21, genuine regime collapse 22+.").range(1.0, 100.0).step(0.5));
-        v.push(F::new(g, e, "gboost_drift_consecutive_required", "Drift Consecutive Required", "int", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. Consecutive above-threshold retrains required before entries are suppressed.").range(1.0, 10.0).step(1.0));
-        v.push(F::new(g, e, "gboost_drift_stable_clear_required", "Drift Stable Clear Required", "int", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. Consecutive below-threshold retrains required before suppression is lifted.").range(1.0, 10.0).step(1.0));
-        v.push(F::new(g, e, "gboost_label_max_age_hours", "Label Max Age", "int", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. Oldest lookahead label the retrain pool may hold, in hours. The pool is persisted under logs/ across \
-             restarts; labels older than this are dropped at every harvest, so a pool restored after a long stop \
-             cannot retrain the model on a regime that is days gone. In normal operation the FIFO cap already \
-             keeps the pool to a few hours of data, so this mostly governs what a reload is allowed to bring back.")
-            .range(1.0, 720.0).step(1.0).unit("h"));
-        v.push(F::new(g, e, "gboost_holdout_min_skill", "Retrain Acceptance Skill", "decimal", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. How much better than a coin a retrain must be before it replaces the running model. Before \
-             adoption, a validation model is fit on the older part of the label pool and scored on the newest \
-             tenth, held out behind a gap of twice the label horizon so no training label overlaps a holdout \
-             outcome. Its logloss skill over the best constant forecast (1 - model / constant) must reach this: \
-             0 means no better than a coin weighted at the holdout's own base rate, 0.05 means five percent \
-             less loss than that coin. A rejected retrain keeps the previous model and logs the measured skill \
-             with the reason, so a run of rejections means the model is not generalizing to the latest window, \
-             not that anything is broken. Same in every profile; this is validation mechanism, not risk appetite. \
-             Setting it far below zero (say -10) adopts every retrain that is not a stump regardless of what it \
-             scored; that is only defensible with Shadow Mode on, to collect shadow entries from a model the \
-             test rejects, and never while GBoost is placing orders.")
-            .range(-10.0, 0.5).step(0.01));
-        v.push(F::new(g, e, "gboost_holdout_min_independent", "Retrain Acceptance Min Outcomes", "int", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. Fewest independent outcomes the holdout must hold before its skill score counts. Pool rows land \
-             about a second apart and each label is the oracle's direction one label horizon later, so a \
-             holdout of hundreds of rows can hold only three or four outcomes, and a fit that calls those \
-             right by luck reads as near-perfect skill: on 2026-09-06 production adopted eight retrains at \
-             +28% to +83% skill on holdouts of 14 to 38 minutes while every walk-forward window scored below \
-             zero. Measured as non-overlapping horizon-length blocks across the holdout (an upper bound on \
-             its independent outcomes). Below this the retrain is deferred as 'holdout too thin to judge' \
-             before anything is fit, and the previous model stays. At the 300 s horizon 12 is one hour of \
-             holdout, about the point where a lucky pass drops from several a day to one a fortnight; the \
-             label pool must span roughly ten hours for a tenth of it to reach that. Set to 1 to disable the \
-             guard, which is only defensible with Shadow Mode on. Same in every profile: validation mechanism, \
-             not risk appetite.")
-            .range(1.0, 100.0).step(1.0));
-        v.push(F::new(g, e, "gboost_structural_min_trees", "Structural Tree Floor", "int", true,
-            "Retired: read only by the self-retraining classifier that plan B replaced, so it has no effect. Fewest trees a retrain may have. This only catches the fit that stops at a single stump because \
-             the window's labels offered nothing to learn (a frozen oracle, one-directional drift). It is not \
-             a quality bar: tree count does not track holdout quality, and the old 20-30 floor rejected \
-             correctly fitted models. Quality is judged by Retrain Acceptance Skill. A fit that finds nothing \
-             stops at 1 to 3 trees; real fits run from the high teens up. Leave at 5.")
-            .range(1.0, 50.0).step(1.0));
     }
 
     // ── TrendReversal ─────────────────────────────────────────────────────────────

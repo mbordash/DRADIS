@@ -159,9 +159,10 @@ where
 //
 // Previously hardcoded to 8 to cover a BTC+ETH+SOL multi-asset deployment.  On
 // the single-asset (ASSETS=btc) t3.large production box (2 vCPUs) that is 4x
-// oversubscription: during a rayon-based GBoost retrain — which itself spawns
-// ~num_cpus threads that saturate both cores — 8 tokio workers, the rayon pool,
-// and the timer driver all contend for 2 cores.  Because `tokio::time::timeout`
+// oversubscription: during a CPU-bound blocking task (the in-process GBoost
+// retrain of the time spawned ~num_cpus rayon threads that saturated both
+// cores) 8 tokio workers, the rayon pool, and the timer driver all contend for
+// 2 cores.  Because `tokio::time::timeout`
 // is cooperative it cannot interrupt a synchronous / std::sync::Mutex-blocked
 // section, so a CPU-starved eval tick can hang past the 300 s watchdog (see the
 // watchdog comment below — this is the exact class of stall it names).
@@ -264,8 +265,8 @@ async fn run() -> Result<()> {
     // ── OS-thread watchdog — immune to tokio runtime deadlocks ───────────────
     // Root cause of the May 28 overnight freeze: the tokio runtime ran with 1
     // worker thread on a single-core t2.small.  Any call that blocked that thread
-    // synchronously (TCP stall, std::sync::Mutex contention during GBoost retrain,
-    // Polymarket WS reconnect loop) froze the ENTIRE runtime — watchdog_ticker,
+    // synchronously (TCP stall, std::sync::Mutex contention during the GBoost
+    // retrain of the time, Polymarket WS reconnect loop) froze the ENTIRE runtime — watchdog_ticker,
     // timeouts, heartbeat, select! arms, all silenced.  The container became
     // (unhealthy) but `--restart unless-stopped` only restarts on process exit
     // (not on health-check failure), so it sat dead for 10+ hours.

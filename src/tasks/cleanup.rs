@@ -890,7 +890,21 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
                     // Routing these to settlement instead would book an off-strategy
                     // sale at $1.00 or $0.00 rather than its actual sale price, and
                     // then delete the row so nothing could correct it.
-                    R::NotClosed => {}
+                    //
+                    // That path books at the row's mark, and a row this young may
+                    // not have one: chain-sync only refreshes `current_price` for
+                    // tokens the wallet holds, so a position opened and closed
+                    // between two passes reaches the purge with NULL (2026-09-13:
+                    // GBoost's row was 3.5 minutes old). Source the market's
+                    // current price now, while the market is verifiably open, so
+                    // the booking is at a real mark rather than labeled unknown.
+                    R::NotClosed => {
+                        if let Some(px) = crate::helpers::market::open_market_mark_for_token(resolution_http(), &token).await {
+                            db::update_position_current_price(&pool, &token, px).await;
+                            info!("🧾 Off-strategy exit detected [{}]: market still open, sourced mark ${:.4} for the booking",
+                                  &token[..token.len().min(12)], px);
+                        }
+                    }
                     // No answer at all: never guess, retry next sweep — but not
                     // forever. A token the market API will never price again would
                     // otherwise pin its row open for the life of the process.
@@ -1368,8 +1382,10 @@ async fn record_settled_arb_trade(
                 return;
             }
 
+            let scope = db::filing_scope_for_market(&pool, &market_title).await;
             let inserted = db::record_settlement_trade_idempotent(
                 &pool,
+                &scope,
                 "ArbitrageStrategy",
                 &market_title,
                 "YES",
@@ -1466,8 +1482,10 @@ async fn record_settled_arb_trade(
             }
 
             let settle_strategy = logged_strategy.as_deref().unwrap_or("ArbitrageStrategy");
+            let scope = db::filing_scope_for_market(&pool, &market_title).await;
             let inserted = db::record_settlement_trade_idempotent(
                 &pool,
+                &scope,
                 settle_strategy,
                 &market_title,
                 side,
@@ -1806,8 +1824,10 @@ pub async fn detect_orphaned_arb_settlements(safe_address: Address, squadron_ass
                         // A confirmed YES+NO pair resolves to exactly $1.00 (one leg
                         // pays $1, the other $0). Realized P&L = ($1.00 − cost)/pair.
                         let pnl = (Decimal::ONE - entry_per_pair) * pairs;
+                        let scope = db::filing_scope_for_market(&pool, &market_name).await;
                         let inserted = db::record_settlement_trade_idempotent(
                             &pool,
+                            &scope,
                             "ArbitrageStrategy",
                             &market_name,
                             "YES",

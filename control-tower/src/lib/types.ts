@@ -117,8 +117,6 @@ export interface DynamicConfig {
   deploy_min_liquidity_usd: string;
   collateral_sweep_enabled:      boolean;
   collateral_sweep_min_usdc:     string;
-  gboost_budget:                 string;
-  gboost_iteration_limit:        number;
   position_quote_ttl_secs:       number;
   llm_max_output_tokens:         number;
   obi_use_whole_book:            boolean;
@@ -157,25 +155,7 @@ export interface DynamicConfig {
   basis_min_secs_to_expiry:      number;
 
   // GBoost Viper
-  gboost_entry_threshold:   string;
-  gboost_stop_loss_pct:     string;
-  gboost_target_profit_pct: string;
   gboost_max_exposure_usdc: string;
-  gboost_max_yes_entry_price:   string;
-  gboost_max_no_entry_price:    string;
-  gboost_min_entry_price:       string;
-  gboost_obi_adverse_block:     string;
-  gboost_obi_exhaustion_block:  string;
-  gboost_min_edge_from_fair:    string;
-  gboost_min_hist_vol:          string;
-  gboost_min_net_profit_usdc:   string;
-  gboost_min_secs_to_expiry:    number;
-  gboost_signal_exit_threshold: string;
-  gboost_concept_drift_threshold: string;
-  gboost_drift_consecutive_required: number;
-  gboost_drift_stable_clear_required: number;
-  gboost_label_max_age_hours: number;
-  gboost_shadow_mode: boolean;
   gboost_planb_trade_size_usdc: string;
   gboost_planb_margin: string;
   gboost_planb_take_profit_pct: string;
@@ -186,9 +166,6 @@ export interface DynamicConfig {
   gboost_planb_first_minute: number;
   gboost_planb_last_minute: number;
   gboost_resting_tp_enabled: boolean;
-  gboost_structural_min_trees: number;
-  gboost_holdout_min_skill: string;
-  gboost_holdout_min_independent: number;
 
   // TrendCapture Viper
   trendcapture_min_trade_size_usdc: string;

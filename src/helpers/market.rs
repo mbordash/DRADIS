@@ -490,8 +490,8 @@ pub use crate::venues::core::TokenResolution;
 
 /// Final resolved price for ONE CLOB token.
 ///
-/// Sibling of [`fetch_resolved_outcome_prices`], keyed by token rather than by
-/// condition. `open_positions` rows carry a token id and no condition id, and the
+/// Keyed by token rather than by condition, because
+/// `open_positions` rows carry a token id and no condition id, and the
 /// settlement path needs an answer for a position whose market has already resolved
 /// and redeemed — at which point the chain no longer reports it and there is nothing
 /// left to look the condition up from.
@@ -583,6 +583,44 @@ pub async fn resolution_for_token(
     TokenResolution::Resolved(px)
 }
 
+/// The current Gamma mark for `token_id` on a market that is still trading.
+///
+/// For the chain sweep's off-strategy exit booking: a position that left the
+/// wallet by a trade while its market is open is booked at "last mark", and
+/// the row only carries one if a chain-sync pass refreshed it while the
+/// position was live. A position opened and closed between two passes has
+/// none (2026-09-13: GBoost's row was 3.5 minutes old when the sweep found
+/// it), so the sweep asks the market instead. `None` on any failure: the
+/// caller then books with the mark it has, or labels the exit unknown.
+pub async fn open_market_mark_for_token(http: &reqwest::Client, token_id: &str) -> Option<rust_decimal::Decimal> {
+    let url = format!("https://gamma-api.polymarket.com/markets?clob_token_ids={}", token_id);
+    let resp = http.get(&url).send().await.ok()?;
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let arr = data.as_array().cloned()
+        .or_else(|| data.get("data").and_then(|v| v.as_array()).cloned())?;
+    mark_from_gamma_market(arr.first()?, token_id)
+}
+
+/// `outcomePrices[i]` for the `clobTokenIds[i]` that is `token_id`, from a
+/// Gamma market object. Both arrays arrive as JSON arrays that are sometimes
+/// string-encoded. A price outside (0, 1) is not a mark.
+pub fn mark_from_gamma_market(m: &serde_json::Value, token_id: &str) -> Option<rust_decimal::Decimal> {
+    use std::str::FromStr;
+    let as_vec = |v: &serde_json::Value| -> Option<Vec<serde_json::Value>> {
+        if let Some(a) = v.as_array() { return Some(a.clone()); }
+        v.as_str().and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(s).ok())
+    };
+    let toks = m.get("clobTokenIds").and_then(as_vec)?;
+    let prices = m.get("outcomePrices").and_then(as_vec)?;
+    let idx = toks.iter().position(|t| t.as_str() == Some(token_id))?;
+    let raw = prices.get(idx)?;
+    let px = match raw.as_str() {
+        Some(s) => rust_decimal::Decimal::from_str(s).ok()?,
+        None => rust_decimal::Decimal::try_from(raw.as_f64()?).ok()?,
+    };
+    (px > rust_decimal::Decimal::ZERO && px < rust_decimal::Decimal::ONE).then_some(px)
+}
+
 /// The market's scheduled end, from a Gamma market object. `None` when the
 /// field is absent or unparseable — which corroboration treats as "cannot
 /// confirm still trading", never as an answer.
@@ -646,70 +684,6 @@ fn corroborate_not_closed(
         // defer, never book from a mark.
         _ => TokenResolution::Unknown,
     }
-}
-
-/// Resolved settlement prices for a market, keyed by CLOB token id (decimal string).
-///
-/// Authoritative source for "did this side win?", used to label `gboost_vetoes`
-/// rows after settlement. The order book is deliberately NOT used for this: a
-/// resolved market's book is frequently empty, and a price endpoint that returns
-/// $0.00 for "no resting orders" is indistinguishable from $0.00 for "this side
-/// lost" — that ambiguity would silently mislabel winners as losers and poison
-/// the very calibration evidence the veto log exists to provide.
-///
-/// Returns `None` when the market is not yet closed, is missing resolution data,
-/// or the request fails; the caller retries on a later sweep. `Some(map)` is only
-/// produced for a `closed` market whose outcome prices parse cleanly.
-pub async fn fetch_resolved_outcome_prices(
-    http: &reqwest::Client,
-    condition_id: &str,
-) -> Option<std::collections::HashMap<String, rust_decimal::Decimal>> {
-    use rust_decimal::Decimal;
-    use std::str::FromStr;
-
-    // `closed=true` is REQUIRED, not an optimisation: Gamma's default filter
-    // excludes closed markets, so without it this endpoint returns `[]` for every
-    // settled market — i.e. for exactly the set we need to score. (Verified
-    // 2026-08-12: the same condition_id returns [] bare and the resolved market
-    // with the flag. Note `condition_id=` singular is silently IGNORED and returns
-    // the unfiltered market list, which would resolve every token to the wrong
-    // market — use `condition_ids=`.)
-    let url = format!(
-        "https://gamma-api.polymarket.com/markets?condition_ids={}&closed=true",
-        condition_id
-    );
-    let resp = http.get(&url).send().await.ok()?;
-    let data: serde_json::Value = resp.json().await.ok()?;
-    let arr = data.as_array()
-        .or_else(|| data.get("data").and_then(|v| v.as_array()))?;
-    let m = arr.first()?;
-
-    // Only a CLOSED market has a final resolution. An open market can carry
-    // outcomePrices that merely reflect the current mark.
-    if !m.get("closed").and_then(|v| v.as_bool()).unwrap_or(false) {
-        return None;
-    }
-
-    // Both fields arrive as JSON arrays that are sometimes string-encoded.
-    let as_vec = |v: &serde_json::Value| -> Option<Vec<serde_json::Value>> {
-        if let Some(a) = v.as_array() { return Some(a.clone()); }
-        v.as_str().and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(s).ok())
-    };
-    let token_ids = as_vec(m.get("clobTokenIds")?)?;
-    let prices    = as_vec(m.get("outcomePrices")?)?;
-    if token_ids.len() != prices.len() || token_ids.is_empty() {
-        return None;
-    }
-
-    let mut out = std::collections::HashMap::new();
-    for (t, p) in token_ids.iter().zip(prices.iter()) {
-        let tid = t.as_str().map(|s| s.to_string())
-            .or_else(|| t.as_u64().map(|n| n.to_string()))?;
-        let price = p.as_str().and_then(|s| Decimal::from_str(s).ok())
-            .or_else(|| p.as_f64().and_then(Decimal::from_f64_retain))?;
-        out.insert(tid, price);
-    }
-    Some(out)
 }
 
 #[cfg(test)]
@@ -876,5 +850,35 @@ mod resolution_tests {
             super::corroborate_not_closed(None, chrono::Utc::now()),
             TokenResolution::Unknown,
         );
+    }
+}
+
+#[cfg(test)]
+mod gamma_mark_tests {
+    use super::mark_from_gamma_market;
+    use rust_decimal_macros::dec;
+
+    /// Gamma string-encodes both arrays on the live endpoint; a plain array
+    /// must parse the same way, and the token's own index is what prices it.
+    #[test]
+    fn the_mark_is_the_outcome_price_at_the_tokens_index() {
+        let encoded = serde_json::json!({
+            "clobTokenIds": "[\"111\", \"222\"]",
+            "outcomePrices": "[\"0.405\", \"0.595\"]",
+        });
+        assert_eq!(mark_from_gamma_market(&encoded, "222"), Some(dec!(0.595)));
+        assert_eq!(mark_from_gamma_market(&encoded, "111"), Some(dec!(0.405)));
+        let plain = serde_json::json!({ "clobTokenIds": ["111", "222"], "outcomePrices": ["0.4", "0.6"] });
+        assert_eq!(mark_from_gamma_market(&plain, "222"), Some(dec!(0.6)));
+    }
+
+    /// An unknown token, a missing array or a resolved price ($0/$1) is not a
+    /// mark for an open market: the sweep labels the exit unknown instead.
+    #[test]
+    fn no_mark_without_the_token_or_inside_a_binary_price() {
+        let m = serde_json::json!({ "clobTokenIds": ["111", "222"], "outcomePrices": ["1", "0"] });
+        assert_eq!(mark_from_gamma_market(&m, "333"), None);
+        assert_eq!(mark_from_gamma_market(&m, "111"), None, "a settled $1.00 is not an open-market mark");
+        assert_eq!(mark_from_gamma_market(&serde_json::json!({ "clobTokenIds": ["111"] }), "111"), None);
     }
 }

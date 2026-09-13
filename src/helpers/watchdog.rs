@@ -40,8 +40,10 @@ pub enum Phase {
     Idle = 0,
     /// Evaluating strategy signals for a tick (see `detail` for the specific viper).
     SignalEval = 1,
-    /// GBoost retrain trigger — sample collection + lock acquisition on the loop
-    /// thread, before the `spawn_blocking` fit. The #1 historical stall suspect.
+    /// Reserved. Was the in-process GBoost retrain (sample collection and lock
+    /// acquisition on the loop thread before a `spawn_blocking` fit), the #1
+    /// historical stall suspect. The engine no longer trains a model, so nothing
+    /// enters this phase; the discriminant is kept so dump readers stay stable.
     GboostRetrain = 2,
     /// Placing an order (CLOB round-trip).
     OrderPlace = 3,

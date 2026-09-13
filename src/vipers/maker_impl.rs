@@ -2041,7 +2041,7 @@ mod ghost_exit_coverage_tests {
     fn vipers_use_the_ghost_aware_fill_accessor() {
         const VIPERS: &[(&str, &str)] = &[
             ("maker",         include_str!("maker_impl.rs")),
-            ("gboost",        include_str!("gboost_impl.rs")),
+            ("gboost",        include_str!("gboost_planb.rs")),
             ("momentum",      include_str!("momentum_impl.rs")),
             ("convergence",   include_str!("convergence_impl.rs")),
             ("trendreversal", include_str!("trendreversal_impl.rs")),

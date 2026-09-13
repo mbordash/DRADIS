@@ -225,7 +225,7 @@ pub async fn run_price_raptor(
                                         // Shared oracle-vol math so any viper can calibrate its
                                         // own choppiness gates against a common 60m measure.
                                         if now.duration_since(last_vol_log).as_secs()
-                                            >= config::GBOOST_PRED_LOG_INTERVAL_SECS
+                                            >= config::DIAGNOSTIC_LOG_INTERVAL_SECS
                                         {
                                             last_vol_log = now;
                                             let prices: Vec<f64> = price_history_60m

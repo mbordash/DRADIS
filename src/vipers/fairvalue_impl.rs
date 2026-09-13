@@ -118,8 +118,7 @@ use crate::venues::core::TimeInForce;
 /// All FairValue state outlives the strategy object, which is recreated on
 /// every market rotation (`create_all_strategies()` in patrol_impl) and would
 /// otherwise wipe the vol sampler mid-warmup every ~25-35 min and reset
-/// persistence streaks / exit cooldowns. Same pattern as gboost_label_pool and
-/// the Maker baselines.
+/// persistence streaks / exit cooldowns. Same pattern as the Maker baselines.
 ///
 /// State is keyed **per asset**, not per process. The CAG runs a squadron per
 /// asset (btc-open, eth-open, …) concurrently, and every one of them evaluates
@@ -1018,7 +1017,7 @@ impl Strategy for FairValueStrategyImpl {
                 // Warmup visibility: without this the viper is totally silent
                 // for the first FAIRVALUE_MIN_VOL_SAMPLES × SAMPLE_SECS.
                 let mut last = globals(&ctx.crypto_filter).last_diag_log_at.lock().unwrap();
-                let due = last.map_or(true, |t| t.elapsed().as_secs() >= config::GBOOST_PRED_LOG_INTERVAL_SECS);
+                let due = last.map_or(true, |t| t.elapsed().as_secs() >= config::DIAGNOSTIC_LOG_INTERVAL_SECS);
                 if due {
                     *last = Some(Instant::now());
                     let n = globals(&ctx.crypto_filter).vol_samples.lock().map(|s| s.len()).unwrap_or(0);
@@ -1090,7 +1089,7 @@ impl Strategy for FairValueStrategyImpl {
         // ── Periodic diagnostic (calibration visibility, throttled) ──────────
         {
             let mut last = globals(&ctx.crypto_filter).last_diag_log_at.lock().unwrap();
-            let due = last.map_or(true, |t| t.elapsed().as_secs() >= config::GBOOST_PRED_LOG_INTERVAL_SECS);
+            let due = last.map_or(true, |t| t.elapsed().as_secs() >= config::DIAGNOSTIC_LOG_INTERVAL_SECS);
             if due {
                 *last = Some(Instant::now());
                 tracing::info!(

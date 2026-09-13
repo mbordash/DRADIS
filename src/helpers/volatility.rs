@@ -16,14 +16,14 @@
 
 //! Shared realized-volatility helpers.
 //!
-//! Centralizes the oracle-volatility math so every consumer (the GBoost
-//! flatness gate, the Price raptor's periodic telemetry, and any future viper
-//! that wants to self-gate on choppiness) computes it identically.
+//! Centralizes the oracle-volatility math so every consumer (the Price
+//! raptor's periodic telemetry, and any viper that wants to self-gate on
+//! choppiness) computes it identically.
 
-/// Normalized historical volatility of a price series, on the same scale as
-/// GBoost's `GBOOST_MIN_HIST_VOL` gate: the standard deviation of consecutive
-/// log-returns divided by 0.020 (a 2%-per-tick std-dev maps to 1.0), capped at
-/// 1.0. Returns 0.0 for fewer than 5 samples or when no valid returns exist.
+/// Normalized historical volatility of a price series: the standard deviation
+/// of consecutive log-returns divided by 0.020 (a 2%-per-tick std-dev maps to
+/// 1.0), capped at 1.0. Returns 0.0 for fewer than 5 samples or when no valid
+/// returns exist.
 pub fn normalized_hist_vol(prices: &[f64]) -> f64 {
     if prices.len() < 5 {
         return 0.0;

@@ -24,7 +24,6 @@ pub mod arbitrage_impl;
 pub mod time_decay_impl;
 pub mod maker_impl;
 pub mod basis_impl;
-pub mod gboost_impl;
 pub mod gboost_planb;
 pub mod trendreversal_impl;
 pub mod convergence_impl;

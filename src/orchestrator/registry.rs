@@ -67,10 +67,10 @@ impl StrategyRegistry {
             config::BASIS_STOP_LOSS_PERCENT * dec!(100),
         );
         info!(
-            "   Gboost      | entry_thr={} (startup default) | min_edge={} | TP={}% SL={}%",
-            config::GBOOST_ENTRY_THRESHOLD, config::GBOOST_MIN_EDGE_FROM_FAIR,
-            config::GBOOST_TARGET_PROFIT_PERCENT * dec!(100),
-            config::GBOOST_STOP_LOSS_PERCENT * dec!(100),
+            "   Gboost      | plan B: margin={} | trade_size=${} | TP={}% SL={}% (startup defaults)",
+            config::GBOOST_PLANB_MARGIN, config::GBOOST_PLANB_TRADE_SIZE_USDC,
+            config::GBOOST_PLANB_TAKE_PROFIT_PCT * dec!(100),
+            config::GBOOST_PLANB_STOP_LOSS_PCT * dec!(100),
         );
         info!(
             "   {}| mode={} exhaust_mult={} | TP={}% SL={}% (fade) | min_entry=${} late=${} | max_ask_sum={}",
