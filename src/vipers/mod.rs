@@ -234,6 +234,42 @@ pub fn note_position_without_venue(strategy: &str, token_id: &crate::venues::cor
     );
 }
 
+/// Report, at most once a minute per token, that a position is below the
+/// venue's minimum order and is being held to settlement.
+///
+/// A sell smaller than the minimum is refused, and the patrol re-emits a refused
+/// exit every few seconds for the rest of the hour, so the strategy holds the
+/// position instead. A short fill on a thin touch is how one arises: a 5-share
+/// order into a touch holding four leaves four.
+pub fn note_position_below_venue_minimum(
+    strategy: &str,
+    token_id: &crate::venues::core::MarketId,
+    market_name: &str,
+    shares: rust_decimal::Decimal,
+    minimum: rust_decimal::Decimal,
+) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    static LAST: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    let map = LAST.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut guard) = map.lock() else { return };
+
+    let key = format!("{strategy}:{token_id}");
+    if !guard.get(&key).is_none_or(|t| t.elapsed().as_secs() >= 60) {
+        return;
+    }
+    guard.insert(key, Instant::now());
+    guard.retain(|_, t| t.elapsed().as_secs() < 3600);
+
+    info!(
+        "⏸️  [{}] {} holds {:.2} shares, below the venue's {}-share minimum order: no exit can be placed, \
+         holding to settlement.",
+        strategy, market_name, shares, minimum,
+    );
+}
+
 #[cfg(test)]
 mod venue_resolution_tests {
     use super::*;

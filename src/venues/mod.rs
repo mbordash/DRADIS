@@ -173,6 +173,25 @@ pub fn taker_fee_rate() -> Decimal { dec!(0.07) }
 #[cfg(feature = "us_retail")]
 pub fn taker_fee_rate() -> Decimal { crate::venues::us::live_taker_fee_rate() }
 
+/// The smallest order the venue accepts, in shares or contracts. Sizing that
+/// falls below it is an order the venue refuses, however sound the signal.
+///
+/// Polymarket International publishes `orderMinSize` per market; it is 5 on the
+/// BTC hourly and daily "Up or Down" markets the crypto vipers trade (Gamma,
+/// 2026-09-14: the 3PM ET hourly and the September 15 daily). GBoost plan B
+/// carries the same figure as its own `VENUE_MIN_SHARES`.
+#[cfg(feature = "intl_clob")]
+pub fn min_order_shares() -> Decimal { dec!(5) }
+
+/// Kalshi trades whole contracts; one is the smallest order.
+#[cfg(feature = "kalshi")]
+pub fn min_order_shares() -> Decimal { dec!(1) }
+
+/// Polymarket US trades whole contracts (`map_quantity` rounds a quantity and
+/// refuses one that rounds to zero); one is the smallest order.
+#[cfg(feature = "us_retail")]
+pub fn min_order_shares() -> Decimal { dec!(1) }
+
 /// Cancel every resting order the VENUE reports, before trading begins.
 ///
 /// A crashed or restarted session leaves its GTC orders working. Polymarket

@@ -528,6 +528,41 @@ impl FairValueStrategyImpl {
         config::CRYPTO_FEE_RATE * price * (dec!(1) - price)
     }
 
+    /// Shares to buy for an entry at `ask`: the trade size net of the fee
+    /// headroom, raised to the venue's minimum order (`venue_min`) when it falls
+    /// short, and refused when that many shares with the headroom would not fit
+    /// in the exposure `room` left.
+    ///
+    /// Polymarket International's BTC markets carry `orderMinSize` 5 and reject
+    /// anything smaller. Sized as `trade_size / headroom / ask` alone, the
+    /// balanced profile's $4 buys fewer than 5 shares at any ask above $0.727:
+    /// every settlement-snipe entry, and 26 of the 80 entries a four-month
+    /// replay of the balanced settings took (2026-05-16 to 2026-09-13,
+    /// `fairvalue-replay-2026-09-14`). Those were orders the venue would refuse.
+    /// Mirrors GBoost plan B's `entry_shares`, including its rounding to two
+    /// decimals toward zero before the floor. The unfloored size always fits:
+    /// the exposure gate has already required `trade_size <= room`. The room
+    /// check is conservative by the headroom on the new order alone, since open
+    /// positions count toward exposure at `shares × avg_entry` without it.
+    fn entry_shares(
+        trade_size: Decimal,
+        fee_headroom: Decimal,
+        ask: Decimal,
+        venue_min: Decimal,
+        room: Decimal,
+    ) -> std::result::Result<Decimal, &'static str> {
+        if ask <= dec!(0) || ask >= dec!(1) || fee_headroom <= dec!(0) {
+            return Err("no usable ask");
+        }
+        let shares = (trade_size / fee_headroom / ask)
+            .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero)
+            .max(venue_min);
+        if shares * ask * fee_headroom > room {
+            return Err("exposure cap has no room for the venue's minimum order");
+        }
+        Ok(shares)
+    }
+
     /// Is the model still standing where it was at entry, so the stop-loss veto
     /// may be considered at all?
     ///
@@ -1191,7 +1226,7 @@ impl Strategy for FairValueStrategyImpl {
 
         // ── No pyramiding: one position per market ───────────────────────────
         // ── Exposure cap ──────────────────────────────────────────────────────
-        {
+        let current_exposure: Decimal = {
             let pos_map = ctx.positions.lock().await;
             if pos_map.contains_key(&PositionKey::new(&ctx.squadron_id, "FairValueStrategy", market.yes_token.clone()))
                 || pos_map.contains_key(&PositionKey::new(&ctx.squadron_id, "FairValueStrategy", market.no_token.clone()))
@@ -1208,11 +1243,27 @@ impl Strategy for FairValueStrategyImpl {
                 idle("exposure cap reached");
                 return Ok(StrategySignal::NoSignal);
             }
-        }
+            current_exposure
+        };
+
+        // ── Size: the trade size, raised to the venue's minimum order ────────
+        let fee_headroom = dec!(1) + Decimal::from(fee_bps) / dec!(10000);
+        let shares = match Self::entry_shares(
+            dc.fairvalue_trade_size_usdc,
+            fee_headroom,
+            ask,
+            crate::venues::min_order_shares(),
+            dc.fairvalue_max_exposure_usdc - current_exposure,
+        ) {
+            Ok(s) => s,
+            Err(reason) => {
+                idle(reason);
+                return Ok(StrategySignal::NoSignal);
+            }
+        };
 
         // ── Balance gate (fee headroom, mirrors Basis) ───────────────────────
-        let fee_headroom = dec!(1) + Decimal::from(fee_bps) / dec!(10000);
-        if ctx.available_collateral < dc.fairvalue_trade_size_usdc {
+        if ctx.available_collateral < dc.fairvalue_trade_size_usdc.max(shares * ask * fee_headroom) {
             idle("insufficient collateral");
             return Ok(StrategySignal::NoSignal);
         }
@@ -1305,7 +1356,6 @@ impl Strategy for FairValueStrategyImpl {
         }
 
         let side = if want_yes { "YES" } else { "NO" };
-        let shares = (dc.fairvalue_trade_size_usdc / fee_headroom) / ask;
         // Anchor the model-reversal exit to the thesis we are entering on.
         let entry_fair = if want_yes { fair_yes_side } else { fair_no_side };
         self.record_entry_fair(&ctx.crypto_filter, token_id.as_str(), entry_fair);
@@ -1384,6 +1434,18 @@ impl Strategy for FairValueStrategyImpl {
             let bid = if token_is_yes { snap.yes_bid } else { snap.no_bid };
             let avg_entry = position.avg_entry;
             if avg_entry <= dec!(0) {
+                continue;
+            }
+            // Below the venue's minimum order nothing can be sold: the venue
+            // refuses the order and the patrol re-emits a refused exit every few
+            // seconds for the rest of the hour. A short fill on a thin touch
+            // leaves exactly this (a 5-share order into four resting shares).
+            // Hold to settlement, as GBoost plan B holds its own remainders.
+            let venue_min = crate::venues::min_order_shares();
+            if position.shares < venue_min {
+                crate::vipers::note_position_below_venue_minimum(
+                    strategy_name, token_id, &market.market_name, position.shares, venue_min,
+                );
                 continue;
             }
             let profit_margin = (bid - avg_entry) / avg_entry;
@@ -1673,7 +1735,7 @@ impl Strategy for FairValueStrategyImpl {
             // is idempotent, so re-emitting every tick is the contract.
             if dc.fairvalue_resting_tp_enabled
                 && position.fill_effective_at(dc.ghost_mode).is_some()
-                && position.shares >= config::MIN_ORDER_SHARES
+                && position.shares >= crate::venues::min_order_shares()
             {
                 let settle_hold = self.settle_hold_for_position(
                     &ctx.crypto_filter, token_id.as_str(), position.opened_at,
@@ -2405,6 +2467,33 @@ mod tests {
         assert!(d_sigma.abs() >= config::FAIRVALUE_MIN_ABS_SIGMA);
     }
 
+    #[test]
+    fn entry_size_is_raised_to_the_venue_minimum_and_refused_past_the_cap() {
+        let size = |trade: Decimal, ask: Decimal, min: Decimal, room: Decimal| {
+            FairValueStrategyImpl::entry_shares(trade, dec!(1.10), ask, min, room)
+        };
+        // Trade 25 (aggressive $6 at $0.86) bought 6.34 shares: already above the minimum.
+        assert_eq!(size(dec!(6), dec!(0.86), dec!(5), dec!(12)), Ok(dec!(6.34)));
+        // Balanced $4 at $0.60 is 6.06 shares, and at $0.72 still 5.05: unchanged.
+        assert_eq!(size(dec!(4), dec!(0.60), dec!(5), dec!(8)), Ok(dec!(6.06)));
+        assert_eq!(size(dec!(4), dec!(0.72), dec!(5), dec!(8)), Ok(dec!(5.05)));
+        // $0.727 is the last cent-rounded ask above the line: 5.001 shares, rounded to exactly 5.
+        assert_eq!(size(dec!(4), dec!(0.727), dec!(5), dec!(8)), Ok(dec!(5)));
+        // Balanced $4 at trade 25's $0.86 is 4.23 shares, which the venue refuses: raised to 5.
+        assert_eq!(size(dec!(4), dec!(0.86), dec!(5), dec!(8)), Ok(dec!(5)));
+        // Every ask from $0.73 to $0.98 is placeable at the balanced $4 inside its $8 cap.
+        for cents in 73..=98 {
+            assert_eq!(size(dec!(4), Decimal::new(cents, 2), dec!(5), dec!(8)), Ok(dec!(5)), "ask {cents}");
+        }
+        // Refused when the floored order does not fit: 5 x $0.86 x 1.10 = $4.73 against $4 of room.
+        assert!(size(dec!(4), dec!(0.86), dec!(5), dec!(4)).is_err());
+        // A venue whose minimum is one contract (Kalshi, Polymarket US) sizes as before.
+        assert_eq!(size(dec!(4), dec!(0.86), dec!(1), dec!(8)), Ok(dec!(4.22)));
+        // No usable ask.
+        assert!(size(dec!(4), dec!(0), dec!(5), dec!(8)).is_err());
+        assert!(size(dec!(4), dec!(1), dec!(5), dec!(8)).is_err());
+    }
+
     /// Edge must be charged both legs' fees, so the hurdle is strictly higher
     /// than the old entry-only calculation.
     #[test]
@@ -3115,6 +3204,53 @@ mod entry_book_tests {
         assert_eq!(params.price, dec!(0.16));
         assert!(!params.post_only && params.order_type == TimeInForce::Fak, "a stop crosses");
         assert!(reason.starts_with("FairValueSL: bid=$0.1600, loss=-20.00%"), "{reason}");
+    }
+
+    /// A position below the venue's minimum order cannot be sold: the venue
+    /// refuses the order and the patrol would re-emit the refused exit every few
+    /// seconds for the rest of the hour. It is held to settlement with nothing
+    /// resting, while the same mark at the minimum still stops out. Venue-agnostic:
+    /// the minimum is 5 on Polymarket International and 1 on the other venues.
+    #[tokio::test]
+    async fn a_position_below_the_venue_minimum_is_held_to_settlement() {
+        use crate::state::Position;
+
+        let min = crate::venues::min_order_shares();
+        for (asset, shares, expect_exit) in [("btc-minsize-below", min - dec!(0.5), false), ("btc-minsize-at", min, true)] {
+            let mut hourly = book(dec!(200), dec!(150));
+            hourly.no_bid = dec!(0.16); hourly.no_bid_depth = dec!(50);
+            hourly.no_ask = dec!(0.18); hourly.no_ask_depth = dec!(50);
+            hourly.yes_bid = dec!(0.82); hourly.yes_ask = dec!(0.84);
+            let mut c = ctx(hourly, book(dec!(100), dec!(100)));
+            c.crypto_filter = asset.to_string();
+            let mut dc = DynamicConfig::default();
+            dc.enable_fairvalue = true;
+            dc.fairvalue_target_profit_pct = dec!(0.20);
+            dc.fairvalue_stop_loss_pct = dec!(0.15);
+            dc.fairvalue_resting_tp_enabled = true;
+            c.dynamic_config = Arc::new(dc);
+
+            let no_token = c.market.no_token.clone();
+            let opened = Utc::now() - chrono::Duration::seconds(config::FAIRVALUE_MIN_HOLD_SECS_BEFORE_STOP_LOSS + 30);
+            c.positions.lock().await.insert(
+                PositionKey::new(c.squadron_id.clone(), "FairValueStrategy", no_token.clone()),
+                Position {
+                    shares, avg_entry: dec!(0.20), opened_at: opened,
+                    close_time: c.market.market_close_time,
+                    market_name: c.market.market_name.clone(),
+                    pair_token_id: c.market.yes_token.clone(),
+                    fill_confirmed_at: Some(opened), paired_leg_token_id: None,
+                    entry_fee: dec!(0.05),
+                },
+            );
+
+            let sig = FairValueStrategyImpl::default().evaluate_exit(&c).await.expect("exit evaluation runs");
+            if expect_exit {
+                assert!(matches!(sig, StrategySignal::Exit { .. }), "{shares} shares at -20% past the min-hold must stop out, got {sig:?}");
+            } else {
+                assert!(matches!(sig, StrategySignal::NoSignal), "{shares} shares are below the venue minimum and must be held, got {sig:?}");
+            }
+        }
     }
 
     /// B40 composition: an entry above 1/(1 + TP) has no target price, so it

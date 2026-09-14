@@ -672,9 +672,9 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(g, e, "enable_fairvalue", "Enabled", "bool", false,
             "Analytic binary pricing Φ(ln(S/K)/σ√T): buys sides trading at a discount to model fair value; snipes settlements."));
         v.push(F::new(g, e, "fairvalue_trade_size_usdc", "Size", "usd", false,
-            "Fixed entry size per position.").min(0.0).step(0.5).unit("USDC"));
+            "Entry size per position. When the size buys fewer shares than the venue's minimum order (5 on Polymarket International), the order is raised to that minimum, within Max Exposure.").min(0.0).step(0.5).unit("USDC"));
         v.push(F::new(g, e, "fairvalue_max_exposure_usdc", "Max Exposure", "usd", false,
-            "Hard cap on total FairValue capital at risk.").min(0.0).step(0.5).unit("USDC"));
+            "Hard cap on total FairValue capital at risk. It also bounds the raise to the venue's minimum order: an entry that would not fit is skipped.").min(0.0).step(0.5).unit("USDC"));
         v.push(F::new(g, e, "fairvalue_stop_loss_pct", "Stop Loss", "pct", false,
             "Entry-relative stop loss (0.12 = 12%). Catastrophic bypass at 2× this.").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "fairvalue_obi_adverse_block", "OBI Adverse Block", "decimal", true,

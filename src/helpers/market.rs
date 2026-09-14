@@ -398,8 +398,23 @@ pub fn merge_candidates(sources: Vec<Vec<GammaCandidate>>) -> Vec<GammaCandidate
 ///     caller checks for it and the squadron sits idle until the next hourly
 ///     market opens, which is the truthful state rather than a dead market
 ///     dressed up as one.
+///
+/// Before any of that, only the soonest-closing "Up or Down" market competes;
+/// a later hour's is dropped. The slug lookup returns the current hour and the
+/// next, both high priority, and the next hour could otherwise win on volume
+/// or on the time-left tiebreak, whereupon the market monitor's
+/// `time_based_upgrade` switches to it and the hour that has just opened goes
+/// untraded. Production, 2026-09-13 22:00:16 ET: the 10PM market (vol24h 0 at
+/// its last selection) lost to the 11PM market (vol24h 0) on the tiebreak.
+/// 2026-09-14 01:00:16 ET: the 1AM market lost to the 2AM market on volume,
+/// $8 against $4. FairValue priced only the daily venue for both hours. A
+/// current hour inside `MIN_SECONDS_TO_EXPIRY_FOR_ENTRY` already fails
+/// validation, so the next hour still takes over when it should.
 pub fn pick_hourly_candidate(merged: &[GammaCandidate], vol_floor: f64) -> Option<GammaCandidate> {
     let mut hourly: Vec<&GammaCandidate> = merged.iter().filter(|c| is_hourly_candidate(c)).collect();
+    if let Some(soonest) = hourly.iter().filter(|c| c.4).filter_map(|c| c.5).min() {
+        hourly.retain(|c| !c.4 || c.5.map_or(true, |close| close == soonest));
+    }
     hourly.sort_by(|a, b| {
         b.4.cmp(&a.4)
             .then_with(|| b.3.partial_cmp(&a.3).unwrap_or(Ordering::Equal))
@@ -1141,6 +1156,94 @@ mod hourly_slug_discovery_tests {
             .filter_map(|m| candidate_from_gamma_market(m, "btc", now, 0.0)).collect();
         let pick = pick_hourly_candidate(&merge_candidates(vec![by_slug]), config::MIN_HOURLY_MARKET_VOL24H).unwrap();
         assert_eq!(pick.7, FOUR_PM_CID, "source order must not decide; the sort does");
+    }
+
+    /// A pair of consecutive BTC hourly markets as the slug lookup returns them.
+    fn hour_pair(first: (&str, &str, &str, f64), second: (&str, &str, &str, f64)) -> [serde_json::Value; 2] {
+        let mk = |(question, slug, end, vol): (&str, &str, &str, f64), cid: &str, yes: &str, no: &str| {
+            slug_market(question, slug, end, "2026-09-11T00:00:00Z", vol, cid, yes, no)
+        };
+        [
+            mk(first, "0x00000000000000000000000000000000000000000000000000000000000000a1",
+               "11111111111111111111111111111111111111111111111111111111111111111111111111101",
+               "11111111111111111111111111111111111111111111111111111111111111111111111111102"),
+            mk(second, "0x00000000000000000000000000000000000000000000000000000000000000a2",
+               "11111111111111111111111111111111111111111111111111111111111111111111111111103",
+               "11111111111111111111111111111111111111111111111111111111111111111111111111104"),
+        ]
+    }
+    const FIRST_HOUR_CID: &str = "0x00000000000000000000000000000000000000000000000000000000000000a1";
+
+    fn pick_at(now: DateTime<Utc>, markets: &[serde_json::Value]) -> GammaCandidate {
+        let by_slug: Vec<GammaCandidate> = markets.iter()
+            .filter_map(|m| candidate_from_gamma_market(m, "btc", now, 0.0)).collect();
+        assert_eq!(by_slug.len(), markets.len(), "every market validates: {:?}", by_slug.iter().map(|c| &c.1).collect::<Vec<_>>());
+        pick_hourly_candidate(&merge_candidates(vec![by_slug]), config::MIN_HOURLY_MARKET_VOL24H).unwrap()
+    }
+
+    /// Production, 2026-09-13 22:00:16 ET: sixteen seconds into the 10PM window
+    /// the slug lookup returned the 10PM and 11PM markets, both at zero volume,
+    /// and the time-left tiebreak picked 11PM. The monitor switched and the 10PM
+    /// hour went untraded.
+    #[test]
+    fn a_just_opened_hour_is_not_abandoned_on_the_tiebreak() {
+        let markets = hour_pair(
+            ("Bitcoin Up or Down - September 13, 10PM ET", "bitcoin-up-or-down-september-13-2026-10pm-et", "2026-09-14T03:00:00Z", 0.0),
+            ("Bitcoin Up or Down - September 13, 11PM ET", "bitcoin-up-or-down-september-13-2026-11pm-et", "2026-09-14T04:00:00Z", 0.0),
+        );
+        assert_eq!(pick_at(utc("2026-09-14T02:00:16Z"), &markets).7, FIRST_HOUR_CID);
+    }
+
+    /// Production, 2026-09-14 01:00:16 ET: the 2AM market ($8 of 24h volume)
+    /// outranked the just-opened 1AM market ($4) and the 1AM hour went untraded.
+    #[test]
+    fn a_just_opened_hour_is_not_abandoned_on_volume() {
+        let markets = hour_pair(
+            ("Bitcoin Up or Down - September 14, 1AM ET", "bitcoin-up-or-down-september-14-2026-1am-et", "2026-09-14T06:00:00Z", 4.0),
+            ("Bitcoin Up or Down - September 14, 2AM ET", "bitcoin-up-or-down-september-14-2026-2am-et", "2026-09-14T07:00:00Z", 8.0),
+        );
+        assert_eq!(pick_at(utc("2026-09-14T05:00:16Z"), &markets).7, FIRST_HOUR_CID);
+    }
+
+    /// The next hour clearing the volume floor while the live one does not is
+    /// the same abandonment by the first tier; before either window opens the
+    /// sooner one is still the pick.
+    #[test]
+    fn the_next_hour_above_the_volume_floor_does_not_take_the_live_one() {
+        let markets = hour_pair(
+            ("Bitcoin Up or Down - September 14, 1AM ET", "bitcoin-up-or-down-september-14-2026-1am-et", "2026-09-14T06:00:00Z", 10.0),
+            ("Bitcoin Up or Down - September 14, 2AM ET", "bitcoin-up-or-down-september-14-2026-2am-et", "2026-09-14T07:00:00Z", config::MIN_HOURLY_MARKET_VOL24H + 5000.0),
+        );
+        assert_eq!(pick_at(utc("2026-09-14T05:30:00Z"), &markets).7, FIRST_HOUR_CID);
+        assert_eq!(pick_at(utc("2026-09-14T04:52:00Z"), &markets).7, FIRST_HOUR_CID);
+    }
+
+    fn bare(name: &str, vol: f64, close: Option<DateTime<Utc>>, cid: &str) -> GammaCandidate {
+        (Vec::new(), name.to_string(), String::new(), vol, is_high_priority_text(name), close, String::new(), cid.to_string())
+    }
+
+    /// Several assets' current hours share a close and all stay in contention:
+    /// volume chooses among them as before, and each asset's next hour drops out.
+    #[test]
+    fn every_assets_current_hour_competes_and_no_next_hour_does() {
+        let merged = vec![
+            bare("Bitcoin Up or Down - September 14, 1AM ET", 100.0, Some(utc("2026-09-14T06:00:00Z")), "btc-1am"),
+            bare("Ethereum Up or Down - September 14, 1AM ET", 50.0, Some(utc("2026-09-14T06:00:00Z")), "eth-1am"),
+            bare("Bitcoin Up or Down - September 14, 2AM ET", 50_000.0, Some(utc("2026-09-14T07:00:00Z")), "btc-2am"),
+        ];
+        assert!(merged.iter().all(|c| c.4), "fixture: all are Up or Down");
+        assert_eq!(pick_hourly_candidate(&merged, config::MIN_HOURLY_MARKET_VOL24H).unwrap().7, "btc-1am");
+    }
+
+    /// An "Up or Down" candidate without a close time neither sets the soonest
+    /// close nor is dropped by it: it competes on volume as it did before.
+    #[test]
+    fn an_up_or_down_without_a_close_time_is_left_to_the_volume_sort() {
+        let merged = vec![
+            bare("Bitcoin Up or Down - September 14, 1AM ET", 10.0, Some(utc("2026-09-14T06:00:00Z")), "dated"),
+            bare("Bitcoin Up or Down - September 14, 2AM ET", 20.0, None, "undated"),
+        ];
+        assert_eq!(pick_hourly_candidate(&merged, config::MIN_HOURLY_MARKET_VOL24H).unwrap().7, "undated");
     }
 
     /// The same market reached by slug and by a listing scan is one candidate,
