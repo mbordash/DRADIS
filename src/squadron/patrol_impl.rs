@@ -1709,15 +1709,23 @@ impl Squadron {
                                             // and the same loss was recorded twice). If the fill was
                                             // confirmed within the settlement grace window, trust the
                                             // fill over the balance reads: hold and retry.
+                                            //
+                                            // An exit can also be sent before the fill is confirmed at
+                                            // all: Momentum's catastrophic floor may fire seconds after
+                                            // a taker entry (2026-09-15). Keying the grace off
+                                            // `fill_confirmed_at` alone read such a position as stale,
+                                            // so a balance-rejected sell deleted it with no trade row
+                                            // while its shares sat on-chain. Until the fill confirms,
+                                            // the open time is the fill time for this check.
                                             let fill_is_fresh = {
                                                 let map = positions.lock().await;
                                                 map.get(&pos_key)
-                                                    .and_then(|p| p.fill_confirmed_at)
+                                                    .map(|p| p.fill_confirmed_at.unwrap_or(p.opened_at))
                                                     .map(|fc| (Utc::now() - fc).num_seconds() < config::FRESH_FILL_SETTLEMENT_GRACE_SECS)
                                                     .unwrap_or(false)
                                             };
                                             if fill_is_fresh {
-                                                warn!("⚠️ EXIT rejected [{}] but fill confirmed <{}s ago: settlement lag (balance endpoint not caught up) — holding position, retrying exit in {}s",
+                                                warn!("⚠️ EXIT rejected [{}] but fill confirmed or opened <{}s ago: settlement lag (balance endpoint not caught up) — holding position, retrying exit in {}s",
                                                       sn, config::FRESH_FILL_SETTLEMENT_GRACE_SECS, exit_retry_cooldown_secs);
                                                 last_trade_time.insert(sn.clone(), Instant::now());
                                                 // Bug #6: placement was rejected — clear the viper's exit-signal cooldown.

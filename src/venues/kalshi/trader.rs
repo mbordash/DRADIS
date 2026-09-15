@@ -1835,6 +1835,30 @@ fn clear_exit_retry_backoff(strategy_name: &str, token_id: &str) {
     guard.remove(&format!("{strategy_name}:{token_id}"));
 }
 
+#[cfg(test)]
+mod exit_retry_backoff_tests {
+    use super::*;
+
+    /// A failed exit arms a per-(strategy, token) backoff that holds the next
+    /// attempt off, a filled exit clears it, and neither touches another token or
+    /// another strategy on the same token. Names are unique to this test because
+    /// the map is process-wide.
+    #[test]
+    fn a_failed_exit_backs_off_only_its_own_strategy_and_token() {
+        let (s, other_s) = ("KalshiBackoffTestStrategy", "KalshiBackoffTestOtherStrategy");
+        let (tok, other_tok) = ("kalshi-backoff-test-token", "kalshi-backoff-test-other-token");
+        assert!(!exit_retry_backed_off(s, tok), "nothing is armed before a failure");
+
+        arm_exit_retry_backoff(s, tok);
+        assert!(exit_retry_backed_off(s, tok), "a failed exit must back off the retry");
+        assert!(!exit_retry_backed_off(s, other_tok), "another token is unaffected");
+        assert!(!exit_retry_backed_off(other_s, tok), "another strategy on the same token is unaffected");
+
+        clear_exit_retry_backoff(s, tok);
+        assert!(!exit_retry_backed_off(s, tok), "a filled exit clears the backoff");
+    }
+}
+
 async fn dispatch_single(
     // Squadron whose positions these guards belong to.
     squadron_id: &str,

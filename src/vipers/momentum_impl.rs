@@ -85,6 +85,9 @@ pub struct MomentumStrategyImpl {
     prev_no_obi:  Mutex<Decimal>,
     obi_exhaust_since: Mutex<HashMap<MarketId, chrono::DateTime<chrono::Utc>>>,
     reversal_since: Mutex<HashMap<MarketId, chrono::DateTime<chrono::Utc>>>,
+    /// The same clock for the catastrophic floor: when the bid first read past it
+    /// without interruption. One thin top-of-book reading must not sell.
+    catastrophic_since: Mutex<HashMap<MarketId, chrono::DateTime<chrono::Utc>>>,
 }
 
 impl MomentumStrategyImpl {
@@ -94,6 +97,7 @@ impl MomentumStrategyImpl {
             prev_no_obi:  Mutex::new(dec!(0)),
             obi_exhaust_since: Mutex::new(HashMap::new()),
             reversal_since: Mutex::new(HashMap::new()),
+            catastrophic_since: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -214,7 +218,8 @@ impl Strategy for MomentumStrategyImpl {
             }
         }
 
-        let trade_size = kelly_momentum_size(
+        let trade_size = momentum_trade_size(
+            dc.momentum_scaled_sizing_enabled,
             velocity, threshold,
             dc.momentum_min_trade_size_usdc,
             dc.momentum_max_trade_size_usdc,
@@ -604,6 +609,10 @@ impl Strategy for MomentumStrategyImpl {
             if !reversals.is_empty() {
                 reversals.retain(|tok, _| held(tok));
             }
+            let mut floors = self.catastrophic_since.lock().unwrap();
+            if !floors.is_empty() {
+                floors.retain(|tok, _| held(tok));
+            }
         }
 
         for (key, position) in pos_map.iter() {
@@ -622,21 +631,29 @@ impl Strategy for MomentumStrategyImpl {
             // actually moved against us?" can mark against mid rather than bid. A
             // position marked at bid the instant it fills is underwater by the full
             // spread with no price having moved at all.
-            let (bid, ask) = if tok == ctx.market.yes_token {
-                (ctx.snapshot.yes_bid, ctx.snapshot.yes_ask)
+            let (bid, ask, bid_depth, snap_ts) = if tok == ctx.market.yes_token {
+                (ctx.snapshot.yes_bid, ctx.snapshot.yes_ask, ctx.snapshot.yes_bid_depth, ctx.snapshot.timestamp)
             } else if tok == ctx.market.no_token {
-                (ctx.snapshot.no_bid, ctx.snapshot.no_ask)
+                (ctx.snapshot.no_bid, ctx.snapshot.no_ask, ctx.snapshot.no_bid_depth, ctx.snapshot.timestamp)
             } else if let (Some(mk), Some(mk_snap)) = (&ctx.maker_market, &ctx.maker_snapshot) {
                 if tok == mk.yes_token {
-                    (mk_snap.yes_bid, mk_snap.yes_ask)
+                    (mk_snap.yes_bid, mk_snap.yes_ask, mk_snap.yes_bid_depth, mk_snap.timestamp)
                 } else if tok == mk.no_token {
-                    (mk_snap.no_bid, mk_snap.no_ask)
+                    (mk_snap.no_bid, mk_snap.no_ask, mk_snap.no_bid_depth, mk_snap.timestamp)
                 } else {
                     continue
                 }
             } else {
                 continue
             };
+
+            // A zero bid is an empty book (or a position evaluated before its first
+            // snapshot), not a price. Every exit below sells at the bid, so none of
+            // them may act on it: a reconciled position could otherwise be stopped out
+            // and written off at $0.
+            if bid <= dec!(0) {
+                continue;
+            }
 
             let secs_held = (chrono::Utc::now() - position.opened_at).num_seconds();
 
@@ -648,6 +665,14 @@ impl Strategy for MomentumStrategyImpl {
             // trade. The templates now ladder it above the stop; this floor makes the
             // invariant hold for any value an operator can dial in from Control Tower.
             let catastrophic_sl_pct = dc.momentum_catastrophic_sl_pct.max(dc.momentum_stop_loss_pct);
+
+            // Advance the catastrophic floor's persistence clock on every tick, before
+            // any branch below can `continue` past it, so a mark that recovers above
+            // the floor always resets the clock.
+            let floor_breached = position.avg_entry > dec!(0)
+                && (bid - position.avg_entry) / position.avg_entry <= -catastrophic_sl_pct;
+            let floor_persisted_secs = reversal_persisted_secs(
+                &mut self.catastrophic_since.lock().unwrap(), &tok, floor_breached, chrono::Utc::now());
 
             // Ghost fills count as confirmed; without this a simulated position
             // sat in the fill-confirmation branch for its entire life, where only
@@ -664,7 +689,7 @@ impl Strategy for MomentumStrategyImpl {
                     if profit_margin_check > -catastrophic_sl_pct {
                         continue; // Not catastrophic yet — wait for fill confirmation
                     }
-                    // Fall through: loss > catastrophic threshold → allow exit below
+                    // Fall through: the catastrophic floor below exits this tick
                 } else {
                     // After 30s: normal stop-loss gate
                     if profit_margin_check > -dc.momentum_stop_loss_pct { continue; }
@@ -709,6 +734,33 @@ impl Strategy for MomentumStrategyImpl {
                         ghost_mode: dc.ghost_mode,
                     }
                 };
+            }
+
+            // Catastrophic floor: the last-resort exit, at any hold time and in
+            // either fill state.
+            //
+            // The stop-loss below waits MOMENTUM_MIN_HOLD_BEFORE_SL_SECS so a brief
+            // wiggle after entry cannot stop a position out. Until 2026-09-15 the
+            // catastrophic floor only lived in the fill-confirmation branch above,
+            // and even there it fell through to that same held-time gate, so it
+            // never fired at all. 2026-09-15 14:29 ET: Momentum bought YES at $0.63
+            // on a $560 BTC spike that reversed within ten seconds; the bid was
+            // $0.52 (−17%) 12 s in and $0.41 by 71 s, and the only exit that could
+            // act was the stop at exactly 120 s, which sold at $0.31 (−51%, −$2.50).
+            //
+            // The floor reads the raw top of book, which publishes the best level
+            // whatever its size, so it waits `momentum_catastrophic_persist_secs` of
+            // continuous breach (the clock is advanced above) before it sells: one thin
+            // level with the next bid ten cents down must not sell into a book that
+            // reposts a second later. Zero bids never reach this point.
+            if floor_breached && floor_persisted_secs >= dc.momentum_catastrophic_persist_secs {
+                let spread = if ask > bid { ask - bid } else { dec!(0) };
+                let age = (chrono::Utc::now() - snap_ts).num_seconds();
+                let reason = format!(
+                    "MomentumCatastrophicSL: bid=${:.4}, loss={:.2}%, held={}s, persisted={}s | ask=${:.4} spread=${:.2} bid_depth={:.0} age={}s",
+                    bid, profit_margin * dec!(100), secs_held, floor_persisted_secs, ask, spread, bid_depth, age,
+                );
+                return Ok(StrategySignal::Exit { params: exit_params!(), reason, exit_pair: false });
             }
 
             // Near-expiry forced exit
@@ -1006,6 +1058,20 @@ impl Strategy for MomentumStrategyImpl {
     fn risk_model(&self) -> &'static str { "Gross one-sided" }
 }
 
+/// Momentum's trade size: flat at `min_size` unless the operator has turned on
+/// Scaled Sizing (`momentum_scaled_sizing_enabled`), in which case it scales with
+/// the strength of the triggering move. The switch is the runtime control;
+/// `config::ENABLE_KELLY_SIZING` only seeds its default per profile.
+pub fn momentum_trade_size(
+    scaled:    bool,
+    velocity:  rust_decimal::Decimal,
+    threshold: rust_decimal::Decimal,
+    min_size:  rust_decimal::Decimal,
+    max_size:  rust_decimal::Decimal,
+) -> rust_decimal::Decimal {
+    if scaled { kelly_momentum_size(velocity, threshold, min_size, max_size) } else { min_size }
+}
+
 /// Kelly-fractional position sizing for Momentum.
 /// Accepts min/max from DynamicConfig so the caller controls the range.
 /// Structural params (KELLY_MAX_MULTIPLIER) remain compile-time constants.
@@ -1015,7 +1081,6 @@ pub fn kelly_momentum_size(
     min_size:  rust_decimal::Decimal,
     max_size:  rust_decimal::Decimal,
 ) -> rust_decimal::Decimal {
-    if !config::ENABLE_KELLY_SIZING { return min_size; }
     if threshold <= rust_decimal::Decimal::ZERO { return min_size; }
     let strength = (velocity.abs() / threshold)
         .max(rust_decimal::Decimal::ONE)
@@ -1470,5 +1535,110 @@ mod tests {
         assert_eq!(params.price, dec!(0.45));
         assert!(!params.post_only && params.order_type == TimeInForce::Fak, "a stop crosses");
         assert!(reason.starts_with("MomentumSL: bid=$0.4500"), "{reason}");
+    }
+
+    /// Start a token's catastrophic-floor clock `secs_ago`, as a breach that has
+    /// already persisted that long would have left it.
+    fn floor_breached_since(strat: &MomentumStrategyImpl, token: &MarketId, secs_ago: i64) {
+        strat.catastrophic_since.lock().unwrap()
+            .insert(token.clone(), chrono::Utc::now() - chrono::Duration::seconds(secs_ago));
+    }
+
+    /// 2026-09-15 14:29 ET, trade 37: YES bought at $0.63 into a spike that
+    /// reversed; 12 s in the bid was $0.52 (−17.46%), past the 17% catastrophic
+    /// floor, and nothing exited until the stop's 120 s hold ran out at $0.31.
+    /// The floor must act inside that hold, confirmed or not, once the breach has
+    /// persisted; a single reading must not sell, a recovery resets the clock, an
+    /// ordinary dip inside the hold still waits, and an empty bid never triggers it.
+    #[tokio::test]
+    async fn the_catastrophic_floor_exits_inside_the_stop_hold() {
+        let mut dc = plan();
+        dc.momentum_catastrophic_persist_secs = 2;
+
+        // Confirmed fill, 12 s held, bid $0.52 against a $0.63 entry. The first
+        // reading past the floor only starts the clock.
+        let strat = MomentumStrategyImpl::default();
+        let c = ctx(book(dec!(0.52), dec!(0.54)), dc.clone());
+        hold_yes(&c, dec!(0.63), dec!(7.11), 12, true).await;
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        assert!(!matches!(sig, StrategySignal::Exit { .. }), "one reading past the floor must not sell, got {sig:?}");
+        assert!(strat.catastrophic_since.lock().unwrap().contains_key(&c.market.yes_token), "the breach must start the clock");
+
+        // Once the breach has persisted past the setting, it sells at the bid.
+        floor_breached_since(&strat, &c.market.yes_token, 3);
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        let StrategySignal::Exit { params, reason, .. } = sig else {
+            panic!("a −17.5% mark persisting past the floor must exit, got {sig:?}");
+        };
+        assert_eq!(params.price, dec!(0.52));
+        assert_eq!(params.shares, dec!(7.11));
+        assert!(!params.post_only && params.order_type == TimeInForce::Fak, "the floor crosses");
+        assert!(reason.starts_with("MomentumCatastrophicSL: bid=$0.5200, loss=-17.46%, held="), "{reason}");
+        assert!(reason.contains("persisted=3s | ask=$0.5400 spread=$0.02 bid_depth=100 age="), "{reason}");
+
+        // A reading back above the floor resets the clock, so the next breach starts over.
+        let strat = MomentumStrategyImpl::default();
+        let c = ctx(book(dec!(0.55), dec!(0.57)), dc.clone());
+        hold_yes(&c, dec!(0.63), dec!(7.11), 12, true).await;
+        floor_breached_since(&strat, &c.market.yes_token, 3);
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        assert!(!matches!(sig, StrategySignal::Exit { .. }), "a −12.7% dip above the floor must wait out the stop hold, got {sig:?}");
+        assert!(!strat.catastrophic_since.lock().unwrap().contains_key(&c.market.yes_token), "a recovery must reset the clock");
+
+        // Unconfirmed fill, 5 s held, breach persisted: the escape the fill-confirmation branch promises.
+        let strat = MomentumStrategyImpl::default();
+        let c = ctx(book(dec!(0.52), dec!(0.54)), dc.clone());
+        hold_yes(&c, dec!(0.63), dec!(7.11), 5, false).await;
+        floor_breached_since(&strat, &c.market.yes_token, 3);
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        let StrategySignal::Exit { reason, .. } = sig else {
+            panic!("an unconfirmed fill past the floor must exit too, got {sig:?}");
+        };
+        assert!(reason.starts_with("MomentumCatastrophicSL: bid=$0.5200"), "{reason}");
+
+        // An empty bid reads as −100% but is not a price: no exit of any kind.
+        let strat = MomentumStrategyImpl::default();
+        let c = ctx(book(dec!(0), dec!(0.54)), dc.clone());
+        hold_yes(&c, dec!(0.63), dec!(7.11), 200, true).await;
+        floor_breached_since(&strat, &c.market.yes_token, 3);
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        assert!(!matches!(sig, StrategySignal::Exit { .. }), "a zero bid must not trigger any exit, got {sig:?}");
+
+        // Past the stop's hold at −51% (the fill trade 37 took): a fresh breach is
+        // the ordinary stop's; a persisted one is the floor's.
+        let strat = MomentumStrategyImpl::default();
+        let c = ctx(book(dec!(0.31), dec!(0.33)), dc.clone());
+        hold_yes(&c, dec!(0.63), dec!(7.11), 123, true).await;
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        let StrategySignal::Exit { reason, .. } = sig else { panic!("a −51% mark past the hold must exit, got {sig:?}"); };
+        assert!(reason.starts_with("MomentumSL: bid=$0.3100"), "{reason}");
+        floor_breached_since(&strat, &c.market.yes_token, 3);
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        let StrategySignal::Exit { reason, .. } = sig else { panic!("a persisted −51% mark must exit, got {sig:?}"); };
+        assert!(reason.starts_with("MomentumCatastrophicSL: bid=$0.3100"), "{reason}");
+
+        // Persistence 0 fires on the first reading.
+        let mut dc0 = plan();
+        dc0.momentum_catastrophic_persist_secs = 0;
+        let strat = MomentumStrategyImpl::default();
+        let c = ctx(book(dec!(0.52), dec!(0.54)), dc0);
+        hold_yes(&c, dec!(0.63), dec!(7.11), 12, true).await;
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        assert!(matches!(sig, StrategySignal::Exit { .. }), "persistence 0 must fire on the first reading, got {sig:?}");
+    }
+
+    /// Scaled Sizing off: every trade is Min Size, however strong the move.
+    /// On: Min Size at the threshold, Max Size at the Kelly cap and beyond.
+    #[test]
+    fn scaled_sizing_is_a_runtime_switch() {
+        let (min, max) = (dec!(5), dec!(25));
+        let threshold = dec!(77);
+        assert_eq!(momentum_trade_size(false, dec!(273), threshold, min, max), min);
+        assert_eq!(momentum_trade_size(false, threshold * dec!(100), threshold, min, max), min);
+        assert_eq!(momentum_trade_size(true, threshold, threshold, min, max), min);
+        assert_eq!(momentum_trade_size(true, threshold * config::MOMENTUM_KELLY_MAX_MULTIPLIER, threshold, min, max), max);
+        assert_eq!(momentum_trade_size(true, threshold * dec!(100), threshold, min, max), max);
+        let mid = momentum_trade_size(true, threshold * dec!(1.5), threshold, min, max);
+        assert!(mid > min && mid < max, "a move between the threshold and the cap sizes between min and max, got {mid}");
     }
 }

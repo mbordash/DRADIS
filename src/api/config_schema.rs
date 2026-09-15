@@ -262,9 +262,9 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(g, e, "enable_momentum", "Enabled", "bool", false,
             "Rides Binance oracle velocity bursts."));
         v.push(F::new(g, e, "momentum_min_trade_size_usdc", "Min Size", "usd", false,
-            "Lower bound on Kelly-sized trade.").min(0.0).step(0.5).unit("USDC"));
+            "Trade size when Scaled Sizing is off, and the lower bound when it is on.").min(0.0).step(0.5).unit("USDC"));
         v.push(F::new(g, e, "momentum_max_trade_size_usdc", "Max Size", "usd", false,
-            "Upper bound on Kelly-sized trade.").min(0.0).step(0.5).unit("USDC"));
+            "Upper bound on trade size when Scaled Sizing is on; unused when it is off.").min(0.0).step(0.5).unit("USDC"));
         v.push(F::new(g, e, "momentum_stop_loss_pct", "Stop Loss", "pct", false,
             "Entry-relative stop loss (0.05 = 5%).").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "momentum_target_profit_pct", "Take Profit", "pct", false,
@@ -327,6 +327,15 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              requires a second, independent reading to agree. Any non-reversed reading resets the clock. The \
              2026-09-09 11:01 ET exit fired on one reading 62s after entry, paid the second taker fee, and turned a \
              −5.7% mark into a −12.3% realized loss. The stop-loss is unaffected.").range(0.0, 120.0).step(1.0).unit("s"));
+        v.push(F::new(g, e, "momentum_catastrophic_persist_secs", "Catastrophic Persistence", "secs", true,
+            "How long the bid must stay past the Catastrophic Stop, continuously, before that last-resort exit fires. \
+             The catastrophic stop acts at any hold time, inside the stop-loss's minimum hold, so this keeps a single \
+             thin top-of-book reading from selling into a book that reposts a second later. Any reading back above \
+             the floor resets the clock. 0 fires on the first reading.").range(0.0, 30.0).step(1.0).unit("s"));
+        v.push(F::new(g, e, "momentum_scaled_sizing_enabled", "Scaled Sizing", "bool", true,
+            "On: scale each trade between Min Size and Max Size by the strength of the oracle move that triggered it. \
+             Off: every trade uses Min Size. The strongest moves are often the most exhausted, so flat sizing is the \
+             cautious default."));
         v.push(F::new(g, e, "momentum_resting_tp_enabled", "Resting Take Profit", "bool", true,
             "Take profit with a resting post-only ask at entry × (1 + Take Profit) instead of a taker FAK at the \
              bid. Momentum crosses the spread to get in and used to cross it again to get out, paying the taker fee \

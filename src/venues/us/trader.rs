@@ -2092,6 +2092,12 @@ async fn dispatch_signal(
         // there is nothing to queue or replay if this venue later implements it.
         StrategySignal::MakerRestingExit { .. } => false,
         StrategySignal::Exit { params, reason, exit_pair } => {
+            // An exit that didn't fill re-signals on the very next tick (the stop
+            // condition is still true), so back off between attempts rather than
+            // hammering the order endpoint, as the Kalshi trader does.
+            if exit_retry_backed_off(strategy_name, params.token_id.as_str()) {
+                return false;
+            }
             info!("🚪 [{strategy_name}] exit ({reason}): {} @ {:.4}", params.token_id, params.price);
             // Snapshot the entry BEFORE the sell so the round-trip can be booked
             // to the tradelog — the guard is cleared below and there is no second
@@ -2102,9 +2108,19 @@ async fn dispatch_signal(
                 .get(&PositionKey::new(squadron_id, strategy_name, params.token_id.clone()))
                 .map(|p| (p.avg_entry, p.shares, p.entry_fee));
             let acted = dispatch_single(squadron_id, venue, pool, positions, lifecycle, scope, strategy_name, params, Side::Sell, starting).await;
-            if acted {
-                record_round_trip(pool, scope, strategy_name, params, entered, reason).await;
+            if !acted {
+                // Nothing traded (an error or a 0-of-N fill), so we still own the
+                // shares. Dropping the position here left a live stop unmanaged:
+                // local state said flat while the venue said long. Kalshi fixed the
+                // same shape on 2026-08-10; keep the position and retry after the
+                // backoff.
+                warn!("↩️ [{strategy_name}] exit did NOT execute on {} — position retained, will retry",
+                    params.token_id);
+                arm_exit_retry_backoff(strategy_name, params.token_id.as_str());
+                return false;
             }
+            record_round_trip(pool, scope, strategy_name, params, entered, reason).await;
+            clear_exit_retry_backoff(strategy_name, params.token_id.as_str());
             // Clear this strategy's guard for the leg (and the paired leg, if any)
             // so it can re-enter later.
             let mut map = positions.lock().await;
@@ -2117,9 +2133,61 @@ async fn dispatch_signal(
                     .collect();
                 for k in paired { map.remove(&PositionKey::new(squadron_id, k.0, k.1)); }
             }
-            acted
+            true
         }
         StrategySignal::NoSignal => false,
+    }
+}
+
+/// Minimum gap between retries of an exit that did not execute.
+const EXIT_RETRY_BACKOFF_SECS: u64 = 5;
+
+fn exit_retry_backoff() -> &'static std::sync::Mutex<HashMap<String, std::time::Instant>> {
+    static B: OnceLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> = OnceLock::new();
+    B.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn exit_retry_backed_off(strategy_name: &str, token_id: &str) -> bool {
+    let map = exit_retry_backoff();
+    let guard = match map.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    guard
+        .get(&format!("{strategy_name}:{token_id}"))
+        .is_some_and(|t| t.elapsed().as_secs() < EXIT_RETRY_BACKOFF_SECS)
+}
+
+fn arm_exit_retry_backoff(strategy_name: &str, token_id: &str) {
+    let map = exit_retry_backoff();
+    let mut guard = match map.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    guard.insert(format!("{strategy_name}:{token_id}"), std::time::Instant::now());
+}
+
+fn clear_exit_retry_backoff(strategy_name: &str, token_id: &str) {
+    let map = exit_retry_backoff();
+    let mut guard = match map.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    guard.remove(&format!("{strategy_name}:{token_id}"));
+}
+
+#[cfg(test)]
+mod exit_retry_backoff_tests {
+    use super::*;
+
+    /// A failed exit arms a per-(strategy, token) backoff that holds the next
+    /// attempt off, a filled exit clears it, and neither touches another token or
+    /// another strategy on the same token. Names are unique to this test because
+    /// the map is process-wide.
+    #[test]
+    fn a_failed_exit_backs_off_only_its_own_strategy_and_token() {
+        let (s, other_s) = ("UsBackoffTestStrategy", "UsBackoffTestOtherStrategy");
+        let (tok, other_tok) = ("us-backoff-test-token", "us-backoff-test-other-token");
+        assert!(!exit_retry_backed_off(s, tok), "nothing is armed before a failure");
+
+        arm_exit_retry_backoff(s, tok);
+        assert!(exit_retry_backed_off(s, tok), "a failed exit must back off the retry");
+        assert!(!exit_retry_backed_off(s, other_tok), "another token is unaffected");
+        assert!(!exit_retry_backed_off(other_s, tok), "another strategy on the same token is unaffected");
+
+        clear_exit_retry_backoff(s, tok);
+        assert!(!exit_retry_backed_off(s, tok), "a filled exit clears the backoff");
     }
 }
 

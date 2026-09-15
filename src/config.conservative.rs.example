@@ -292,6 +292,14 @@ pub const MOMENTUM_MAX_FEE_TO_TARGET_RATIO: Decimal = dec!(0.40);
 /// The stop-loss and catastrophic stop are unaffected. Conservative: 12s.
 pub const MOMENTUM_REVERSAL_PERSIST_SECS: i64 = 12;
 
+/// How long the bid must stay past MOMENTUM_CATASTROPHIC_SL_PCT, continuously,
+/// before that last-resort exit fires. The catastrophic floor acts at any hold
+/// time (inside MOMENTUM_MIN_HOLD_BEFORE_SL_SECS), so it reads the raw top of
+/// book; one thin level with the next bid ten cents down must not sell into a
+/// book that reposts a second later. 2026-09-15 trade 37 still exits about 14s
+/// in at $0.52 with this set. Any reading back above the floor resets the clock.
+pub const MOMENTUM_CATASTROPHIC_PERSIST_SECS: i64 = 2;
+
 /// Take Momentum's profit with a resting post-only ask instead of a taker FAK.
 ///
 /// Momentum crosses the spread to get in and, before this, crossed it again to

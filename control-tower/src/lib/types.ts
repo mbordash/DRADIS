@@ -102,6 +102,8 @@ export interface DynamicConfig {
   momentum_reversal_min_hold_secs:       number;
   momentum_reversal_persist_secs:        number;
   momentum_resting_tp_enabled:           boolean;
+  momentum_catastrophic_persist_secs:    number;
+  momentum_scaled_sizing_enabled:        boolean;
 
   // Maker Viper
   maker_max_entry_price:   string;

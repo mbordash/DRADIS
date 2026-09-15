@@ -309,6 +309,8 @@ fn default_momentum_reversal_ratio()              -> Decimal { config::MOMENTUM_
 fn default_momentum_reversal_min_hold_secs()      -> i64     { config::MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL }
 fn default_momentum_reversal_persist_secs()       -> i64     { config::MOMENTUM_REVERSAL_PERSIST_SECS       }
 fn default_momentum_resting_tp_enabled()          -> bool    { config::MOMENTUM_RESTING_TP_ENABLED          }
+fn default_momentum_catastrophic_persist_secs()   -> i64     { config::MOMENTUM_CATASTROPHIC_PERSIST_SECS   }
+fn default_momentum_scaled_sizing_enabled()       -> bool    { config::ENABLE_KELLY_SIZING                  }
 fn default_maker_tp_fee_margin_mult()             -> Decimal { config::MAKER_TP_FEE_MARGIN_MULT             }
 fn default_fairvalue_stop_veto_max_model_decay_pct() -> Decimal { config::FAIRVALUE_STOP_VETO_MAX_MODEL_DECAY_PCT }
 fn default_fairvalue_settle_snipe_hold()  -> bool    { config::FAIRVALUE_SETTLE_SNIPE_HOLD             }
@@ -539,6 +541,15 @@ pub struct DynamicConfig {
     /// taker FAK at the bid. Stops and every signal-driven exit still cross.
     #[serde(default = "default_momentum_resting_tp_enabled")]
     pub momentum_resting_tp_enabled: bool,
+    /// How long the bid must stay past the catastrophic stop, continuously, before
+    /// that last-resort exit fires. It acts at any hold time, so this keeps one thin
+    /// top-of-book reading from selling into a book that reposts a second later.
+    #[serde(default = "default_momentum_catastrophic_persist_secs")]
+    pub momentum_catastrophic_persist_secs: i64,
+    /// Scale each Momentum trade between min and max size by the strength of the
+    /// triggering move; off means every trade uses the min size.
+    #[serde(default = "default_momentum_scaled_sizing_enabled")]
+    pub momentum_scaled_sizing_enabled: bool,
 
     // ── Maker Viper ───────────────────────────────────────────────────────────
     pub maker_max_entry_price:    Decimal,
@@ -1088,6 +1099,8 @@ impl Default for DynamicConfig {
             momentum_reversal_min_hold_secs:      config::MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL,
             momentum_reversal_persist_secs:       config::MOMENTUM_REVERSAL_PERSIST_SECS,
             momentum_resting_tp_enabled:          config::MOMENTUM_RESTING_TP_ENABLED,
+            momentum_catastrophic_persist_secs:   config::MOMENTUM_CATASTROPHIC_PERSIST_SECS,
+            momentum_scaled_sizing_enabled:       config::ENABLE_KELLY_SIZING,
 
             maker_max_entry_price:    config::MAKER_MAX_ENTRY_PRICE,
             maker_min_entry_price:    config::MAKER_MIN_ENTRY_PRICE,
@@ -1858,6 +1871,7 @@ mod tests {
             "gboost_resting_tp_enabled",
             "gboost_planb_training_enabled", "gboost_planb_auto_adopt", "gboost_planb_train_window_days", "gboost_planb_holdout_days",
             "gboost_planb_retrain_hours", "gboost_planb_gate_min_trades", "gboost_planb_gate_min_win_rate", "gboost_planb_budget",
+            "momentum_catastrophic_persist_secs", "momentum_scaled_sizing_enabled",
         ] {
             assert!(obj.remove(added).is_some(), "{added} must be a serialized field");
         }
@@ -1865,6 +1879,8 @@ mod tests {
             serde_json::from_value(legacy).expect("an old persisted row must still deserialize");
 
         assert_eq!(cfg.momentum_resting_tp_enabled, config::MOMENTUM_RESTING_TP_ENABLED);
+        assert_eq!(cfg.momentum_catastrophic_persist_secs, config::MOMENTUM_CATASTROPHIC_PERSIST_SECS);
+        assert_eq!(cfg.momentum_scaled_sizing_enabled, config::ENABLE_KELLY_SIZING);
         assert_eq!(cfg.convergence_max_fee_to_target_ratio, config::CONVERGENCE_MAX_FEE_TO_TARGET_RATIO);
         assert_eq!(cfg.convergence_tp_fee_margin_mult, config::CONVERGENCE_TP_FEE_MARGIN_MULT);
         assert_eq!(cfg.convergence_resting_tp_enabled, config::CONVERGENCE_RESTING_TP_ENABLED);
