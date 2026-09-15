@@ -545,7 +545,7 @@ fn setup_auth_disabled() -> bool {
 /// the AMI first-boot wizard can enter credentials and create the password. The
 /// moment a hash exists, everything behind this gate requires a login.
 /// Operator exception: DRADIS_SETUP_AUTH=off waives the gate entirely.
-async fn require_admin(req: Request, next: Next) -> Response {
+pub(crate) async fn require_admin(req: Request, next: Next) -> Response {
     if !setup_auth_disabled() && admin_hash().is_some() && !request_is_admin(&req) {
         // `code` lets the Control Tower say "your session expired" at the
         // login card instead of re-showing the card with no explanation.
@@ -565,7 +565,7 @@ async fn require_admin(req: Request, next: Next) -> Response {
 /// exactly one arm survives the preprocessor. Do NOT collapse this back to
 /// `intl` / `not(intl)`: a Kalshi build then reports itself as "us", which
 /// makes the Setup view demand Polymarket US keys that the binary never reads.
-fn build_venue() -> &'static str {
+pub(crate) fn build_venue() -> &'static str {
     #[cfg(feature = "intl_clob")]
     { "intl" }
     #[cfg(feature = "us_retail")]
@@ -1352,6 +1352,23 @@ const BUNDLE_SCHEMA_VERSION: u32 = 1;
 /// DynamicConfig, and every squadron config. Admin-gated; treat the file as
 /// sensitive — it holds keys.
 async fn export_bundle() -> Response {
+    let bundle = config_bundle_value().await;
+    info!("📦 Setup: config bundle exported ({} secrets, {} squadron configs)",
+          bundle["secrets"].as_object().map(|o| o.len()).unwrap_or(0),
+          bundle["squadron_configs"].as_object().map(|o| o.len()).unwrap_or(0));
+
+    (
+        [
+            ("content-type", "application/json"),
+            ("content-disposition", "attachment; filename=\"dradis-config-bundle.json\""),
+        ],
+        bundle.to_string(),
+    ).into_response()
+}
+
+/// The config bundle as a value. Shared by the bundle export above and by the
+/// instance backup (`helpers::migration`), which carries it inside its archive.
+pub(crate) async fn config_bundle_value() -> serde_json::Value {
     let secrets = read_secrets();
     // Everything in the secrets file except this box's own IDENTITY.
     //
@@ -1397,16 +1414,39 @@ async fn export_bundle() -> Response {
         "dynamic_config": dynamic_config,
         "squadron_configs": squadrons,
     });
-    info!("📦 Setup: config bundle exported ({} secrets, {} squadron configs)",
-          secrets.len().saturating_sub(1), bundle["squadron_configs"].as_object().map(|o| o.len()).unwrap_or(0));
+    bundle
+}
 
-    (
-        [
-            ("content-type", "application/json"),
-            ("content-disposition", "attachment; filename=\"dradis-config-bundle.json\""),
-        ],
-        bundle.to_string(),
-    ).into_response()
+/// Merge a bundle's credentials into the managed secrets file and the process
+/// environment, returning how many were written. Only whitelisted keys are taken.
+///
+/// `allow_admin_hash` keeps the config import's behavior for bundles exported
+/// before the admin hash stopped travelling. The instance restore passes false:
+/// a new instance keeps its own login (see `config_bundle_value`).
+fn merge_secrets(secrets: &BTreeMap<String, String>, allow_admin_hash: bool) -> std::io::Result<usize> {
+    let mut map = read_secrets();
+    let mut imported = 0usize;
+    for (k, v) in secrets {
+        let allowed = MANAGED_KEYS.iter().any(|(mk, _, _, _, _)| mk == k)
+            || (allow_admin_hash && k == "DRADIS_ADMIN_HASH")
+            || k.starts_with("LLM_");   // autonomy knobs persisted by put_autonomy
+        if !allowed || v.is_empty() { continue; }
+        map.insert(k.clone(), v.clone());
+        std::env::set_var(k, v);
+        imported += 1;
+    }
+    write_secrets(&map)?;
+    Ok(imported)
+}
+
+/// The instance restore's entry to [`merge_secrets`]: the `secrets` object of the
+/// config bundle carried inside a backup archive.
+pub(crate) fn merge_bundle_secrets(bundle: &serde_json::Value) -> anyhow::Result<usize> {
+    let secrets: BTreeMap<String, String> = bundle
+        .get("secrets")
+        .and_then(|s| serde_json::from_value(s.clone()).ok())
+        .unwrap_or_default();
+    Ok(merge_secrets(&secrets, false)?)
 }
 
 #[derive(Deserialize)]
@@ -1449,21 +1489,13 @@ async fn import_bundle(Json(bundle): Json<ImportBundle>) -> Response {
     }
 
     // ── Secrets: merge managed + internal admin hash; never the session key ──
-    let mut map = read_secrets();
-    let mut imported_secrets = 0usize;
-    for (k, v) in &bundle.secrets {
-        let allowed = MANAGED_KEYS.iter().any(|(mk, _, _, _, _)| mk == k)
-            || k == "DRADIS_ADMIN_HASH"
-            || k.starts_with("LLM_");   // autonomy knobs persisted by put_autonomy
-        if !allowed || v.is_empty() { continue; }
-        map.insert(k.clone(), v.clone());
-        std::env::set_var(k, v);
-        imported_secrets += 1;
-    }
-    if let Err(e) = write_secrets(&map) {
-        return (StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("could not persist secrets: {e}")}))).into_response();
-    }
+    let imported_secrets = match merge_secrets(&bundle.secrets, true) {
+        Ok(n) => n,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("could not persist secrets: {e}")}))).into_response();
+        }
+    };
 
     // ── Configs: validate through the current schema, then persist ──────────
     let mut config_restored = false;

@@ -1728,6 +1728,13 @@ pub async fn run_pipeline(asset: String) {
     info!("GBoost plan-B pipeline [{asset}]: started; data under {}, serving model {}", dir.root.display(), serving_path.display());
 
     loop {
+        // A retired instance stops writing training data and models, so the
+        // migration backup copies a folder nothing is changing.
+        if crate::helpers::migration::is_retired() {
+            update_status(&asset, |s| { s.phase = "retired".into(); s.next_train_at = None; });
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            continue;
+        }
         let knobs = training_knobs();
         if !knobs.enabled {
             update_status(&asset, |s| { s.phase = "disabled".into(); s.next_train_at = None; });

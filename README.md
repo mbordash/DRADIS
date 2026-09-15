@@ -353,6 +353,13 @@ before trusting a result.
 | `/api/setup/autonomy` | GET/PUT | AI autonomy tier, kill switch, breaker reset (admin-gated) |
 | `/api/setup/export` | GET | Download portable config bundle — secrets + global/squadron configs (admin-gated) |
 | `/api/setup/import` | POST | Restore a config bundle on a new instance; restart applies (admin-gated) |
+| `/api/migration/status` | GET | Ledger size, retirement, backup progress, staged or applied restore (admin-gated) |
+| `/api/migration/prepare` | POST | Retire this instance (no new orders, squadrons down) and build a full backup (admin-gated) |
+| `/api/migration/archive` | GET | Download the latest backup: databases, GBoost models and training data, config bundle (admin-gated) |
+| `/api/migration/resume` | POST | Clear the retirement and restart so this instance trades again (admin-gated) |
+| `/api/migration/restore` | POST | Upload a backup (`?overwrite=true` to replace an instance that has trades); verified and staged (admin-gated) |
+| `/api/migration/restore/apply` | POST | Restart and apply the staged restore before any database opens (admin-gated) |
+| `/api/migration/restore/discard` | POST | Drop a staged restore (admin-gated) |
 
 All data endpoints accept `?asset=btc` query param to scope to a specific asset pool.
 
@@ -523,7 +530,7 @@ The **Setup** tab lets you configure DRADIS entirely from the browser — design
   sudo docker restart dradis
   ```
 
-  Without shell access, launch a fresh instance and import a config bundle: bundles never carry the Setup password, so the new instance asks you to create one.
+  Without shell access, launch a fresh instance and move to it with **Setup → Move to a New Instance** (1.2 and later) or a config bundle: neither carries the Setup password, so the new instance asks you to create one. See [docs/UPGRADING.md](docs/UPGRADING.md).
 - **Write-only fields**: the API never returns stored secrets — only a "set / …last4" hint.
 - **Test buttons**: validate credentials live before saving (intl wallet → full CLOB auth + Safe derivation; Polygon RPC → `eth_blockNumber`; Alpaca → data probe; Telegram → `getMe`).
 - **Storage**: saved to `$DRADIS_DATA_DIR/secrets.env` on the data volume; it **overrides** container env on boot, so values survive container recreation. **Restart engine** applies them (Docker respawns the process).

@@ -321,6 +321,151 @@ export function importBundle(bundleJson: string): Promise<ImportResult> {
   return request('/api/setup/import', { method: 'POST', body: bundleJson });
 }
 
+// ── Instance migration (E64): move the data, retire the old engine ───────────
+
+export interface MigrationManifest {
+  kind: string;
+  schema_version: number;
+  app_version: string;
+  venue: string;
+  created_at: string;
+  include_training_data: boolean;
+  trades: number;
+  open_positions: number;
+  files: { path: string; bytes: number; sha256: string }[];
+}
+
+export interface MigrationState {
+  /** Set while this instance is retired: it refuses new orders and keeps squadrons down. */
+  retired: { retired_at: string; reason: string } | null;
+  /** The backup being built in this engine process, if any. */
+  backup: {
+    phase: 'retiring' | 'cancelling_orders' | 'snapshotting' | 'copying' | 'archiving' | 'ready' | 'failed' | string;
+    started_at?: string | null;
+    finished_at?: string | null;
+    error?: string | null;
+  } | null;
+  latest_backup: { archive_name: string; archive_bytes: number; manifest: MigrationManifest } | null;
+  restore_staged: { staged_at: string; manifest: MigrationManifest } | null;
+  last_restore: {
+    applied_at: string;
+    backup_dir: string;
+    restored: string[];
+    source_created_at: string;
+    source_app_version: string;
+    source_trades: number;
+    source_open_positions: number;
+    secrets_merged: number;
+  } | null;
+  restore_failed: { failed_at?: string; error?: string; replaced_files_kept_in?: string } | null;
+}
+
+export interface MigrationStatus {
+  venue: VenueId;
+  app_version: string;
+  trades: number;
+  open_positions: number;
+  state: MigrationState;
+}
+
+export function getMigrationStatus(): Promise<MigrationStatus> {
+  return request('/api/migration/status');
+}
+
+/** Retire this instance and build its backup in the background. Poll getMigrationStatus(). */
+export function prepareMigration(includeTrainingData: boolean): Promise<{ ok: boolean; state: MigrationState }> {
+  return request('/api/migration/prepare', {
+    method: 'POST',
+    body: JSON.stringify({ include_training_data: includeTrainingData }),
+  });
+}
+
+/** Undo a retirement on this instance; the engine restarts and trades again. */
+export function resumeTrading(): Promise<{ ok: boolean; message: string }> {
+  return request('/api/migration/resume', { method: 'POST' });
+}
+
+/** Download the latest backup archive. It holds credentials and the full ledger. */
+export async function downloadMigrationArchive(): Promise<Blob> {
+  const res = await fetch(`${BASE}/api/migration/archive`, { headers: authHeaders(), cache: 'no-store' });
+  if (!res.ok) {
+    let msg = `download failed: HTTP ${res.status}`;
+    try {
+      const body = await res.json();
+      if (body?.error) msg = body.error;
+    } catch { /* non-JSON error body */ }
+    throw new SetupApiError(res.status, msg);
+  }
+  return res.blob();
+}
+
+export interface RestoreUploadResult {
+  ok: boolean;
+  received_bytes: number;
+  manifest: MigrationManifest;
+}
+
+/** The engine refused to stage a restore over an instance that already has trades. */
+export class RestoreNeedsOverwrite extends Error {
+  existingTrades: number;
+  constructor(message: string, existingTrades: number) {
+    super(message);
+    this.existingTrades = existingTrades;
+  }
+}
+
+/**
+ * Upload a backup archive to be verified and staged for the next restart.
+ *
+ * XMLHttpRequest rather than fetch, because fetch reports no upload progress and
+ * an archive can take minutes to send. Rejects with RestoreNeedsOverwrite when
+ * this instance already has trades and `overwrite` was not set.
+ */
+export function uploadMigrationArchive(
+  file: File,
+  overwrite: boolean,
+  onProgress?: (fraction: number) => void,
+): Promise<RestoreUploadResult> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    // `size` lets the engine refuse up front when its disk cannot hold the upload.
+    const query = new URLSearchParams({ size: String(file.size) });
+    if (overwrite) query.set('overwrite', 'true');
+    xhr.open('POST', `${BASE}/api/migration/restore?${query.toString()}`);
+    const token = getAdminToken();
+    if (token) xhr.setRequestHeader('X-Admin-Token', token);
+    xhr.setRequestHeader('Content-Type', 'application/gzip');
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total);
+    };
+    xhr.onload = () => {
+      let body: { error?: string; needs_overwrite?: boolean; existing_trades?: number } | null = null;
+      try { body = JSON.parse(xhr.responseText); } catch { /* non-JSON body */ }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(body as unknown as RestoreUploadResult);
+      } else if (xhr.status === 409 && body?.needs_overwrite) {
+        reject(new RestoreNeedsOverwrite(body.error ?? 'this instance already has trades', body.existing_trades ?? 0));
+      } else if (xhr.status === 413) {
+        // nginx answers this before DRADIS sees the upload, so there is no JSON body.
+        reject(new SetupApiError(413, 'The upload was refused for its size before it reached DRADIS. On an instance installed before 1.2, copy deploy/ami/nginx.conf to /opt/dradis/nginx.conf and restart the dradis-proxy container.'));
+      } else {
+        reject(new SetupApiError(xhr.status, body?.error ?? `upload failed: HTTP ${xhr.status}`));
+      }
+    };
+    xhr.onerror = () => reject(new SetupApiError(0, 'upload failed: the connection dropped'));
+    xhr.send(file);
+  });
+}
+
+/** Restart the engine so a staged restore is applied before any database opens. */
+export function applyStagedRestore(): Promise<{ ok: boolean; message: string }> {
+  return request('/api/migration/restore/apply', { method: 'POST' });
+}
+
+export function discardStagedRestore(): Promise<{ ok: boolean }> {
+  return request('/api/migration/restore/discard', { method: 'POST' });
+}
+
 // ── Risk-posture config profiles ──────────────────────────────────────────────
 
 export interface ConfigProfile {

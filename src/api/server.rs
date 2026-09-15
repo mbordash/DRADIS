@@ -4410,9 +4410,18 @@ pub async fn run_api_server(
         .layer(axum::middleware::from_fn_with_state(state.clone(), require_api_key))
         .layer(axum::middleware::from_fn_with_state(state.clone(), enforce_read_only));
 
+    // Instance migration (E64): admin-gated like Setup and under the same
+    // X-API-Key and read-only layers. Unlike Setup's routes these need the CAG,
+    // so they carry the state.
+    let migration_routes = crate::api::migration::admin_routes()
+        .layer(axum::middleware::from_fn_with_state(state.clone(), require_api_key))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), enforce_read_only))
+        .with_state(state.clone());
+
     let app = public_routes
         .merge(protected_routes)
         .merge(setup_routes)
+        .merge(migration_routes)
         // Permissive CORS (outer layer — runs first, handles OPTIONS pre-flight
         // before the API-key middleware is reached).
         .layer(CorsLayer::permissive());

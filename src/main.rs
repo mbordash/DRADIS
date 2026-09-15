@@ -259,6 +259,19 @@ async fn run() -> Result<()> {
         // Control Tower Console view (GET /api/logs) — stdout is unchanged.
         .with_writer(dradis::helpers::logbuf::TeeMakeWriter)
         .init();
+    // Instance migration (E64). A staged restore is applied here, before any
+    // database is opened, and the credentials it merged are loaded. The retired
+    // flag is loaded before anything can place an order.
+    if dradis::helpers::migration::apply_pending_restore_at_boot() {
+        dradis::api::setup::load_secrets_file();
+    }
+    if let Some(r) = dradis::helpers::migration::load_retired_flag() {
+        tracing::warn!(
+            "🛬 This instance is RETIRED for migration since {} ({}): new orders are refused and squadrons stay down. \
+             Resume trading from Setup to undo.",
+            r.retired_at, r.reason,
+        );
+    }
     ring::default_provider().install_default().expect("rustls provider");
     print_banner();
 

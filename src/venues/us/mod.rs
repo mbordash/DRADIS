@@ -687,10 +687,13 @@ impl UsRetailVenue {
 #[async_trait]
 impl Execution for UsRetailVenue {
     async fn place_order(&self, intent: OrderIntent) -> Result<Fill> {
+        // A retired instance places nothing: its replacement owns the account (E64).
+        crate::helpers::migration::refuse_if_retired()?;
         self.submit_order(&intent).await
     }
 
     async fn place_atomic(&self, legs: [OrderIntent; 2]) -> Result<[Fill; 2]> {
+        crate::helpers::migration::refuse_if_retired()?;
         // Engine-atomic two-leg placement via `/v1/orders/batched` (atomic=true):
         // the gateway places both legs or neither, eliminating the single-sided
         // orphan risk that a network-parallel pair of single POSTs would carry.

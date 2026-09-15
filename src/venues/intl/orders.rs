@@ -289,6 +289,9 @@ pub async fn place_limit_order_filled(
     expiration_secs: u64,
     http: &reqwest::Client,
 ) -> Result<(String, Decimal, Decimal)> {
+    // Every Polymarket International order passes through here or the batch
+    // below, so this is where a retired instance stops trading (E64).
+    crate::helpers::migration::refuse_if_retired()?;
     // Convert the neutral key to the on-chain id at the venue boundary (slice 2b).
     let token_id = u256_from_market_id(token_id)?;
     // Map the neutral TIF onto the SDK enum once, at the venue boundary.
@@ -470,6 +473,7 @@ pub async fn place_limit_orders_atomic(
             ));
         }
     }
+    crate::helpers::migration::refuse_if_retired()?;
     // Map the neutral TIFs onto the SDK enum once, past the batch-eligibility guard.
     let order_type_a = to_clob(order_type_a);
     let order_type_b = to_clob(order_type_b);

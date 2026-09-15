@@ -720,6 +720,15 @@ async fn run_wing(
             return;
         }
 
+        // A retired instance hunts for no market: its replacement owns the
+        // account (helpers::migration).
+        if crate::helpers::migration::is_retired() {
+            if wait_or_cancel(cancel, AUTO_DEPLOY_RECHECK_SECS).await {
+                return;
+            }
+            continue;
+        }
+
         // ── Auto-deploy switch ───────────────────────────────────────────────
         // The same two switches that decide whether Kalshi seeds a politics or
         // sports squadron decide whether this wing hunts for a market. Without

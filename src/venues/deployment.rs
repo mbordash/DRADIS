@@ -193,6 +193,12 @@ pub async fn run_deployment_processor<R: DeploymentRunner>(
             _ = ticker.tick() => {}
         }
 
+        // A retired instance starts nothing: the instance replacing it is taking
+        // over the wallet. The flag outlives restarts, so this holds after one too.
+        if crate::helpers::migration::is_retired() {
+            continue;
+        }
+
         // Seed the classes DRADIS is configured to keep running. Ordered after
         // the requeue above so a squadron restored from the last process is
         // already visible and is not duplicated.

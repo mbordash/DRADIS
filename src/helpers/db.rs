@@ -186,6 +186,17 @@ pub fn pool() -> Option<&'static SqlitePool> {
     DB_POOL.get()
 }
 
+/// Every registered pool, one per distinct database file. The instance backup
+/// (`helpers::migration`) snapshots each of them.
+pub fn all_pools() -> Vec<SqlitePool> {
+    let map = pools_map().lock().unwrap();
+    let mut seen = std::collections::HashSet::new();
+    map.values()
+        .filter(|p| seen.insert(p.connect_options().get_filename().to_path_buf()))
+        .cloned()
+        .collect()
+}
+
 /// Alias registry: dashboard asset key → the pool key that actually backs it.
 /// Populated by [`alias_pool`]; consulted by [`pool_for`] only on a miss.
 static POOL_ALIASES: OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =

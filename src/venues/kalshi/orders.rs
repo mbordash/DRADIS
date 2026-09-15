@@ -169,10 +169,13 @@ impl KalshiVenue {
 #[async_trait]
 impl Execution for KalshiVenue {
     async fn place_order(&self, intent: OrderIntent) -> Result<Fill> {
+        // A retired instance places nothing: its replacement owns the account (E64).
+        crate::helpers::migration::refuse_if_retired()?;
         self.place_one(&intent).await
     }
 
     async fn place_atomic(&self, legs: [OrderIntent; 2]) -> Result<[Fill; 2]> {
+        crate::helpers::migration::refuse_if_retired()?;
         // Kalshi has no atomic two-leg endpoint; place sequentially
         // (network-atomic best effort, same contract as the US venue).
         let a = self.place_one(&legs[0]).await?;

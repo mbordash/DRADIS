@@ -42,6 +42,8 @@ pub mod latency;
 pub mod viper_status;
 pub mod redact;
 pub mod shutdown;
+/// Instance migration (E64): retire and back up an instance, or restore a backup.
+pub mod migration;
 
 pub use price::*;
 pub use json::*;

@@ -286,6 +286,19 @@ where
             break 'market_loop;
         }
 
+        // A retired instance keeps its crypto squadron down: the instance
+        // replacing it is taking over the wallet (helpers::migration).
+        if crate::helpers::migration::is_retired() {
+            let cancelled = tokio::select! {
+                _ = cancel.cancelled() => true,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => false,
+            };
+            if cancelled {
+                break 'market_loop;
+            }
+            continue 'market_loop;
+        }
+
         let (
             hourly_yes_token,
             hourly_no_token,

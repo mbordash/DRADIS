@@ -468,6 +468,16 @@ pub async fn run_kalshi_trader(
             return;
         }
 
+        // A retired instance selects no market: its replacement owns the
+        // account (helpers::migration).
+        if crate::helpers::migration::is_retired() {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+            }
+            continue;
+        }
+
         let selection = match select_market(&venue, &series, &filter, &cancel, &process_heartbeat_secs).await {
             Some(s) => s,
             None => return,

@@ -38,6 +38,9 @@ import {
   exportBundle, importBundle,
   getProfiles, applyProfile, ConfigProfile,
   getAdminToken, clearAdminToken, SetupApiError,
+  MigrationStatus, MigrationManifest, RestoreNeedsOverwrite,
+  getMigrationStatus, prepareMigration, resumeTrading, downloadMigrationArchive,
+  uploadMigrationArchive, applyStagedRestore, discardStagedRestore,
 } from '@/lib/setupApi';
 import { useConfirm } from '@/components/ConfirmDialog';
 import useSWR, { useSWRConfig } from 'swr';
@@ -1538,6 +1541,396 @@ function AutonomyPanel({ onAuthError }: { onAuthError: () => void }) {
   );
 }
 
+// ── Move to a new instance (E64) ──────────────────────────────────────────────
+
+const MIGRATION_PHASES: Record<string, string> = {
+  retiring: 'Retiring this instance…',
+  cancelling_orders: 'Cancelling resting orders…',
+  snapshotting: 'Snapshotting the databases…',
+  copying: 'Copying models and training data…',
+  archiving: 'Writing the backup archive…',
+};
+
+function formatBytes(n: number): string {
+  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+  return `${n} B`;
+}
+
+function formatWhen(iso?: string | null): string {
+  if (!iso) return '-';
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+}
+
+function describeBackup(m: MigrationManifest): string {
+  return `${m.trades} trade(s), ${m.open_positions} open position(s), ${m.files.length} file(s), version ${m.app_version}, training data ${m.include_training_data ? 'included' : 'left out'}`;
+}
+
+/**
+ * Moving to a new instance is how a Marketplace customer upgrades. The config
+ * bundle above carries settings and credentials; this carries the ledger, the
+ * strategy labels on open positions and the GBoost models, and retires the old
+ * engine so two instances never trade one wallet.
+ */
+function MigrationPanel({ onAuthError }: { onAuthError: () => void }) {
+  const [status, setStatus] = useState<MigrationStatus | null>(null);
+  const [reachable, setReachable] = useState(true);
+  const [includeTraining, setIncludeTraining] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [upload, setUpload] = useState<number | null>(null);
+  const [message, setMessage] = useState<{ kind: 'ok' | 'err' | 'info'; text: string } | null>(null);
+  // Set while the engine restarts after a resume or an applied restore.
+  const [restartFor, setRestartFor] = useState<{ kind: 'apply' | 'resume'; at: number } | null>(null);
+  const [confirm, confirmDialog] = useConfirm();
+
+  const load = useCallback(async () => {
+    try {
+      setStatus(await getMigrationStatus());
+      setReachable(true);
+    } catch (err) {
+      if (err instanceof SetupApiError && err.status === 401) onAuthError();
+      else setReachable(false);
+    }
+  }, [onAuthError]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const st = status?.state;
+  const phase = st?.backup?.phase;
+  const building = !!phase && phase !== 'ready' && phase !== 'failed';
+
+  useEffect(() => {
+    if (!building && !restartFor) return;
+    const id = setInterval(load, 3000);
+    return () => clearInterval(id);
+  }, [building, restartFor, load]);
+
+  useEffect(() => {
+    if (!restartFor || !st || !reachable) return;
+    if (restartFor.kind === 'resume' && !st.retired && Date.now() - restartFor.at > 15000) {
+      setRestartFor(null);
+      setMessage({ kind: 'ok', text: 'This instance is trading again.' });
+    } else if (restartFor.kind === 'apply' && st.restore_failed) {
+      setRestartFor(null);
+      setMessage({ kind: 'err', text: `The restore was not applied: ${st.restore_failed.error ?? 'see the engine log'}` });
+    } else if (restartFor.kind === 'apply' && st.last_restore
+               && Date.parse(st.last_restore.applied_at) >= restartFor.at - 5000) {
+      setRestartFor(null);
+      setMessage({ kind: 'ok', text: 'Restore applied. This instance now trades from the restored ledger.' });
+    }
+  }, [st, reachable, restartFor]);
+
+  const fail = (err: unknown, fallback: string) => {
+    if (err instanceof SetupApiError && err.status === 401) { onAuthError(); return; }
+    setMessage({ kind: 'err', text: err instanceof Error ? err.message : fallback });
+  };
+
+  const prepare = async () => {
+    let openNow = status?.open_positions ?? 0;
+    try {
+      const fresh = await getMigrationStatus();
+      setStatus(fresh);
+      openNow = fresh.open_positions;
+    } catch { /* keep the last reading */ }
+    const ok = await confirm({
+      title: 'Retire this instance and back it up?',
+      tone: 'danger',
+      confirmLabel: 'Retire and back up',
+      body: (
+        <>
+          <p>This instance <span className="text-amber-400">stops trading now</span>: it refuses new orders, cancels
+            its resting orders and stands its squadrons down. It stays retired across restarts until you resume
+            trading here.</p>
+          <p>Open positions stay in the wallet, and the backup carries the ledger, so the new instance keeps their
+            strategy labels and manages them once it is running from this backup.</p>
+          <p className="text-amber-400">
+            {openNow === 0
+              ? 'This instance holds no open positions right now.'
+              : `Until then, no stop or exit can fire on the ${openNow} open position(s) this instance holds. Retire when it holds none, or accept that risk.`}
+          </p>
+          <p className="text-gray-500">Restore the backup on the new instance only after this one shows as retired,
+            so two engines never trade the same wallet.</p>
+        </>
+      ),
+    });
+    if (!ok) return;
+    setBusy(true);
+    setMessage(null);
+    try {
+      await prepareMigration(includeTraining);
+      await load();
+    } catch (err) {
+      fail(err, 'Could not start the backup');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const download = async () => {
+    const latest = st?.latest_backup;
+    if (!latest) return;
+    setBusy(true);
+    setMessage(null);
+    try {
+      const blob = await downloadMigrationArchive();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = latest.archive_name;
+      a.click();
+      URL.revokeObjectURL(url);
+      setMessage({ kind: 'ok', text: 'Backup downloaded. It holds your credentials and full ledger, so keep it safe. Restore it on the new instance from this same panel.' });
+    } catch (err) {
+      fail(err, 'Download failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const resume = async () => {
+    const ok = await confirm({
+      title: 'Resume trading on this instance?',
+      tone: 'danger',
+      confirmLabel: 'Resume trading',
+      body: (
+        <>
+          <p>The engine restarts and its squadrons come back.</p>
+          <p className="text-amber-400">Do not do this if a new instance is already running from this backup: two
+            engines would trade the same wallet.</p>
+        </>
+      ),
+    });
+    if (!ok) return;
+    setBusy(true);
+    setMessage(null);
+    try {
+      const r = await resumeTrading();
+      setMessage({ kind: 'info', text: r.message });
+      setRestartFor({ kind: 'resume', at: Date.now() });
+    } catch (err) {
+      fail(err, 'Could not resume trading');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const confirmReplace = (existingTrades: number) => confirm({
+    title: "Replace this instance's ledger?",
+    tone: 'danger',
+    confirmLabel: 'Replace and restore',
+    body: (
+      <>
+        <p>This instance already has <span className="text-amber-400">{existingTrades} trade(s)</span>.
+          Restoring replaces its databases and models with the backup&apos;s.</p>
+        <p className="text-gray-500">The replaced files are kept on this instance under
+          logs/migration/pre-restore-*.</p>
+      </>
+    ),
+  });
+
+  const restoreFrom = async (file: File, overwrite = false): Promise<void> => {
+    // Ask before sending hundreds of megabytes, not after: the engine's 409 is
+    // only the backstop for a ledger this panel had not seen yet.
+    if (!overwrite && (status?.trades ?? 0) > 0) {
+      if (!(await confirmReplace(status?.trades ?? 0))) return;
+      overwrite = true;
+    }
+    setBusy(true);
+    setMessage(null);
+    setUpload(0);
+    try {
+      await uploadMigrationArchive(file, overwrite, setUpload);
+      await load();
+      setMessage({ kind: 'ok', text: 'Backup verified and staged. Check the summary below, then apply it.' });
+    } catch (err) {
+      if (err instanceof RestoreNeedsOverwrite) {
+        setUpload(null);
+        setBusy(false);
+        if (await confirmReplace(err.existingTrades)) await restoreFrom(file, true);
+        return;
+      }
+      fail(err, 'Upload failed');
+    } finally {
+      setBusy(false);
+      setUpload(null);
+    }
+  };
+
+  const apply = async () => {
+    const staged = st?.restore_staged;
+    if (!staged) return;
+    const ok = await confirm({
+      title: 'Apply the restore and restart?',
+      tone: 'danger',
+      confirmLabel: 'Apply and restart',
+      body: (
+        <>
+          <p>The engine restarts, replaces this instance&apos;s databases and GBoost models
+            {staged.manifest.include_training_data ? ' and training data' : ''} with the backup&apos;s, and trades
+            from the restored ledger.</p>
+          <p className="text-gray-500">Check that the old instance shows as retired first. The backup&apos;s
+            credentials are merged in; this instance keeps its own Setup password.</p>
+        </>
+      ),
+    });
+    if (!ok) return;
+    setBusy(true);
+    setMessage(null);
+    try {
+      const r = await applyStagedRestore();
+      setMessage({ kind: 'info', text: r.message });
+      setRestartFor({ kind: 'apply', at: Date.now() });
+    } catch (err) {
+      fail(err, 'Could not apply the restore');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const discard = async () => {
+    setBusy(true);
+    try {
+      await discardStagedRestore();
+      await load();
+      setMessage(null);
+    } catch (err) {
+      fail(err, 'Could not discard the staged restore');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const latest = st?.latest_backup;
+  const staged = st?.restore_staged;
+  const messageCls = message?.kind === 'err'
+    ? 'bg-rose-500/10 border-rose-500/30 text-rose-300'
+    : message?.kind === 'ok'
+      ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+      : 'bg-indigo-500/10 border-indigo-500/30 text-indigo-300';
+
+  return (
+    <div className="bg-[#13131f] border border-[#1e1e32] rounded-xl p-4 space-y-3">
+      {confirmDialog}
+      <div>
+        <h3 className="text-sm font-mono text-gray-200">🚚 Move to a New Instance</h3>
+        <p className="text-xs text-gray-500 mt-0.5">
+          Upgrading means launching a new instance. On the old instance, retire it and download a backup of its
+          ledger, open positions and GBoost models. On the new instance, restore that backup here. Credentials travel
+          inside the backup, so there is no separate config bundle to import.
+        </p>
+      </div>
+
+      {!status ? (
+        <p className="text-xs font-mono text-gray-500">{reachable ? 'Loading…' : 'Waiting for the engine…'}</p>
+      ) : (
+        <>
+          <p className="text-xs font-mono text-gray-400">
+            This instance: {status.venue} · v{status.app_version} · {status.trades} trade(s) · {status.open_positions} open
+            position(s){!reachable && ' · engine restarting…'}
+          </p>
+
+          {st?.retired && (
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg px-3 py-2 bg-amber-500/10 border border-amber-500/30">
+              <p className="text-xs font-mono text-amber-300">
+                🛬 Retired for migration since {formatWhen(st.retired.retired_at)}: this instance places no orders and
+                runs no squadrons.
+              </p>
+              <button className={btnCls('ghost')} disabled={busy || building} onClick={resume}>Resume trading here</button>
+            </div>
+          )}
+
+          <div className="space-y-2">
+            <p className="text-xs font-mono text-gray-300">1. On the old instance</p>
+            {building ? (
+              <p className="text-xs font-mono text-indigo-300">⏳ {MIGRATION_PHASES[phase ?? ''] ?? phase}</p>
+            ) : (
+              <div className="flex flex-wrap items-center gap-3">
+                <label className="flex items-center gap-2 text-xs text-gray-400">
+                  <input
+                    type="checkbox"
+                    checked={includeTraining}
+                    disabled={busy}
+                    onChange={(e) => setIncludeTraining(e.target.checked)}
+                  />
+                  Include GBoost training data (larger; the new instance keeps its training schedule)
+                </label>
+                <button className={btnCls(st?.retired ? 'ghost' : 'danger')} disabled={busy} onClick={prepare}>
+                  {st?.retired ? '↻ Rebuild backup' : '🛬 Retire and back up'}
+                </button>
+              </div>
+            )}
+            {phase === 'failed' && st?.backup?.error && (
+              <p className="text-xs font-mono text-rose-300">✗ Backup failed: {st.backup.error}</p>
+            )}
+            {latest && !building && (
+              <div className="flex flex-wrap items-center gap-3">
+                <p className="text-xs font-mono text-gray-400">
+                  📦 {latest.archive_name} · {formatBytes(latest.archive_bytes)} · made {formatWhen(latest.manifest.created_at)} ·{' '}
+                  {describeBackup(latest.manifest)}
+                </p>
+                <button className={btnCls('primary')} disabled={busy} onClick={download}>⬇ Download backup</button>
+              </div>
+            )}
+          </div>
+
+          <div className="space-y-2 pt-2 border-t border-[#1e1e32]">
+            <p className="text-xs font-mono text-gray-300">2. On the new instance</p>
+            {st?.retired ? (
+              <p className="text-xs text-gray-500">This instance is retired, so it takes no restore. Restore the backup on
+                the new instance.</p>
+            ) : staged ? (
+              <div className="space-y-2">
+                <p className="text-xs font-mono text-gray-400">
+                  Staged: a {staged.manifest.venue} backup made {formatWhen(staged.manifest.created_at)} ·{' '}
+                  {describeBackup(staged.manifest)}
+                </p>
+                <div className="flex items-center gap-2">
+                  <button className={btnCls('danger')} disabled={busy} onClick={apply}>🔄 Apply and restart</button>
+                  <button className={btnCls('ghost')} disabled={busy} onClick={discard}>Discard</button>
+                </div>
+              </div>
+            ) : (
+              <label className={btnCls('ghost') + ' cursor-pointer inline-block'}>
+                {upload != null ? `⬆ Uploading ${Math.round(upload * 100)}%` : '⬆ Restore from backup…'}
+                <input
+                  type="file"
+                  accept=".gz,application/gzip"
+                  className="hidden"
+                  disabled={busy}
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    e.target.value = '';
+                    if (file) restoreFrom(file);
+                  }}
+                />
+              </label>
+            )}
+            {st?.last_restore && (
+              <p className="text-xs font-mono text-emerald-300">
+                ✓ Restored {formatWhen(st.last_restore.applied_at)}: {st.last_restore.restored.length} item(s) from a
+                v{st.last_restore.source_app_version} backup made {formatWhen(st.last_restore.source_created_at)}
+                ({st.last_restore.source_trades} trade(s), {st.last_restore.source_open_positions} open position(s)).
+                Replaced files are kept in {st.last_restore.backup_dir}.
+              </p>
+            )}
+            {st?.restore_failed && (
+              <p className="text-xs font-mono text-rose-300">
+                ✗ The last restore failed: {st.restore_failed.error ?? 'see the engine log'}
+                {st.restore_failed.replaced_files_kept_in ? ` (replaced files kept in ${st.restore_failed.replaced_files_kept_in})` : ''}
+              </p>
+            )}
+          </div>
+        </>
+      )}
+
+      {message && (
+        <div className={`text-xs font-mono rounded-lg px-3 py-2 border ${messageCls}`}>{message.text}</div>
+      )}
+    </div>
+  );
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function SetupPage() {
@@ -1789,12 +2182,13 @@ export default function SetupPage() {
       {/* ── Config bundle export / import (instance migration) ────────────── */}
       <div className="bg-[#13131f] border border-[#1e1e32] rounded-xl p-4 space-y-3">
         <div>
-          <h3 className="text-sm font-mono text-gray-200">📦 Instance Migration</h3>
+          <h3 className="text-sm font-mono text-gray-200">📦 Config Bundle</h3>
           <p className="text-xs text-gray-500 mt-0.5">
-            Export this instance&apos;s configuration — venue and signal credentials,
-            global + squadron configs — as a single bundle, then import it on a new
-            instance (e.g. a newer AMI) and restart. The Setup password is not included:
-            each instance keeps its own. The bundle contains secrets; store it safely.
+            Export this instance&apos;s configuration (venue and signal credentials,
+            global and squadron configs) as a single bundle, and import it on another
+            instance. Settings only: to move the ledger, open positions and GBoost models
+            to a new instance, use Move to a New Instance below. The Setup password is not
+            included; each instance keeps its own. The bundle contains secrets; store it safely.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -1868,6 +2262,8 @@ export default function SetupPage() {
           </label>
         </div>
       </div>
+
+      <MigrationPanel onAuthError={sessionLost} />
 
       {/* ── Support policy ─────────────────────────────────────────────────── */}
       {/* Mirrors the risk gate: a customer who paid for this must be pointed at
