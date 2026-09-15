@@ -60,7 +60,8 @@ export function middleware(req: NextRequest) {
 }
 
 export const config = {
-  // Apply to every route except Next.js internals and static files
-  matcher: ['/((?!_next/static|_next/image|favicon.ico).*)'],
+  // Apply to every route except Next.js internals and the public icons (so the login
+  // prompt's tab shows them before credentials are sent)
+  matcher: ['/((?!_next/static|_next/image|favicon.ico|icon.svg|apple-icon.png).*)'],
 };
 
