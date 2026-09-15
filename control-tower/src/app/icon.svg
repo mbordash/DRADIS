@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 270 270" width="270" height="270"
+     role="img" aria-label="DRADIS">
+  <title>DRADIS</title>
+  <!--
+    Control Tower favicon: the DRADIS scope mark (the marketing site's dradis-logo.svg) on a
+    near-black rounded square, so the thin rings stay legible at tab size on light and dark
+    browser chrome alike.
+
+    Colors are the brand palette: base #0a0a12, indigo #6366f1 as the accent and radar
+    phosphor, violet #a855f7 for the single detected contact. The mark is the logo's
+    270 box geometry, scaled to 86% around the center.
+  -->
+  <defs>
+    <linearGradient id="sweep" x1="0.15" y1="0.9" x2="0.9" y2="0.1">
+      <stop offset="0"   stop-color="#6366f1" stop-opacity="0"/>
+      <stop offset="1"   stop-color="#6366f1" stop-opacity="0.5"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="270" height="270" rx="54" fill="#0a0a12"/>
+
+  <g transform="translate(135 135) scale(0.86) translate(-135 -135)">
+    <g fill="none" stroke="#6366f1" stroke-linecap="round">
+      <!-- sweep wedge, trailing edge fading behind the leading edge -->
+      <path d="M135,135 L82.3,27.0 A120.15,120.15 0 0 1 229.7,61.0 Z"
+            fill="url(#sweep)" stroke="none"/>
+
+      <!-- crosshair ticks, kept inside the outer ring -->
+      <g stroke-width="4.9" opacity="0.46">
+        <line x1="20.3" y1="135" x2="249.8" y2="135"/>
+        <line x1="135" y1="20.3" x2="135" y2="249.8"/>
+      </g>
+
+      <!-- concentric range rings -->
+      <g stroke-width="6.5" opacity="0.62">
+        <circle cx="135" cy="135" r="54"/>
+        <circle cx="135" cy="135" r="86.4"/>
+      </g>
+
+      <!-- leading edge of the sweep -->
+      <line x1="135" y1="135" x2="229.7" y2="61.0" stroke-width="4" opacity="0.95"/>
+
+      <!-- outer ring, drawn last so nothing crosses it -->
+      <circle cx="135" cy="135" r="120.15" stroke-width="9.2"/>
+    </g>
+
+    <!-- contacts: one faint, one detected -->
+    <circle cx="175.5" cy="183.6" r="7.0"  fill="#6366f1" opacity="0.7"/>
+    <circle cx="166.1" cy="95.9"  r="10.8" fill="#a855f7"/>
+  </g>
+</svg>
