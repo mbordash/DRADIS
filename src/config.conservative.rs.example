@@ -864,6 +864,24 @@ pub const GBOOST_RESTING_TP_ENABLED: bool = true;
 /// 0.8%. It is a different risk profile, not a free improvement.
 pub const GBOOST_PLANB_EXIT_POSTURE: i64 = 0;
 
+/// Ceiling on GBoost plan-B capital sitting in positions whose market has CLOSED
+/// and which are waiting on settlement or redemption, in dollars.
+///
+/// `GBOOST_MAX_EXPOSURE_USDC` deliberately stops counting a position once its
+/// market closes (`Position::counts_toward_exposure`), because a position on a
+/// closed market is waiting on redemption rather than holding market risk, and
+/// counting it pinned another viper's cap in a 2026-09-01 bug. That was safe while
+/// nothing outlived its market. The `Ride to settlement` and `Split` exit postures
+/// make outliving the market the normal case, so without a second ceiling every
+/// hour's entry would see a full cap while the previous hour's held position still
+/// held real shares, and holds would accumulate with nothing bounding the total.
+///
+/// This caps that population on its own terms. At the $4 trade size the default
+/// allows two concurrent holds. It has no effect at posture 0, where nothing is
+/// ever held. Seeds the `gboost_planb_held_exposure_usdc` Control Tower setting.
+pub const GBOOST_PLANB_HELD_EXPOSURE_USDC: Decimal = dec!(8.0);
+
+
 // ── GBoost plan-B in-engine training (2026-09-13) ─────────────────────────────
 // Every instance trains its own plan-B model from public data (Polymarket Gamma, data-api
 // and CLOB history; Binance bars and funding), validates it on a held-out fold behind a

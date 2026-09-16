@@ -180,6 +180,7 @@ export interface DynamicConfig {
   gboost_planb_gate_min_win_rate: string;
   gboost_planb_budget: string;
   gboost_planb_exit_posture: number;
+  gboost_planb_held_exposure_usdc: string;
 
   // TrendCapture Viper
   trendcapture_min_trade_size_usdc: string;
@@ -243,6 +244,9 @@ export interface ConfigFieldSchema {
   enable_key:  string | null;   // owning viper enable flag (null for global)
   label:       string;
   type:        'usd' | 'price' | 'pct' | 'decimal' | 'secs' | 'int' | 'bool' | 'string';
+  /** Where an out-of-range entry lands when clamping to the nearest bound would
+   *  be unsafe (a mode field, where the nearest bound is not the nearest meaning). */
+  clamp_fallback?: number | null;
   unit:        string | null;
   min:         number | null;
   max:         number | null;

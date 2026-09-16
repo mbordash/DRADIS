@@ -1044,6 +1044,24 @@ impl Strategy for GboostPlanBStrategy {
                 .filter(|(_, p)| p.counts_toward_exposure(now))
                 .map(|(_, p)| p.shares * p.avg_entry)
                 .sum();
+            // A hold deliberately outlives its market, so it leaves the population above
+            // the moment the market closes while still holding real shares on chain.
+            // Without its own ceiling the next hour would see a full cap and open again,
+            // hour after hour, with nothing bounding the total. This counts exactly the
+            // population the cap above excludes.
+            let held: Decimal = positions.iter()
+                .filter(|(key, _)| key.strategy == STRATEGY_NAME && key.squadron == ctx.squadron_id)
+                .filter(|(_, p)| !p.counts_toward_exposure(now))
+                .map(|(_, p)| p.shares * p.avg_entry)
+                .sum();
+            if held >= dc.gboost_planb_held_exposure_usdc {
+                info!(
+                    "GBoost plan-B [{}] not entering: ${:.2} already held awaiting settlement, cap ${:.2}",
+                    market.market_name, held, dc.gboost_planb_held_exposure_usdc,
+                );
+                idle("held exposure cap reached");
+                return Ok(StrategySignal::NoSignal);
+            }
             dc.gboost_max_exposure_usdc - exposure
         };
         let shares = match entry_shares(dc.gboost_planb_trade_size_usdc, room, ask_dec, dc.intl_taker_fee_rate) {
@@ -1077,6 +1095,20 @@ impl Strategy for GboostPlanBStrategy {
             "p": preds[side].1,
             "break_even": decisions[side].break_even,
             "required": decisions[side].required,
+            // The posture IN FORCE AT ENTRY, and this position's arm under it.
+            //
+            // `evaluate_exit` reads the posture fresh every tick, so an operator who
+            // moves the knob changes how already-open positions are managed. Stamping
+            // it here records what the position was opened under, which is both what
+            // the exit study needs to score arms and the only way to detect that drift
+            // after the fact (entry posture against the exit reason's posture).
+            //
+            // It is also the only durable record for a held position: a hold emits no
+            // exit signal, so its trade row is written by the generic settlement path,
+            // which knows nothing of GBoost or postures and is indistinguishable from
+            // a below-minimum dust ride.
+            "exit_posture": ExitPosture::from_i64(dc.gboost_planb_exit_posture).label(),
+            "settlement_arm": holds_to_settlement(ExitPosture::from_i64(dc.gboost_planb_exit_posture), token_id.as_str()),
             "feature_names": FEATURE_NAMES,
             "features": features[side].iter().map(|x| if x.is_nan() { serde_json::Value::Null } else { serde_json::json!(x) }).collect::<Vec<_>>(),
         }));
@@ -1252,6 +1284,44 @@ mod tests {
         let arms: Vec<bool> = (0..400).map(|i| settlement_arm(&format!("{i}{}", token))).collect();
         let held = arms.iter().filter(|a| **a).count();
         assert!((120..=280).contains(&held), "expected a roughly even split, got {held} of 400");
+    }
+
+    /// The held-exposure cap counts exactly the population the main cap drops.
+    ///
+    /// `GBOOST_MAX_EXPOSURE_USDC` stops counting a position the moment its market
+    /// closes, which was safe while nothing outlived its market. A hold posture
+    /// makes that the normal case, so without this cap each hour's entry would see
+    /// a full allowance while the previous hour's hold still held real shares, and
+    /// holds would stack with nothing bounding the total.
+    #[test]
+    fn the_held_exposure_cap_counts_what_the_main_cap_drops() {
+        let now = chrono::Utc::now();
+        let open = |close: Option<chrono::DateTime<chrono::Utc>>| crate::state::Position {
+            shares: dec!(5.06), avg_entry: dec!(0.79), opened_at: now,
+            close_time: close, market_name: "Bitcoin Up or Down - September 16, 10AM ET".into(),
+            pair_token_id: crate::venues::core::MarketId::new("t"), fill_confirmed_at: Some(now),
+            paired_leg_token_id: None, entry_fee: Decimal::ZERO,
+        };
+        // A position whose market is still open is live risk: the main cap sees it,
+        // the held cap does not.
+        let live = open(Some(now + chrono::Duration::minutes(20)));
+        assert!(live.counts_toward_exposure(now), "an open market is live risk");
+        // Once the market closes the main cap drops it, which is exactly when the
+        // held cap must pick it up. These two predicates must stay complementary:
+        // if both ever excluded a position, its capital would be invisible to both.
+        let held = open(Some(now - chrono::Duration::minutes(5)));
+        assert!(!held.counts_toward_exposure(now), "a closed market leaves the main cap");
+        assert!(live.counts_toward_exposure(now) != held.counts_toward_exposure(now),
+                "every position must fall under exactly one of the two caps");
+        // The gate refuses entry once the held total is at or over the cap, which is
+        // what bounds accumulation. At the $4 trade size the $8 default admits two
+        // concurrent holds and refuses the third, so a hold posture can trade while
+        // the population stays bounded instead of growing hourly.
+        let stake = held.shares * held.avg_entry;      // 5.06 x $0.79 = $3.9974
+        let cap = dec!(8.0);
+        assert!(stake < cap, "one hold must fit, or a hold posture could never trade");
+        assert!(stake * dec!(2) < cap, "two holds must fit at the default");
+        assert!(stake * dec!(3) >= cap, "three holds must be refused: {stake} each against {cap}");
     }
 
     /// The gates posture never holds, settlement always holds, and split defers

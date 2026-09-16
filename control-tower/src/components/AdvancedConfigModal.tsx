@@ -78,9 +78,17 @@ export function AdvancedRow({ field, config, onPatch, disabled }: RowProps) {
     }
     const n = parseFloat(draft);
     if (isNaN(n)) { setError('not a number'); setDraft(stored); return; }
-    const clamped = clamp(n, field.min, field.max);
+    // A field may declare where out-of-range input lands. Without it we clamp to the
+    // nearest bound, which is right for magnitudes and wrong for modes: on a posture
+    // field the nearest bound is not the nearest meaning, and clamping a mistyped 3
+    // to 2 would enable the experimental posture rather than fall back to the safe one.
+    const outOfRange = (field.min != null && n < field.min) || (field.max != null && n > field.max);
+    const fallback = field.clamp_fallback;
+    const clamped = outOfRange && fallback != null ? fallback : clamp(n, field.min, field.max);
     const next = String(clamped);
-    setError(clamped !== n ? `clamped to ${clamped}` : null);
+    setError(clamped !== n
+      ? (outOfRange && fallback != null ? `out of range: reset to ${clamped}` : `clamped to ${clamped}`)
+      : null);
     if (next === stored) { setDraft(next); return; }
     setSaving(true);
     try {

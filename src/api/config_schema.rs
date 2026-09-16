@@ -99,6 +99,17 @@ pub struct ConfigFieldSchema {
     pub max: Option<f64>,
     /// Optional input step.
     pub step: Option<f64>,
+    /// Where an out-of-range entry lands, for fields where clamping to the nearest
+    /// bound would be unsafe.
+    ///
+    /// The Control Tower clamps a number to `[min, max]` before sending it. For most
+    /// fields that is right: a value past a bound means "as far as allowed". For a
+    /// field whose values are modes rather than magnitudes it is wrong, because the
+    /// nearest bound is not the nearest meaning. `gboost_planb_exit_posture` is the
+    /// case this exists for: 0 is the safe default and 2 is the experimental posture,
+    /// so clamping a fat-fingered 3 to 2 would enable the experiment the engine's own
+    /// `from_i64` fallback is written to prevent.
+    pub clamp_fallback: Option<f64>,
     /// `false` → Basic panel (shown today); `true` → Advanced modal.
     pub advanced: bool,
     /// Short tooltip describing what the field does.
@@ -121,7 +132,7 @@ impl ConfigFieldSchema {
     ) -> Self {
         Self {
             key, group, enable_key, label, value_type,
-            unit: None, min: None, max: None, step: None,
+            unit: None, min: None, max: None, step: None, clamp_fallback: None,
             advanced, description,
             // Placeholder; the post-pass at the end of `config_schema()` resolves
             // it from the group so the two can never disagree.
@@ -132,6 +143,7 @@ impl ConfigFieldSchema {
     fn min(mut self, min: f64) -> Self { self.min = Some(min); self }
     fn step(mut self, step: f64) -> Self { self.step = Some(step); self }
     fn unit(mut self, unit: &'static str) -> Self { self.unit = Some(unit); self }
+    fn clamp_fallback(mut self, v: f64) -> Self { self.clamp_fallback = Some(v); self }
 }
 
 /// Build the full editable-config schema.
@@ -516,6 +528,14 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(g, e, "gboost_planb_take_profit_pct", "Plan Take Profit", "pct", true,
             "Take-profit target, entry-relative. The model's labels were built with 20%, so a different \
              target changes what its probabilities mean, which is why this is operator-only.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "gboost_planb_held_exposure_usdc", "Held Exposure Cap", "usd", true,
+            "Most this viper may have tied up in positions whose market has already closed and which are \
+             waiting to settle. Only the hold postures create these; at Exit Posture 0 nothing is ever held \
+             and this has no effect. It exists because the main Max Exposure cap stops counting a position \
+             the moment its market closes, which is correct when nothing outlives its market and unsafe once \
+             something does: without this, each hour's entry would see a full cap while the previous hour's \
+             held position still held real shares. At a $4 trade size the default allows two concurrent holds."
+        ).min(0.0).step(1.0).unit("USDC"));
         v.push(F::new(g, e, "gboost_planb_exit_posture", "Exit Posture", "int", true,
             "How a held position is managed. 0 = start and stop gates: the resting take-profit and taker stop \
              this model was trained on, plus the flatten before the hourly rotation. 1 = ride to settlement \
@@ -526,7 +546,7 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              hold returned +6.11% per trade against +3.24% for the gates, but its maximum drawdown was $40.83 \
              against $11.01 at $4 stakes, and 36.3% of trades lost the whole stake against 0.8%. A held position \
              also locks its capital until the market resolves and cannot be managed after the rotation."
-        ).range(0.0, 2.0).step(1.0));
+        ).range(0.0, 2.0).step(1.0).clamp_fallback(0.0));
         v.push(F::new(g, e, "gboost_planb_stop_loss_pct", "Plan Stop Loss", "pct", true,
             "Taker stop marked against the bid, entry-relative. The model's labels were built with 11%, so a \
              different stop changes what its probabilities mean, which is why this is operator-only.").range(0.0, 1.0).step(0.01));
