@@ -821,6 +821,22 @@ pub const GBOOST_PLANB_MAX_ASK: Decimal = dec!(0.75);
 pub const GBOOST_PLANB_FIRST_MINUTE: i64 = 5;
 pub const GBOOST_PLANB_LAST_MINUTE: i64 = 45;
 pub const GBOOST_RESTING_TP_ENABLED: bool = true;
+
+/// How a held GBoost plan-B position is managed. Seeds the `gboost_planb_exit_posture`
+/// Control Tower setting.
+///
+/// 0 = start and stop gates: the resting take-profit and taker stop the model is
+/// trained on. 1 = ride to settlement: no stop, no take-profit and no rotation
+/// flatten, so the position resolves at $1.00 or $0.00. 2 = split: each position
+/// takes one arm or the other, deterministically, so both run on the same markets.
+/// Any other value reads as 0.
+///
+/// Default 0 on every profile. On the exit study's 608 spent entries a hold returned
+/// +6.11% per trade against +3.24% for the gates, with a maximum drawdown of $40.83
+/// against $11.01 at $4 stakes and 36.3% of trades losing the whole stake against
+/// 0.8%. It is a different risk profile, not a free improvement.
+pub const GBOOST_PLANB_EXIT_POSTURE: i64 = 0;
+
 // ── GBoost plan-B in-engine training (2026-09-13) ─────────────────────────────
 // Every instance trains its own plan-B model from public data (Polymarket Gamma, data-api
 // and CLOB history; Binance bars and funding), validates it on a held-out fold behind a

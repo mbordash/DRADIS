@@ -311,6 +311,7 @@ fn default_momentum_reversal_persist_secs()       -> i64     { config::MOMENTUM_
 fn default_momentum_resting_tp_enabled()          -> bool    { config::MOMENTUM_RESTING_TP_ENABLED          }
 fn default_momentum_catastrophic_persist_secs()   -> i64     { config::MOMENTUM_CATASTROPHIC_PERSIST_SECS   }
 fn default_momentum_scaled_sizing_enabled()       -> bool    { config::ENABLE_KELLY_SIZING                  }
+fn default_gboost_planb_exit_posture()            -> i64     { config::GBOOST_PLANB_EXIT_POSTURE            }
 fn default_momentum_decay_exit_fraction()         -> Decimal { config::MOMENTUM_DECAY_EXIT_FRACTION         }
 fn default_momentum_decay_fee_margin_mult()       -> Decimal { config::MOMENTUM_DECAY_FEE_MARGIN_MULT       }
 fn default_maker_tp_fee_margin_mult()             -> Decimal { config::MAKER_TP_FEE_MARGIN_MULT             }
@@ -783,6 +784,11 @@ pub struct DynamicConfig {
     pub gboost_planb_gate_min_win_rate: Decimal,
     #[serde(default = "default_gboost_planb_budget")]
     pub gboost_planb_budget: Decimal,
+    /// How a held plan-B position is managed: 0 gates (resting take-profit and
+    /// taker stop, the trained plan), 1 hold to settlement, 2 split both arms
+    /// per position. Anything else reads as 0. See `vipers::gboost_planb::ExitPosture`.
+    #[serde(default = "default_gboost_planb_exit_posture")]
+    pub gboost_planb_exit_posture: i64,
 
     // ── TrendCapture Viper ────────────────────────────────────────────────────
     #[serde(default = "default_trendcapture_min_trade_size")]
@@ -1111,6 +1117,7 @@ impl Default for DynamicConfig {
             momentum_resting_tp_enabled:          config::MOMENTUM_RESTING_TP_ENABLED,
             momentum_catastrophic_persist_secs:   config::MOMENTUM_CATASTROPHIC_PERSIST_SECS,
             momentum_scaled_sizing_enabled:       config::ENABLE_KELLY_SIZING,
+            gboost_planb_exit_posture:            config::GBOOST_PLANB_EXIT_POSTURE,
             momentum_decay_exit_fraction:         config::MOMENTUM_DECAY_EXIT_FRACTION,
             momentum_decay_fee_margin_mult:       config::MOMENTUM_DECAY_FEE_MARGIN_MULT,
 
@@ -1885,6 +1892,7 @@ mod tests {
             "gboost_planb_retrain_hours", "gboost_planb_gate_min_trades", "gboost_planb_gate_min_win_rate", "gboost_planb_budget",
             "momentum_catastrophic_persist_secs", "momentum_scaled_sizing_enabled",
             "momentum_decay_exit_fraction", "momentum_decay_fee_margin_mult",
+            "gboost_planb_exit_posture",
         ] {
             assert!(obj.remove(added).is_some(), "{added} must be a serialized field");
         }
@@ -1894,6 +1902,7 @@ mod tests {
         assert_eq!(cfg.momentum_resting_tp_enabled, config::MOMENTUM_RESTING_TP_ENABLED);
         assert_eq!(cfg.momentum_catastrophic_persist_secs, config::MOMENTUM_CATASTROPHIC_PERSIST_SECS);
         assert_eq!(cfg.momentum_scaled_sizing_enabled, config::ENABLE_KELLY_SIZING);
+        assert_eq!(cfg.gboost_planb_exit_posture, config::GBOOST_PLANB_EXIT_POSTURE);
         assert_eq!(cfg.momentum_decay_exit_fraction, config::MOMENTUM_DECAY_EXIT_FRACTION);
         assert_eq!(cfg.momentum_decay_fee_margin_mult, config::MOMENTUM_DECAY_FEE_MARGIN_MULT);
         assert_eq!(cfg.convergence_max_fee_to_target_ratio, config::CONVERGENCE_MAX_FEE_TO_TARGET_RATIO);

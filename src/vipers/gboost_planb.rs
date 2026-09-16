@@ -393,6 +393,86 @@ pub fn exit_action(entry: Decimal, bid: Decimal, tp: Decimal, sl: Decimal, ceili
 /// above the bid.
 const TICK: Decimal = dec!(0.01);
 
+/// How a held plan-B position is managed, chosen by the operator in the Control
+/// Tower (`gboost_planb_exit_posture`).
+///
+/// The plan the model is trained on is `Gates`: a resting take-profit at +20% and
+/// a taker stop at 11%. `Settlement` is the experimental posture the exit
+/// comparison study (`~/dradis-research/gboost-exit-comparison-2026-09-15`) exists
+/// to test: hold every entry to the market's resolution instead. On the study's
+/// 608 spent entries a hold returned +6.11% per trade against the gates' +3.24%,
+/// and did so with a maximum drawdown of $40.83 against $11.01 at $4 stakes, with
+/// 36.3% of trades losing the whole stake against 0.8%. That is a different risk
+/// profile, not a free improvement, which is why the operator selects it and why
+/// the default is unchanged behavior.
+///
+/// `Split` runs both, assigning each position by `settlement_arm`. Both arms then
+/// see identical market conditions, which is what makes the comparison worth
+/// anything: the alternative is comparing periods, where the market moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitPosture {
+    /// Resting take-profit, taker stop, flatten before the rotation. The default.
+    Gates,
+    /// No stop, no take-profit, and no rotation flatten: the position resolves
+    /// on chain at $1.00 or $0.00.
+    Settlement,
+    /// Per-position, deterministically: half `Gates`, half `Settlement`.
+    Split,
+}
+
+impl ExitPosture {
+    /// Anything outside the three known values is `Gates`.
+    ///
+    /// The fallback is deliberate and one-directional. An unrecognized number can
+    /// only ever mean the conservative posture, never the experimental one, so a
+    /// bad write, a hand-edited config row or a future value from a newer build
+    /// cannot silently put real money on the hold plan.
+    pub fn from_i64(v: i64) -> Self {
+        match v {
+            1 => ExitPosture::Settlement,
+            2 => ExitPosture::Split,
+            _ => ExitPosture::Gates,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ExitPosture::Gates => "gates",
+            ExitPosture::Settlement => "settlement",
+            ExitPosture::Split => "split",
+        }
+    }
+}
+
+/// Which arm a position takes under `ExitPosture::Split`: true = hold to settlement.
+///
+/// Derived from the token id alone, so it is stable for the life of the position.
+/// `evaluate_exit` runs every tick and must reach the same answer every time: a
+/// position that changed arms between ticks could take a stop and then be held, or
+/// be held past the flatten and then stopped, which would be neither arm and would
+/// corrupt the comparison it exists to serve. Deriving it from durable identity
+/// rather than storing it also keeps the schema unchanged.
+///
+/// FNV-1a over the token id's bytes, low bit. The hash is only a coin: it needs an
+/// even split across unrelated ids, not cryptographic strength.
+pub fn settlement_arm(token_id: &str) -> bool {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in token_id.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h & 1 == 1
+}
+
+/// Whether this position is held to settlement under `posture`.
+pub fn holds_to_settlement(posture: ExitPosture, token_id: &str) -> bool {
+    match posture {
+        ExitPosture::Gates => false,
+        ExitPosture::Settlement => true,
+        ExitPosture::Split => settlement_arm(token_id),
+    }
+}
+
 /// The last mid recorded at or before `at`, if no older than the harness's staleness limit.
 fn mid_at(series: Option<&BTreeMap<i64, [Option<f64>; 2]>>, side: usize, at: i64) -> Option<f64> {
     let (key, mids) = series?.range(..=at).next_back()?;
@@ -1064,10 +1144,30 @@ impl Strategy for GboostPlanBStrategy {
                 post_only,
                 ghost_mode: dc.ghost_mode,
             };
+            // The operator's posture for this position. A held position skips the
+            // stop, both take-profits AND the rotation flatten: a flattened hold is
+            // neither plan, and the study's hold arm is unflattened, so flattening
+            // here would measure something nobody chose. What closes it instead is
+            // the settlement path in `tasks::cleanup`, which asks the market what it
+            // resolved to and books it at exactly $1.00 or $0.00 against this
+            // strategy, idempotently. That path is already load-bearing: the
+            // below-minimum branch above rides to settlement the same way.
+            let posture = ExitPosture::from_i64(dc.gboost_planb_exit_posture);
+            let held = holds_to_settlement(posture, token_id.as_str());
+            if held {
+                if lock(&g.below_minimum_noted).insert(format!("posture-hold:{token_id}")) {
+                    info!(
+                        "GBoost plan-B [{}] holding to settlement ({} posture{}): no stop, no take-profit, no rotation flatten",
+                        market.market_name, posture.label(),
+                        if posture == ExitPosture::Split { ", settlement arm" } else { "" },
+                    );
+                }
+                continue;
+            }
             if market.market_close_time.is_some_and(|c| now_s >= rotation_flatten_at(c.timestamp())) && bid > Decimal::ZERO {
                 return Ok(StrategySignal::Exit {
                     params: params(bid, TimeInForce::Fak, false),
-                    reason: format!("GBoostPlanBRotation: bid=${:.4} entry=${:.4}, flattened before the market rotation ends exit management", bid, entry),
+                    reason: format!("GBoostPlanBRotation: bid=${:.4} entry=${:.4}, flattened before the market rotation ends exit management | posture={}", bid, entry, posture.label()),
                     exit_pair: false,
                 });
             }
@@ -1075,14 +1175,14 @@ impl Strategy for GboostPlanBStrategy {
                 ExitAction::Stop => {
                     return Ok(StrategySignal::Exit {
                         params: params(bid, TimeInForce::Fak, false),
-                        reason: format!("GBoostPlanBSL: bid=${:.4} stop=${:.4} entry=${:.4}", bid, entry * (Decimal::ONE - dc.gboost_planb_stop_loss_pct), entry),
+                        reason: format!("GBoostPlanBSL: bid=${:.4} stop=${:.4} entry=${:.4} | posture={}", bid, entry * (Decimal::ONE - dc.gboost_planb_stop_loss_pct), entry, posture.label()),
                         exit_pair: false,
                     });
                 }
                 ExitAction::TakeProfit => {
                     return Ok(StrategySignal::Exit {
                         params: params(bid, TimeInForce::Fak, false),
-                        reason: format!("GBoostPlanBTP: bid=${:.4} entry=${:.4}", bid, entry),
+                        reason: format!("GBoostPlanBTP: bid=${:.4} entry=${:.4} | posture={}", bid, entry, posture.label()),
                         exit_pair: false,
                     });
                 }
