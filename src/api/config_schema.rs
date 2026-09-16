@@ -516,6 +516,17 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(g, e, "gboost_planb_take_profit_pct", "Plan Take Profit", "pct", true,
             "Take-profit target, entry-relative. The model's labels were built with 20%, so a different \
              target changes what its probabilities mean, which is why this is operator-only.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "gboost_planb_exit_posture", "Exit Posture", "int", true,
+            "How a held position is managed. 0 = start and stop gates: the resting take-profit and taker stop \
+             this model was trained on, plus the flatten before the hourly rotation. 1 = ride to settlement \
+             (EXPERIMENTAL): no stop, no take-profit and no flatten, so every entry resolves at $1.00 or $0.00. \
+             2 = split: each position takes one arm or the other, fixed by its token, so both arms run on the \
+             same markets and can be compared directly. Any other value reads as 0. \
+             WARNING: posture 1 is a different risk profile, not a free improvement. On 608 replayed entries a \
+             hold returned +6.11% per trade against +3.24% for the gates, but its maximum drawdown was $40.83 \
+             against $11.01 at $4 stakes, and 36.3% of trades lost the whole stake against 0.8%. A held position \
+             also locks its capital until the market resolves and cannot be managed after the rotation."
+        ).range(0.0, 2.0).step(1.0));
         v.push(F::new(g, e, "gboost_planb_stop_loss_pct", "Plan Stop Loss", "pct", true,
             "Taker stop marked against the bid, entry-relative. The model's labels were built with 11%, so a \
              different stop changes what its probabilities mean, which is why this is operator-only.").range(0.0, 1.0).step(0.01));

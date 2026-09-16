@@ -179,6 +179,7 @@ export interface DynamicConfig {
   gboost_planb_gate_min_trades: number;
   gboost_planb_gate_min_win_rate: string;
   gboost_planb_budget: string;
+  gboost_planb_exit_posture: number;
 
   // TrendCapture Viper
   trendcapture_min_trade_size_usdc: string;

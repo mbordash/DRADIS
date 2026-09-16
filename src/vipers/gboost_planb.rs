@@ -1221,6 +1221,52 @@ impl Strategy for GboostPlanBStrategy {
 mod tests {
     use super::*;
 
+    /// An unrecognized posture is always the conservative one. The fallback is
+    /// one-directional on purpose: a bad write, a hand-edited config row or a
+    /// value from a newer build must never put real money on the hold plan by
+    /// accident, and 36.3% of held trades lose the whole stake.
+    #[test]
+    fn the_exit_posture_falls_back_to_gates() {
+        assert_eq!(ExitPosture::from_i64(0), ExitPosture::Gates);
+        assert_eq!(ExitPosture::from_i64(1), ExitPosture::Settlement);
+        assert_eq!(ExitPosture::from_i64(2), ExitPosture::Split);
+        for unknown in [-9_i64, -1, 3, 7, 99, i64::MAX, i64::MIN] {
+            assert_eq!(ExitPosture::from_i64(unknown), ExitPosture::Gates, "{unknown} must read as gates");
+        }
+    }
+
+    /// `evaluate_exit` runs every tick, so a split position must reach the same
+    /// arm every time. One that changed arms could take a stop and then be held,
+    /// or be held past the flatten and then stopped, which is neither arm and
+    /// would corrupt the comparison the posture exists to serve.
+    #[test]
+    fn a_split_position_keeps_its_arm() {
+        let token = "99366542591070685238863007489473194324758699764861491299517243361573997343945";
+        let first = settlement_arm(token);
+        for _ in 0..100 {
+            assert_eq!(settlement_arm(token), first, "the arm must not move between ticks");
+        }
+        // Different tokens are assigned independently, and the split is roughly even
+        // across many ids: a coin that always answered the same way would put every
+        // position in one arm and measure nothing.
+        let arms: Vec<bool> = (0..400).map(|i| settlement_arm(&format!("{i}{}", token))).collect();
+        let held = arms.iter().filter(|a| **a).count();
+        assert!((120..=280).contains(&held), "expected a roughly even split, got {held} of 400");
+    }
+
+    /// The gates posture never holds, settlement always holds, and split defers
+    /// to the token's own arm.
+    #[test]
+    fn holds_to_settlement_follows_the_posture() {
+        let token = "12345678901234567890";
+        assert!(!holds_to_settlement(ExitPosture::Gates, token), "gates never holds");
+        assert!(holds_to_settlement(ExitPosture::Settlement, token), "settlement always holds");
+        assert_eq!(holds_to_settlement(ExitPosture::Split, token), settlement_arm(token));
+        assert_eq!(ExitPosture::Gates.label(), "gates");
+        assert_eq!(ExitPosture::Settlement.label(), "settlement");
+        assert_eq!(ExitPosture::Split.label(), "split");
+    }
+
     fn opt(v: &serde_json::Value) -> Option<f64> { v.as_f64() }
 
     /// Eight rows the research harness built from real Phase 1 markets
