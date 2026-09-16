@@ -311,6 +311,8 @@ fn default_momentum_reversal_persist_secs()       -> i64     { config::MOMENTUM_
 fn default_momentum_resting_tp_enabled()          -> bool    { config::MOMENTUM_RESTING_TP_ENABLED          }
 fn default_momentum_catastrophic_persist_secs()   -> i64     { config::MOMENTUM_CATASTROPHIC_PERSIST_SECS   }
 fn default_momentum_scaled_sizing_enabled()       -> bool    { config::ENABLE_KELLY_SIZING                  }
+fn default_momentum_decay_exit_fraction()         -> Decimal { config::MOMENTUM_DECAY_EXIT_FRACTION         }
+fn default_momentum_decay_fee_margin_mult()       -> Decimal { config::MOMENTUM_DECAY_FEE_MARGIN_MULT       }
 fn default_maker_tp_fee_margin_mult()             -> Decimal { config::MAKER_TP_FEE_MARGIN_MULT             }
 fn default_fairvalue_stop_veto_max_model_decay_pct() -> Decimal { config::FAIRVALUE_STOP_VETO_MAX_MODEL_DECAY_PCT }
 fn default_fairvalue_settle_snipe_hold()  -> bool    { config::FAIRVALUE_SETTLE_SNIPE_HOLD             }
@@ -550,6 +552,14 @@ pub struct DynamicConfig {
     /// triggering move; off means every trade uses the min size.
     #[serde(default = "default_momentum_scaled_sizing_enabled")]
     pub momentum_scaled_sizing_enabled: bool,
+    /// The decay exit's "move is spent" test: the 5 s oracle velocity in the
+    /// position's direction has fallen below this fraction of the entry threshold.
+    #[serde(default = "default_momentum_decay_exit_fraction")]
+    pub momentum_decay_exit_fraction: Decimal,
+    /// Multiple of the entry-leg fee the decay exit must have cleared, net of the
+    /// exit fee, before it may preempt the resting take-profit; 0 is the old bar.
+    #[serde(default = "default_momentum_decay_fee_margin_mult")]
+    pub momentum_decay_fee_margin_mult: Decimal,
 
     // ── Maker Viper ───────────────────────────────────────────────────────────
     pub maker_max_entry_price:    Decimal,
@@ -1101,6 +1111,8 @@ impl Default for DynamicConfig {
             momentum_resting_tp_enabled:          config::MOMENTUM_RESTING_TP_ENABLED,
             momentum_catastrophic_persist_secs:   config::MOMENTUM_CATASTROPHIC_PERSIST_SECS,
             momentum_scaled_sizing_enabled:       config::ENABLE_KELLY_SIZING,
+            momentum_decay_exit_fraction:         config::MOMENTUM_DECAY_EXIT_FRACTION,
+            momentum_decay_fee_margin_mult:       config::MOMENTUM_DECAY_FEE_MARGIN_MULT,
 
             maker_max_entry_price:    config::MAKER_MAX_ENTRY_PRICE,
             maker_min_entry_price:    config::MAKER_MIN_ENTRY_PRICE,
@@ -1872,6 +1884,7 @@ mod tests {
             "gboost_planb_training_enabled", "gboost_planb_auto_adopt", "gboost_planb_train_window_days", "gboost_planb_holdout_days",
             "gboost_planb_retrain_hours", "gboost_planb_gate_min_trades", "gboost_planb_gate_min_win_rate", "gboost_planb_budget",
             "momentum_catastrophic_persist_secs", "momentum_scaled_sizing_enabled",
+            "momentum_decay_exit_fraction", "momentum_decay_fee_margin_mult",
         ] {
             assert!(obj.remove(added).is_some(), "{added} must be a serialized field");
         }
@@ -1881,6 +1894,8 @@ mod tests {
         assert_eq!(cfg.momentum_resting_tp_enabled, config::MOMENTUM_RESTING_TP_ENABLED);
         assert_eq!(cfg.momentum_catastrophic_persist_secs, config::MOMENTUM_CATASTROPHIC_PERSIST_SECS);
         assert_eq!(cfg.momentum_scaled_sizing_enabled, config::ENABLE_KELLY_SIZING);
+        assert_eq!(cfg.momentum_decay_exit_fraction, config::MOMENTUM_DECAY_EXIT_FRACTION);
+        assert_eq!(cfg.momentum_decay_fee_margin_mult, config::MOMENTUM_DECAY_FEE_MARGIN_MULT);
         assert_eq!(cfg.convergence_max_fee_to_target_ratio, config::CONVERGENCE_MAX_FEE_TO_TARGET_RATIO);
         assert_eq!(cfg.convergence_tp_fee_margin_mult, config::CONVERGENCE_TP_FEE_MARGIN_MULT);
         assert_eq!(cfg.convergence_resting_tp_enabled, config::CONVERGENCE_RESTING_TP_ENABLED);

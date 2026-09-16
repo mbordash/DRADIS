@@ -104,6 +104,8 @@ export interface DynamicConfig {
   momentum_resting_tp_enabled:           boolean;
   momentum_catastrophic_persist_secs:    number;
   momentum_scaled_sizing_enabled:        boolean;
+  momentum_decay_exit_fraction:          string;
+  momentum_decay_fee_margin_mult:        string;
 
   // Maker Viper
   maker_max_entry_price:   string;

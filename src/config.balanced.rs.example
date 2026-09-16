@@ -214,6 +214,14 @@ pub const MOMENTUM_SHORT_WINDOW_FRACTION: Decimal = dec!(0.65);
 pub const MOMENTUM_ACCELERATION_BYPASS_MULTIPLIER: Decimal = dec!(2.5);
 pub const MOMENTUM_DECAY_EXIT_FRACTION: Decimal = dec!(0.20);
 
+/// How much of the ENTRY-leg fee the decay exit must have cleared, net of the
+/// exit fee it pays, before it may preempt the resting take-profit. 1.0 means
+/// the round trip is at least break-even when the exit sells; 0 restores the
+/// pre-2026-09-16 bar (any net gain after the exit fee alone), which booked
+/// losses of the entry fee on positions that were ahead. Seeds the
+/// `momentum_decay_fee_margin_mult` Control Tower setting.
+pub const MOMENTUM_DECAY_FEE_MARGIN_MULT: Decimal = dec!(1.0);
+
 /// Velocity threshold as fraction of oracle price/5s.
 /// 0.001 = 0.10% of price. Balanced: at BTC=$100k → $100/5s.
 pub const MOMENTUM_THRESHOLD_PCT: Decimal = dec!(0.001);

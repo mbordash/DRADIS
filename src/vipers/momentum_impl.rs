@@ -698,7 +698,6 @@ impl Strategy for MomentumStrategyImpl {
 
             let avg_entry = position.avg_entry;
             let velocity = ctx.snapshot.velocity;
-            let velocity_1s = ctx.snapshot.velocity_1s;
             let threshold = config::oracle_threshold(dc.momentum_threshold_pct, ctx.snapshot.oracle_price);
 
             if avg_entry <= dec!(0) { continue; }
@@ -834,11 +833,38 @@ impl Strategy for MomentumStrategyImpl {
             // is the strategy saying the move is spent and the target will not
             // be reached — so it has to at least clear the fee it chooses to pay
             // in place of the free lift it gives up.
-            let decay_min = threshold * config::MOMENTUM_DECAY_EXIT_FRACTION;
+            //
+            // Two defects fixed 2026-09-16, both found by the entry replay
+            // (~/dradis-research/momentum-replay-2026-09-15, registered run V0):
+            // this exit took 30 of 42 exits, banked +5.4% of stake gross on
+            // average and paid 92% of it to the two taker fees, +$0.02 net each.
+            //
+            //   1. Units. `decay_min` is a fraction of `threshold`, a 5 s velocity,
+            //      but it was compared with the 1 s velocity. A 1 s move of 30% of
+            //      the 5 s threshold is a pace 1.5x the entry trigger, so "spent"
+            //      read true on nearly every second, and on every second the
+            //      raptor's 1 s window read zero (about half of them at Binance's
+            //      1 Hz ticker). The signal was vacuous and the exit was "sell on
+            //      the first tick a fee above entry". The fade is now read on the
+            //      same 5 s window the trigger uses, and the fraction is a knob.
+            //   2. Bar. Net of the exit fee alone, "> 0" only means the trade
+            //      loses no more than its entry fee, so the exit booked losses on
+            //      positions that were ahead while forfeiting a lift that pays no
+            //      fee. It must now also clear `momentum_decay_fee_margin_mult`
+            //      times the entry-leg fee: at the default 1.0 the round trip is
+            //      at least break-even before this exit may take it; 0 restores
+            //      the old bar.
+            let decay_min = threshold * dc.momentum_decay_exit_fraction;
             let is_yes = tok == ctx.market.yes_token;
             let net_profit_margin = taker_exit_net_margin(avg_entry, bid);
-            if net_profit_margin > dec!(0) && ((is_yes && velocity_1s < decay_min) || (!is_yes && velocity_1s > -decay_min)) {
-                let reason = format!("MomentumDecay: bid=${:.4}, profit={:.2}%", bid, profit_margin * dec!(100));
+            let decay_floor = crate::venues::entry_only_fee_pct(avg_entry) * dc.momentum_decay_fee_margin_mult;
+            let faded = if is_yes { velocity < decay_min } else { velocity > -decay_min };
+            if faded && net_profit_margin > decay_floor {
+                let reason = format!(
+                    "MomentumDecay: bid=${:.4}, profit={:.2}%, net={:.2}% vs floor {:.2}%, v5={:.2} vs fade {:.2}",
+                    bid, profit_margin * dec!(100), net_profit_margin * dec!(100), decay_floor * dec!(100),
+                    velocity, if is_yes { decay_min } else { -decay_min },
+                );
                 return Ok(StrategySignal::Exit { params: exit_params!(), reason, exit_pair: false });
             }
 
@@ -1373,8 +1399,8 @@ mod tests {
     }
 
     /// A quiet hourly book with the given YES touch: no velocity, so no
-    /// reversal reads and the decay exit's velocity leg is armed (any
-    /// net-positive mark would decay out), balanced depth so OBI is neutral.
+    /// reversal reads and the decay exit's fade test holds (a mark past the
+    /// decay fee floor would decay out), balanced depth so OBI is neutral.
     fn book(yes_bid: Decimal, yes_ask: Decimal) -> MarketSnapshot {
         MarketSnapshot {
             yes_bid, yes_bid_depth: dec!(100),
@@ -1411,6 +1437,8 @@ mod tests {
         dc.momentum_reversal_min_hold_secs = 45;
         dc.momentum_reversal_persist_secs = 8;
         dc.momentum_resting_tp_enabled = true;
+        dc.momentum_decay_exit_fraction = dec!(0.30);
+        dc.momentum_decay_fee_margin_mult = dec!(1.0);
         dc
     }
 
@@ -1625,6 +1653,56 @@ mod tests {
         hold_yes(&c, dec!(0.63), dec!(7.11), 12, true).await;
         let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
         assert!(matches!(sig, StrategySignal::Exit { .. }), "persistence 0 must fire on the first reading, got {sig:?}");
+    }
+
+    /// The decay exit reads "the move is spent" on the 5 s window the trigger
+    /// uses, and it may only preempt the resting ask with a gain that leaves the
+    /// round trip at least break-even. 2026-09-15 BTC replay: it took 30 of 42
+    /// exits on a 1 s velocity test that held almost always, banked +5.4% of
+    /// stake gross and paid 92% of it in fees, and it booked losses of the entry
+    /// fee on positions that were ahead. Margin 0 restores that old bar.
+    #[tokio::test]
+    async fn the_decay_exit_needs_a_faded_move_and_a_round_trip_that_clears_both_fees() {
+        let strat = MomentumStrategyImpl::default();
+
+        // Still running: 5 s velocity at twice the $65 threshold, bid well
+        // above entry. The move is not spent, so the ask keeps working.
+        let mut running = book(dec!(0.67), dec!(0.69));
+        running.velocity = dec!(130);
+        let c = ctx(running, plan());
+        hold_yes(&c, dec!(0.63), dec!(7.94), 30, true).await;
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        assert!(matches!(sig, StrategySignal::MakerRestingExit { .. }), "a running move must not decay, got {sig:?}");
+
+        // Faded (velocity 0) and +6.3% at the bid: net of the exit fee that
+        // clears the entry-leg fee with room, so the gain is banked.
+        let c = ctx(book(dec!(0.67), dec!(0.69)), plan());
+        hold_yes(&c, dec!(0.63), dec!(7.94), 30, true).await;
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        let StrategySignal::Exit { params, reason, .. } = sig else {
+            panic!("a faded move with the round trip covered must decay out, got {sig:?}");
+        };
+        assert_eq!(params.price, dec!(0.67));
+        assert!(!params.post_only && params.order_type == TimeInForce::Fak, "decay crosses");
+        assert!(reason.starts_with("MomentumDecay: bid=$0.6700, profit=6.34%, net="), "{reason}");
+        assert!(reason.contains("v5=0.00 vs fade 19.50"), "{reason}");
+
+        // Faded but only a hair above entry net of the exit fee (+3.2% at the
+        // bid, the exit fee alone is about 2.5%): the old bar sold here and
+        // booked a loss of the entry fee. Now the position keeps its free lift.
+        let c = ctx(book(dec!(0.65), dec!(0.67)), plan());
+        hold_yes(&c, dec!(0.63), dec!(7.94), 30, true).await;
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        assert!(matches!(sig, StrategySignal::MakerRestingExit { .. }), "a gain under the decay fee floor must rest, not decay, got {sig:?}");
+
+        // Margin 0 is the old bar: any gain net of the exit fee alone sells.
+        let mut dc0 = plan();
+        dc0.momentum_decay_fee_margin_mult = dec!(0);
+        let c = ctx(book(dec!(0.65), dec!(0.67)), dc0);
+        hold_yes(&c, dec!(0.63), dec!(7.94), 30, true).await;
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        let StrategySignal::Exit { reason, .. } = sig else { panic!("margin 0 must restore the old bar, got {sig:?}"); };
+        assert!(reason.starts_with("MomentumDecay: bid=$0.6500"), "{reason}");
     }
 
     /// Scaled Sizing off: every trade is Min Size, however strong the move.

@@ -336,6 +336,20 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "On: scale each trade between Min Size and Max Size by the strength of the oracle move that triggered it. \
              Off: every trade uses Min Size. The strongest moves are often the most exhausted, so flat sizing is the \
              cautious default."));
+        v.push(F::new(g, e, "momentum_decay_exit_fraction", "Decay Fade Fraction", "decimal", true,
+            "The decay exit's \"move is spent\" test: the 5 s oracle velocity in the position's direction has fallen \
+             below this fraction of the entry threshold, read on the same 5 s window the entry trigger uses. Until \
+             2026-09-16 it was compared with the 1 s velocity, which reads zero on about half of all seconds at \
+             Binance's 1 Hz ticker, so the test held almost always and the exit sold on the first tick a fee above \
+             entry. Lower is stricter (the move must have faded further)."
+        ).range(0.0, 1.0).step(0.05));
+        v.push(F::new(g, e, "momentum_decay_fee_margin_mult", "Decay Fee Margin", "decimal", true,
+            "How much of the entry-leg fee the decay exit must have cleared, net of the exit fee it pays, before it \
+             may preempt the resting take-profit. 1.0 means the round trip is at least break-even when it sells. 0 \
+             restores the old bar, any net gain after the exit fee alone, which booked losses of the entry fee on \
+             positions that were ahead: in the 2026-09-15 BTC replay this exit took 30 of 42 exits, banked +5.4% of \
+             stake gross on average and paid 92% of it in fees."
+        ).range(0.0, 3.0).step(0.05));
         v.push(F::new(g, e, "momentum_resting_tp_enabled", "Resting Take Profit", "bool", true,
             "Take profit with a resting post-only ask at entry × (1 + Take Profit) instead of a taker FAK at the \
              bid. Momentum crosses the spread to get in and used to cross it again to get out, paying the taker fee \
