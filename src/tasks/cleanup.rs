@@ -789,13 +789,47 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
     // into ETH/SOL DBs (and vice versa), causing cross-asset UI contamination.
     let mut live_by_asset: HashMap<String, HashMap<String, _>> = HashMap::new();
     let mut unmatched_titles = 0usize;
+    // Tokens the wallet demonstrably HOLDS but whose market title names no asset.
+    //
+    // `infer_asset_from_title` only recognizes bitcoin, ethereum and solana, so any
+    // market outside those — a sports moneyline, say — infers nothing and its live
+    // position never enters `live_by_asset`. Before 2026-09-17 that was the whole
+    // story: the token was counted here and dropped, so it was missing from every
+    // asset's `live_ids`, and `purge_stale_open_positions` read that absence as
+    // "the wallet no longer holds this", deleted the row and booked a fabricated
+    // exit at the last mark. The shares never moved. On 2026-09-17 that cycled four
+    // times on one tennis market, booking +$4.67 of profit that did not exist while
+    // $15.14 of real collateral sat in shares the engine had forgotten.
+    //
+    // Absence from the map means UNKNOWN ROUTING, never absent from the wallet.
+    // These ids are therefore added to every asset's purge-protection set below,
+    // and deliberately NOT to `live_by_asset`: adoption must not invent a BTC row
+    // for a tennis position.
+    let mut unmapped_live_ids: HashSet<String> = HashSet::new();
     for pos in &filtered_live_positions {
-        if let Some(asset) = infer_asset_from_title(&pos.title) {
+        let token = pos.asset.to_string();
+        // Ownership first, title second.
+        //
+        // A shard that already holds a row for this token owns it, whatever the
+        // market is called: that row was written by this engine, which recorded
+        // what the position is at entry. Re-deriving the asset from the title
+        // discards that and fails for every market outside btc/eth/sol. The title
+        // guess is kept only for a token no shard has a row for, which is a
+        // position bought outside DRADIS.
+        let owner = match db::asset_owning_token(&token).await {
+            Some(a) => Some(a),
+            None => infer_asset_from_title(&pos.title).map(|a| a.to_string()),
+        };
+        if let Some(asset) = owner {
             live_by_asset
-                .entry(asset.to_string())
+                .entry(asset)
                 .or_default()
-                .insert(pos.asset.to_string(), *pos);
+                .insert(token, *pos);
         } else {
+            // No shard owns it and the title names no asset: a position this engine
+            // never opened, in a market it cannot classify. It is still HELD, so it
+            // is protected from the purge below, but nothing manages it.
+            unmapped_live_ids.insert(token);
             unmatched_titles += 1;
         }
     }
@@ -833,9 +867,15 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
         };
 
         let live_map = live_by_asset.get(asset);
-        let live_ids: HashSet<String> = live_map
+        // `live_map` drives ADOPTION into this asset's DB and must stay strictly
+        // this asset's positions. `live_ids` answers a different question for the
+        // purge — "does the wallet still hold this token?" — so the unmapped live
+        // tokens belong in it. Without them the purge deletes rows for shares that
+        // are demonstrably still held and books an invented exit price.
+        let mut live_ids: HashSet<String> = live_map
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
+        live_ids.extend(unmapped_live_ids.iter().cloned());
 
         // ── Settled-and-already-redeemed positions ───────────────────────────
         //
@@ -992,7 +1032,14 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
             if let Some(latest_snap) = db::get_pnl_history(&pool, 1).await.into_iter().next() {
                 if let Ok(collateral) = latest_snap.collateral.parse::<Decimal>() {
                     if collateral > Decimal::ZERO {
-                        let snap_session_pnl = latest_snap.session_pnl.parse::<Decimal>().unwrap_or(Decimal::ZERO);
+                        // Ask the ledger rather than copying the previous row's value
+                        // forward. That copy made this writer a second, weaker authority
+                        // over the figure: if the status task stalls, it would keep
+                        // republishing the last known number indefinitely, which is the
+                        // original freeze bug reintroduced through the back door.
+                        let snap_session_pnl = db::session_realized_pnl(
+                            &pool, crate::helpers::dynamic_config::ghosting_now()
+                        ).await;
                         let snap_total = collateral + live_positions_value;
                         db::record_pnl_snapshot(&pool, snap_session_pnl, collateral, snap_total).await;
                         debug!(" Chain-sync [{}]: wrote accurate pnl_snapshot — collateral=${:.4} positions=${:.4} total=${:.4}",
@@ -1050,7 +1097,13 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
         info!("⏳ Chain-sync: {} redeemable (settled) position(s) booked at resolution — auto_settle will claim the cash", redeemable_count);
     }
     if unmatched_titles > 0 {
-        warn!("⚠️ Chain-sync: {} live position(s) had unknown market-asset title and were not mapped to an asset DB", unmatched_titles);
+        warn!("⚠️ Chain-sync: {} live position(s) are held in the wallet but no shard currently tracks them \
+               and their market title names no asset, so this engine cannot classify them (it may never have \
+               opened them, or the row may have been removed earlier). They are protected from the stale purge and left in place, and they WILL still be \
+               booked when the market resolves (the redeemable and resolution paths key on the token, not \
+               the title), but no viper manages them meanwhile: no stop and no take-profit. Token(s): {}",
+              unmatched_titles,
+              unmapped_live_ids.iter().map(|t| t[..t.len().min(14)].to_string()).collect::<Vec<_>>().join(", "));
     }
     if total_purged == 0 && total_adopted == 0 {
         info!("✅ Chain-sync: open_positions DB(s) in sync with on-chain holdings ({} live, {} redeemable, {} asset DB(s))",
@@ -1938,4 +1991,39 @@ mod settlement_evidence_tests {
             "the type filter must be honored server-side"
         );
     }
+
+    /// A market title naming no asset must be recognized as UNROUTABLE, never as
+    /// absent from the wallet.
+    ///
+    /// `infer_asset_from_title` matches only bitcoin, ethereum and solana, so a
+    /// sports market returns None and its live position cannot be routed to an
+    /// asset shard. Before 2026-09-17 such a position was dropped from
+    /// `live_by_asset` and therefore from every shard's `live_ids`, which
+    /// `purge_stale_open_positions` reads as "the wallet no longer holds this":
+    /// it deleted the row and booked a fabricated exit at the last mark. The
+    /// shares had not moved. On one tennis market that cycled four times, writing
+    /// +$4.67 of profit that never happened while $15.14 of real collateral sat
+    /// in shares the engine had forgotten, and each purge made the Maker viper
+    /// believe it held nothing, so it bought again.
+    ///
+    /// This pins both halves: sports titles are unroutable, and crypto titles
+    /// still route, so protecting the former cannot have broken the latter.
+    #[test]
+    fn a_wallet_position_whose_title_names_no_asset_is_unroutable_not_absent() {
+        // The market that actually caused the incident, and its neighbors.
+        for title in [
+            "Valencia: Guiomar Maristany vs Marina Bassols Ribera",
+            "Devils vs. Flames",
+            "Will the Fed cut rates in December?",
+        ] {
+            assert_eq!(infer_asset_from_title(title), None,
+                       "{title} names no asset, so it cannot be routed to a shard");
+        }
+        // Routing for the markets DRADIS does trade must be unchanged.
+        assert_eq!(infer_asset_from_title("Bitcoin Up or Down - September 17, 4AM ET"), Some("btc"));
+        assert_eq!(infer_asset_from_title("Bitcoin Up or Down on June 7?"), Some("btc"));
+        assert_eq!(infer_asset_from_title("Will ETH exceed $3000?"), Some("eth"));
+        assert_eq!(infer_asset_from_title("Solana Up or Down on September 17?"), Some("sol"));
+    }
+
 }

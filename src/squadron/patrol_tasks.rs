@@ -605,7 +605,34 @@ pub fn spawn_status_task(
                             *live_collateral.lock().await = bal;
                             debug!(" Live pUSD balance: ${:.4}", bal);
                             if let Some(pool) = db::pool_for(&asset) {
-                                let pnl_snap = *total_pnl.lock().await;
+                                // Derived from the ledger, not from the in-memory
+                                // counter: every writer that books a trade row is
+                                // counted automatically, including the settlement
+                                // and reconciliation paths that touch no counter.
+                                // `total_pnl` is deliberately left in place — it
+                                // still gates the vipers' drawdown limit, which is
+                                // a separate concern from what the chart plots.
+                                let pnl_snap = db::session_realized_pnl(
+                                    &pool, crate::helpers::dynamic_config::ghosting_now()
+                                ).await;
+                                // Feed the ledger figure back into the counter the
+                                // vipers' drawdown limit reads.
+                                //
+                                // Without this the chart and the risk gate disagree:
+                                // a LOSING settlement — the highest-stakes event a
+                                // drawdown limit exists to catch — would move the
+                                // chart and leave the gate blind, letting Momentum
+                                // and FairValue keep entering past what should be a
+                                // real-money stop. That is worse than the previous
+                                // state, where both were wrong together.
+                                //
+                                // Writing it here rather than teaching the settlement
+                                // path to increment is deliberate: `cleanup.rs` has no
+                                // handle to any squadron's SessionState, and threading
+                                // one in is the fragile pattern that produced this bug
+                                // three times. The gate is now ledger-derived at a
+                                // bounded 60 s lag instead of permanently blind.
+                                *total_pnl.lock().await = pnl_snap;
 
                                 // Calculate total portfolio value: cash + mark-to-market positions
                                 let positions_value = calculate_positions_value(&pool, &trading_client).await;

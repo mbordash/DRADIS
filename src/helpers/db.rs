@@ -1504,6 +1504,70 @@ pub async fn record_sports_line_result(pool: &SqlitePool, condition_id: &str, to
     }
 }
 
+/// Realized P&L for the current session, summed from the `trades` ledger.
+///
+/// The figure the Portfolio chart plots used to come from an in-memory counter
+/// (`SessionState::total_pnl`) that every code path booking a trade had to
+/// remember to increment. Three paths forgot, each found only after it had
+/// already misreported real money:
+///
+///   * orphan flattens, silently diverging by -$2.25 over 12 trades since July
+///     (`helpers/balance.rs`, fixed 2026-09-12);
+///   * a TimeDecay trim that sold 6 YES at $0.47 and never reached the ledger
+///     (`squadron/patrol_tasks.rs`, fixed 2026-09-12);
+///   * settlement and reconciliation bookings, which reach the database through
+///     `record_settlement_trade_idempotent` and touch no counter at all. On
+///     2026-09-16/17 that froze the chart at -$0.697 for fifteen hours across a
+///     +$2.16 settlement win, so a profitable night displayed as a loss.
+///
+/// Each of those was fixed by teaching one more writer to increment the counter,
+/// which leaves the next writer free to forget again. Summing the ledger ends the
+/// class instead: a trade that is in `trades` is counted, whoever wrote it and
+/// however it got there, and a path that books no row was never P&L to begin with.
+///
+/// Scoped to `session_id` and to the current ghost flag, so a simulated session
+/// reports simulated P&L and a live one reports live. Indexed by
+/// `idx_trades_session` and `idx_trades_session_ts`.
+pub async fn session_realized_pnl(pool: &SqlitePool, ghost: bool) -> Decimal {
+    // Summed in Rust over the stored text, not by SQLite.
+    //
+    // `pnl` is a TEXT column holding a Decimal. `SUM(CAST(pnl AS REAL))` would
+    // hand back a float, losing exactness on money, and the first version of this
+    // function then decoded that REAL into a String, which fails — and the
+    // `unwrap_or` swallowed the failure into a silent $0.00. A P&L figure that
+    // reads zero while looking healthy is the same class of bug this function
+    // exists to end, so the rows are fetched and parsed instead.
+    //
+    // A row whose text will not parse contributes zero rather than poisoning the
+    // whole figure, and says so, because one bad row must not blank the chart.
+    // A failed READ is not zero P&L. Defaulting the whole query to an empty Vec
+    // would republish $0.00 as though the session had booked nothing, which is
+    // the same "reads zero while looking healthy" failure this function exists to
+    // end — the per-row fallback below is honest because it logs; this one was not.
+    let rows: Vec<(String,)> = match sqlx::query_as(
+        "SELECT pnl FROM trades WHERE session_id = ? AND ghost = ?"
+    )
+    .bind(current_session_id())
+    .bind(ghost as i32)
+    .fetch_all(pool)
+    .await {
+        Ok(r) => r,
+        Err(e) => {
+            error!("❌ session P&L: could not read the trades ledger ({e}) — reporting $0.00 for this \
+                    snapshot, which is NOT a statement that the session is flat");
+            return Decimal::ZERO;
+        }
+    };
+    let mut total = Decimal::ZERO;
+    for (raw,) in rows {
+        match raw.parse::<Decimal>() {
+            Ok(v)  => total += v,
+            Err(_) => warn!("⚠️ session P&L: unparseable pnl {:?} in trades — counted as zero", raw),
+        }
+    }
+    total
+}
+
 pub async fn record_pnl_snapshot(pool: &SqlitePool, session_pnl: Decimal, collateral: Decimal, total_value: Decimal) {
     let ts = Utc::now().to_rfc3339();
     if let Err(e) = sqlx::query(
@@ -2546,6 +2610,61 @@ pub const SETTLEMENT_DEFER_MAX_SECS: i64 = 24 * 3600;
 /// definition, so a settlement lookup for one is meaningless (and booking one
 /// would corrupt the simulated ledger — see the ghost exclusion on
 /// `purge_stale_open_positions`).
+/// The asset shard that already holds an `open_positions` row for `token_id`, if any.
+///
+/// Chain-sync must decide which shard owns a live wallet position. It used to decide
+/// that by string-matching the market title against "bitcoin", "ethereum" and
+/// "solana" (`infer_asset_from_title`), which is a guess at information the engine
+/// already has: every row this engine writes records its `squadron_id`,
+/// `market_class` and `underlying` at entry. A market outside those three words —
+/// a sports moneyline, say — matched nothing and routed nowhere, and on 2026-09-17
+/// that caused the purge to delete a row for shares the wallet still held and book
+/// a fabricated exit, four times over, on one tennis market.
+///
+/// Asking the databases which one owns the token answers the question exactly for
+/// every position DRADIS opened, whatever its market is called. The title guess
+/// remains as the fallback for a token no shard has a row for, which is the genuine
+/// "bought outside DRADIS" case.
+///
+/// GHOST ROWS ARE NOT OWNERS. Ghost mode simulates against real market data and
+/// real token ids, so a simulated row can carry the same `token_id` as a position
+/// the wallet genuinely holds. `purge_stale_open_positions` excludes them for this
+/// reason and says why at length; the same exclusion belongs here, because the
+/// caller uses this answer to write real chain shares and prices onto the row it
+/// points at. Without the filter, an operator evaluating in ghost mode against a
+/// wallet holding real positions would watch chain data overwrite their paper
+/// ledger.
+///
+/// Read-only. There is no index on `token_id`, so this is a scan per shard, but
+/// `open_positions` holds only currently-open rows (tens at most) and this runs
+/// once per live wallet position per 300 s sweep.
+pub async fn asset_owning_token(token_id: &str) -> Option<String> {
+    let mut owners: Vec<String> = Vec::new();
+    for asset in available_assets() {
+        let Some(pool) = pool_for(&asset) else { continue };
+        let found: Option<(String,)> = sqlx::query_as(
+            "SELECT token_id FROM open_positions WHERE token_id = ? AND ghost_mode = 0 LIMIT 1"
+        )
+        .bind(token_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap_or(None);
+        if found.is_some() {
+            owners.push(asset);
+        }
+    }
+    // More than one shard claiming the same token is the cross-asset leak this
+    // file's own comments record as previously observed. Picking the first
+    // alphabetically would hide it, and the wrong shard may be the unmanaged one,
+    // so say so and take the first deterministically.
+    if owners.len() > 1 {
+        warn!("⚠️ Chain-sync: token {} has an open_positions row in MORE THAN ONE shard ({}). \
+               Routing to '{}'. This is cross-asset row leakage and the other shard's row is stale.",
+              &token_id[..token_id.len().min(14)], owners.join(", "), owners[0]);
+    }
+    owners.into_iter().next()
+}
+
 pub async fn confirmed_open_positions(pool: &SqlitePool) -> Vec<(String, String)> {
     sqlx::query_as::<_, (String, String)>(
         "SELECT token_id, ts FROM open_positions
@@ -4120,6 +4239,7 @@ pub async fn set_llm_action_outcome(
 #[cfg(test)]
 mod reconcile_tests {
     use super::*;
+    use rust_decimal_macros::dec;
     use std::collections::{HashMap, HashSet};
 
     /// A brand-new database must be able to queue a deployment.
@@ -4134,6 +4254,141 @@ mod reconcile_tests {
     /// Asserting the INSERT rather than the column list, because the INSERT is
     /// what actually breaks and it fails the same way whichever mechanism is
     /// meant to supply the column.
+    /// Chain-sync must route a live wallet position by the shard that already holds
+    /// a row for it, not by string-matching its market title.
+    ///
+    /// The title guess (`infer_asset_from_title`) only knows bitcoin, ethereum and
+    /// solana. On 2026-09-17 a Maker position on "Valencia: Guiomar Maristany vs
+    /// Marina Bassols Ribera" matched none of them, routed nowhere, and the purge
+    /// read that as "the wallet no longer holds this": it deleted the row and booked
+    /// a fabricated exit at the last mark, four times, while $15.14 of real
+    /// collateral sat in shares the engine had forgotten. Every row this engine
+    /// writes records what the position is, so the ownership question is answerable
+    /// exactly and the guess is only a fallback for positions opened elsewhere.
+    #[tokio::test]
+    async fn a_token_routes_by_the_shard_that_owns_it_whatever_the_title_says() {
+        let pool = memory_pool_for_tests().await;
+        // `market_class`, `underlying` and `venue` are migration-added columns, and
+        // the point of this test is that a REAL sports row routes by ownership, so
+        // the row must carry what a real one carries.
+        run_migrations(&pool).await;
+        pools_map().lock().unwrap().insert("ownertest".into(), pool.clone());
+
+        // A sports position, whose title names no asset at all.
+        let tennis = "114286303372136578654707647172517537065594957593718919039773485288226325468599";
+        sqlx::query(
+            "INSERT INTO open_positions (ts, session_id, strategy, token_id, market, side, entry_price, \
+             shares, squadron_id, market_class, underlying) \
+             VALUES ('2026-09-17T07:53:06Z','2026-09-17T07:44:13Z','MakerStrategy',?, \
+             'Valencia: Guiomar Maristany vs Marina Bassols Ribera','YES','0.47','17.02', \
+             'sports-open','sports','sports')"
+        )
+        .bind(tennis)
+        .execute(&pool)
+        .await
+        .expect("the row inserts");
+
+        assert_eq!(asset_owning_token(tennis).await.as_deref(), Some("ownertest"),
+                   "a shard holding the row owns the token, whatever the market is called");
+
+        // A token no shard has a row for: ownership answers None, so the caller
+        // falls back to the title guess. That is the position-bought-elsewhere case.
+        assert_eq!(asset_owning_token("999999999999999999").await, None,
+                   "a token with no row is owned by no shard");
+
+        pools_map().lock().unwrap().remove("ownertest");
+    }
+
+    /// A ghost row must never be treated as owning a token.
+    ///
+    /// Ghost mode simulates against real market data and real token ids, so a
+    /// paper position can carry the same `token_id` the wallet genuinely holds.
+    /// `purge_stale_open_positions` excludes ghost rows for exactly this reason.
+    /// Chain-sync uses the ownership answer to write real chain shares and prices
+    /// onto the row it names, so if a ghost row could answer "mine", an operator
+    /// evaluating in ghost mode against a funded wallet would watch real chain
+    /// data overwrite their simulated ledger.
+    #[tokio::test]
+    async fn a_ghost_row_is_not_an_owner() {
+        let pool = memory_pool_for_tests().await;
+        run_migrations(&pool).await;
+        pools_map().lock().unwrap().insert("ghosttest".into(), pool.clone());
+
+        let token = "5981679391209254450212162599561647944275928677097438514337583415909";
+        sqlx::query(
+            "INSERT INTO open_positions (ts, session_id, strategy, token_id, market, side, entry_price, \
+             shares, ghost_mode) \
+             VALUES ('2026-09-17T07:53:06Z','2026-09-17T07:44:13Z','MakerStrategy',?, \
+             'Bitcoin Up or Down - September 17, 7AM ET','YES','0.63','6.18',1)"
+        )
+        .bind(token)
+        .execute(&pool)
+        .await
+        .expect("the ghost row inserts");
+
+        assert_eq!(asset_owning_token(token).await, None,
+                   "a ghost row must not claim ownership: chain data would overwrite a simulated position");
+
+        // The same token as a REAL row is owned, so the filter excludes ghosts
+        // rather than breaking ownership altogether.
+        sqlx::query("UPDATE open_positions SET ghost_mode = 0 WHERE token_id = ?")
+            .bind(token)
+            .execute(&pool)
+            .await
+            .expect("the update applies");
+        assert_eq!(asset_owning_token(token).await.as_deref(), Some("ghosttest"),
+                   "a real row for the same token is owned");
+
+        pools_map().lock().unwrap().remove("ghosttest");
+    }
+
+    /// The chart's session figure must count a settlement booking.
+    ///
+    /// This is the 2026-09-16/17 failure exactly: trade 45 (a viper exit) moved
+    /// the counter to -$0.697 and trade 50 (+$2.16, booked at resolution through
+    /// `record_settlement_trade_idempotent`) did not, because that path touches no
+    /// counter. The figure sat frozen for fifteen hours and a profitable night
+    /// displayed as a loss. Summing the ledger counts whoever wrote the row.
+    #[tokio::test]
+    async fn a_settlement_booking_reaches_the_session_figure() {
+        let pool = memory_pool_for_tests().await;
+        run_migrations(&pool).await;
+        let scope = crate::state::TradeScope::crypto("btc", "polymarket-intl", "btc");
+
+        // A viper exit, the kind that always counted.
+        record_trade_db(&pool, &scope, dec!(0.21), "GboostStrategy", "Bitcoin Up or Down - 5PM ET",
+                        "NO", dec!(0.60), dec!(0.52), dec!(6.1), dec!(-0.697),
+                        "GBoostPlanBSL: bid=$0.5200", None).await;
+        assert_eq!(session_realized_pnl(&pool, false).await, dec!(-0.697));
+
+        // The settlement booking that used to vanish from the figure.
+        let booked = record_settlement_trade_idempotent(
+            &pool, &scope, "GboostStrategy", "Bitcoin Up or Down - 4AM ET", "YES",
+            dec!(0.6299), dec!(1), dec!(6.0952), dec!(2.156), dec!(0.099),
+            "Settlement (won — pending redemption)", None,
+        ).await;
+        assert!(booked, "the settlement row inserts");
+        assert_eq!(session_realized_pnl(&pool, false).await, dec!(1.459),
+                   "a settlement booking must move the session figure");
+
+        // Ghost rows belong to a simulated session, never to the live one.
+        let mut ghost_scope = scope.clone();
+        ghost_scope.ghost = true;
+        record_trade_db(&pool, &ghost_scope, dec!(0), "MakerStrategy", "Simulated",
+                        "YES", dec!(0.50), dec!(0.90), dec!(10), dec!(4.0),
+                        "ghost fill", None).await;
+        assert_eq!(session_realized_pnl(&pool, false).await, dec!(1.459),
+                   "a ghost row must not reach the live figure");
+        assert_eq!(session_realized_pnl(&pool, true).await, dec!(4.0),
+                   "and the ghost session sees only its own");
+
+        // A different session's rows are not this session's P&L.
+        sqlx::query("UPDATE trades SET session_id = 'an-older-session' WHERE pnl = '2.156'")
+            .execute(&pool).await.expect("the update applies");
+        assert_eq!(session_realized_pnl(&pool, false).await, dec!(-0.697),
+                   "only this session counts");
+    }
+
     #[tokio::test]
     async fn a_fresh_database_can_queue_a_deployment() {
         let pool = SqlitePoolOptions::new()
