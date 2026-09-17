@@ -117,7 +117,11 @@ async fn prepare(State(s): State<ApiState>, body: axum::body::Bytes) -> Response
     }
     // Retirement already refuses every new order; standing the squadrons down
     // stops them evaluating at all, so the databases go quiet before the snapshot.
-    s.cag.stand_down_all();
+    //
+    // Squadrons only: `stand_down_all()` also aborts the per-asset loop tasks that
+    // `main.rs` awaits as the last statement of `run()`, which ends the process and
+    // destroys the backup task spawned just below before it can write anything.
+    s.cag.stand_down_squadrons();
     info!("📦 Migration: preparing a backup (training data {})", if include_training_data { "included" } else { "left out" });
 
     let cag = s.cag.clone();
@@ -140,6 +144,32 @@ async fn prepare(State(s): State<ApiState>, body: axum::body::Bytes) -> Response
             bundle: crate::api::setup::config_bundle_value().await,
             pools: crate::helpers::db::all_pools(),
         };
+        // The watchdog stands down for the duration: every heartbeat store site is
+        // inside a squadron patrol, and they are all down by now.
+        //
+        // The park is released by a DROP GUARD rather than a straight-line call.
+        // Only the two heaviest steps of `build_backup` run under `spawn_blocking`,
+        // which turns a panic into an `Err`; everything else (the VACUUM queries,
+        // the manifest write, the free-space check) panics straight through the
+        // await. A missed unpark would leave `PARKED_FOR_BACKUP` true for the life
+        // of the process, silently disarming the OS watchdog — the one recovery
+        // path that survives a wedged tokio runtime. Trading would continue with no
+        // crash safety net and nothing in the log to say so.
+        struct ParkGuard;
+        impl Drop for ParkGuard {
+            fn drop(&mut self) {
+                crate::helpers::watchdog::unpark_from_backup();
+                // A panic unwinds past `set_progress("ready")`, so the phase would
+                // stay mid-flight and `backup_in_progress()` would answer 409 to
+                // every later attempt. Nothing restarts the engine to clear that
+                // now, so the wedge would be permanent.
+                if mig::backup_in_progress() {
+                    mig::fail_progress("the backup task ended unexpectedly (panic)");
+                }
+            }
+        }
+        crate::helpers::watchdog::park_for_backup();
+        let _park = ParkGuard;
         if let Err(e) = mig::build_backup(work(), inputs).await {
             error!("❌ Instance backup failed: {e:#}");
             mig::fail_progress(&format!("{e:#}"));
@@ -204,6 +234,19 @@ struct RestoreQuery {
 /// How often free space is rechecked while an upload streams in.
 const SPACE_CHECK_EVERY: u64 = 256 * 1024 * 1024;
 
+/// Phrase a size mismatch the way an operator reads it, so the message says what
+/// went wrong rather than only quoting two numbers.
+fn describe_shortfall(received: u64, expected: u64) -> String {
+    if received > expected {
+        return "more arrived than the browser said it would send".to_string();
+    }
+    let missing = expected - received;
+    match expected {
+        0 => "nothing arrived".to_string(),
+        _ => format!("{:.0}% of the backup is missing", (missing as f64 / expected as f64) * 100.0),
+    }
+}
+
 /// POST /api/migration/restore?overwrite=: receive an archive as the raw request
 /// body, verify it and stage it for the next restart. Answers 409 with
 /// `needs_overwrite` when this instance already has trades.
@@ -267,6 +310,26 @@ async fn restore_upload(Query(q): Query<RestoreQuery>, body: Body) -> Response {
     }
     drop(file);
 
+    // A stream that ends early is not an error on the stream: the loop above just
+    // stops. Without this the short file is staged as though it were whole, and the
+    // operator sees a raw zlib failure from deep inside the extract instead of being
+    // told the transfer did not finish.
+    if let Some(size) = q.size {
+        if received != size {
+            warn!("📥 Migration: upload did not finish — {received} bytes of {size} arrived; the partial file was discarded");
+            let _ = tokio::fs::remove_file(&path).await;
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "the upload did not finish: {received} bytes of {size} arrived ({}). \
+                     Nothing was restored. Check the connection and upload the backup again.",
+                    describe_shortfall(received, size),
+                ),
+            );
+        }
+    }
+    info!("📥 Migration: upload received in full ({received} bytes); verifying the archive");
+
     let (existing_trades, _) = instance_counts().await;
     let venue = crate::api::setup::build_venue();
     let version = env!("CARGO_PKG_VERSION");
@@ -286,8 +349,14 @@ async fn restore_upload(Query(q): Query<RestoreQuery>, body: Body) -> Response {
             })),
         )
             .into_response(),
-        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e.to_string()),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("verifying the upload: {e}")),
+        Ok(Err(e)) => {
+            warn!("📥 Migration: the uploaded archive was rejected: {e}");
+            error_response(StatusCode::BAD_REQUEST, e.to_string())
+        }
+        Err(e) => {
+            error!("📥 Migration: verifying the upload panicked: {e}");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("verifying the upload: {e}"))
+        }
     }
 }
 
@@ -305,4 +374,21 @@ async fn restore_apply() -> Response {
 async fn restore_discard() -> Response {
     mig::discard_staged_restore(work());
     Json(json!({ "ok": true })).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::describe_shortfall;
+
+    #[test]
+    fn a_truncated_upload_is_described_as_a_shortfall() {
+        assert_eq!(describe_shortfall(43_022_448, 71_704_081), "40% of the backup is missing");
+        assert_eq!(describe_shortfall(0, 71_704_081), "100% of the backup is missing");
+        assert_eq!(describe_shortfall(71_704_082, 71_704_081), "more arrived than the browser said it would send");
+    }
+
+    #[test]
+    fn a_zero_length_declaration_does_not_divide_by_zero() {
+        assert_eq!(describe_shortfall(0, 0), "nothing arrived");
+    }
 }

@@ -399,7 +399,38 @@ impl Cag {
         }
     }
 
-    /// Stand down ALL active squadrons and asset loops (e.g. on SIGTERM).
+    /// Stand down every squadron while LEAVING the per-asset loop tasks running.
+    ///
+    /// `main.rs` awaits those loop handles as the last statement of `run()`, so
+    /// aborting them ends `run()`, returns from `block_on` and exits the process.
+    /// That is fatal during a migration backup: `prepare` called `stand_down_all()`
+    /// and the engine killed
+    /// itself about 150 ms later, taking the freshly spawned backup task with the
+    /// runtime. It happened on every attempt (2026-09-17, three in a row), leaving
+    /// the instance retired with no archive and a blank progress state, because
+    /// `PROGRESS` is in memory while `retired.json` is on disk. The operator saw a
+    /// modal that never produced a download link.
+    ///
+    /// Cancelling the squadrons alone is enough for a quiet snapshot: retirement
+    /// already refuses new orders (`refuse_if_retired` on every order path), and
+    /// both the market loop (`cag::run`) and the deployment processor
+    /// (`venues::deployment`) check `is_retired()` and keep squadrons down, so the
+    /// surviving asset loops idle rather than re-deploying during the backup.
+    pub fn stand_down_squadrons(&self) {
+        for entry in self.inner.registry.iter() {
+            entry.cancel_token.cancel();
+        }
+        info!("🛬  CAG: stand-down signal broadcast to all squadrons (asset loops left running)");
+    }
+
+    /// Stand down ALL active squadrons and asset loops.
+    ///
+    /// NOTE (2026-09-17): this has NO production caller. SIGTERM does not reach it
+    /// — `shutdown::spawn_signal_handler` and the Setup restart handler both run
+    /// the shutdown hook and call `process::exit(0)` directly, never touching the
+    /// CAG. Its only remaining caller is a unit test. Aborting the asset loops ends
+    /// `run()` and exits the process, so wiring this into any live path re-creates
+    /// the migration self-kill described on `stand_down_squadrons`. Prefer that one.
     ///
     /// Fires cancellation tokens on every registered squadron entry AND every
     /// per-asset `run_market_loop` task, then aborts each loop task handle to
@@ -512,6 +543,48 @@ impl SquadronBuilder {
 #[cfg(test)]
 mod adama_registration_tests {
     use super::*;
+
+    /// A migration backup must not kill the process that is building it.
+    ///
+    /// `main.rs` awaits the per-asset loop `JoinHandle`s as the last statement of
+    /// `run()`. Aborting those handles therefore ends `run()`, returns from
+    /// `block_on` and exits the process — fatal
+    /// during `POST /api/migration/prepare`, which spawns the backup onto that same
+    /// runtime. On 2026-09-17 prepare called `stand_down_all()` and the engine
+    /// exited 0 about 150 ms later, three attempts in a row, each leaving the
+    /// instance retired (the flag is on disk) with no archive and a blank progress
+    /// state (the progress is in memory). The operator saw a modal that never
+    /// produced a download link, and `build_backup` never ran at all.
+    ///
+    /// So the two must stay distinguishable: squadrons down, asset loops alive.
+    #[tokio::test]
+    async fn standing_down_squadrons_leaves_the_asset_loops_running() {
+        let cag = Cag::new();
+        let squadron_cancel = CancellationToken::new();
+        cag.register_adama_squadron(
+            "btc-open", "0xmarket", "crypto", "Bitcoin Up or Down?",
+            &["price".to_string()], &["gboost".to_string()],
+            squadron_cancel.clone(),
+        );
+
+        // An asset loop task that would outlive the squadrons, as main.rs spawns.
+        let loop_cancel = CancellationToken::new();
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        cag.register_loop_task("btc", handle.abort_handle(), loop_cancel.clone());
+
+        cag.stand_down_squadrons();
+        assert!(squadron_cancel.is_cancelled(), "the squadron must stand down");
+        assert!(!loop_cancel.is_cancelled(), "the asset loop's token must NOT be cancelled");
+        assert!(!handle.is_finished(),
+                "the asset loop task must still be running, or main's join returns and the process exits");
+
+        // The SIGTERM path still takes everything down, which is what it is for.
+        cag.stand_down_all();
+        assert!(loop_cancel.is_cancelled(), "stand_down_all cancels the asset loop");
+        let _ = handle.await;
+    }
 
     /// The registry's token must BE the token the patrol task selects on.
     ///

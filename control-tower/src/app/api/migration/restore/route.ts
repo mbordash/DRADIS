@@ -28,11 +28,18 @@
  */
 import type { NextRequest } from 'next/server';
 import { ENGINE_API_BASE, engineHeaders } from '@/lib/engineUpstream';
+import { basicAuthFailure } from '@/lib/basicAuth';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 export async function POST(req: NextRequest) {
+  // This route is excluded from the Basic Auth middleware, because Next.js
+  // truncates the cloned request body it hands to middleware at 10 MB. The same
+  // check runs here instead, before a single byte is forwarded.
+  const unauthorized = basicAuthFailure(req);
+  if (unauthorized) return unauthorized;
+
   const search = new URL(req.url).search;
   try {
     const init: RequestInit & { duplex: 'half' } = {

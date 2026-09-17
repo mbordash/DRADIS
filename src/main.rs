@@ -326,6 +326,46 @@ async fn run() -> Result<()> {
                     }
                     continue;
                 }
+                // A migration backup is long and runs with every squadron stood
+                // down, so nothing pulses the heartbeat while it works. Killing it
+                // at 300 s would leave the instance retired with no archive — the
+                // same end state as the self-kill this park was added alongside.
+                // A RETIRED instance is the same starvation, and it is permanent.
+                //
+                // Retirement keeps every squadron down by design (`cag::run` and
+                // `venues::deployment` both check `is_retired()`), and every
+                // heartbeat store site lives inside a squadron patrol or its status
+                // task. So a retired engine never pulses the heartbeat and the
+                // watchdog kills it every 300 s, forever. Observed on production
+                // 2026-09-17: retired at 18:24, then exit(1) at 18:30, 18:36,
+                // 18:42, 18:48, 18:54 — a six-minute crash loop, with the log
+                // reading "trading loop silent for 360s — frozen phase=CHAIN_SYNC".
+                // The operator was trying to migrate off that box at the time.
+                //
+                // Retirement is deliberate idleness, exactly like awaiting setup:
+                // no orders can be placed (`refuse_if_retired` guards every order
+                // path), so there is nothing for the watchdog to protect.
+                if dradis::helpers::migration::is_retired()
+                    || dradis::helpers::watchdog::is_parked_for_backup() {
+                    if !parked_noted {
+                        eprintln!(
+                            " OS WATCHDOG: instance retired or a migration backup is running — \
+                             standing down until it trades again"
+                        );
+                        parked_noted = true;
+                    }
+                    // Keep the heartbeat fresh while parked, or the watchdog
+                    // inherits a stale baseline the moment it re-arms. Nothing
+                    // pulses it during a backup: every store site is inside a
+                    // squadron patrol and they are all stood down. Without this,
+                    // `silent_secs` at unpark is the standdown wait PLUS the whole
+                    // backup, so the next tick after a SUCCESSFUL long backup goes
+                    // straight to the hard kill with no soft warning — exactly the
+                    // backups this park exists to protect, and an ungraceful exit
+                    // moments after the archive lands.
+                    hb.store(now_secs, AtomicOrdering::Relaxed);
+                    continue;
+                }
                 // Lock-free read of the last activity breadcrumb — safe even if the
                 // tokio runtime is fully wedged on a std::sync primitive.
                 let (phase, phase_secs, seq) = dradis::helpers::watchdog::snapshot();

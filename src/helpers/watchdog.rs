@@ -103,6 +103,38 @@ pub fn is_parked_for_setup() -> bool {
     PARKED_FOR_SETUP.load(Ordering::Relaxed)
 }
 
+static PARKED_FOR_BACKUP: AtomicBool = AtomicBool::new(false);
+
+/// Declare that a migration backup is running; the OS watchdog stands down.
+///
+/// Every heartbeat store site lives inside an active squadron's patrol or its
+/// status task, so once `prepare` stands the squadrons down NOTHING pulses the
+/// heartbeat. The backup itself is long: on the instance this was found on it
+/// must `VACUUM INTO` the ledger and then copy, hash and gzip about 405 MB (335
+/// of it GBoost training data, included by default) on two vCPUs. If that runs
+/// past the watchdog's 300 s the watchdog calls `process::exit(1)` and kills the
+/// backup — reproducing, by a second route, exactly the failure this whole area
+/// was just fixed for: a retired instance, no archive, and a modal that never
+/// shows a download link.
+///
+/// UNLIKE `park_for_setup`, this MUST be paired with `unpark_from_backup`: setup
+/// ends in a restart, so its park never needs clearing, but an engine goes on
+/// trading after a backup and an unpaired park would leave the watchdog disabled
+/// for the life of the process.
+pub fn park_for_backup() {
+    PARKED_FOR_BACKUP.store(true, Ordering::Relaxed);
+}
+
+/// The backup is over (succeeded or failed); re-arm the OS watchdog.
+pub fn unpark_from_backup() {
+    PARKED_FOR_BACKUP.store(false, Ordering::Relaxed);
+}
+
+/// Whether a migration backup is running.
+pub fn is_parked_for_backup() -> bool {
+    PARKED_FOR_BACKUP.load(Ordering::Relaxed)
+}
+
 static CURRENT_PHASE: AtomicU8 = AtomicU8::new(Phase::Idle as u8);
 static PHASE_SINCE_SECS: AtomicU64 = AtomicU64::new(0);
 static PHASE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -335,6 +367,23 @@ mod park_and_label_tests {
     /// customer entering credentials watched the engine crash-loop — twice on a
     /// fresh ami.4 box before a venue was even chosen.
     #[test]
+    /// The backup park must be reversible, unlike the setup park.
+    ///
+    /// Setup ends in a restart, so `park_for_setup` never needs clearing. A
+    /// migration backup does not: the engine goes on trading afterwards, so a
+    /// park that was never cleared would leave the OS watchdog disabled for the
+    /// life of the process — the engine could wedge and nothing would restart it.
+    #[test]
+    fn the_backup_park_is_reversible() {
+        assert!(!is_parked_for_backup(), "must not start parked");
+        park_for_backup();
+        assert!(is_parked_for_backup(), "the watchdog must be able to see the park");
+        unpark_from_backup();
+        assert!(!is_parked_for_backup(), "and the park MUST clear, or the watchdog never re-arms");
+        // Global flag in a shared test binary — leave it as we found it.
+        PARKED_FOR_BACKUP.store(false, Ordering::Relaxed);
+    }
+
     fn parking_is_reported_and_is_not_a_stall() {
         assert!(!is_parked_for_setup(), "must not start parked");
         park_for_setup();

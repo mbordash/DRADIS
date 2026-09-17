@@ -26,42 +26,24 @@
  *   CT_PASSWORD=your-strong-password
  */
 import { NextRequest, NextResponse } from 'next/server';
+import { basicAuthFailure } from '@/lib/basicAuth';
 
 export function middleware(req: NextRequest) {
-  const expectedUser = process.env.CT_USERNAME;
-  const expectedPass = process.env.CT_PASSWORD;
-
-  // No credentials configured → open access (local dev / intentional)
-  if (!expectedUser || !expectedPass) {
-    return NextResponse.next();
-  }
-
-  const authHeader = req.headers.get('authorization') ?? '';
-  if (authHeader.startsWith('Basic ')) {
-    const encoded = authHeader.slice(6);
-    const decoded = Buffer.from(encoded, 'base64').toString('utf-8');
-    const colon   = decoded.indexOf(':');
-    if (colon !== -1) {
-      const user = decoded.slice(0, colon);
-      const pass = decoded.slice(colon + 1);
-      if (user === expectedUser && pass === expectedPass) {
-        return NextResponse.next();
-      }
-    }
-  }
-
-  // Prompt the browser for credentials
-  return new NextResponse('Unauthorized', {
-    status: 401,
-    headers: {
-      'WWW-Authenticate': 'Basic realm="DRADIS Control Tower", charset="UTF-8"',
-    },
-  });
+  return basicAuthFailure(req) ?? NextResponse.next();
 }
 
 export const config = {
   // Apply to every route except Next.js internals and the public icons (so the login
-  // prompt's tab shows them before credentials are sent)
-  matcher: ['/((?!_next/static|_next/image|favicon.ico|icon.svg|apple-icon.png).*)'],
+  // prompt's tab shows them before credentials are sent).
+  //
+  // `api/migration/restore` is excluded for a different reason: Next.js clones the
+  // request body for every middleware-matched route and silently truncates that
+  // clone at `middlewareClientMaxBodySize` (10 MB), which cut a 71 MB backup upload
+  // down to 10 MB. The route checks Basic Auth itself, so it stays protected.
+  // The `$` matters: without it the exclusion is a prefix and would also drop
+  // `restore/apply` and `restore/discard`, which restart the engine, out of auth.
+  matcher: [
+    '/((?!_next/static|_next/image|favicon.ico|icon.svg|apple-icon.png|api/migration/restore$).*)',
+  ],
 };
 
