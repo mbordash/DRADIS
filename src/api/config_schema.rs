@@ -809,6 +809,33 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              in the settlement-snipe posture rests nothing because its target price does not exist. Replay of \
              the first four live entries (2026-09-06): lifted in two, saving $0.362 — 40% of all fees paid \
              across the first three trades. Off restores the taker take-profit."));
+        v.push(F::new(g, e, "fairvalue_settle_hold_secs", "Settlement Hold Window", "secs", true,
+            "How long before expiry a confident position may decline its Take Profit and ride to settlement \
+             instead, collecting $1.00 with no exit fee. Inside this window a position whose model still reads \
+             at least the Settlement Hold Confidence skips the taker take-profit; outside it, the take-profit \
+             behaves normally. Widening this holds more positions to settlement, which trades a booked profit \
+             now for a larger fee-free one that depends on the contract actually settling in your favor.")
+            .min(0.0).step(60.0).unit("s"));
+        v.push(F::new(g, e, "fairvalue_settle_hold_min_prob", "Settlement Hold Confidence", "decimal", true,
+            "Model probability required before a position inside the Settlement Hold Window gives up a bankable \
+             take-profit for the $1.00 settlement. Lowering it means less certainty is demanded before passing \
+             on real profit, so more holds end at $0.00 instead of $1.00.")
+            .range(0.5, 1.0).step(0.01));
+        v.push(F::new(g, e, "fairvalue_bail_secs", "Endgame Bail Window", "secs", true,
+            "How long before expiry a fading side is sold rather than gambled on settlement. Inside this window \
+             a position whose model has dropped below the Endgame Bail Confidence is exited even at a loss, on \
+             the reasoning that a losing binary near expiry is far more likely to settle at $0.00 than recover.")
+            .min(0.0).step(30.0).unit("s"));
+        v.push(F::new(g, e, "fairvalue_bail_prob", "Endgame Bail Confidence", "decimal", true,
+            "Model probability below which the endgame bail-out fires inside its window. Raising it bails out \
+             of more positions earlier, taking more small certain losses to avoid fewer total ones.")
+            .range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "fairvalue_min_exit_bid", "Min Exit Bid", "price", true,
+            "Bid below which a position is treated as unexitable and no sell is attempted, because an order into \
+             a vaporised bid cannot fill. Read this as a hold decision, not just an exit-eligibility floor: \
+             raising it widens the band in which a collapsed position stops being sellable at all and therefore \
+             rides to settlement by default, which is the opposite of what a higher floor sounds like it does.")
+            .range(0.0, 0.5).step(0.005));
         v.push(F::new(g, e, "fairvalue_post_exit_cooldown_secs", "Post-Exit Cooldown", "secs", true,
             "Seconds a token is locked out after any FairValue exit. Second entries into a market the viper had \
              just left went 0-for-4 for −$1.88 gross on 2026-08-13/14 while first entries were flat, and the \

@@ -319,6 +319,11 @@ fn default_maker_tp_fee_margin_mult()             -> Decimal { config::MAKER_TP_
 fn default_fairvalue_stop_veto_max_model_decay_pct() -> Decimal { config::FAIRVALUE_STOP_VETO_MAX_MODEL_DECAY_PCT }
 fn default_fairvalue_settle_snipe_hold()  -> bool    { config::FAIRVALUE_SETTLE_SNIPE_HOLD             }
 fn default_fairvalue_resting_tp_enabled() -> bool    { config::FAIRVALUE_RESTING_TP_ENABLED            }
+fn default_fairvalue_settle_hold_secs()     -> i64     { config::FAIRVALUE_SETTLE_HOLD_SECS            }
+fn default_fairvalue_settle_hold_min_prob() -> Decimal { decimal_from_f64(config::FAIRVALUE_SETTLE_HOLD_MIN_PROB) }
+fn default_fairvalue_bail_secs()            -> i64     { config::FAIRVALUE_BAIL_SECS                   }
+fn default_fairvalue_bail_prob()            -> Decimal { decimal_from_f64(config::FAIRVALUE_BAIL_PROB) }
+fn default_fairvalue_min_exit_bid()         -> Decimal { config::FAIRVALUE_MIN_EXIT_BID                }
 
 fn default_time_decay_max_fast_velocity_pct()      -> Decimal { config::TIME_DECAY_MAX_FAST_VELOCITY_PCT      }
 fn default_time_decay_max_slow_drift_pct()         -> Decimal { config::TIME_DECAY_MAX_SLOW_DRIFT_PCT         }
@@ -921,6 +926,33 @@ pub struct DynamicConfig {
     #[serde(default = "default_fairvalue_resting_tp_enabled")]
     pub fairvalue_resting_tp_enabled:     bool,
 
+    // ── FairValue: settlement hold vs. exit ──────────────────────────────────
+    // These five decide whether a position rides into settlement or is closed
+    // before it. They govern real money, not internals, so they are operator
+    // knobs rather than compile-time constants.
+    /// How long before expiry a confident position may decline its take-profit
+    /// and collect $1.00 at settlement instead, paying no exit fee. Longer
+    /// means more positions held to settlement.
+    #[serde(default = "default_fairvalue_settle_hold_secs")]
+    pub fairvalue_settle_hold_secs:       i64,
+    /// Model probability required to take that settlement hold. Lower means
+    /// less certainty is demanded before giving up a bankable take-profit.
+    #[serde(default = "default_fairvalue_settle_hold_min_prob")]
+    pub fairvalue_settle_hold_min_prob:   Decimal,
+    /// How long before expiry a fading side is dumped rather than gambled on
+    /// settlement.
+    #[serde(default = "default_fairvalue_bail_secs")]
+    pub fairvalue_bail_secs:              i64,
+    /// Model probability below which that endgame bail-out fires.
+    #[serde(default = "default_fairvalue_bail_prob")]
+    pub fairvalue_bail_prob:              Decimal,
+    /// Bid below which a position is treated as unexitable and no sell is
+    /// attempted. Raising this is a hold decision disguised as an exit-
+    /// eligibility floor: it widens the band in which a collapsed position
+    /// stops being sellable and therefore rides to settlement instead.
+    #[serde(default = "default_fairvalue_min_exit_bid")]
+    pub fairvalue_min_exit_bid:           Decimal,
+
     // ── Convergence Viper ─────────────────────────────────────────────────────
     #[serde(default = "default_convergence_enable")]
     pub enable_convergence:               bool,
@@ -1246,6 +1278,11 @@ impl Default for DynamicConfig {
             fairvalue_stop_model_confirm_frac: config::FAIRVALUE_STOP_MODEL_CONFIRM_FRAC,
             fairvalue_settle_snipe_hold:      config::FAIRVALUE_SETTLE_SNIPE_HOLD,
             fairvalue_resting_tp_enabled:     config::FAIRVALUE_RESTING_TP_ENABLED,
+            fairvalue_settle_hold_secs:       config::FAIRVALUE_SETTLE_HOLD_SECS,
+            fairvalue_settle_hold_min_prob:   decimal_from_f64(config::FAIRVALUE_SETTLE_HOLD_MIN_PROB),
+            fairvalue_bail_secs:              config::FAIRVALUE_BAIL_SECS,
+            fairvalue_bail_prob:              decimal_from_f64(config::FAIRVALUE_BAIL_PROB),
+            fairvalue_min_exit_bid:           config::FAIRVALUE_MIN_EXIT_BID,
 
             enable_convergence:               config::ENABLE_CONVERGENCE_TRADING,
             convergence_position_size_usdc:   config::CONVERGENCE_POSITION_SIZE_USDC,
@@ -1891,6 +1928,8 @@ mod tests {
         for added in [
             "fairvalue_stop_model_confirm_frac", "arb_settle_grace_secs", "fairvalue_settle_snipe_hold",
             "fairvalue_resting_tp_enabled", "momentum_resting_tp_enabled",
+            "fairvalue_settle_hold_secs", "fairvalue_settle_hold_min_prob",
+            "fairvalue_bail_secs", "fairvalue_bail_prob", "fairvalue_min_exit_bid",
             "convergence_max_fee_to_target_ratio", "convergence_tp_fee_margin_mult", "convergence_resting_tp_enabled",
             "gboost_planb_trade_size_usdc", "gboost_planb_margin", "gboost_planb_take_profit_pct", "gboost_planb_stop_loss_pct", "gboost_planb_tp_ceiling",
             "gboost_planb_min_ask", "gboost_planb_max_ask", "gboost_planb_first_minute", "gboost_planb_last_minute",

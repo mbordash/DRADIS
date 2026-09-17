@@ -1407,6 +1407,16 @@ impl Strategy for FairValueStrategyImpl {
         let dc = &ctx.dynamic_config;
         let positions = ctx.positions.lock().await;
 
+        // The two settlement probabilities are operator knobs stored as Decimal;
+        // the model reads as f64. Converted once here rather than per position.
+        // A failed conversion falls back to the compiled default, never to 0.0:
+        // a zero hold threshold would hold every position to settlement, and a
+        // zero bail threshold would disarm the endgame bail-out entirely.
+        let settle_hold_min_prob = dc.fairvalue_settle_hold_min_prob
+            .to_f64().unwrap_or(config::FAIRVALUE_SETTLE_HOLD_MIN_PROB);
+        let bail_prob = dc.fairvalue_bail_prob
+            .to_f64().unwrap_or(config::FAIRVALUE_BAIL_PROB);
+
         // Resting take-profit asks, deferred until every position has had its
         // hard exits evaluated: a healthy position's ask must never preempt a
         // stop still pending on another, since one signal leaves per tick.
@@ -1490,8 +1500,8 @@ impl Strategy for FairValueStrategyImpl {
                 // with nothing armed for as long as the bid stays above the target.
                 // Re-deciding each tick lets a collapse fall through to this taker
                 // take-profit, as it always has.
-                let settle_hold = secs_left < config::FAIRVALUE_SETTLE_HOLD_SECS
-                    && fair_side.map_or(false, |p| p >= config::FAIRVALUE_SETTLE_HOLD_MIN_PROB);
+                let settle_hold = secs_left < dc.fairvalue_settle_hold_secs
+                    && fair_side.map_or(false, |p| p >= settle_hold_min_prob);
                 if !settle_hold {
                     self.arm_cooldown(&ctx.crypto_filter, token_id.as_str());
                     return Ok(StrategySignal::Exit {
@@ -1511,7 +1521,7 @@ impl Strategy for FairValueStrategyImpl {
             let decay_pct = dc.fairvalue_model_reversal_decay_pct.to_f64().unwrap_or(0.0);
             let reversal_floor = baseline * (1.0 - decay_pct);
             if secs_held >= 60
-                && bid >= config::FAIRVALUE_MIN_EXIT_BID
+                && bid >= dc.fairvalue_min_exit_bid
                 && fair_side.map_or(false, |p| p < reversal_floor)
             {
                 self.arm_cooldown(&ctx.crypto_filter, token_id.as_str());
@@ -1527,16 +1537,16 @@ impl Strategy for FairValueStrategyImpl {
             }
 
             // ── 3. Endgame bail-out — don't gamble a fading side on settlement ─
-            if secs_left < config::FAIRVALUE_BAIL_SECS
-                && bid >= config::FAIRVALUE_MIN_EXIT_BID
-                && fair_side.map_or(false, |p| p < config::FAIRVALUE_BAIL_PROB)
+            if secs_left < dc.fairvalue_bail_secs
+                && bid >= dc.fairvalue_min_exit_bid
+                && fair_side.map_or(false, |p| p < bail_prob)
             {
                 self.arm_cooldown(&ctx.crypto_filter, token_id.as_str());
                 return Ok(StrategySignal::Exit {
                     params: exit_params(bid),
                     reason: format!(
                         "FairValueBail: {}s left, fair={:.3} < {:.2}, bid=${:.4}",
-                        secs_left, fair_side.unwrap_or(0.0), config::FAIRVALUE_BAIL_PROB, bid
+                        secs_left, fair_side.unwrap_or(0.0), bail_prob, bid
                     ),
                     exit_pair: false,
                 });
@@ -1551,7 +1561,7 @@ impl Strategy for FairValueStrategyImpl {
             // turned, which is the miscalibration the breaker exists to notice.
             if settle_snipe
                 && secs_held >= config::FAIRVALUE_MIN_HOLD_SECS_BEFORE_STOP_LOSS
-                && bid >= config::FAIRVALUE_MIN_EXIT_BID
+                && bid >= dc.fairvalue_min_exit_bid
             {
                 if let Some(net) = Self::settle_snipe_exit(fair_side, bid) {
                     self.arm_cooldown(&ctx.crypto_filter, token_id.as_str());
@@ -1663,7 +1673,7 @@ impl Strategy for FairValueStrategyImpl {
                     );
                 }
 
-                if bid < config::FAIRVALUE_MIN_EXIT_BID {
+                if bid < dc.fairvalue_min_exit_bid {
                     // Unfillable — an FAK into a vaporised bid just floods logs.
                     continue;
                 }
@@ -1739,8 +1749,8 @@ impl Strategy for FairValueStrategyImpl {
             {
                 let settle_hold = self.settle_hold_for_position(
                     &ctx.crypto_filter, token_id.as_str(), position.opened_at,
-                    secs_left < config::FAIRVALUE_SETTLE_HOLD_SECS
-                        && fair_side.map_or(false, |p| p >= config::FAIRVALUE_SETTLE_HOLD_MIN_PROB),
+                    secs_left < dc.fairvalue_settle_hold_secs
+                        && fair_side.map_or(false, |p| p >= settle_hold_min_prob),
                 );
                 if let Some(price) = Self::resting_tp_price(
                     avg_entry, dc.fairvalue_target_profit_pct, bid, settle_hold,
@@ -2787,6 +2797,169 @@ mod entry_book_tests {
         assert!((no - 0.136).abs() < 0.005, "fair(NO)={no}: the floor priced it 0.300");
         let yes = fair(true);
         assert!((yes - 0.701).abs() < 0.005, "fair(YES)={yes}: the favorite keeps the floored price");
+    }
+
+    /// E05: the settlement-hold thresholds are operator knobs, not constants, so
+    /// changing them must change what the viper does. Same position, same book,
+    /// same model reading — only the `DynamicConfig` values move. Compiling
+    /// against `dc` proves nothing on its own; this drives the real exit path and
+    /// watches the decision flip.
+    #[tokio::test]
+    async fn the_settlement_hold_knobs_change_the_exit_decision() {
+        use crate::state::Position;
+
+        fn position(c: &StrategyContext, opened: DateTime<Utc>) -> Position {
+            Position {
+                shares: dec!(5), avg_entry: dec!(0.80), opened_at: opened,
+                close_time: c.market.market_close_time,
+                market_name: c.market.market_name.clone(),
+                pair_token_id: c.market.no_token.clone(),
+                fill_confirmed_at: Some(opened), paired_leg_token_id: None,
+                entry_fee: dec!(0.02),
+            }
+        }
+        // Each case runs under its own asset. The settle-hold latch lives in a
+        // per-asset global keyed by token, not in the strategy instance, so
+        // sharing one asset would carry the first case's raised $0.99 into the
+        // next and every assertion would pass without the knob doing anything.
+        //
+        // Bid $0.94 on a $0.80 entry is +17.5%: under the 20% target, so rule 1
+        // stays quiet and the position rests an ask. Held, the ask is $0.99;
+        // not held, it is the ordinary target $0.96. That gap is the observable.
+        async fn resting_ask(asset: &str, tweak: impl FnOnce(&mut DynamicConfig)) -> Option<Decimal> {
+            seed_flat_vol(asset);
+            let mut hourly = book(dec!(200), dec!(150));
+            hourly.yes_bid = dec!(0.94); hourly.yes_bid_depth = dec!(50);
+            hourly.yes_ask = dec!(0.95);
+            hourly.no_bid = dec!(0.05); hourly.no_ask = dec!(0.06);
+            let mut c = ctx(hourly, book(dec!(100), dec!(100)));
+            c.crypto_filter = asset.to_string();
+            c.market.market_close_time = Some(Utc::now() + chrono::Duration::seconds(300));
+            c.snapshot.oracle_price = dec!(65110);
+
+            let mut dc = DynamicConfig::default();
+            dc.enable_fairvalue = true;
+            dc.fairvalue_resting_tp_enabled = true;
+            dc.fairvalue_target_profit_pct = dec!(0.20);
+            dc.fairvalue_stop_loss_pct = dec!(0.15);
+            dc.fairvalue_settle_snipe_hold = true;
+            dc.fairvalue_sigma_floor_horizon_secs = 0;
+            dc.fairvalue_min_sigma_per_sqrt_sec = dec!(0.000042);
+            dc.fairvalue_model_reversal_decay_pct = dec!(0.90);
+            tweak(&mut dc);
+            c.dynamic_config = Arc::new(dc);
+
+            let key = PositionKey::new(c.squadron_id.clone(), "FairValueStrategy", c.market.yes_token.clone());
+            let held = Utc::now() - chrono::Duration::seconds(100);
+            c.positions.lock().await.insert(key, position(&c, held));
+
+            let strat = FairValueStrategyImpl::default();
+            match strat.evaluate_exit(&c).await.expect("exit evaluation runs") {
+                StrategySignal::MakerRestingExit { params, .. } => Some(params.price),
+                _ => None,
+            }
+        }
+
+        // Defaults: 300s left is inside the 600s window and the model clears
+        // 0.90, so the position holds for settlement and rests at $0.99.
+        assert_eq!(
+            resting_ask("btc-settle-knob-default", |_| {}).await, Some(dec!(0.99)),
+            "default knobs should hold for settlement",
+        );
+
+        // Demand near-certainty instead. Nothing else moves, and the same model
+        // reading no longer earns the hold, so the ask drops to the target.
+        assert_eq!(
+            resting_ask("btc-settle-knob-prob", |dc| dc.fairvalue_settle_hold_min_prob = dec!(0.999)).await,
+            Some(dec!(0.96)),
+            "raising Settlement Hold Confidence must end the hold",
+        );
+
+        // Same again through the window rather than the probability: with 60s of
+        // hold window and 300s left, the position is outside it.
+        assert_eq!(
+            resting_ask("btc-settle-knob-window", |dc| dc.fairvalue_settle_hold_secs = 60).await,
+            Some(dec!(0.96)),
+            "narrowing Settlement Hold Window must end the hold",
+        );
+    }
+
+    /// E05: the endgame bail-out reads its window and its confidence from the
+    /// operator knobs. At 300s left the default 120s window keeps the bail-out
+    /// out of the way; widening it past the time remaining arms it.
+    #[tokio::test]
+    async fn the_endgame_bail_knobs_arm_and_disarm_the_bail_out() {
+        use crate::state::Position;
+
+        let asset = "btc-endgame-bail-knobs";
+        seed_flat_vol(asset);
+
+        // Bid $0.40 on a $0.80 entry: deep underwater, and the model is weak, so
+        // the bail-out fires the moment its window covers the time remaining.
+        let mut hourly = book(dec!(200), dec!(150));
+        hourly.yes_bid = dec!(0.40); hourly.yes_bid_depth = dec!(50);
+        hourly.yes_ask = dec!(0.42);
+        hourly.no_bid = dec!(0.58); hourly.no_ask = dec!(0.60);
+        let mut c = ctx(hourly, book(dec!(100), dec!(100)));
+        c.crypto_filter = asset.to_string();
+        c.market.market_close_time = Some(Utc::now() + chrono::Duration::seconds(300));
+        c.snapshot.oracle_price = dec!(64900);
+
+        let base = || {
+            let mut dc = DynamicConfig::default();
+            dc.enable_fairvalue = true;
+            dc.fairvalue_target_profit_pct = dec!(0.20);
+            dc.fairvalue_stop_loss_pct = dec!(0.90);   // keep rule 4 out of the way
+            dc.fairvalue_settle_snipe_hold = false;
+            dc.fairvalue_resting_tp_enabled = false;
+            dc.fairvalue_sigma_floor_horizon_secs = 0;
+            dc.fairvalue_min_sigma_per_sqrt_sec = dec!(0.000042);
+            dc.fairvalue_model_reversal_decay_pct = dec!(0.99);
+            dc
+        };
+
+        let strat = FairValueStrategyImpl::default();
+        let key = PositionKey::new(c.squadron_id.clone(), "FairValueStrategy", c.market.yes_token.clone());
+        // Held 30s, deliberately under the 60s that rule 2 (model reversal)
+        // requires. On this book the model has collapsed, so rule 2 would exit
+        // first and the bail-out under test would never be reached.
+        let opened = Utc::now() - chrono::Duration::seconds(30);
+        c.positions.lock().await.insert(key.clone(), Position {
+            shares: dec!(5), avg_entry: dec!(0.80), opened_at: opened,
+            close_time: c.market.market_close_time,
+            market_name: c.market.market_name.clone(),
+            pair_token_id: c.market.no_token.clone(),
+            fill_confirmed_at: Some(opened), paired_leg_token_id: None,
+            entry_fee: dec!(0.02),
+        });
+
+        // 300s left against the default 120s window: the bail-out cannot fire.
+        c.dynamic_config = Arc::new(base());
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        if let StrategySignal::Exit { reason, .. } = &sig {
+            assert!(!reason.starts_with("FairValueBail"), "bail fired outside its window: {reason}");
+        }
+
+        // Widen the window past the time remaining and it arms.
+        let mut dc = base();
+        dc.fairvalue_bail_secs = 600;
+        c.dynamic_config = Arc::new(dc);
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        let StrategySignal::Exit { reason, .. } = sig else {
+            panic!("widening Endgame Bail Window must arm the bail-out, got {sig:?}");
+        };
+        assert!(reason.starts_with("FairValueBail"), "{reason}");
+
+        // Inside that same window, a bail confidence of zero disarms it again:
+        // no model reading can fall below zero.
+        let mut dc = base();
+        dc.fairvalue_bail_secs = 600;
+        dc.fairvalue_bail_prob = dec!(0);
+        c.dynamic_config = Arc::new(dc);
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        if let StrategySignal::Exit { reason, .. } = &sig {
+            assert!(!reason.starts_with("FairValueBail"), "bail fired at zero confidence: {reason}");
+        }
     }
 
     /// 2026-09-11 01:50-01:52 ET, driven through the real exit path. Fair value
