@@ -1803,6 +1803,10 @@ function MigrationPanel({ onAuthError }: { onAuthError: () => void }) {
 
   const latest = st?.latest_backup;
   const staged = st?.restore_staged;
+  // A backup describing fewer trades than the instance currently holds predates
+  // the ledger in front of the operator. Only meaningful once the engine has
+  // answered, so it stays false while status is still loading.
+  const staleBackup = !!latest && !!status && latest.manifest.trades < status.trades;
   const messageCls = message?.kind === 'err'
     ? 'bg-rose-500/10 border-rose-500/30 text-rose-300'
     : message?.kind === 'ok'
@@ -1864,12 +1868,31 @@ function MigrationPanel({ onAuthError }: { onAuthError: () => void }) {
               <p className="text-xs font-mono text-rose-300">✗ Backup failed: {st.backup.error}</p>
             )}
             {latest && !building && (
-              <div className="flex flex-wrap items-center gap-3">
+              <div className="space-y-2">
                 <p className="text-xs font-mono text-gray-400">
                   📦 {latest.archive_name} · {formatBytes(latest.archive_bytes)} · made {formatWhen(latest.manifest.created_at)} ·{' '}
                   {describeBackup(latest.manifest)}
                 </p>
-                <button className={btnCls('primary')} disabled={busy} onClick={download}>⬇ Download backup</button>
+                {/* A backup holding less than the instance does is not a backup of
+                    this instance as it stands. It happens after a restore, where
+                    the archive made before the restore describes a ledger that no
+                    longer exists. Taking it to a new instance loses everything in
+                    between, and the trade count alone reads as just another
+                    detail, so say plainly what it means. */}
+                {staleBackup && (
+                  <p className="text-xs font-mono text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded-lg px-3 py-2">
+                    ⚠ This backup holds {latest.manifest.trades} trade(s), but this instance has {status.trades}. It was
+                    made before the ledger you have now, so restoring it elsewhere would lose the difference. Build a
+                    new backup before migrating.
+                  </p>
+                )}
+                <button
+                  className={btnCls(staleBackup ? 'ghost' : 'primary')}
+                  disabled={busy}
+                  onClick={download}
+                >
+                  {staleBackup ? '⬇ Download it anyway' : '⬇ Download backup'}
+                </button>
               </div>
             )}
           </div>

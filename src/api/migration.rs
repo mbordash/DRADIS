@@ -110,6 +110,11 @@ async fn prepare(State(s): State<ApiState>, body: axum::body::Bytes) -> Response
         }
     };
 
+    // Before anything else: the previous backup stops being offered the moment a
+    // new one is asked for. Leaving it downloadable is how a restored instance
+    // hands back the near-empty archive it made before the restore.
+    mig::invalidate_latest_backup(work());
+
     mig::set_progress("retiring");
     if let Err(e) = mig::retire("migration") {
         mig::fail_progress(&format!("{e:#}"));
@@ -390,5 +395,40 @@ mod tests {
     #[test]
     fn a_zero_length_declaration_does_not_divide_by_zero() {
         assert_eq!(describe_shortfall(0, 0), "nothing arrived");
+    }
+
+    /// `prepare` must withdraw the previous backup before it starts building the
+    /// next one, or a restored instance keeps offering the near-empty archive it
+    /// made before the restore — the 2026-09-17 failure, where an operator
+    /// downloaded a zero-trade backup of an instance holding 52 trades.
+    ///
+    /// Asserted at source level, and deliberately: the defect is a missing call,
+    /// and no unit test of `invalidate_latest_backup` can catch its caller not
+    /// calling it. Ordering matters as much as presence, so both are checked.
+    #[test]
+    fn prepare_withdraws_the_previous_backup_before_building_the_next() {
+        let src = include_str!("migration.rs");
+        let body = src.split("async fn prepare(").nth(1).expect("prepare must exist");
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+
+        let withdraw = body
+            .find("invalidate_latest_backup")
+            .expect("prepare must withdraw the previous backup, or a stale one stays downloadable");
+
+        // After the in-progress guard: a request refused with 409 must not throw
+        // away a good backup the operator has not downloaded yet.
+        let guard = body.find("backup_in_progress()").expect("prepare must refuse a concurrent build");
+        assert!(
+            guard < withdraw,
+            "the previous backup must be withdrawn only after the concurrent-build check, not before it",
+        );
+
+        // Before the build is spawned: withdrawing afterwards would leave a window
+        // in which the stale archive is still being offered.
+        let spawn = body.find("tokio::spawn").expect("prepare must spawn the backup task");
+        assert!(
+            withdraw < spawn,
+            "the previous backup must be withdrawn before the new build starts, not after",
+        );
     }
 }

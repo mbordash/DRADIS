@@ -279,6 +279,34 @@ pub fn backup_in_progress() -> bool {
     progress().is_some_and(|p| !matches!(p.phase.as_str(), "ready" | "failed" | ""))
 }
 
+/// Stop offering the previous backup the moment a new one is requested.
+///
+/// `latest-backup.json` is the only thing that makes an archive downloadable,
+/// and it lives on disk while the build's progress lives in memory (`PROGRESS`).
+/// Anything that restarts the engine — applying a restore does exactly that —
+/// clears the progress but leaves the pointer, so the Control Tower shows the
+/// previous archive as a finished, downloadable backup with no build running.
+///
+/// On a fresh instance that stale archive is harmless. On one that has since
+/// restored a real ledger it is a near-empty backup of the instance as it was
+/// before, presented in the same panel, with the same button, as the operator's
+/// actual data. 2026-09-17: an operator migrating off a restored instance
+/// downloaded a 19,863-byte, zero-trade archive that way while the instance held
+/// 52 trades, and only the manifest inside it revealed which one it was.
+///
+/// Clearing the pointer first means a stale ledger can never be served as
+/// current: until the new backup finishes there is simply nothing to download.
+/// The archive bytes are left alone — `build_backup` removes the superseded file
+/// once the replacement is written.
+pub fn invalidate_latest_backup(work: &Path) {
+    let pointer = migration_dir(work).join(LATEST_BACKUP_FILE);
+    match fs::remove_file(&pointer) {
+        Ok(()) => info!("📦 Previous backup withdrawn; it is superseded by the one now being built"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!("📦 Could not withdraw the previous backup pointer {}: {e}", pointer.display()),
+    }
+}
+
 /// The archive `latest-backup.json` names, if it is still on disk.
 pub fn latest_archive(work: &Path) -> Option<(PathBuf, LatestBackup)> {
     let mig = migration_dir(work);
@@ -1026,6 +1054,116 @@ mod tests {
         let rec = RetiredRecord { retired_at: "2026-09-15T00:00:00Z".into(), reason: "migration".into() };
         write_json_atomic(&retired_path(&data), &rec).unwrap();
         assert_eq!(read_retired(&data), Some(rec));
+    }
+
+    /// 2026-09-17: an operator migrating off a restored instance pressed backup
+    /// and was handed the 19,863-byte, zero-trade archive the instance had made
+    /// before its restore, while it held 52 trades. `latest-backup.json` lives on
+    /// disk and the build progress lives in memory, so the restore's own restart
+    /// cleared the progress and left the pointer, and the panel showed a finished
+    /// backup that was not the ledger. Requesting a new backup must withdraw the
+    /// old one first, so a stale ledger can never be downloaded as the current one.
+    #[tokio::test]
+    async fn requesting_a_backup_withdraws_the_previous_one() {
+        let (old, archive, manifest) = old_instance(true).await;
+
+        // The instance is offering a finished backup, exactly as after a restart.
+        assert!(latest_archive(&old).is_some(), "the fixture should start with a downloadable backup");
+        assert!(archive.exists());
+        assert_eq!(manifest.trades, 3);
+
+        invalidate_latest_backup(&old);
+
+        // Nothing is downloadable any more: the pointer is what serves an archive.
+        assert!(
+            latest_archive(&old).is_none(),
+            "a superseded backup must not stay downloadable while a new one is built",
+        );
+        assert!(
+            !migration_dir(&old).join(LATEST_BACKUP_FILE).exists(),
+            "the pointer file itself should be gone",
+        );
+        // The bytes are left for `build_backup` to clear once it has a replacement.
+        assert!(archive.exists(), "the archive file is cleaned up by the next successful build, not here");
+
+        // Idempotent: a second request, or one on an instance that never backed
+        // up, must not error.
+        invalidate_latest_backup(&old);
+        invalidate_latest_backup(&temp_dir("never-backed-up"));
+    }
+
+    /// The whole operator round trip, end to end, because the last step of it had
+    /// never been executed by anything until 2026-09-17, when an operator ran it
+    /// for real and it handed back the wrong ledger.
+    ///
+    /// A new instance backs itself up while nearly empty, restores a fuller
+    /// backup, and is then asked for another backup — the migrate-again case. The
+    /// second backup must describe the restored ledger, and at no point may the
+    /// pre-restore archive be downloadable as the current one.
+    #[tokio::test]
+    async fn backing_up_again_after_a_restore_captures_the_restored_ledger() {
+        // A new instance with a ledger of its own, backed up before any restore.
+        let new = temp_dir("migrate-again");
+        let fresh = ledger(&new.join("logs/btc-dradis.db"), 0, 0).await;
+        let first = build_backup(&new, BackupInputs {
+            include_training_data: true,
+            venue: "intl".to_string(),
+            app_version: "1.2.0".to_string(),
+            bundle: serde_json::json!({ "kind": "dradis-config-bundle", "secrets": {} }),
+            pools: vec![fresh.clone()],
+        }).await.unwrap().1;
+        assert_eq!(first.trades, 0, "the pre-restore backup is the near-empty one");
+        let (stale_path, stale) = latest_archive(&new).expect("the instance is offering its own backup");
+        assert_eq!(stale.manifest.trades, 0);
+        fresh.close().await;
+
+        // It restores a real ledger from elsewhere. Applying a restore restarts
+        // the engine in production, which is what clears the in-memory progress
+        // and leaves the on-disk pointer behind.
+        let (_old, archive, source) = old_instance(true).await;
+        stage_restore(&new, &archive, "intl", "1.2.0", 0, true).unwrap();
+        let merge = |_: &serde_json::Value| Ok(0usize);
+        let report = apply_pending_restore(&new, &merge).unwrap().expect("the restore applies");
+        assert_eq!(report.source_trades, source.trades);
+
+        // The operator now migrates onward and asks for a backup. First the
+        // previous one is withdrawn, exactly as `prepare` does.
+        invalidate_latest_backup(&new);
+        assert!(
+            latest_archive(&new).is_none(),
+            "the pre-restore archive must not be downloadable once a new backup is requested",
+        );
+
+        let restored = ledger(&new.join("logs/btc-dradis.db"), 0, 0).await;
+        let (second_path, second) = build_backup(&new, BackupInputs {
+            include_training_data: true,
+            venue: "intl".to_string(),
+            app_version: "1.2.0".to_string(),
+            bundle: serde_json::json!({ "kind": "dradis-config-bundle", "secrets": {} }),
+            pools: vec![restored.clone()],
+        }).await.unwrap();
+        restored.close().await;
+
+        // The second backup is the restored ledger, not the empty one it replaced.
+        assert_eq!(
+            second.trades, source.trades,
+            "backing up after a restore must capture the restored ledger, not the pre-restore one",
+        );
+        // Archive names carry second resolution, so a test that builds both
+        // backups inside one second gets one filename for both and the second
+        // simply replaces the first in place. Assert on content, which is what
+        // actually matters, rather than on the paths differing.
+        let _ = (&stale_path, &second_path);
+
+        // And what the panel would now offer is that second backup.
+        let (offered_path, offered) = latest_archive(&new).expect("the new backup is downloadable");
+        assert_eq!(offered_path, second_path);
+        assert_eq!(offered.manifest.trades, source.trades);
+
+        // The models and training data came across the restore and travel again.
+        let paths: Vec<&str> = second.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"logs/btc-gboost_planb_v1.json"), "the restored model travels onward: {paths:?}");
+        assert!(paths.contains(&"logs/gboost_planb/btc/markets/1789390800.json"), "restored training data travels onward");
     }
 
     #[tokio::test]
