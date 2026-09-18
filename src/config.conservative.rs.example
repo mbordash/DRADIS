@@ -602,6 +602,17 @@ pub const TIME_DECAY_GATE_LOG_INTERVAL_SECS: u64 = 300;
 /// are held back. Log verbosity, not trading behavior — same treatment as
 /// TIME_DECAY_GATE_LOG_INTERVAL_SECS above.
 pub const REENTRY_SUPPRESS_LOG_INTERVAL_SECS: u64 = 300;
+/// Re-log interval for a Momentum gate rejection whose reason has NOT changed.
+/// Each distinct reason logs at most once per interval, so a velocity that
+/// flaps around its trigger cannot flood the log by alternating two reasons.
+/// Log verbosity, not trading behavior — same treatment as
+/// TIME_DECAY_GATE_LOG_INTERVAL_SECS above.
+pub const MOMENTUM_GATE_LOG_INTERVAL_SECS: u64 = 300;
+/// Re-log interval for a Momentum near miss: velocity crossed the trigger but a
+/// gate held the entry. Shorter than the quiet-book interval because spikes are
+/// rare and each one is the evidence for why Momentum sat out a move; a spike
+/// lasting several seconds still logs once per distinct set of blocking gates.
+pub const MOMENTUM_SPIKE_LOG_INTERVAL_SECS: u64 = 30;
 pub const MOMENTUM_MIN_MARKET_AGE_SECS: i64 = 600;
 /// Must be strictly > MOMENTUM_EXPIRY_EXIT_SECS (1200s); 5 min breathing room.
 pub const MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY: i64 = 1500;

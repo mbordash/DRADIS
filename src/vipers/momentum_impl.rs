@@ -158,12 +158,140 @@ impl Default for MomentumStrategyImpl {
     fn default() -> Self { Self::new() }
 }
 
+/// Throttle for Momentum's gate log lines: `(asset, key) → last logged at`.
+///
+/// Process-global rather than a field on the strategy for the same reason as
+/// TimeDecay's: patrol rebuilds every strategy object on each market rotation,
+/// which would reset per-instance state every hour.
+///
+/// Keyed per reason rather than on "last reason" alone. Momentum's commonest
+/// transition is velocity crossing its trigger and falling back, which can
+/// happen several times a second in a choppy tape; a last-reason throttle would
+/// log every one of those flips.
+///
+/// Nested `asset → key → last logged at` so both lookups borrow `&str`: this
+/// runs on every patrol tick, and a tuple key would allocate two Strings per
+/// tick just to ask whether to stay quiet.
+fn momentum_gate_log_state()
+    -> &'static Mutex<HashMap<String, HashMap<String, std::time::Instant>>>
+{
+    static REG: std::sync::OnceLock<Mutex<HashMap<String, HashMap<String, std::time::Instant>>>> =
+        std::sync::OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// True when a gate line for `key` on `asset` should be written now: it has not
+/// been logged within `interval_secs`. Records the emit when it returns true.
+/// Allocates only when it returns true.
+fn momentum_gate_log_permitted(asset: &str, key: &str, interval_secs: u64) -> bool {
+    let mut reg = match momentum_gate_log_state().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let quiet = reg.get(asset)
+        .and_then(|by_key| by_key.get(key))
+        .is_some_and(|at| at.elapsed().as_secs() < interval_secs);
+    if quiet { return false; }
+    reg.entry(asset.to_string()).or_default().insert(key.to_string(), std::time::Instant::now());
+    true
+}
+
+/// Feed the "why no trades?" registry with `ui_reason` (unchanged from what the
+/// Control Tower has always shown) and write a throttled info line.
+///
+/// Momentum used to report its gates only to that in-memory registry and to
+/// `debug!`, so after a large BTC move on 2026-09-17 nothing on disk said whether
+/// it saw the move and declined it or never triggered at all. `detail` is built
+/// only when the line is actually written, so the quiet-book path costs a map
+/// lookup and no formatting.
+fn report_gate(
+    asset: &str,
+    ui_reason: &str,
+    log_key: &str,
+    interval_secs: u64,
+    detail: impl FnOnce() -> String,
+) {
+    crate::helpers::viper_status::report_reason(asset, "MomentumStrategy", ui_reason);
+    if momentum_gate_log_permitted(asset, log_key, interval_secs) {
+        tracing::info!("🔒 Momentum gate: {}", detail());
+    }
+}
+
+/// One side's gate readings at the moment its velocity trigger fired.
+///
+/// Mirrors the entry conditions in `evaluate_entry` so a near miss can be named
+/// gate by gate. `strike` is `(oracle, strike, buffer)` when the market has a
+/// resolved strike; without one the strike-relative and window checks do not
+/// apply, exactly as in the no-strike entry branch.
+pub struct SpikeGates {
+    pub bull: bool,
+    pub strike: Option<(Decimal, Decimal, Decimal)>,
+    pub ask: Decimal,
+    pub min_entry: Decimal,
+    pub max_entry: Decimal,
+    pub crossing_max: Decimal,
+    pub short_ok: bool,
+    pub accel_ok: bool,
+    pub window_blocks: bool,
+    pub fee_blocks: bool,
+    pub obi_adverse: bool,
+    pub obi_exhausted: bool,
+    pub obi_swing: bool,
+    pub drift_blocks: bool,
+}
+
+/// The gates that held a triggered side, in entry-check order. Static names so
+/// they can key the log throttle; the numbers go in the line itself.
+///
+/// With a strike, the side may enter by the primary branch (oracle beyond
+/// strike + buffer, ask ≤ max entry) or the crossing branch (oracle beyond
+/// strike, ask ≤ crossing cap); the price blocker is named only when neither
+/// branch's price condition holds.
+pub fn spike_blockers(g: &SpikeGates) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    match g.strike {
+        Some((oracle, strike, buffer)) => {
+            let (beyond_strike, beyond_buffer) = if g.bull {
+                (oracle > strike, oracle > strike + buffer)
+            } else {
+                (oracle < strike, oracle < strike - buffer)
+            };
+            let primary_ok = beyond_buffer && g.ask <= g.max_entry;
+            let crossing_ok = beyond_strike && g.ask <= g.crossing_max;
+            if !(primary_ok || crossing_ok) {
+                if !beyond_strike {
+                    out.push("oracle on wrong side of strike");
+                } else if !beyond_buffer {
+                    out.push("ask above crossing cap (oracle inside strike buffer)");
+                } else {
+                    out.push("ask above max entry");
+                }
+            }
+        }
+        None => {
+            if g.ask > g.max_entry { out.push("ask above max entry"); }
+        }
+    }
+    if g.ask < g.min_entry { out.push("ask below min entry"); }
+    if !g.short_ok { out.push("1s velocity not confirming"); }
+    if !g.accel_ok { out.push("decelerating"); }
+    if g.strike.is_some() && g.window_blocks { out.push("daily window against"); }
+    if g.fee_blocks { out.push("fee-dominated"); }
+    if g.obi_adverse { out.push("OBI adverse"); }
+    if g.obi_exhausted { out.push("OBI exhausted"); }
+    if g.obi_swing { out.push("OBI swing"); }
+    if g.drift_blocks { out.push("10m drift against"); }
+    out
+}
+
 #[async_trait]
 impl Strategy for MomentumStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config;
-        // "Why no trades?" registry feed (GET /api/vipers/status).
-        let idle = |r: &str| crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), r);
+        // "Why no trades?" registry feed (GET /api/vipers/status) plus a throttled
+        // info line, so the blocking gate is recoverable from the log afterwards.
+        let asset = ctx.crypto_filter.as_str();
+        let idle = |r: &str| report_gate(asset, r, r, config::MOMENTUM_GATE_LOG_INTERVAL_SECS, || r.to_string());
         if !dc.enable_momentum {
             idle("disabled in config");
             return Ok(StrategySignal::NoSignal);
@@ -272,7 +400,8 @@ impl Strategy for MomentumStrategyImpl {
             if secs_left < dc.momentum_min_secs_to_expiry_for_entry {
                 debug!(" Momentum entry blocked: only {}s to expiry (min {}s)",
                     secs_left, dc.momentum_min_secs_to_expiry_for_entry);
-                idle("too close to expiry");
+                report_gate(asset, "too close to expiry", "too close to expiry", config::MOMENTUM_GATE_LOG_INTERVAL_SECS, || format!(
+                    "too close to expiry | {}s left (min {}s)", secs_left, dc.momentum_min_secs_to_expiry_for_entry));
                 return Ok(StrategySignal::NoSignal);
             }
         }
@@ -293,7 +422,8 @@ impl Strategy for MomentumStrategyImpl {
         if secs_since_market_start < config::MOMENTUM_MARKET_WARMUP_SECS {
             debug!(" Momentum entry blocked: market warmup period ({}s < {}s min)",
                 secs_since_market_start, config::MOMENTUM_MARKET_WARMUP_SECS);
-            idle("market warmup");
+            report_gate(asset, "market warmup", "market warmup", config::MOMENTUM_GATE_LOG_INTERVAL_SECS, || format!(
+                "market warmup | {}s since switch (min {}s)", secs_since_market_start, config::MOMENTUM_MARKET_WARMUP_SECS));
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -302,7 +432,8 @@ impl Strategy for MomentumStrategyImpl {
         if snap_age > config::MOMENTUM_MAX_SNAPSHOT_AGE_SECS {
             debug!(" Momentum entry blocked: snapshot too stale ({}s > max {}s)",
                 snap_age, config::MOMENTUM_MAX_SNAPSHOT_AGE_SECS);
-            idle("snapshot stale");
+            report_gate(asset, "snapshot stale", "snapshot stale", config::MOMENTUM_GATE_LOG_INTERVAL_SECS, || format!(
+                "snapshot stale | {}s old (max {}s)", snap_age, config::MOMENTUM_MAX_SNAPSHOT_AGE_SECS));
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -311,7 +442,8 @@ impl Strategy for MomentumStrategyImpl {
         if ask_sum > dc.momentum_max_entry_ask_sum {
             debug!(" Momentum spread gate: ask_sum={:.3} > max {:.3} — book too wide",
                 ask_sum, dc.momentum_max_entry_ask_sum);
-            idle("book too wide");
+            report_gate(asset, "book too wide", "book too wide", config::MOMENTUM_GATE_LOG_INTERVAL_SECS, || format!(
+                "book too wide | ask_sum={:.3} > max {:.3}", ask_sum, dc.momentum_max_entry_ask_sum));
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -326,7 +458,9 @@ impl Strategy for MomentumStrategyImpl {
         if yes_ask < dc.momentum_min_entry_price && no_ask < dc.momentum_min_entry_price {
             debug!(" Momentum min-price blocked: yes_ask={:.3} no_ask={:.3} both below floor {:.3}",
                 yes_ask, no_ask, dc.momentum_min_entry_price);
-            idle("asks below entry price floor");
+            report_gate(asset, "asks below entry price floor", "asks below entry price floor", config::MOMENTUM_GATE_LOG_INTERVAL_SECS, || format!(
+                "asks below entry price floor | yes_ask={:.3} no_ask={:.3} both < {:.3}",
+                yes_ask, no_ask, dc.momentum_min_entry_price));
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -473,27 +607,29 @@ impl Strategy for MomentumStrategyImpl {
             }));
         };
 
+        // ── Window/Daily trend filter ─────────────────────────────────────────
+        // Read here rather than inside the strike branch so the near-miss log
+        // below can report it; it is applied only when a strike is known, as
+        // before.
+        let window_yes_mid = match (&ctx.maker_market, &ctx.maker_snapshot) {
+            (Some(_), Some(ws)) => Some(if ws.yes_bid > dec!(0) && ws.yes_ask < dec!(1) {
+                (ws.yes_bid + ws.yes_ask) / dec!(2)
+            } else {
+                dec!(0.5)
+            }),
+            _ => None,
+        };
+        let window_blocks_bull = window_yes_mid.is_some_and(|m|
+            config::MOMENTUM_WINDOW_BEARISH_BLOCK > dec!(0) && m < config::MOMENTUM_WINDOW_BEARISH_BLOCK);
+        let window_blocks_bear = window_yes_mid.is_some_and(|m|
+            config::MOMENTUM_WINDOW_BULLISH_BLOCK > dec!(0) && m > config::MOMENTUM_WINDOW_BULLISH_BLOCK);
+
         if let Some(strike) = strike_price {
-            // ── Window/Daily trend filter ─────────────────────────────────────
-            let window_blocks_bull;
-            let window_blocks_bear;
-            if let (Some(_wm), Some(ws)) = (&ctx.maker_market, &ctx.maker_snapshot) {
-                let w_yes_mid = if ws.yes_bid > dec!(0) && ws.yes_ask < dec!(1) {
-                    (ws.yes_bid + ws.yes_ask) / dec!(2)
-                } else {
-                    dec!(0.5)
-                };
-                window_blocks_bull = config::MOMENTUM_WINDOW_BEARISH_BLOCK > dec!(0)
-                    && w_yes_mid < config::MOMENTUM_WINDOW_BEARISH_BLOCK;
-                window_blocks_bear = config::MOMENTUM_WINDOW_BULLISH_BLOCK > dec!(0)
-                    && w_yes_mid > config::MOMENTUM_WINDOW_BULLISH_BLOCK;
+            if let Some(m) = window_yes_mid {
                 if window_blocks_bull || window_blocks_bear {
                     debug!(" Momentum window filter: YES_mid={:.3} blocks {}",
-                        w_yes_mid, if window_blocks_bull { "BULL" } else { "BEAR" });
+                        m, if window_blocks_bull { "BULL" } else { "BEAR" });
                 }
-            } else {
-                window_blocks_bull = false;
-                window_blocks_bear = false;
             }
 
             // Primary entry
@@ -574,14 +710,70 @@ impl Strategy for MomentumStrategyImpl {
         // operator needs to see it as such — declining a fee-dominated trade is
         // the product working, and the Control Tower should say so.
         if velocity.abs() <= threshold {
-            idle("velocity below trigger");
-        } else if velocity > threshold && fee_blocks_bull {
-            idle(fee_reason_bull.as_deref().unwrap_or("fee-dominated entry"));
-        } else if velocity < -threshold && fee_blocks_bear {
-            idle(fee_reason_bear.as_deref().unwrap_or("fee-dominated entry"));
-        } else {
-            idle("spike blocked by entry gates (OBI/drift/price)");
+            report_gate(asset, "velocity below trigger", "velocity below trigger",
+                config::MOMENTUM_GATE_LOG_INTERVAL_SECS, || format!(
+                "velocity below trigger | vel={:.2} trigger=±{:.2} (5s, oracle ${:.2})",
+                velocity, threshold, binance_price));
+            return Ok(StrategySignal::NoSignal);
         }
+
+        // A spike fired and a gate held it. Name every gate that held the
+        // triggered side, with the readings, so a sat-out move can be explained
+        // from the log. The Control Tower reason is unchanged.
+        let bull = velocity > threshold;
+        let gates = if bull {
+            SpikeGates {
+                bull, strike: strike_price.map(|s| (binance_price, s, strike_buffer)),
+                ask: yes_ask, min_entry: dc.momentum_min_entry_price, max_entry: dc.momentum_max_entry_price,
+                crossing_max: config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE,
+                short_ok: short_ok_bull, accel_ok: accel_ok_bull, window_blocks: window_blocks_bull,
+                fee_blocks: fee_blocks_bull, obi_adverse: obi_blocks_bull, obi_exhausted: obi_exhausted_bull,
+                obi_swing: obi_swing_blocks_bull, drift_blocks: drift_blocks_bull,
+            }
+        } else {
+            SpikeGates {
+                bull, strike: strike_price.map(|s| (binance_price, s, strike_buffer)),
+                ask: no_ask, min_entry: dc.momentum_min_entry_price, max_entry: dc.momentum_max_entry_price,
+                crossing_max: config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE,
+                short_ok: short_ok_bear, accel_ok: accel_ok_bear, window_blocks: window_blocks_bear,
+                fee_blocks: fee_blocks_bear, obi_adverse: obi_blocks_bear, obi_exhausted: obi_exhausted_bear,
+                obi_swing: obi_swing_blocks_bear, drift_blocks: drift_blocks_bear,
+            }
+        };
+        let blockers = spike_blockers(&gates);
+        let side = if bull { "BULL" } else { "BEAR" };
+        let key = format!("spike {} | {}", side, blockers.join(", "));
+        let fee_reason = if bull { &fee_reason_bull } else { &fee_reason_bear };
+        let ui_reason = if gates.fee_blocks {
+            fee_reason.as_deref().unwrap_or("fee-dominated entry")
+        } else {
+            "spike blocked by entry gates (OBI/drift/price)"
+        };
+        report_gate(asset, ui_reason, &key, config::MOMENTUM_SPIKE_LOG_INTERVAL_SECS, || {
+            let strike_txt = strike_price
+                .map(|s| format!("${:.2} (buffer ${:.2})", s, strike_buffer))
+                .unwrap_or_else(|| "unknown".into());
+            let window_txt = window_yes_mid
+                .map(|m| format!("{:.3}", m))
+                .unwrap_or_else(|| "n/a".into());
+            let (obi, swing) = if bull { (yes_obi, yes_obi_swing) } else { (no_obi, no_obi_swing) };
+            format!(
+                "{} spike held by [{}] | vel={:.2} trigger=±{:.2} 1s={:.2} (need {:.2}) accel={:.3} \
+                 | oracle=${:.2} strike={} | {}_ask={:.3} (entry {:.2}–{:.2}, crossing ≤{:.2}) \
+                 | OBI={:.2} (adverse <{:.2}, exhausted >{:.2}) swing={:.2} (max {:.2}) \
+                 | drift10m={:.2} (block {:.2}) | daily YES mid={}{}",
+                side,
+                if blockers.is_empty() { "unclassified".to_string() } else { blockers.join(", ") },
+                velocity, threshold, velocity_1s, short_min, acceleration,
+                binance_price, strike_txt,
+                if bull { "yes" } else { "no" }, gates.ask,
+                dc.momentum_min_entry_price, dc.momentum_max_entry_price, config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE,
+                obi, dc.momentum_obi_adverse_block, dc.momentum_obi_exhaustion_block,
+                swing, config::MOMENTUM_OBI_SWING_BLOCK,
+                drift_10m, drift_block_mag, window_txt,
+                fee_reason.as_ref().map(|r| format!(" | fee: {}", r)).unwrap_or_default(),
+            )
+        });
         Ok(StrategySignal::NoSignal)
     }
 
@@ -1120,6 +1312,81 @@ pub fn kelly_momentum_size(
 mod tests {
     use super::*;
     use crate::helpers::dynamic_config::DynamicConfig;
+
+    fn clean_bull_spike() -> SpikeGates {
+        SpikeGates {
+            bull: true,
+            strike: Some((dec!(78100), dec!(78000), dec!(8))),
+            ask: dec!(0.65), min_entry: dec!(0.58), max_entry: dec!(0.78), crossing_max: dec!(0.62),
+            short_ok: true, accel_ok: true, window_blocks: false, fee_blocks: false,
+            obi_adverse: false, obi_exhausted: false, obi_swing: false, drift_blocks: false,
+        }
+    }
+
+    /// A spike that passes every gate has no blockers; the log names nothing.
+    #[test]
+    fn spike_blockers_empty_when_every_gate_passes() {
+        assert!(spike_blockers(&clean_bull_spike()).is_empty());
+    }
+
+    /// The price blocker follows the two entry branches: inside the strike
+    /// buffer only the crossing cap applies, beyond it the max entry applies,
+    /// and on the wrong side of the strike neither branch can fire.
+    #[test]
+    fn spike_blockers_price_follows_primary_and_crossing_branches() {
+        let mut g = clean_bull_spike();
+        g.strike = Some((dec!(78004), dec!(78000), dec!(8)));   // inside buffer
+        g.ask = dec!(0.60);
+        assert!(spike_blockers(&g).is_empty(), "crossing branch admits $0.60");
+        g.ask = dec!(0.65);
+        assert_eq!(spike_blockers(&g), vec!["ask above crossing cap (oracle inside strike buffer)"]);
+
+        g.strike = Some((dec!(78100), dec!(78000), dec!(8)));   // beyond buffer
+        g.ask = dec!(0.80);
+        assert_eq!(spike_blockers(&g), vec!["ask above max entry"]);
+
+        g.strike = Some((dec!(77900), dec!(78000), dec!(8)));   // wrong side
+        g.ask = dec!(0.60);
+        assert_eq!(spike_blockers(&g), vec!["oracle on wrong side of strike"]);
+
+        // BEAR mirrors it: oracle above strike is the wrong side.
+        g.bull = false;
+        assert!(spike_blockers(&g).is_empty());
+        g.strike = Some((dec!(78100), dec!(78000), dec!(8)));
+        assert_eq!(spike_blockers(&g), vec!["oracle on wrong side of strike"]);
+    }
+
+    /// Every gate is named, in entry-check order; the daily window only counts
+    /// when a strike is known, as in the no-strike entry branch.
+    #[test]
+    fn spike_blockers_names_every_gate_in_order() {
+        let mut g = clean_bull_spike();
+        g.ask = dec!(0.50);
+        g.short_ok = false; g.accel_ok = false; g.window_blocks = true; g.fee_blocks = true;
+        g.obi_adverse = true; g.obi_exhausted = true; g.obi_swing = true; g.drift_blocks = true;
+        assert_eq!(spike_blockers(&g), vec![
+            "ask below min entry", "1s velocity not confirming", "decelerating", "daily window against",
+            "fee-dominated", "OBI adverse", "OBI exhausted", "OBI swing", "10m drift against",
+        ]);
+        g.strike = None;
+        assert!(!spike_blockers(&g).contains(&"daily window against"));
+    }
+
+    /// Each reason logs once per interval, independently: two reasons flapping
+    /// every tick log once each, not once per flip.
+    #[test]
+    fn gate_log_throttle_is_per_reason() {
+        let a = "momtest_flap";
+        assert!(momentum_gate_log_permitted(a, "velocity below trigger", 300));
+        assert!(momentum_gate_log_permitted(a, "spike BULL | OBI adverse", 300));
+        for _ in 0..10 {
+            assert!(!momentum_gate_log_permitted(a, "velocity below trigger", 300));
+            assert!(!momentum_gate_log_permitted(a, "spike BULL | OBI adverse", 300));
+        }
+        assert!(momentum_gate_log_permitted(a, "spike BULL | OBI swing", 300), "a new blocker set logs at once");
+        assert!(momentum_gate_log_permitted("momtest_other_asset", "velocity below trigger", 300));
+        assert!(momentum_gate_log_permitted(a, "velocity below trigger", 0), "interval elapsed");
+    }
 
     /// The take-profit target must clear the round trip it has to pay for.
     ///
