@@ -1233,9 +1233,6 @@ pub const FAILURE_COOLDOWN_SECS: i64 = 60;
 
 pub const SHARE_SCALE: Decimal = dec!(1_000_000);
 
-/// Polymarket's crypto fee rate. Used in dynamic fee calculation: fee = C * feeRate * p * (1 - p)
-pub const CRYPTO_FEE_RATE: Decimal = dec!(0.072);
-
 
 // ============================================================================
 // POSITION DURATION AND TIMING (Seconds)

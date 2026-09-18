@@ -46,8 +46,8 @@ use rust_decimal::prelude::ToPrimitive;
 /// "Orphan Settle Grace" wrote a row nobody read. `llm_max_output_tokens`
 /// rendered in the Deployment panel and was never read at all — every provider
 /// call used the compile-time constant, while its help text told operators to
-/// raise it. `intl_taker_fee_rate` is read at BOTH scopes, so one round trip can
-/// book at two different fee rates.
+/// raise it. `intl_taker_fee_rate` was read at BOTH scopes, so one round trip could
+/// book at two different fee rates; every reader now takes the global row.
 ///
 /// Declared per GROUP rather than per field because the group already decides
 /// where the UI renders a field, and the two must agree by construction: the

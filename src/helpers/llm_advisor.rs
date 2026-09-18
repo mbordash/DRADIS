@@ -214,6 +214,29 @@ struct LlmReply {
     truncated_by_length: bool,
 }
 
+/// Whether an LLM base URL points at the operator's own machine or private
+/// network, where inference runs on local hardware rather than a hosted API.
+fn is_local_endpoint(base_url: &str) -> bool {
+    let host = base_url
+        .split("://").nth(1).unwrap_or(base_url)
+        .split(['/', '?']).next().unwrap_or("");
+    // Strip the port, keeping a bracketed IPv6 literal intact.
+    let host = if let Some(v6) = host.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        host.rsplit_once(':').map_or(host, |(h, _)| h)
+    };
+    let host = host.to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".local") || host.ends_with(".localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback(),
+        Err(_) => false,
+    }
+}
+
 /// Normalize an LLM API base URL.
 ///
 /// Operators paste the endpoint from the provider's documentation — the
@@ -322,6 +345,14 @@ impl LlmProvider {
     fn inference_timeout(&self) -> Duration {
         match self {
             Self::Ollama { .. } => Duration::from_secs(config::LLM_INFERENCE_TIMEOUT_SECS),
+            // An OpenAI-compatible server on the operator's own machine or LAN
+            // (LM Studio, vLLM, llama.cpp) is local inference as much as Ollama
+            // is, and a 30B model needs minutes, not seconds: at the hosted 120s
+            // every call to one timed out mid-generation (gemma-4-31b in LM
+            // Studio, 2026-09-18), so the advisor could never answer. Hosted
+            // endpoints keep 120s so a hung call still fails fast.
+            Self::OpenAiCompatible { base_url, .. } if is_local_endpoint(base_url) =>
+                Duration::from_secs(config::LLM_INFERENCE_TIMEOUT_SECS),
             _ => Duration::from_secs(120),
         }
     }
@@ -2237,6 +2268,38 @@ pub async fn run_llm_advisor_loop(
             }
         }
         } // end per-squadron pass
+    }
+}
+
+#[cfg(test)]
+mod inference_timeout_tests {
+    use super::*;
+
+    fn openai(base: &str) -> LlmProvider {
+        LlmProvider::OpenAiCompatible { base_url: base.into(), api_key: String::new(), model: "m".into() }
+    }
+
+    /// A local OpenAI-compatible server gets the local-inference budget; a hosted
+    /// API keeps the short one so a hung call still fails fast.
+    #[test]
+    fn local_openai_compatible_endpoints_get_the_local_timeout() {
+        let local = Duration::from_secs(config::LLM_INFERENCE_TIMEOUT_SECS);
+        for base in [
+            "http://localhost:1234/v1", "http://127.0.0.1:8000/v1", "http://[::1]:8080/v1",
+            "http://192.168.1.20:1234/v1", "http://10.0.0.5/v1", "http://gpu-box.local:8000/v1",
+        ] {
+            assert_eq!(openai(base).inference_timeout(), local, "{base}");
+        }
+        for base in [
+            "https://api.openai.com/v1", "https://api.groq.com/openai/v1",
+            "https://openrouter.ai/api/v1", "https://8.8.8.8/v1",
+        ] {
+            assert_eq!(openai(base).inference_timeout(), Duration::from_secs(120), "{base}");
+        }
+        let anthropic = LlmProvider::Anthropic {
+            base_url: "http://localhost:1234".into(), api_key: String::new(), model: "m".into(),
+        };
+        assert_eq!(anthropic.inference_timeout(), Duration::from_secs(120));
     }
 }
 

@@ -1585,7 +1585,9 @@ fn squadron_plan(asset: &str) -> Option<(String, Plan)> {
         .into_iter()
         .find(|id| id == &asset.to_ascii_lowercase() || id.starts_with(&prefix))?;
     let dc = crate::helpers::dynamic_config::squadron_config_snapshot(&id)?;
-    let fee = dc.intl_taker_fee_rate.to_f64().unwrap_or(0.07);
+    // The venue's rate from the global knob, the same figure the live gate and
+    // the ledger use; the squadron row's copy is not kept in step with it.
+    let fee = crate::venues::taker_fee_rate().to_f64().unwrap_or(0.07);
     Some((id, Plan::from_config(&dc, fee)))
 }
 

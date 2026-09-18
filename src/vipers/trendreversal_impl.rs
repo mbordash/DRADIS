@@ -458,7 +458,7 @@ impl Strategy for TrendReversalStrategyImpl {
                 };
 
                 // ── Coin-flip-zone gate (fade mode) ──────────────────────────
-                // Polymarket's fee (CRYPTO_FEE_RATE·p·(1−p)) peaks at $0.50; every
+                // The taker fee (rate·p·(1−p)) peaks at $0.50; every
                 // Jul 1-4 fade entry sat in the $0.43-0.58 max-fee band where ~3.6%
                 // round-trip fees consume most of the 8% reversion target.
                 if dc.trendreversal_mode

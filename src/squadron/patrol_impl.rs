@@ -1150,7 +1150,11 @@ impl Squadron {
                         token_ownership.lock().await.remove(&m);
                         info!("🧾 Released {} in-memory position(s) on {} — the chain sweep booked and closed the row", dead.len(), tok);
                     }
-                    let intl_taker_fee_rate = dyn_cfg.intl_taker_fee_rate;
+                    // A Global-scope knob, read from the global row like every other fee
+                    // reader (entry gates, the orphan path, balance). The squadron row
+                    // carries a copy that nothing keeps in step with it, so reading it
+                    // here let one round trip book at two rates.
+                    let intl_taker_fee_rate = crate::venues::intl::live_taker_fee_rate();
                     // Hoisted like the two above: dyn_cfg is moved into `ctx` below.
                     let exit_reconcile_max_dev = dyn_cfg.exit_reconcile_max_deviation;
 

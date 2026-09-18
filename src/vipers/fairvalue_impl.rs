@@ -523,9 +523,16 @@ impl FairValueStrategyImpl {
         min + (base - min) * frac
     }
 
-    /// Polymarket dynamic taker fee fraction at price p: rate · p · (1−p).
+    /// The venue's taker fee fraction at price p: rate · p · (1−p).
+    ///
+    /// Reads the same rate the venue books P&L with (`venues::taker_fee_rate`:
+    /// the live `intl_taker_fee_rate` or `us_taker_fee_rate` knob, 0.07 on
+    /// Kalshi). It used to read a separate `CRYPTO_FEE_RATE = 0.072`, so the
+    /// entry gate and the accounting disagreed on every venue, by 20% on
+    /// Polymarket US, and editing the rate in the Control Tower moved only the
+    /// accounting.
     fn fee_frac(price: Decimal) -> Decimal {
-        config::CRYPTO_FEE_RATE * price * (dec!(1) - price)
+        crate::venues::taker_fee_per_share(price)
     }
 
     /// Shares to buy for an entry at `ask`: the trade size net of the fee
@@ -2157,6 +2164,9 @@ mod tests {
     /// still to run — then settled at $1.00. The model read entry-grade edge at
     /// the very moment the price rule was selling, which is exactly the state
     /// the veto exists to catch.
+    // Polymarket International replay: the figures are that venue's logged
+    // values, so the test prices fees at its rate and runs on its build only.
+    #[cfg(feature = "intl_clob")]
     #[test]
     fn model_confirmation_vetoes_the_stop_that_sold_a_winner() {
         let fair_no = 1.0 - 0.380;
@@ -2165,8 +2175,9 @@ mod tests {
 
         let edge = FairValueStrategyImpl::stop_vetoed_by_model(Some(fair_no), no_ask, req, dec!(1.0))
             .expect("model still showed entry-grade edge — the stop must be vetoed");
-        // Matches the +0.145 the viper itself logged at 04:00:28.
-        assert_eq!(edge.round_dp(3), dec!(0.145));
+        // The viper logged +0.145 at 04:00:28, priced at the old 0.072 fee rate;
+        // at the rate the venue actually books (0.07) the same state is +0.146.
+        assert_eq!(edge.round_dp(3), dec!(0.146));
 
         // A conservative profile demands 1.5x entry-grade edge and would still
         // have taken this stop — the knob genuinely spans both behaviors.
@@ -2185,6 +2196,9 @@ mod tests {
     /// −0.077 against a +0.036 requirement (488s left on the balanced taper).
     /// No setting of `fairvalue_stop_model_confirm_frac` can flip a negative
     /// edge, so the knob was not the cause either.
+    // Polymarket International replay: the figures are that venue's logged
+    // values, so the test prices fees at its rate and runs on its build only.
+    #[cfg(feature = "intl_clob")]
     #[test]
     fn the_2026_09_05_stop_could_not_be_vetoed_at_any_confirm() {
         let fair_no = Some(0.776);
@@ -2193,7 +2207,8 @@ mod tests {
 
         let edge = FairValueStrategyImpl::model_live_edge(fair_no, no_ask)
             .expect("both a model reading and a quoted ask were present");
-        assert_eq!(edge.round_dp(3), dec!(-0.077));
+        // −0.077 as booked at the old 0.072 fee rate; −0.076 at the booked 0.07.
+        assert_eq!(edge.round_dp(3), dec!(-0.076));
         assert!(edge < dec!(0), "the veto's edge was negative: fair sat below the ask");
 
         for confirm in [dec!(0.01), dec!(0.5), dec!(1.0), dec!(1.5)] {
@@ -2219,17 +2234,24 @@ mod tests {
     /// net edge at the entry's own ask is already below zero — the position
     /// would not have been opened at 0.776, whatever the model-direction
     /// guard made of the decay from the (unrecorded) entry fair.
+    // Polymarket International replay: the figures are that venue's logged
+    // values, so the test prices fees at its rate and runs on its build only.
+    #[cfg(feature = "intl_clob")]
     #[test]
     fn a_fair_above_entry_price_is_not_an_intact_thesis() {
+        // At the old 0.072 fee rate this net edge read slightly negative; at the
+        // 0.07 the venue actually charges it is +0.0007 — positive, but a
+        // twentieth of the smallest edge any profile will enter on.
         let edge_at_entry_ask = FairValueStrategyImpl::model_live_edge(Some(0.776), dec!(0.75))
             .expect("quoted");
         assert!(
-            edge_at_entry_ask < dec!(0),
-            "net of fees, fair 0.776 has no edge at the $0.75 it was bought at: {edge_at_entry_ask}",
+            edge_at_entry_ask < dec!(0.015),
+            "net of fees, fair 0.776 has no admissible edge at the $0.75 it was bought at: {edge_at_entry_ask}",
         );
         // The floor of every profile's `fairvalue_min_edge` is 0.015; the
         // entry needed at least that on top of fees. Solve for the fair that
-        // just clears it: ~0.80, above the exit reading.
+        // just clears it: 0.790 at the booked 0.07 fee rate, above the exit
+        // reading.
         let smallest_admissible = (776..=820)
             .map(|m| m as f64 / 1000.0)
             .find(|f| {
@@ -2237,7 +2259,7 @@ mod tests {
                     .is_some_and(|e| e >= dec!(0.015))
             })
             .expect("some fair below 0.82 admits the entry");
-        assert!(smallest_admissible > 0.79, "was {smallest_admissible}");
+        assert!(smallest_admissible >= 0.79, "was {smallest_admissible}");
     }
 
     /// Every way the veto can fail to hold gets its own note, so the ledger
@@ -2369,7 +2391,7 @@ mod tests {
         let ticks = min_entry * stop / tick;
         assert!(ticks >= 2.5, "stop is only {ticks:.1} ticks wide at the minimum entry price");
         // And the round-trip toll must stay under the take-profit target.
-        let toll = 2.0 * config::CRYPTO_FEE_RATE.to_f64().unwrap() * (1.0 - min_entry);
+        let toll = 2.0 * crate::venues::taker_fee_rate().to_f64().unwrap() * (1.0 - min_entry);
         let tp = config::FAIRVALUE_TARGET_PROFIT_PERCENT.to_f64().unwrap();
         assert!(toll < tp, "round-trip toll {toll:.3} must leave something under a {tp:.2} TP");
     }
@@ -2516,6 +2538,27 @@ mod tests {
         assert!(round_trip < entry_only, "round-trip hurdle must exceed entry-only");
         // The exit fee is material, not a rounding artifact.
         assert!(entry_only - round_trip > dec!(0.01));
+    }
+
+    /// The entry gate must charge the fee the venue actually books. FairValue
+    /// once priced fees at its own 0.072 while every venue booked P&L at another
+    /// rate (0.07 on Polymarket International and Kalshi, 0.06 on Polymarket
+    /// US), so the gate and the ledger disagreed about every trade.
+    #[test]
+    fn fee_frac_matches_the_rate_the_venue_books() {
+        let rate = crate::venues::taker_fee_rate();
+        #[cfg(feature = "intl_clob")]
+        assert_eq!(rate, config::INTL_TAKER_FEE_RATE);
+        #[cfg(feature = "us_retail")]
+        assert_eq!(rate, config::US_TAKER_FEE_RATE);
+        #[cfg(feature = "kalshi")]
+        assert_eq!(rate, dec!(0.07));
+        for p in [dec!(0.05), dec!(0.36), dec!(0.50), dec!(0.78), dec!(0.95)] {
+            assert_eq!(FairValueStrategyImpl::fee_frac(p), rate * p * (dec!(1) - p), "at ${p}");
+        }
+        // Resolved prices carry no fee.
+        assert_eq!(FairValueStrategyImpl::fee_frac(dec!(0)), dec!(0));
+        assert_eq!(FairValueStrategyImpl::fee_frac(dec!(1)), dec!(0));
     }
 
     /// Guards the whole diagnostic line, not just the constant — this is the

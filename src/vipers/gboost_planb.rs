@@ -997,7 +997,7 @@ impl Strategy for GboostPlanBStrategy {
         let preds = model.predict(&features);
         let decisions: Vec<SideDecision> = (0..2)
             .map(|side| decide_side(
-                ask[side], preds[side].1, f(dc.intl_taker_fee_rate), f(dc.gboost_planb_take_profit_pct),
+                ask[side], preds[side].1, f(crate::venues::taker_fee_rate()), f(dc.gboost_planb_take_profit_pct),
                 f(dc.gboost_planb_stop_loss_pct), f(dc.gboost_planb_margin), f(dc.gboost_planb_min_ask), f(dc.gboost_planb_max_ask),
             ))
             .collect();
@@ -1064,7 +1064,7 @@ impl Strategy for GboostPlanBStrategy {
             }
             dc.gboost_max_exposure_usdc - exposure
         };
-        let shares = match entry_shares(dc.gboost_planb_trade_size_usdc, room, ask_dec, dc.intl_taker_fee_rate) {
+        let shares = match entry_shares(dc.gboost_planb_trade_size_usdc, room, ask_dec, crate::venues::taker_fee_rate()) {
             Ok(s) => s,
             Err(why) => {
                 info!("GBoost plan-B [{}] {} qualifies but is not entered: {why} (room ${:.2})", market.market_name, label[side], room);
