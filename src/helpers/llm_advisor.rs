@@ -1662,6 +1662,17 @@ async fn in_flight_actions(pool: &sqlx::SqlitePool, squadron_id: &str) -> Vec<db
 
 /// Spawn this as a long-running tokio task at startup.
 ///
+/// Whether the advisor is switched on: the `ENABLE_LLM_ADVISOR` env var when set
+/// (1/true/yes/on, case-insensitive), otherwise the compile-time default. Also
+/// served on `/api/status` so the dashboard can say "disabled" rather than
+/// "awaiting first analysis" forever ([B43]).
+pub fn advisor_enabled_setting() -> bool {
+    match std::env::var("ENABLE_LLM_ADVISOR") {
+        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Err(_) => config::ENABLE_LLM_ADVISOR,
+    }
+}
+
 /// The task immediately checks ENABLE_LLM_ADVISOR and exits early if disabled,
 /// so there is no cost to always registering it in main.rs.
 ///
@@ -1687,10 +1698,7 @@ pub async fn run_llm_advisor_loop(
     // demo box while disabling it on the live box — the live .env sets
     // ENABLE_LLM_ADVISOR=false and .env.demo re-enables it (demo overrides win).
     // Accepts 1/true/yes/on (case-insensitive) as truthy; anything else is false.
-    let advisor_enabled = match std::env::var("ENABLE_LLM_ADVISOR") {
-        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
-        Err(_) => config::ENABLE_LLM_ADVISOR,
-    };
+    let advisor_enabled = advisor_enabled_setting();
     if !advisor_enabled {
         info!("🤖 LLM Advisor: disabled (ENABLE_LLM_ADVISOR=false)");
         return;

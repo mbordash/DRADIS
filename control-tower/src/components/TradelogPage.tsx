@@ -222,7 +222,7 @@ function assetToEntries(
       curOrExit:   cur,
       priceIsLiveBid: liveBid !== null,
       priceAgeSecs: liveBid !== null
-        ? (liveQuote?.age_secs ?? 0)
+        ? (liveQuote?.age_secs ?? null)
         : p.price_updated_at
           ? Math.max(0, Math.round((Date.now() - new Date(p.price_updated_at).getTime()) / 1000))
           : null,
@@ -269,7 +269,14 @@ function FilterPill({
  * P&L still come from `entries`: those describe currently-open positions, which
  * are never truncated.
  */
-function SummaryBar({ entries, stats }: { entries: LogEntry[]; stats: (TradeStats & { asset: string })[] }) {
+/**
+ * `unknown` carries why the figures are not known yet ("loading…" or a load
+ * error). The cards then show dashes: a list that has not arrived is not an
+ * empty ledger, and must not render as 0 missions and +$0.0000 ([B43]).
+ */
+function SummaryBar({ entries, stats, unknown }: {
+  entries: LogEntry[]; stats: (TradeStats & { asset: string })[]; unknown: string | null;
+}) {
   const launches   = entries.filter(e => e.status === 'launch').length;
   const inflight   = entries.filter(e => e.status === 'inflight').length;
   const completedCount = stats.reduce((s, t) => s + t.count, 0);
@@ -280,6 +287,21 @@ function SummaryBar({ entries, stats }: { entries: LogEntry[]; stats: (TradeStat
 
   const pnlTotal = realizedPnl + unrealized;
   const pnlColor = pnlTotal >= 0 ? 'text-green-400' : 'text-red-400';
+
+  if (unknown) {
+    const card = (label: string) => (
+      <div key={label} className="card px-4 py-3 flex flex-col gap-1">
+        <span className="label-muted">{label}</span>
+        <span className="stat-value text-gray-500">—</span>
+        <span className={`text-xs ${unknown === 'loading…' ? 'text-gray-500' : 'text-red-400'}`}>{unknown}</span>
+      </div>
+    );
+    return (
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        {['🚀 Viper Launches', '✈️ Missions In-Flight', '🎯 Completed Missions', 'Net P&L'].map(card)}
+      </div>
+    );
+  }
 
   return (
     <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -420,7 +442,7 @@ export default function TradelogPage({ availableAssets }: Props) {
   // ── Fetch all assets in parallel ─────────────────────────────────────────────
   const assets = availableAssets.length > 0 ? availableAssets : ['btc', 'eth', 'sol'];
 
-  const { data: allTrades = [], isLoading: tradesLoading } = useSWR(
+  const { data: tradesData, isLoading: tradesLoading, error: tradesError } = useSWR(
     ['tradelog-trades', assets.join(',')],
     async () => {
       const results = await Promise.all(assets.map(a => getTrades(200, a).then(rows => rows.map(r => ({ asset: a, ...r })))));
@@ -431,13 +453,13 @@ export default function TradelogPage({ availableAssets }: Props) {
 
   // Lifetime totals per asset for the summary cards. Kept separate from the
   // trade list above, which stays a bounded window for display.
-  const { data: allStats = [] } = useSWR(
+  const { data: statsData, isLoading: statsLoading, error: statsError } = useSWR(
     ['tradelog-stats', assets.join(',')],
     async () => Promise.all(assets.map(a => getTradeStats(a).then(t => ({ asset: a, ...t })))),
     { refreshInterval: 15_000 },
   );
 
-  const { data: allPositions = [], isLoading: positionsLoading } = useSWR(
+  const { data: positionsData, isLoading: positionsLoading, error: positionsError } = useSWR(
     ['tradelog-positions', assets.join(',')],
     async () => {
       const results = await Promise.all(assets.map(a => getOpenPositions(a).then(rows => rows.map(r => ({ asset: a, ...r })))));
@@ -445,6 +467,20 @@ export default function TradelogPage({ availableAssets }: Props) {
     },
     { refreshInterval: 15_000 },
   );
+
+  const allTrades = tradesData ?? [];
+  const allStats = statsData ?? [];
+  const allPositions = positionsData ?? [];
+
+  // Why the summary's figures are not known, or null when they are. A failed
+  // refresh with the last good data still cached is not "unknown": SWR keeps
+  // that data, and the list below keeps showing it, so only a read that has
+  // never succeeded blanks the cards.
+  const loadErr = (!tradesData && tradesError) || (!statsData && statsError) || (!positionsData && positionsError);
+  const summaryUnknown: string | null =
+    tradesLoading || statsLoading || positionsLoading ? 'loading…'
+      : loadErr ? `couldn't load: ${loadErr instanceof Error ? loadErr.message : String(loadErr)}`
+      : null;
 
   // Live venue quotes for open positions, polled far faster than the rows.
   //
@@ -580,6 +616,7 @@ export default function TradelogPage({ availableAssets }: Props) {
       <SummaryBar
         entries={assetFilter === 'all' ? allEntries : allEntries.filter(e => e.shard === assetFilter)}
         stats={assetFilter === 'all' ? allStats : allStats.filter(s => s.asset === assetFilter)}
+        unknown={summaryUnknown}
       />
 
       {/* ── Filters ──────────────────────────────────────────────────────────── */}
@@ -771,7 +808,7 @@ export default function TradelogPage({ availableAssets }: Props) {
                                 !isOpen
                                   ? 'Exit price'
                                   : e.priceIsLiveBid
-                                    ? `Live best bid from the venue (${e.priceAgeSecs ?? 0}s old). This is what a manual exit would sell into.`
+                                    ? `Live best bid from the venue (${e.priceAgeSecs === null ? "age unknown" : `${e.priceAgeSecs}s old`}). This is what a manual exit would sell into.`
                                     : e.priceAgeSecs === null
                                       ? 'Stored mark price; refresh time unknown'
                                       : `Stored mark price, ${e.priceAgeSecs}s old. Refreshed on a 300s sweep, so it can lag the live book.`

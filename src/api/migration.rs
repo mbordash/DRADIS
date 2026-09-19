@@ -59,27 +59,38 @@ fn error_response(code: StatusCode, message: impl Into<String>) -> Response {
     (code, Json(json!({ "error": message.into() }))).into_response()
 }
 
-async fn instance_counts() -> (i64, i64) {
+/// Trades and open positions across every shard, or why they could not be
+/// counted. A failed count is not zero: it used to read as 0, which showed
+/// "0 trades" in the retire dialog and let a restore skip the confirmation
+/// that protects an existing ledger from being replaced ([B43]).
+async fn instance_counts() -> Result<(i64, i64), String> {
     let (mut trades, mut open_positions) = (0i64, 0i64);
     for pool in crate::helpers::db::all_pools() {
-        trades += sqlx::query_scalar::<_, i64>("SELECT count(*) FROM trades").fetch_one(&pool).await.unwrap_or(0);
+        trades += sqlx::query_scalar::<_, i64>("SELECT count(*) FROM trades")
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| format!("counting trades: {e}"))?;
         open_positions += sqlx::query_scalar::<_, i64>("SELECT count(*) FROM open_positions")
             .fetch_one(&pool)
             .await
-            .unwrap_or(0);
+            .map_err(|e| format!("counting open positions: {e}"))?;
     }
-    (trades, open_positions)
+    Ok((trades, open_positions))
 }
 
 /// GET /api/migration/status: this instance's ledger size, retirement, the
 /// backup in progress or ready, and any staged or applied restore.
 async fn status() -> Response {
-    let (trades, open_positions) = instance_counts().await;
+    let counts = instance_counts().await;
+    if let Err(e) = &counts {
+        warn!("📦 Migration status: {e}");
+    }
     Json(json!({
         "venue": crate::api::setup::build_venue(),
         "app_version": env!("CARGO_PKG_VERSION"),
-        "trades": trades,
-        "open_positions": open_positions,
+        "trades": counts.as_ref().ok().map(|c| c.0),
+        "open_positions": counts.as_ref().ok().map(|c| c.1),
+        "counts_error": counts.as_ref().err(),
         "state": mig::local_state(work()),
     }))
     .into_response()
@@ -335,7 +346,27 @@ async fn restore_upload(Query(q): Query<RestoreQuery>, body: Body) -> Response {
     }
     info!("📥 Migration: upload received in full ({received} bytes); verifying the archive");
 
-    let (existing_trades, _) = instance_counts().await;
+    let existing_trades = match instance_counts().await {
+        Ok((trades, _)) => trades,
+        // Unknown is not empty: without an explicit overwrite, refuse as if the
+        // ledger held trades, so a failed count can never skip the confirmation.
+        Err(e) if !q.overwrite => {
+            let _ = tokio::fs::remove_file(&path).await;
+            warn!("📥 Migration: could not count this instance's ledger ({e}); asking for an explicit overwrite");
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": format!(
+                        "this instance's ledger could not be counted ({e}); restoring replaces it, so confirm the overwrite"
+                    ),
+                    "needs_overwrite": true,
+                    "existing_trades": serde_json::Value::Null,
+                })),
+            )
+                .into_response();
+        }
+        Err(_) => 0, // overwrite confirmed: the count no longer gates anything
+    };
     let venue = crate::api::setup::build_venue();
     let version = env!("CARGO_PKG_VERSION");
     let overwrite = q.overwrite;

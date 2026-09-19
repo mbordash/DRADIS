@@ -20,7 +20,7 @@ import { useState, useCallback } from 'react';
 import useSWR from 'swr';
 import type { DynamicConfig, ViperDef, ConfigFieldSchema, FieldType } from '@/lib/types';
 import { toDisplay, fromDisplay, fieldUnit, NO_MARKET_LABEL } from '@/lib/types';
-import { getConfigSchema, type ViperStatusRow } from '@/lib/api';
+import { getConfigSchema, refusalText, type ViperStatusRow } from '@/lib/api';
 import { DEMO_MODE } from '@/lib/demo';
 import AdvancedConfigModal from '@/components/AdvancedConfigModal';
 
@@ -143,6 +143,7 @@ function ParamRow({ field, config, onPatch, disabled }: ParamRowProps) {
   const [draft,    setDraft]    = useState(initial);
   const [editMode, setEditMode] = useState(false);
   const [saving,   setSaving]   = useState(false);
+  const [saveErr,  setSaveErr]  = useState<string | null>(null);
 
   // Reset draft when config prop changes (e.g. after a remote patch)
   const display = editMode ? draft : toDisplay(type, rawValue as string);
@@ -153,15 +154,18 @@ function ParamRow({ field, config, onPatch, disabled }: ParamRowProps) {
     const prev   = fromDisplay(type, toDisplay(type, rawValue as string));
     if (stored === prev) return;
     setSaving(true);
+    setSaveErr(null);
     try {
       await onPatch({ [field.key]: stored } as Partial<DynamicConfig>);
+    } catch (e) {
+      setSaveErr(refusalText(e));
     } finally {
       setSaving(false);
     }
   }, [draft, field.key, type, rawValue, onPatch]);
 
   return (
-    <div className="flex items-center justify-between py-1 border-b border-[#1e1e32] last:border-0">
+    <div className="flex flex-wrap items-center justify-between py-1 border-b border-[#1e1e32] last:border-0">
       <span className="text-xs text-gray-500 truncate mr-2">{field.label}</span>
       <div className="flex items-center gap-1">
         {editMode ? (
@@ -192,6 +196,7 @@ function ParamRow({ field, config, onPatch, disabled }: ParamRowProps) {
           <span className="text-xs text-gray-600 w-8">{fieldUnit(type)}</span>
         )}
       </div>
+      {saveErr && <span className="basis-full text-[10px] font-mono text-red-400 text-right">{saveErr}</span>}
     </div>
   );
 }
@@ -224,11 +229,15 @@ export default function ViperCard({ viper, config, onPatch, market, status }: Pr
     f => f.group === viper.name && !f.advanced && f.type !== 'bool',
   );
 
+  const [toggleErr, setToggleErr] = useState<string | null>(null);
   const handleToggle = async () => {
     if (DEMO_MODE) return;
     setToggling(true);
+    setToggleErr(null);
     try {
       await onPatch({ [viper.enableKey]: !enabled } as Partial<DynamicConfig>);
+    } catch (e) {
+      setToggleErr(refusalText(e));
     } finally {
       setToggling(false);
     }
@@ -247,6 +256,7 @@ export default function ViperCard({ viper, config, onPatch, market, status }: Pr
         </div>
         <Toggle enabled={enabled} onToggle={handleToggle} loading={toggling || DEMO_MODE} />
       </div>
+      {toggleErr && <p className="text-[10px] font-mono text-red-400 -mt-2">{toggleErr}</p>}
 
       {/* Description */}
       <p className="text-xs text-gray-500 leading-snug">{viper.description}</p>

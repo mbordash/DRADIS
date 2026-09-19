@@ -110,20 +110,25 @@ function RaptorHealthPanel({
             const hasFlag = !!meta?.flag;
             const src = meta?.healthKey ? raptors?.[meta.healthKey] : h;
             const connected = hasFlag ? (src?.[meta!.flag!] ?? false) : false;
+            // No health reading yet (status still loading, or it failed): the
+            // feed's state is unknown, not "Reconnecting" ([B43]).
+            const unread = hasFlag && src === undefined;
             // A feed with an `offlineText` (e.g. Tide off-hours) shows a neutral
             // idle badge when down rather than a red "Reconnecting" error.
             const idleStyle = !connected && meta?.offlineText;
-            const dot = !hasFlag
+            const dot = !hasFlag || unread
               ? 'bg-gray-600'
               : connected
                 ? `${meta!.dot} animate-pulse`
                 : idleStyle ? (meta!.offlineDot ?? 'bg-gray-600') : 'bg-red-500';
             const statusText = !hasFlag
               ? 'Pending'
+              : unread
+                ? 'Checking…'
               : connected
                 ? 'Connected'
                 : idleStyle ? meta!.offlineText! : 'Reconnecting';
-            const statusClass = !hasFlag
+            const statusClass = !hasFlag || unread
               ? 'text-gray-500'
               : connected
                 ? meta!.text
@@ -469,12 +474,12 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <div className="card px-4 py-3 flex flex-col gap-1">
           <span className="label-muted">Completed Trades</span>
-          <span className="stat-value">{statsLoading ? '—' : String(total)}</span>
+          <span className="stat-value">{statsLoading || !tradeStats ? '—' : String(total)}</span>
           <span className="text-xs text-gray-500">{since ? `all time, since ${since}` : 'all time'}</span>
         </div>
         <div className="card px-4 py-3 flex flex-col gap-1">
           <span className="label-muted">Open Positions</span>
-          <span className="stat-value">{positionsLoading ? '—' : String(openPositions?.length ?? 0)}</span>
+          <span className="stat-value">{positionsLoading || !openPositions ? '—' : String(openPositions.length)}</span>
           <span className="text-xs text-gray-500">active now</span>
         </div>
         <div className="card px-4 py-3 flex flex-col gap-1">

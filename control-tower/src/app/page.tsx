@@ -35,10 +35,10 @@ import VenueGate       from '@/components/VenueGate';
 import ErrorBoundary   from '@/components/ErrorBoundary';
 import Footer          from '@/components/Footer';
 import { ViperHealthStrip } from '@/components/ViperHealthStrip';
-import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, getPortfolioValue, getSquadrons } from '@/lib/api';
+import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, getPortfolioValue, getVenueIncome, getSquadrons, refusalText } from '@/lib/api';
 import { DEMO_MODE } from '@/lib/demo';
 import { getSetupStatus } from '@/lib/setupApi';
-import type { DynamicConfig, SquadronSummary, PortfolioValue } from '@/lib/types';
+import type { DynamicConfig, SquadronSummary, PortfolioValue, VenueIncome } from '@/lib/types';
 
 // Recharts must be loaded client-side only
 // Loading states are explicit: without one these render nothing at all while
@@ -179,6 +179,28 @@ function StatCard({ label, value, sub, valueClass = '' }: {
       <span className={`stat-value ${valueClass}`}>{value}</span>
       {sub && <span className="text-xs text-gray-500">{sub}</span>}
     </div>
+  );
+}
+
+/** One line for venue rebates and rewards; see [E57]. */
+function VenueIncomeLine({ income }: { income: VenueIncome }) {
+  const known = income.total !== null && income.session !== null;
+  return (
+    <p className="text-xs text-gray-500 font-mono px-1 -mt-1">
+      <span className="label-muted mr-2">Venue rebates</span>
+      {known ? (
+        <>
+          <span className="text-gray-300">{fmt$(parseFloat(income.total!))}</span> all-time
+          {' · '}
+          <span className="text-gray-300">{fmt$(parseFloat(income.session!))}</span> this session
+          <span className="text-gray-600">
+            {' '}· paid by the venue per wallet, not attributed to any viper
+          </span>
+        </>
+      ) : (
+        <span className="text-gray-600">not read from the venue yet</span>
+      )}
+    </p>
   );
 }
 
@@ -573,7 +595,7 @@ export default function DashboardPage() {
     useSWR('config', getConfig, { refreshInterval: 0, revalidateOnFocus: false });
 
   // CAG-level P&L history: fetch global aggregated history (all assets) for main dashboard
-  const { data: pnl, isLoading: pnlLoading } =
+  const { data: pnl, isLoading: pnlLoading, error: pnlError } =
     useSWR('pnl-global', () => getPnlHistory(1440), { refreshInterval: 60_000 });
 
   const { data: trades, isLoading: tradesLoading } =
@@ -634,7 +656,7 @@ export default function DashboardPage() {
   // Poll every 5 minutes — recommendations only arrive every 30 min at most.
   // Global LLM Advisor reads ALL asset databases and writes to primary pool,
   // so we fetch without an asset filter (always reads from primary).
-  const { data: llmRecs, isLoading: llmLoading } =
+  const { data: llmRecs, isLoading: llmLoading, error: llmError } =
     useSWR('llmRecs', () => getLlmRecommendations(10), { refreshInterval: 300_000 });
 
   // AI config proposals awaiting approval — poll faster (30 s): they're
@@ -650,9 +672,16 @@ export default function DashboardPage() {
   const { data: portfolio, isLoading: portfolioLoading, error: portfolioError } =
     useSWR('portfolio', getPortfolioValue, { refreshInterval: 30_000 });
 
+  // Venue rebates and rewards ([E57]). Read hourly by the engine, so a slow
+  // refresh is plenty.
+  const { data: venueIncome } =
+    useSWR('venue-income', getVenueIncome, { refreshInterval: 300_000 });
+
   // CAG squadron registry — refresh every 10 s to catch state transitions quickly.
-  const { data: squadrons, isLoading: squadronsLoading } =
+  const { data: squadrons, isLoading: squadronsLoading, error: squadronsError } =
     useSWR('squadrons', getSquadrons, { refreshInterval: 10_000 });
+  // No list, loading or failed: the counts are unknown, not zero ([B43]).
+  const squadronsUnknown = squadronsLoading || (!squadrons && !!squadronsError);
 
   // Setup state — drives the "engine idle, complete Setup" first-run banner.
   //
@@ -707,6 +736,8 @@ export default function DashboardPage() {
 
   // ── Stats derived from P&L history ──────────────────────────────────────────
   const latestSnap  = pnl?.[0];
+  // No snapshot yet: Session P&L is unknown, and renders as a dash, not $0.00.
+  const sessionKnown = !!latestSnap;
   const oldestSnap  = pnl?.[pnl.length - 1];
   const startingBal = oldestSnap  ? parseFloat(oldestSnap.collateral)  : 0;
   const sessionPnl  = latestSnap  ? parseFloat(latestSnap.session_pnl) : 0;
@@ -724,6 +755,19 @@ export default function DashboardPage() {
     await patchConfig(patch);
     await refreshConfig();
   }, [refreshConfig]);
+
+  // The GHOST/LIVE switch is the most consequential control on the page; a
+  // refused switch must say so rather than leave the button as it was ([B43]).
+  const [ghostErr, setGhostErr] = useState<string | null>(null);
+  const toggleGhost = useCallback(async () => {
+    if (!config) return;
+    setGhostErr(null);
+    try {
+      await handlePatch({ ghost_mode: !config.ghost_mode });
+    } catch (e) {
+      setGhostErr(refusalText(e));
+    }
+  }, [config, handlePatch]);
 
 
   // ── Squadron navigation ────────────────────────────────────────────────────
@@ -763,9 +807,10 @@ export default function DashboardPage() {
             <div className="flex items-center gap-3">
               <SessionBadge startedAt={status?.session_started_at} />
               <EngineStatus health={health} />
+              {ghostErr && <span className="text-[10px] font-mono text-red-400 max-w-[16rem]">{ghostErr}</span>}
               {config && !DEMO_MODE && (
                 <button
-                  onClick={() => handlePatch({ ghost_mode: !config.ghost_mode })}
+                  onClick={toggleGhost}
                   className={[
                     'flex items-center gap-2 text-xs font-mono px-3 py-1.5 rounded-lg border transition-colors',
                     config.ghost_mode
@@ -818,9 +863,10 @@ export default function DashboardPage() {
           <div className="flex items-center gap-3">
             <SessionBadge startedAt={status?.session_started_at} />
             <EngineStatus health={health} />
+              {ghostErr && <span className="text-[10px] font-mono text-red-400 max-w-[16rem]">{ghostErr}</span>}
             {config && !DEMO_MODE && (
               <button
-                onClick={() => handlePatch({ ghost_mode: !config.ghost_mode })}
+                onClick={toggleGhost}
                 className={[
                   'flex items-center gap-2 text-xs font-mono px-3 py-1.5 rounded-lg border transition-colors',
                   config.ghost_mode
@@ -931,6 +977,7 @@ export default function DashboardPage() {
           <ChunkBoundary name="Portfolio history">
             <PnlChart
               data={pnl ?? []}
+              loadError={!pnl && pnlError ? (pnlError instanceof Error ? pnlError.message : String(pnlError)) : undefined}
               startingBalance={startingBal}
               ghostMode={config?.ghost_mode}
               currentPortfolio={portfolio}
@@ -950,27 +997,36 @@ export default function DashboardPage() {
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <StatCard
             label="Active Squadrons"
-            value={squadronsLoading ? '—' : String(squadrons?.filter(s => s.state === 'PATROLLING' || s.state === 'DEPLOYED').length ?? 0)}
-            sub="deployed + patrolling"
+            value={squadronsUnknown || !squadrons ? '—' : String(squadrons.filter(s => s.state === 'PATROLLING' || s.state === 'DEPLOYED').length)}
+            sub={squadronsError && !squadrons ? "couldn't load" : 'deployed + patrolling'}
           />
           <StatCard
             label="Session P&L"
-            value={fmt$(sessionPnl)}
-            sub={fmtPct(sessionPct)}
-            valueClass={sessionPnl >= 0 ? 'text-green-400' : 'text-red-400'}
+            value={sessionKnown ? fmt$(sessionPnl) : '—'}
+            sub={sessionKnown ? fmtPct(sessionPct) : 'no snapshot yet'}
+            valueClass={!sessionKnown ? '' : sessionPnl >= 0 ? 'text-green-400' : 'text-red-400'}
           />
           <StatCard
             label="Total Squadrons"
-            value={squadronsLoading ? '—' : String(squadrons?.length ?? 0)}
-            sub="all states"
+            value={squadronsUnknown || !squadrons ? '—' : String(squadrons.length)}
+            sub={squadronsError && !squadrons ? "couldn't load" : 'all states'}
           />
         </div>
+
+        {/* Venue income ([E57]): paid by the venue per wallet, outside any
+            trade, so it sits beside the cards rather than inside Session P&L
+            or any viper's figures. Hidden on venues whose income is not read;
+            "not read yet" rather than $0.00 before the first read ([B43]). */}
+        {venueIncome?.supported && (
+          <VenueIncomeLine income={venueIncome} />
+        )}
 
         {/* ── LLM Advisor (summary strip — detail lives in AI Actions) ──── */}
         <LlmAdvisorCard
           recommendations={llmRecs ?? []}
           isLoading={llmLoading}
-          advisorEnabled={true}
+          loadError={!llmRecs && llmError ? (llmError instanceof Error ? llmError.message : String(llmError)) : undefined}
+          advisorEnabled={status?.llm_advisor_enabled ?? true}
           pendingCount={pendingLlmCount}
           onGoToActions={() => navigate('ai')}
         />
@@ -983,11 +1039,17 @@ export default function DashboardPage() {
               Click a squadron to view details, raptors, vipers, and trades
             </span>
           </div>
-          <SquadronsPanel
-            squadrons={squadrons ?? []}
-            isLoading={squadronsLoading}
-            onSquadronClick={handleSquadronClick}
-          />
+          {squadronsError && !squadrons ? (
+            <div className="card p-4 text-sm text-red-400">
+              Couldn&apos;t load the squadron registry: {squadronsError instanceof Error ? squadronsError.message : String(squadronsError)}
+            </div>
+          ) : (
+            <SquadronsPanel
+              squadrons={squadrons ?? []}
+              isLoading={squadronsLoading}
+              onSquadronClick={handleSquadronClick}
+            />
+          )}
         </section>
 
         {/* ── Viper health rollup (per-squadron detail lives in drill-down) ── */}

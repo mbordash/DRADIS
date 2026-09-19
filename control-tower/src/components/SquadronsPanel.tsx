@@ -217,15 +217,16 @@ const DEPLOY_STATUS_STYLES: Record<string, { label: string; bg: string; text: st
   failed:     { label: 'FAILED',   bg: 'bg-red-500/10',   text: 'text-red-300',   dot: 'bg-red-500',   pulse: false },
 };
 
-function PendingDeploymentRow({ dep, onRetry, onDismiss, busy }: {
+function PendingDeploymentRow({ dep, onRetry, onDismiss, busy, error }: {
   dep: DeploymentStatus;
   onRetry: (id: string) => void;
   onDismiss: (id: string) => void;
   busy: boolean;
+  error?: string;
 }) {
   const style = DEPLOY_STATUS_STYLES[dep.status] ?? DEPLOY_STATUS_STYLES.pending;
   return (
-    <div className="flex items-center justify-between px-4 py-3 border-b border-[#1e1e32] last:border-b-0">
+    <div className="flex flex-wrap items-center justify-between px-4 py-3 border-b border-[#1e1e32] last:border-b-0">
       <div className="flex items-center gap-3 min-w-0">
         <span className={`inline-flex items-center gap-1.5 text-[10px] font-mono ${style.bg} ${style.text} rounded-full px-2 py-0.5 shrink-0`}>
           <span className={`w-1.5 h-1.5 rounded-full ${style.dot} ${style.pulse ? 'animate-pulse' : ''}`} />
@@ -278,6 +279,7 @@ function PendingDeploymentRow({ dep, onRetry, onDismiss, busy }: {
           waiting for the engine
         </span>
       )}
+      {error && <span className="basis-full text-[10px] font-mono text-red-400 mt-1">{error}</span>}
     </div>
   );
 }
@@ -399,23 +401,26 @@ export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick, 
   // Row actions. `actingOn` disables just the row being acted on, so a slow
   // request cannot be double-submitted while leaving the others usable.
   const [actingOn, setActingOn] = useState<string | null>(null);
-  const act = useCallback(async (id: string, fn: (id: string) => Promise<void>) => {
+  // A refused Retry used to be swallowed with the dismiss, so the operator
+  // clicked and nothing happened. It is named on its row now ([B43]); a
+  // failed dismiss stays quiet, since the next poll re-reads real state.
+  const [actErr, setActErr] = useState<{ id: string; text: string } | null>(null);
+  const act = useCallback(async (id: string, fn: (id: string) => Promise<void>, reportFailure: boolean) => {
     setActingOn(id);
+    setActErr(null);
     try {
       await fn(id);
       // Refresh at once rather than waiting for the next poll — the row is
       // gone from the operator's point of view the moment they click.
       await mutateDeployments();
-    } catch {
-      // The row stays put and the next poll re-reads real state; nothing is
-      // lost by a failed dismiss, and inventing an error banner for it would
-      // be more noise than the action deserves.
+    } catch (e) {
+      if (reportFailure) setActErr({ id, text: `retry refused: ${e instanceof Error ? e.message : String(e)}` });
     } finally {
       setActingOn(null);
     }
   }, [mutateDeployments]);
-  const handleRetry   = useCallback((id: string) => { void act(id, retryDeployment); }, [act]);
-  const handleDismiss = useCallback((id: string) => { void act(id, dismissDeployment); }, [act]);
+  const handleRetry   = useCallback((id: string) => { void act(id, retryDeployment, true); }, [act]);
+  const handleDismiss = useCallback((id: string) => { void act(id, dismissDeployment, false); }, [act]);
 
   // Build mission count map: asset -> count
   const missionCounts: Record<string, number> = {};
@@ -466,6 +471,7 @@ export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick, 
                   onRetry={handleRetry}
                   onDismiss={handleDismiss}
                   busy={actingOn === dep.id}
+                  error={actErr?.id === dep.id ? actErr.text : undefined}
                 />
               ))}
             </div>

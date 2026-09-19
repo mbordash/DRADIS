@@ -44,7 +44,7 @@ import {
 } from '@/lib/setupApi';
 import { useConfirm } from '@/components/ConfirmDialog';
 import useSWR, { useSWRConfig } from 'swr';
-import { getConfig, patchConfig, getConfigSchema } from '@/lib/api';
+import { getConfig, patchConfig, getConfigSchema, getStatus } from '@/lib/api';
 import { AdvancedRow } from '@/components/AdvancedConfigModal';
 import type { DynamicConfig, ConfigFieldSchema } from '@/lib/types';
 
@@ -1627,7 +1627,8 @@ function MigrationPanel({ onAuthError }: { onAuthError: () => void }) {
   };
 
   const prepare = async () => {
-    let openNow = status?.open_positions ?? 0;
+    // null = could not be counted; the dialog says so rather than "none".
+    let openNow: number | null = status ? status.open_positions : null;
     try {
       const fresh = await getMigrationStatus();
       setStatus(fresh);
@@ -1647,7 +1648,9 @@ function MigrationPanel({ onAuthError }: { onAuthError: () => void }) {
           <p className="text-amber-400">
             {openNow === 0
               ? 'This instance holds no open positions right now.'
-              : `Until then, no stop or exit can fire on the ${openNow} open position(s) this instance holds. Retire when it holds none, or accept that risk.`}
+              : openNow === null
+                ? 'This instance could not count its open positions. Until the new instance is running, no stop or exit can fire on any it holds.'
+                : `Until then, no stop or exit can fire on the ${openNow} open position(s) this instance holds. Retire when it holds none, or accept that risk.`}
           </p>
           <p className="text-gray-500">Restore the backup on the new instance only after this one shows as retired,
             so two engines never trade the same wallet.</p>
@@ -1715,14 +1718,16 @@ function MigrationPanel({ onAuthError }: { onAuthError: () => void }) {
     }
   };
 
-  const confirmReplace = (existingTrades: number) => confirm({
+  const confirmReplace = (existingTrades: number | null) => confirm({
     title: "Replace this instance's ledger?",
     tone: 'danger',
     confirmLabel: 'Replace and restore',
     body: (
       <>
-        <p>This instance already has <span className="text-amber-400">{existingTrades} trade(s)</span>.
-          Restoring replaces its databases and models with the backup&apos;s.</p>
+        <p>{existingTrades === null
+          ? <>This instance&apos;s ledger <span className="text-amber-400">could not be counted</span>, so it may hold trades.</>
+          : <>This instance already has <span className="text-amber-400">{existingTrades} trade(s)</span>.</>}
+          {' '}Restoring replaces its databases and models with the backup&apos;s.</p>
         <p className="text-gray-500">The replaced files are kept on this instance under
           logs/migration/pre-restore-*.</p>
       </>
@@ -1732,8 +1737,9 @@ function MigrationPanel({ onAuthError }: { onAuthError: () => void }) {
   const restoreFrom = async (file: File, overwrite = false): Promise<void> => {
     // Ask before sending hundreds of megabytes, not after: the engine's 409 is
     // only the backstop for a ledger this panel had not seen yet.
-    if (!overwrite && (status?.trades ?? 0) > 0) {
-      if (!(await confirmReplace(status?.trades ?? 0))) return;
+    // An uncounted ledger (trades null) asks too: unknown is not empty.
+    if (!overwrite && status && (status.trades === null || status.trades > 0)) {
+      if (!(await confirmReplace(status.trades))) return;
       overwrite = true;
     }
     setBusy(true);
@@ -1806,7 +1812,7 @@ function MigrationPanel({ onAuthError }: { onAuthError: () => void }) {
   // A backup describing fewer trades than the instance currently holds predates
   // the ledger in front of the operator. Only meaningful once the engine has
   // answered, so it stays false while status is still loading.
-  const staleBackup = !!latest && !!status && latest.manifest.trades < status.trades;
+  const staleBackup = !!latest && !!status && status.trades !== null && latest.manifest.trades < status.trades;
   const messageCls = message?.kind === 'err'
     ? 'bg-rose-500/10 border-rose-500/30 text-rose-300'
     : message?.kind === 'ok'
@@ -1830,9 +1836,14 @@ function MigrationPanel({ onAuthError }: { onAuthError: () => void }) {
       ) : (
         <>
           <p className="text-xs font-mono text-gray-400">
-            This instance: {status.venue} · v{status.app_version} · {status.trades} trade(s) · {status.open_positions} open
-            position(s){!reachable && ' · engine restarting…'}
+            This instance: {status.venue} · v{status.app_version} · {status.trades === null
+              ? 'ledger could not be counted'
+              : <>{status.trades} trade(s) · {status.open_positions ?? '—'} open position(s)</>}
+            {!reachable && ' · engine restarting…'}
           </p>
+          {status.counts_error && (
+            <p className="text-xs font-mono text-amber-400">Count failed: {status.counts_error}</p>
+          )}
 
           {st?.retired && (
             <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg px-3 py-2 bg-amber-500/10 border border-amber-500/30">
@@ -2053,16 +2064,32 @@ export default function SetupPage() {
     if (!ok) return;
     setRestarting(true);
     setNotice({ kind: 'info', text: 'Engine restarting — back in ~30-60s…' });
+    // The session start changes on every engine start, so "back online" means
+    // a NEW session answering, not the old engine still answering: a refused
+    // restart used to be swallowed here and then reported as back online ([B43]).
+    const before = await getStatus().then(s => s.session_started_at).catch(() => undefined);
     try {
       await restartEngine();
-    } catch {
-      // Expected if the process exits before the response flushes.
+    } catch (err) {
+      // A dropped connection is expected: the process exits before the reply
+      // flushes. An HTTP refusal (401, 4xx, 5xx) is not, and must be shown.
+      if (err instanceof SetupApiError) {
+        setRestarting(false);
+        if (err.status === 401) { sessionLost(); return; }
+        setNotice({ kind: 'err', text: `Restart refused: ${err.message}` });
+        return;
+      }
     }
-    // Poll status until the engine is back.
+    // Poll status until a new engine session is up. Without a baseline session
+    // to compare against, only an answer AFTER the engine was seen down counts,
+    // so an unreadable baseline cannot bring back the old false "back online".
     const started = Date.now();
+    let sawDown = false;
     const poll = setInterval(async () => {
       try {
         await getSetupStatus();
+        const now = await getStatus().then(s => s.session_started_at);
+        if (before ? now === before : !sawDown) throw new Error('still the previous session');
         clearInterval(poll);
         setRestarting(false);
         setNotice({ kind: 'ok', text: 'Engine is back online.' });
@@ -2078,11 +2105,12 @@ export default function SetupPage() {
         // has a `session_started_at` backstop for restarts that do not originate
         // here, but that only fires when `status` next polls, up to 30s later.
         mutateAll(() => true);
-      } catch {
+      } catch (e) {
+        if (!(e instanceof Error && e.message === 'still the previous session')) sawDown = true;
         if (Date.now() - started > 120_000) {
           clearInterval(poll);
           setRestarting(false);
-          setNotice({ kind: 'err', text: 'Engine did not come back within 2 minutes — check the container.' });
+          setNotice({ kind: 'err', text: 'No new engine session within 2 minutes: the engine did not restart, or did not come back. Check the container.' });
         }
       }
     }, 3000);

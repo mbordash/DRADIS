@@ -1099,6 +1099,8 @@ async fn get_pnl_history(Query(q): Query<AssetQuery>) -> Response {
 #[derive(Serialize)]
 struct StatusResponse {
     strategy_markets: HashMap<String, String>,
+    /// Whether the LLM Advisor is switched on (env override or compile default).
+    llm_advisor_enabled: bool,
     /// RFC-3339 timestamp of the current session start (= process startup).
     session_started_at: String,
     /// Per-asset Binance Raptor connection health.
@@ -1164,7 +1166,11 @@ async fn get_status(State(s): State<ApiState>) -> Response {
         .map(|(market, market_name, secs)| DarkFeed { market, market_name, dark_for_secs: secs })
         .collect();
     debug!("Successfully retrieved status");
-    Json(StatusResponse { strategy_markets: markets, session_started_at, raptors, dark_market_feeds }).into_response()
+    Json(StatusResponse {
+        strategy_markets: markets,
+        llm_advisor_enabled: crate::helpers::llm_advisor::advisor_enabled_setting(),
+        session_started_at, raptors, dark_market_feeds,
+    }).into_response()
 }
 
 /// GET /api/telemetry
@@ -1325,6 +1331,87 @@ async fn get_trade_stats(Query(q): Query<AssetQuery>) -> Response {
             }).into_response()
         }
     }
+}
+
+/// Venue income ([E57]): rebates and rewards the venue paid the wallet outside
+/// any trade.
+///
+/// `supported` is false on venues whose income DRADIS does not read, and
+/// `last_polled_at` is null until the first read completes; the totals are
+/// null in both cases, because "no income" and "not read" are different facts
+/// and the dashboard must not render the second as $0.00 ([B43]).
+#[derive(Serialize)]
+struct VenueIncomeResponse {
+    supported: bool,
+    last_polled_at: Option<String>,
+    /// All recorded credits.
+    total: Option<String>,
+    /// Credits dated at or after the current session's start.
+    session: Option<String>,
+    by_kind: std::collections::BTreeMap<String, String>,
+    count: usize,
+    rows: Vec<db::VenueIncomeRow>,
+}
+
+/// Sum the ledger's rows: total, those credited at or after `session_start`
+/// (an RFC 3339 timestamp), and per kind.
+fn summarize_venue_income(
+    rows: &[db::VenueIncomeRow],
+    session_start: &str,
+) -> (Decimal, Decimal, std::collections::BTreeMap<String, Decimal>) {
+    let session_start = chrono::DateTime::parse_from_rfc3339(session_start).ok();
+    let mut total = Decimal::ZERO;
+    let mut session = Decimal::ZERO;
+    let mut by_kind = std::collections::BTreeMap::new();
+    for r in rows {
+        let Ok(amount) = Decimal::from_str_exact(&r.amount) else { continue };
+        total += amount;
+        *by_kind.entry(r.kind.clone()).or_insert(Decimal::ZERO) += amount;
+        let credited = chrono::DateTime::parse_from_rfc3339(&r.credited_at).ok();
+        if let (Some(c), Some(s)) = (credited, session_start) {
+            if c >= s { session += amount; }
+        }
+    }
+    (total, session, by_kind)
+}
+
+/// GET /api/venue-income
+async fn get_venue_income() -> Response {
+    #[cfg(feature = "intl_clob")]
+    let last_polled = crate::tasks::venue_income::last_polled_at();
+    #[cfg(not(feature = "intl_clob"))]
+    let last_polled: Option<chrono::DateTime<chrono::Utc>> = None;
+    let supported = cfg!(feature = "intl_clob");
+
+    // Written to the primary shard, but read from every shard: the ledger is
+    // wallet-level, and if the primary ever changes (a multi-asset instance
+    // restored with a different asset order) the next poll re-backfills the
+    // whole history into the new primary. Deduplicating on the venue's own key
+    // keeps both copies from being counted, and keeps the old one visible.
+    let mut rows = Vec::new();
+    if supported {
+        let mut seen = std::collections::HashSet::new();
+        for pool in db::all_pools() {
+            for r in db::venue_income_rows(&pool).await {
+                if seen.insert((r.tx_hash.clone(), r.kind.clone())) {
+                    rows.push(r);
+                }
+            }
+        }
+        rows.sort_by(|a, b| b.credited_at.cmp(&a.credited_at));
+    }
+    let known = supported && last_polled.is_some();
+    let (total, session, by_kind) = summarize_venue_income(&rows, db::current_session_id());
+    Json(VenueIncomeResponse {
+        supported,
+        last_polled_at: last_polled.map(|t| t.to_rfc3339()),
+        total: known.then(|| total.to_string()),
+        session: known.then(|| session.to_string()),
+        by_kind: by_kind.into_iter().map(|(k, v)| (k, v.to_string())).collect(),
+        count: rows.len(),
+        rows,
+    })
+    .into_response()
 }
 
 /// GET /api/positions?asset=btc
@@ -4350,6 +4437,7 @@ pub async fn run_api_server(
         .route("/api/pnl/history",           get(get_pnl_history))
         .route("/api/trades",                get(get_trades))
         .route("/api/trades/stats",          get(get_trade_stats))
+        .route("/api/venue-income",          get(get_venue_income))
         .route("/api/trades/export",         get(export_trades))
         .route("/api/logs",                  get(get_logs))
         .route("/api/latency",               get(get_latency))
@@ -4717,5 +4805,30 @@ mod operator_exit_reason_tests {
                     "{r:?} would match recent_stop_loss_exists");
             assert!(!r.contains("RTB") && !r.contains("Return to Base"), "{r:?} still carries the jargon");
         }
+    }
+}
+
+#[cfg(test)]
+mod venue_income_summary_tests {
+    use super::*;
+
+    fn row(kind: &str, amount: &str, at: &str) -> db::VenueIncomeRow {
+        db::VenueIncomeRow { kind: kind.into(), amount: amount.into(), credited_at: at.into(), tx_hash: "0x".into() }
+    }
+
+    /// Totals are exact decimal sums; the session figure counts only credits at
+    /// or after the session's start.
+    #[test]
+    fn sums_total_session_and_kind() {
+        let rows = [
+            row("MAKER_REBATE", "1.2592", "2026-09-03T00:45:06+00:00"),
+            row("TAKER_REBATE", "10", "2026-07-09T21:43:32+00:00"),
+            row("MAKER_REBATE", "1.6335", "2026-04-27T01:00:28+00:00"),
+        ];
+        let (total, session, by_kind) = summarize_venue_income(&rows, "2026-09-01T00:00:00+00:00");
+        assert_eq!(total.to_string(), "12.8927");
+        assert_eq!(session.to_string(), "1.2592");
+        assert_eq!(by_kind["MAKER_REBATE"].to_string(), "2.8927");
+        assert_eq!(by_kind["TAKER_REBATE"].to_string(), "10");
     }
 }

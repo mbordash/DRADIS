@@ -398,6 +398,24 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
         )"
     ).execute(pool).await?;
 
+    // venue_income: credits the venue pays the wallet outside any trade (maker
+    // and taker rebates, rewards). Wallet-level income: never a trade row and
+    // never attributed to a viper, since the venue computes it per wallet per
+    // epoch and splitting it across strategies would invent attribution. Kept
+    // so the ledger can account for collateral that no trade explains ([E57]).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS venue_income (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            venue       TEXT    NOT NULL,
+            kind        TEXT    NOT NULL,
+            amount      TEXT    NOT NULL,
+            credited_at TEXT    NOT NULL,
+            tx_hash     TEXT    NOT NULL,
+            recorded_at TEXT    NOT NULL,
+            UNIQUE(venue, tx_hash, kind)
+        )"
+    ).execute(pool).await?;
+
     // config: key-value store (used by DynamicConfig for JSON blob persistence)
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS config (
@@ -1566,6 +1584,56 @@ pub async fn session_realized_pnl(pool: &SqlitePool, ghost: bool) -> Decimal {
         }
     }
     total
+}
+
+/// One credit the venue paid the wallet outside any trade.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VenueCredit {
+    /// The venue's own activity type, e.g. `MAKER_REBATE`.
+    pub kind: String,
+    pub amount: Decimal,
+    pub credited_at: DateTime<Utc>,
+    pub tx_hash: String,
+}
+
+/// A recorded venue credit as the API serves it.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct VenueIncomeRow {
+    pub kind: String,
+    pub amount: String,
+    pub credited_at: String,
+    pub tx_hash: String,
+}
+
+/// Record a venue credit once. Returns true when the row is new; the same
+/// `(venue, tx_hash, kind)` seen again on a later poll is ignored.
+pub async fn record_venue_credit(pool: &SqlitePool, venue: &str, c: &VenueCredit) -> anyhow::Result<bool> {
+    let res = sqlx::query(
+        "INSERT OR IGNORE INTO venue_income (venue, kind, amount, credited_at, tx_hash, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?)"
+    )
+    .bind(venue)
+    .bind(&c.kind)
+    .bind(c.amount.to_string())
+    .bind(c.credited_at.to_rfc3339())
+    .bind(&c.tx_hash)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Every recorded venue credit, newest first.
+pub async fn venue_income_rows(pool: &SqlitePool) -> Vec<VenueIncomeRow> {
+    sqlx::query_as::<_, VenueIncomeRow>(
+        "SELECT kind, amount, credited_at, tx_hash FROM venue_income ORDER BY credited_at DESC"
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_else(|e| {
+        warn!("⚠️ venue_income read failed: {}", e);
+        Vec::new()
+    })
 }
 
 pub async fn record_pnl_snapshot(pool: &SqlitePool, session_pnl: Decimal, collateral: Decimal, total_value: Decimal) {

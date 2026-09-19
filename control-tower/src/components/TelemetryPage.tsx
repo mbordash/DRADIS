@@ -364,11 +364,14 @@ function AssetSelector({
   );
 }
 
-function ConnPill({ label, live }: { label: string; live: boolean }) {
+/** `live` is undefined before the first sample: unknown renders grey, not as a red "down" ([B43]). */
+function ConnPill({ label, live }: { label: string; live: boolean | undefined }) {
+  const dot  = live === undefined ? 'bg-gray-600' : live ? 'bg-green-400 animate-pulse' : 'bg-red-500';
+  const text = live === undefined ? 'text-gray-500' : live ? 'text-green-400' : 'text-red-400';
   return (
-    <div className="flex items-center gap-1.5 text-[10px] font-mono">
-      <span className={`h-2 w-2 rounded-full ${live ? 'bg-green-400 animate-pulse' : 'bg-red-500'}`} />
-      <span className={live ? 'text-green-400' : 'text-red-400'}>{label}</span>
+    <div className="flex items-center gap-1.5 text-[10px] font-mono" title={live === undefined ? 'no reading yet' : undefined}>
+      <span className={`h-2 w-2 rounded-full ${dot}`} />
+      <span className={text}>{label}</span>
     </div>
   );
 }
@@ -783,14 +786,14 @@ export default function TelemetryPage({ availableAssets, venue }: { availableAss
         </div>
 
         <div className="flex flex-wrap items-center gap-3 mt-3 pt-3 border-t border-[#1e1e32]">
-          <ConnPill label="Price Raptor" live={!!lastSample?.price_connected} />
-          <ConnPill label="Funding Raptor" live={!!lastSample?.funding_connected} />
-          <ConnPill label="Derivatives Raptor" live={!!lastSample?.deriv_connected} />
+          <ConnPill label="Price Raptor" live={lastSample ? !!lastSample.price_connected : undefined} />
+          <ConnPill label="Funding Raptor" live={lastSample ? !!lastSample.funding_connected : undefined} />
+          <ConnPill label="Derivatives Raptor" live={lastSample ? !!lastSample.deriv_connected : undefined} />
           {asset === 'btc' && (
-            <ConnPill label="Tide Raptor" live={!!lastSample?.tide_connected} />
+            <ConnPill label="Tide Raptor" live={lastSample ? !!lastSample.tide_connected : undefined} />
           )}
           {asset === 'btc' && (
-            <ConnPill label="Horizon Raptor" live={!!lastSample?.horizon_connected} />
+            <ConnPill label="Horizon Raptor" live={lastSample ? !!lastSample.horizon_connected : undefined} />
           )}
 
           {/* Window selector */}
@@ -843,11 +846,23 @@ export default function TelemetryPage({ availableAssets, venue }: { availableAss
       {/* Current-value stat strip */}
       {latest && (
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-          <StatCard label="Oracle Price" value={`$${latest.oracle.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`} />
-          <StatCard label="Velocity (5s)" value={fmtSigned(latest.v5)} valueClass={latest.v5 >= 0 ? 'text-green-400' : 'text-red-400'} />
-          <StatCard label="Drift (10m)" value={fmtSigned(latest.d10)} valueClass={latest.d10 >= 0 ? 'text-green-400' : 'text-red-400'} />
-          <StatCard label="Funding Rate" value={`${latest.funding >= 0 ? '+' : ''}${latest.funding.toFixed(4)}%`} valueClass={latest.funding >= 0 ? 'text-green-400' : 'text-red-400'} />
-          <StatCard label="Open Interest Δ" value={`${latest.oiDelta >= 0 ? '+' : ''}${latest.oiDelta.toFixed(3)}%`} valueClass={latest.oiDelta >= 0 ? 'text-green-400' : 'text-red-400'} />
+          {/* A disconnected feed's last fields are zeros, not readings: dash them
+              rather than print "$0.00" or "+0.0000%" as live values ([B43]). */}
+          {(() => {
+            const priceUp   = !!lastSample?.price_connected;
+            const fundingUp = !!lastSample?.funding_connected;
+            const derivUp   = !!lastSample?.deriv_connected;
+            const off = 'text-gray-500';
+            return (
+              <>
+                <StatCard label="Oracle Price" value={priceUp ? `$${latest.oracle.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—'} valueClass={priceUp ? '' : off} />
+                <StatCard label="Velocity (5s)" value={priceUp ? fmtSigned(latest.v5) : '—'} valueClass={!priceUp ? off : latest.v5 >= 0 ? 'text-green-400' : 'text-red-400'} />
+                <StatCard label="Drift (10m)" value={priceUp ? fmtSigned(latest.d10) : '—'} valueClass={!priceUp ? off : latest.d10 >= 0 ? 'text-green-400' : 'text-red-400'} />
+                <StatCard label="Funding Rate" value={fundingUp ? `${latest.funding >= 0 ? '+' : ''}${latest.funding.toFixed(4)}%` : '—'} valueClass={!fundingUp ? off : latest.funding >= 0 ? 'text-green-400' : 'text-red-400'} />
+                <StatCard label="Open Interest Δ" value={derivUp ? `${latest.oiDelta >= 0 ? '+' : ''}${latest.oiDelta.toFixed(3)}%` : '—'} valueClass={!derivUp ? off : latest.oiDelta >= 0 ? 'text-green-400' : 'text-red-400'} />
+              </>
+            );
+          })()}
           <StatCard
             label="Taker CVD"
             value={latest.cvd > 0 ? latest.cvd.toFixed(3) : '—'}
@@ -954,7 +969,7 @@ export default function TelemetryPage({ availableAssets, venue }: { availableAss
               </p>
             </div>
             <div className="flex items-center gap-3 text-[10px] font-mono shrink-0">
-              <ConnPill label="Sports Raptor" live={!!sportsLast?.sports_connected} />
+              <ConnPill label="Sports Raptor" live={sportsLast ? !!sportsLast.sports_connected : undefined} />
               <span className="text-gray-500">
                 books <span className="text-gray-300">{num(sportsLast?.sports_num_books).toFixed(0)}</span>
               </span>
@@ -1043,7 +1058,7 @@ export default function TelemetryPage({ availableAssets, venue }: { availableAss
               </p>
             </div>
             <div className="flex items-center gap-3 text-[10px] font-mono shrink-0">
-              <ConnPill label="Tennis Raptor" live={!!tennisLast?.tennis_connected} />
+              <ConnPill label="Tennis Raptor" live={tennisLast ? !!tennisLast.tennis_connected : undefined} />
               <span className="text-gray-500">
                 live <span className="text-gray-300">{num(tennisLast?.tennis_num_live).toFixed(0)}</span>
               </span>

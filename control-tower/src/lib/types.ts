@@ -303,6 +303,21 @@ export interface TradeStats {
   last_ts:      string | null;
 }
 
+/**
+ * Venue income from `GET /api/venue-income` ([E57]): rebates and rewards the
+ * venue paid the wallet outside any trade. Wallet-level, never a viper's.
+ * `total` and `session` are null when the venue is unsupported or the ledger
+ * has not completed its first read; render that as unknown, not $0.00.
+ */
+export interface VenueIncome {
+  supported:      boolean;
+  last_polled_at: string | null;
+  total:          string | null;
+  session:        string | null;
+  by_kind:        Record<string, string>;
+  count:          number;
+}
+
 export interface TradeRow {
   ts:          string;
   strategy:    string;
@@ -520,6 +535,8 @@ export interface TelemetrySample {
 /** Response from GET /api/status — maps strategy key to active market name. */
 export interface StatusResponse {
   strategy_markets: Record<string, string>;
+  /** Whether the LLM Advisor is switched on. Absent on older engines. */
+  llm_advisor_enabled?: boolean;
   /** RFC-3339 timestamp of the current bot session start (= process startup). */
   session_started_at?: string;
   /** Per-asset Binance Raptor connection health. Key = asset symbol (e.g. "btc"). */

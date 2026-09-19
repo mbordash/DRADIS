@@ -34,6 +34,8 @@ interface Props {
   trades?: TradeRow[];
   /** Open positions (entries) to overlay on the chart as markers. */
   openPositions?: OpenPositionRow[];
+  /** Set when the history request failed, so an empty chart is not read as "no data yet". */
+  loadError?: string;
 }
 
 function fmt(iso: string) {
@@ -194,7 +196,7 @@ function PositionEntryTip({ events, label }: { events: PositionEvent[]; label: s
   );
 }
 
-export default function PnlChart({ data, startingBalance, ghostMode, currentPortfolio, trades, openPositions }: Props) {
+export default function PnlChart({ data, startingBalance, ghostMode, currentPortfolio, trades, openPositions, loadError }: Props) {
   // API returns newest-first — reverse for chronological chart display
   const base = startingBalance ?? 0;
   const reversedData = [...data].reverse();
@@ -373,7 +375,9 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
   if (chartData.length === 0) {
     return (
       <div className="card p-6 flex items-center justify-center h-48 text-gray-600 text-sm">
-        No balance data yet — snapshots are recorded every 60 s.
+        {loadError
+          ? <span className="text-red-400">Couldn&apos;t load balance history: {loadError}</span>
+          : 'No balance data yet — snapshots are recorded every 60 s.'}
       </div>
     );
   }

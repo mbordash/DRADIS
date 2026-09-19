@@ -31,6 +31,8 @@ import type { LlmRecommendationRow } from '@/lib/types';
 interface Props {
   recommendations: LlmRecommendationRow[];
   isLoading: boolean;
+  /** Set when the recommendations request failed; not the same as "none yet". */
+  loadError?: string;
   advisorEnabled: boolean;
   /** Count of AI config proposals awaiting approval (status 'proposed'). */
   pendingCount?: number;
@@ -52,7 +54,7 @@ function fmtTs(iso: string): string {
 }
 
 export default function LlmAdvisorCard({
-  recommendations, isLoading, advisorEnabled,
+  recommendations, isLoading, loadError, advisorEnabled,
   pendingCount = 0, onGoToActions,
 }: Props) {
   const [expanded, setExpanded] = useState(false);
@@ -78,6 +80,8 @@ export default function LlmAdvisorCard({
 
           {isLoading ? (
             <span className="text-xs font-mono text-gray-600">Loading…</span>
+          ) : loadError ? (
+            <span className="text-xs font-mono text-red-400">couldn&apos;t load: {loadError}</span>
           ) : rec ? (
             <>
               <span className="text-xs font-mono text-gray-400">{fmtTs(rec.ts)}</span>
@@ -100,7 +104,7 @@ export default function LlmAdvisorCard({
             </>
           ) : (
             <span className="text-xs font-mono text-gray-600">
-              {advisorEnabled ? 'awaiting first analysis' : 'enable in config.rs + rebuild'}
+              {advisorEnabled ? 'awaiting first analysis' : 'disabled (ENABLE_LLM_ADVISOR)'}
             </span>
           )}
 

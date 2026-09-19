@@ -19,7 +19,7 @@
 import { useState, useCallback, useEffect } from 'react';
 import useSWR from 'swr';
 import type { DynamicConfig, ConfigFieldSchema } from '@/lib/types';
-import { getConfigSchema } from '@/lib/api';
+import { getConfigSchema, refusalText } from '@/lib/api';
 import { DEMO_MODE } from '@/lib/demo';
 
 // ── Advanced config modal ─────────────────────────────────────────────────────
@@ -71,6 +71,9 @@ export function AdvancedRow({ field, config, onPatch, disabled }: RowProps) {
       setSaving(true);
       try {
         await onPatch({ [field.key]: next } as unknown as Partial<DynamicConfig>);
+      } catch (e) {
+        setError(refusalText(e));
+        setDraft(stored);
       } finally {
         setSaving(false);
       }
@@ -97,6 +100,9 @@ export function AdvancedRow({ field, config, onPatch, disabled }: RowProps) {
       // to avoid f64 precision drift.
       const isInt = field.type === 'int' || field.type === 'secs';
       await onPatch({ [field.key]: isInt ? Math.round(clamped) : next } as unknown as Partial<DynamicConfig>);
+    } catch (e) {
+      setError(refusalText(e));
+      setDraft(stored);
     } finally {
       setSaving(false);
     }
@@ -107,6 +113,8 @@ export function AdvancedRow({ field, config, onPatch, disabled }: RowProps) {
     setSaving(true);
     try {
       await onPatch({ [field.key]: next === 'true' } as unknown as Partial<DynamicConfig>);
+    } catch (e) {
+      setError(refusalText(e));
     } finally {
       setSaving(false);
     }
@@ -128,7 +136,7 @@ export function AdvancedRow({ field, config, onPatch, disabled }: RowProps) {
         {(bounds || error) && (
           <p className="text-[10px] font-mono mt-0.5">
             {bounds && <span className="text-gray-600">{bounds}</span>}
-            {error && <span className="text-amber-400 ml-2">{error}</span>}
+            {error && <span className={`${error.startsWith('not saved') ? 'text-red-400' : 'text-amber-400'} ml-2`}>{error}</span>}
           </p>
         )}
       </div>

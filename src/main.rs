@@ -967,6 +967,12 @@ async fn run() -> Result<()> {
     info!(" Syncing open_positions DB with on-chain holdings...");
     dradis::tasks::cleanup::sync_open_positions_with_chain(safe_address).await;
 
+    // Venue income ledger ([E57]): rebates and rewards paid to the wallet
+    // outside any trade, recorded from the venue's typed activity rows.
+    spawn_supervised("venue-income-ledger", move || {
+        dradis::tasks::venue_income::run_venue_income_ledger(safe_address)
+    });
+
     // ── Phase 3f-6: Spawn one market loop per asset ──────────────────────────
     // Each asset gets its own:
     //   • Price + funding raptors   (different Binance WS symbols)

@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License along
 // with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import type { DynamicConfig, ConfigFieldSchema, PnlSnapshotRow, TradeRow, TradeStats, OpenPositionRow, LlmRecommendationRow, LlmActionRow, ViperDef, StatusResponse, PortfolioValue, PositionQuote, SquadronSummary, TelemetrySnapshot, TelemetrySample } from './types';
+import type { DynamicConfig, ConfigFieldSchema, PnlSnapshotRow, TradeRow, TradeStats, OpenPositionRow, LlmRecommendationRow, LlmActionRow, ViperDef, StatusResponse, PortfolioValue, VenueIncome, PositionQuote, SquadronSummary, TelemetrySnapshot, TelemetrySample } from './types';
 
 // In development, NEXT_PUBLIC_API_URL=http://localhost:9000 (set in .env.local)
 // hits the DRADIS API directly.
@@ -290,6 +290,13 @@ export async function getPositionQuotes(asset: string, fresh = false): Promise<P
   return res.json();
 }
 
+/** Venue rebates and rewards paid outside any trade ([E57]). */
+export async function getVenueIncome(): Promise<VenueIncome> {
+  const res = await fetch(`${BASE}/api/venue-income`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/venue-income → ${res.status}`);
+  return res.json();
+}
+
 export async function getPortfolioValue(): Promise<PortfolioValue> {
   const res = await fetch(`${BASE}/api/portfolio`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`GET /api/portfolio → ${res.status}`);
@@ -502,3 +509,12 @@ export const VIPER_DEFS: ViperDef[] = [
   },
 ];
 
+/**
+ * The text to show when a request the operator made was refused. A failed save
+ * must say so where it happened; a field that silently snaps back reads as a
+ * control that does nothing ([B43]).
+ */
+export function refusalText(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  return `not saved: ${msg}`;
+}

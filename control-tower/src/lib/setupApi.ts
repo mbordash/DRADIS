@@ -363,8 +363,10 @@ export interface MigrationState {
 export interface MigrationStatus {
   venue: VenueId;
   app_version: string;
-  trades: number;
-  open_positions: number;
+  /** `null` when the ledger could not be counted (see `counts_error`); never read that as zero. */
+  trades: number | null;
+  open_positions: number | null;
+  counts_error?: string | null;
   state: MigrationState;
 }
 
@@ -407,8 +409,9 @@ export interface RestoreUploadResult {
 
 /** The engine refused to stage a restore over an instance that already has trades. */
 export class RestoreNeedsOverwrite extends Error {
-  existingTrades: number;
-  constructor(message: string, existingTrades: number) {
+  /** `null` when the engine could not count its ledger. */
+  existingTrades: number | null;
+  constructor(message: string, existingTrades: number | null) {
     super(message);
     this.existingTrades = existingTrades;
   }
@@ -439,12 +442,12 @@ export function uploadMigrationArchive(
       if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total);
     };
     xhr.onload = () => {
-      let body: { error?: string; needs_overwrite?: boolean; existing_trades?: number } | null = null;
+      let body: { error?: string; needs_overwrite?: boolean; existing_trades?: number | null } | null = null;
       try { body = JSON.parse(xhr.responseText); } catch { /* non-JSON body */ }
       if (xhr.status >= 200 && xhr.status < 300) {
         resolve(body as unknown as RestoreUploadResult);
       } else if (xhr.status === 409 && body?.needs_overwrite) {
-        reject(new RestoreNeedsOverwrite(body.error ?? 'this instance already has trades', body.existing_trades ?? 0));
+        reject(new RestoreNeedsOverwrite(body.error ?? 'this instance already has trades', body.existing_trades ?? null));
       } else if (xhr.status === 413) {
         // nginx answers this before DRADIS sees the upload, so there is no JSON body.
         reject(new SetupApiError(413, 'The upload was refused for its size before it reached DRADIS. On an instance installed before 1.2, copy deploy/ami/nginx.conf to /opt/dradis/nginx.conf and restart the dradis-proxy container.'));
