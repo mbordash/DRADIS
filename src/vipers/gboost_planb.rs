@@ -65,7 +65,7 @@
 //! market (after which it can no longer see this book), and otherwise settlement.
 //! GBoost does not consult any other viper.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -111,10 +111,19 @@ const DETAIL_REFRESH_SECS: u64 = 2;
 /// not a profile constant.
 const STRUCTURAL_MIN_TREES: usize = 5;
 
-/// Oldest book snapshot from which a minute's mid is recorded. The intl feed
-/// only moves on a book event, so a quiet market can sit on one reading for
-/// minutes; a mid older than this is not that minute's mid.
-const MAX_SNAPSHOT_AGE_SECS: i64 = 10;
+/// Seconds after a minute boundary before that minute is scored, so the CLOB
+/// price history holds every point the training rows will later hold for it.
+/// Points were measured visible 2 to 7 s after their own timestamps
+/// (2026-09-19, 14 points); 15 s leaves margin inside `DECISION_STALE_SECS`.
+const HISTORY_SETTLE_SECS: i64 = 15;
+/// History fetched per decision: enough before the minute for the 5-minute mid
+/// and its staleness limit.
+const HISTORY_LOOKBACK_SECS: i64 = 900;
+/// Oldest book snapshot from which a minute's `ask` feature is recorded. Training
+/// reads the ask at the minute boundary; the decision now waits for the history,
+/// so the feature is taken from the first fresh tick of the minute rather than at
+/// decision time. The price actually paid is still the ask at decision time.
+const MINUTE_ASK_MAX_AGE_SECS: i64 = 10;
 
 /// Number of model inputs.
 pub const N_FEATURES: usize = 29;
@@ -138,8 +147,6 @@ const KLINES_LIMIT: u32 = 75;
 const BAR_SETTLE_SECS: i64 = 2;
 /// A decision minute not scored within this many seconds is skipped, not scored late.
 const DECISION_STALE_SECS: i64 = 45;
-/// A recorded mid older than this is treated as missing (the harness's staleness rule).
-const MID_STALE_SECS: i64 = 180;
 /// How often the settled funding rate is re-read.
 const FUNDING_REFRESH_SECS: u64 = 120;
 /// How often the model file is checked for a newer version.
@@ -473,20 +480,6 @@ pub fn holds_to_settlement(posture: ExitPosture, token_id: &str) -> bool {
     }
 }
 
-/// The last mid recorded at or before `at`, if no older than the harness's staleness limit.
-fn mid_at(series: Option<&BTreeMap<i64, [Option<f64>; 2]>>, side: usize, at: i64) -> Option<f64> {
-    let (key, mids) = series?.range(..=at).next_back()?;
-    if at - key > MID_STALE_SECS { return None; }
-    mids[side]
-}
-
-fn book_mid(bid: Decimal, ask: Decimal) -> Option<f64> {
-    if bid > Decimal::ZERO && ask > Decimal::ZERO && ask < Decimal::ONE {
-        ((bid + ask) / dec!(2)).to_f64()
-    } else {
-        None
-    }
-}
 
 // ── Model ────────────────────────────────────────────────────────────────────
 
@@ -613,11 +606,22 @@ struct MinuteData {
     last_warn: Option<Instant>,
 }
 
+/// The CLOB price history of both tokens for one (market, decision minute).
+#[derive(Default)]
+struct HistorySlot {
+    /// `(condition id, decision minute)` the series were fetched for.
+    for_key: Option<(String, i64)>,
+    series: [Vec<(i64, f64)>; 2],
+    fetching: Option<(String, i64)>,
+}
+
 #[derive(Default)]
 struct PlanBGlobals {
     model: StdMutex<ModelSlot>,
     data: StdMutex<MinuteData>,
-    mids: StdMutex<HashMap<String, BTreeMap<i64, [Option<f64>; 2]>>>,
+    history: StdMutex<HistorySlot>,
+    /// Each minute's asks from its first fresh tick, keyed by (condition id, minute).
+    minute_asks: StdMutex<HashMap<(String, i64), [f64; 2]>>,
     decided: StdMutex<HashSet<(String, i64)>>,
     attempted: StdMutex<HashSet<(String, usize)>>,
     below_minimum_noted: StdMutex<HashSet<String>>,
@@ -785,6 +789,62 @@ async fn fetch_funding() -> std::result::Result<(f64, i64), String> {
     parse_funding(&get_json("https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=1").await?)
 }
 
+async fn fetch_price_history(tokens: &[String; 2], t: i64) -> std::result::Result<[Vec<(i64, f64)>; 2], String> {
+    let url = |tok: &str| format!(
+        "https://clob.polymarket.com/prices-history?market={tok}&startTs={}&endTs={}&fidelity=1",
+        t - HISTORY_LOOKBACK_SECS, t + 60,
+    );
+    // Both tokens at once: a slow endpoint must not spend the decision window twice.
+    let (up_url, down_url) = (url(&tokens[0]), url(&tokens[1]));
+    let (up, down) = tokio::join!(get_json(&up_url), get_json(&down_url));
+    let parse = crate::vipers::gboost_planb_train::parse_price_history;
+    Ok([parse(&up?), parse(&down?)])
+}
+
+/// Both tokens' price history for decision minute `t` of market `cid`, fetched in
+/// the background (a tick has 500 ms) and cached for that minute. `None` until it
+/// arrives.
+fn ensure_price_history(g: &'static PlanBGlobals, cid: &str, tokens: [String; 2], t: i64) -> Option<[Vec<(i64, f64)>; 2]> {
+    let key = (cid.to_string(), t);
+    let mut h = lock(&g.history);
+    if h.for_key.as_ref() == Some(&key) {
+        return Some(h.series.clone());
+    }
+    if h.fetching.as_ref() != Some(&key) {
+        h.fetching = Some(key.clone());
+        tokio::spawn(async move {
+            // Two attempts: with both tokens fetched together and a 5 s HTTP timeout,
+            // the worst case is about 12 s, inside the window between
+            // HISTORY_SETTLE_SECS and DECISION_STALE_SECS.
+            for _ in 0..2 {
+                match fetch_price_history(&tokens, t).await {
+                    Ok(series) => {
+                        let mut h = lock(&g.history);
+                        // Only the fetch still being waited for may fill the slot, so a
+                        // late result for an earlier minute cannot replace a newer one.
+                        if h.fetching.as_ref() == Some(&key) {
+                            h.series = series;
+                            h.for_key = Some(key.clone());
+                            h.fetching = None;
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        let mut d = lock(&g.data);
+                        if warn_due(&mut d.last_warn) {
+                            warn!("GBoost plan-B: Polymarket price history unavailable ({e})");
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+            }
+            let mut h = lock(&g.history);
+            if h.fetching.as_ref() == Some(&key) { h.fetching = None; }
+        });
+    }
+    None
+}
+
 /// Closed bars through `t` and the settled funding rate, fetching in the background
 /// until both are in hand. A model that zeroes funding does not wait for it.
 fn ensure_minute_data(g: &'static PlanBGlobals, t: i64, need_funding: bool) -> Option<(Vec<Bar>, Option<f64>)> {
@@ -936,12 +996,13 @@ impl Strategy for GboostPlanBStrategy {
         let cid = market.condition_id.clone();
         let minute_start = w + (now_s - w) / 60 * 60;
 
-        // Record each minute's mids from the first fresh tick after its boundary.
-        if (now - snap.timestamp).num_seconds() <= MAX_SNAPSHOT_AGE_SECS {
-            let mut mids = lock(&g.mids);
-            let series = mids.entry(cid.clone()).or_default();
-            series.entry(minute_start).or_insert([book_mid(snap.yes_bid, snap.yes_ask), book_mid(snap.no_bid, snap.no_ask)]);
-            mids.retain(|_, s| s.last_key_value().is_some_and(|(k, _)| now_s - k < 7200));
+        // Record each minute's asks from the first fresh tick after its boundary: the
+        // model's `ask` input matches training's ask at the minute, not at decision time.
+        if (now - snap.timestamp).num_seconds() <= MINUTE_ASK_MAX_AGE_SECS {
+            let mut asks = lock(&g.minute_asks);
+            asks.entry((cid.clone(), minute_start))
+                .or_insert([snap.yes_ask.to_f64().unwrap_or(0.0), snap.no_ask.to_f64().unwrap_or(0.0)]);
+            asks.retain(|(_, m), _| now_s - m < 7200);
         }
 
         let k = (now_s - w) / 60;
@@ -954,7 +1015,7 @@ impl Strategy for GboostPlanBStrategy {
             idle("too close to the market rotation to manage a new position");
             return Ok(StrategySignal::NoSignal);
         }
-        if now_s < t + BAR_SETTLE_SECS || lock(&g.decided).contains(&(cid.clone(), t)) {
+        if now_s < t + BAR_SETTLE_SECS.max(HISTORY_SETTLE_SECS) || lock(&g.decided).contains(&(cid.clone(), t)) {
             return Ok(StrategySignal::NoSignal);
         }
         if now_s > t + DECISION_STALE_SECS {
@@ -974,18 +1035,26 @@ impl Strategy for GboostPlanBStrategy {
             return Ok(StrategySignal::NoSignal);
         };
 
-        let (mid_now, mid_m1, mid_m5) = {
-            let mids = lock(&g.mids);
-            let s = mids.get(&cid);
-            ([mid_at(s, 0, t), mid_at(s, 1, t)], [mid_at(s, 0, t - 60), mid_at(s, 1, t - 60)], [mid_at(s, 0, t - 300), mid_at(s, 1, t - 300)])
+        // The market's own price, from the same CLOB history and the same rule the
+        // training rows use ([B46]), never from the order book.
+        let tokens = [market.yes_token.as_str().to_string(), market.no_token.as_str().to_string()];
+        let Some(hist) = ensure_price_history(g, &cid, tokens, t) else {
+            idle("waiting for the Polymarket price history");
+            return Ok(StrategySignal::NoSignal);
         };
+        let at = |side: usize, x: i64| crate::vipers::gboost_planb_train::history_mid_at(&hist[side], x);
+        let (mid_now, mid_m1, mid_m5) = ([at(0, t), at(1, t)], [at(0, t - 60), at(1, t - 60)], [at(0, t - 300), at(1, t - 300)]);
+        // The price paid and the break-even it is judged against: the book now.
         let ask = [snap.yes_ask.to_f64().unwrap_or(0.0), snap.no_ask.to_f64().unwrap_or(0.0)];
+        // The model's `ask` input: the minute's first fresh ask, as in training; the
+        // current ask only if the minute had no fresh tick (e.g. just after a restart).
+        let feature_ask = lock(&g.minute_asks).get(&(cid.clone(), t)).copied().unwrap_or(ask);
         {
             let mut decided = lock(&g.decided);
             decided.insert((cid.clone(), t));
             decided.retain(|(_, dt)| now_s - dt < 7200);
         }
-        let inputs = DecisionInputs { w, t, bars: &bars, mid_now, mid_m1, mid_m5, ask, funding };
+        let inputs = DecisionInputs { w, t, bars: &bars, mid_now, mid_m1, mid_m5, ask: feature_ask, funding };
         let features = match build_features(&inputs) {
             Ok(f) => f,
             Err(gap) => {
@@ -1532,18 +1601,28 @@ mod tests {
         assert!(at < close - config::FINAL_EXPIRY_WINDOW_SECS, "the flatten must come before the market switch");
         // The last trained decision minute still leaves room to hold before it.
         let w = close - 3600;
-        assert!(w + 45 * 60 + BAR_SETTLE_SECS + MIN_HOLD_BEFORE_FLATTEN_SECS <= at);
+        assert!(w + 45 * 60 + BAR_SETTLE_SECS.max(HISTORY_SETTLE_SECS) + MIN_HOLD_BEFORE_FLATTEN_SECS <= at);
     }
 
+    /// The live mid is the training rule applied to the CLOB history: the last
+    /// point at or before the minute, missing when older than the staleness limit.
     #[test]
     fn a_mid_older_than_the_staleness_limit_is_missing() {
-        let mut s = BTreeMap::new();
-        s.insert(1000, [Some(0.40), Some(0.61)]);
-        assert_eq!(mid_at(Some(&s), 0, 1000), Some(0.40));
-        assert_eq!(mid_at(Some(&s), 1, 1000 + MID_STALE_SECS), Some(0.61));
-        assert_eq!(mid_at(Some(&s), 0, 1000 + MID_STALE_SECS + 1), None);
-        assert_eq!(mid_at(Some(&s), 0, 999), None);
-        assert_eq!(mid_at(None, 0, 1000), None);
+        use crate::vipers::gboost_planb_train::history_mid_at;
+        let s = [(940, 0.38), (1000, 0.40)];
+        assert_eq!(history_mid_at(&s, 1000), Some(0.40));
+        assert_eq!(history_mid_at(&s, 1059), Some(0.40), "a point up to a minute old is that minute's mid");
+        assert_eq!(history_mid_at(&s, 1000 + 180), Some(0.40));
+        assert_eq!(history_mid_at(&s, 1000 + 181), None);
+        assert_eq!(history_mid_at(&s, 939), None);
+        assert_eq!(history_mid_at(&[], 1000), None);
+    }
+
+    /// Live and training parse a `prices-history` response into the same series.
+    #[test]
+    fn price_history_parses_sorted() {
+        let v = serde_json::json!({"history": [{"t": 1060, "p": 0.305}, {"t": 1000, "p": 0.29}, {"t": "x", "p": 0.1}]});
+        assert_eq!(crate::vipers::gboost_planb_train::parse_price_history(&v), vec![(1000, 0.29), (1060, 0.305)]);
     }
 
     #[test]

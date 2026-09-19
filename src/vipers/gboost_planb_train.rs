@@ -387,6 +387,32 @@ fn last_at<T: Copy>(series: &[(i64, T)], t: i64) -> Option<(usize, T)> {
     if i == 0 { None } else { Some((i - 1, series[i - 1].1)) }
 }
 
+/// A side's Polymarket mid at `t` from its CLOB price history (`prices-history`,
+/// fidelity 1), sorted by time: the last point at or before `t`, or `None` when that
+/// point is more than `MID_STALE_SECS` old.
+///
+/// The ONE definition of the model's market price, used by the training rows and
+/// by the live viper alike ([B46]). Live used to read the order-book mid instead;
+/// the history is a once-a-minute sample of that book taken at its own seconds,
+/// so in a moving market the two differed by several cents at the same minute,
+/// and at 27 live entries the price features sat 4.6 ¢ above what training would
+/// have computed, while every Binance feature matched exactly.
+pub fn history_mid_at(series: &[(i64, f64)], t: i64) -> Option<f64> {
+    let (i, p) = last_at(series, t)?;
+    if t - series[i].0 > MID_STALE_SECS { None } else { Some(p) }
+}
+
+/// Points of a `prices-history` response as `(t, p)`, sorted by time. Parsed the
+/// same way as the training fetch, so both paths read identical series.
+pub fn parse_price_history(v: &serde_json::Value) -> Vec<(i64, f64)> {
+    let mut pts: Vec<(i64, f64)> = v["history"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|p| Some((num(&p["t"])? as i64, num(&p["p"])?))).collect())
+        .unwrap_or_default();
+    pts.sort_by_key(|x| x.0);
+    pts
+}
+
 /// Every row of one market, exactly as the reference builder produced them, with the
 /// features from the viper's own `build_features`.
 pub fn build_market_rows(w: i64, rec: &MarketRecord, bars: &[Bar], funding: &[(i64, f64)], plan: &Plan) -> Vec<TrainingRow> {
@@ -414,10 +440,7 @@ pub fn build_market_rows(w: i64, rec: &MarketRecord, bars: &[Bar], funding: &[(i
     if hist[0].len() < MIN_HIST_POINTS || hist[1].len() < MIN_HIST_POINTS {
         return out;
     }
-    let mid_at = |side: usize, t: i64| -> Option<f64> {
-        let (i, p) = last_at(&hist[side], t)?;
-        if t - hist[side][i].0 > MID_STALE_SECS { None } else { Some(p) }
-    };
+    let mid_at = |side: usize, t: i64| history_mid_at(&hist[side], t);
 
     for k in plan.first_minute..=plan.last_minute {
         let t = w + 60 * k;
