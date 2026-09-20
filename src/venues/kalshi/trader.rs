@@ -1318,6 +1318,7 @@ async fn trade_one_market(
             available_collateral,
             dynamic_config: dyn_cfg.clone(),
             arb_market_lockouts: None,
+            sports: crate::raptors::sports_ledger::line_for(market_cfg.yes_token.as_str(), market_cfg.no_token.as_str()),
         };
 
         let eval = match evaluate_strategies(&strategies, &ctx).await {

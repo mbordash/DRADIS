@@ -1447,6 +1447,7 @@ impl Squadron {
                         }) },
                         dynamic_config: dyn_cfg,
                         arb_market_lockouts: Some(arb_market_lockouts.clone()),
+                        sports: crate::raptors::sports_ledger::line_for(hourly_market_config_for_ctx.yes_token.as_str(), hourly_market_config_for_ctx.no_token.as_str()),
                     };
 
                     let eval_result = match execute_strategies_concurrent(&strategies, &ctx, 500, &mut last_executor_summary).await {

@@ -326,6 +326,7 @@ mod venue_resolution_tests {
             maker_market: maker,
             dynamic_config: Arc::new(DynamicConfig::default()),
             arb_market_lockouts: None,
+            sports: None,
         }
     }
 

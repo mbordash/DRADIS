@@ -1062,6 +1062,7 @@ mod tests {
             maker_market: None,
             dynamic_config: Arc::new(dc),
             arb_market_lockouts: None,
+            sports: None,
         }
     }
 

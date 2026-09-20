@@ -44,7 +44,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::Decimal;
 use serde_json::Value;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
@@ -85,6 +86,12 @@ const RESULT_AFTER_START_SECS: i64 = 3 * 3600;
 /// ...and given up on once it started this long ago, so a market Gamma never
 /// settles cannot occupy the per-pass budget forever.
 const RESULT_GIVE_UP_SECS: i64 = 14 * 86_400;
+/// A board line older than this is not the current state of its game, so the
+/// telemetry panel reports the feed as not live.
+const BOARD_FRESH_SECS: i64 = 30 * 60;
+/// A line is kept on the board until this long after kick-off: long enough to cover
+/// a game and its overtime, short enough that the board is the current slate.
+const BOARD_RETAIN_SECS: i64 = 6 * 3600;
 /// Most markets checked for a resolution per pass.
 const RESULTS_PER_PASS: usize = 40;
 /// Two team names are the same team when this share of the shorter name's
@@ -271,6 +278,182 @@ pub struct MatchedGame {
     pub pm_slug: String,
     pub commence: DateTime<Utc>,
     pub outcomes: Vec<MatchedOutcome>,
+}
+
+/// One outcome token's line: the bookmakers' consensus for the outcome that token
+/// pays on, with the confidence and freshness a consumer needs to judge it ([E63]).
+///
+/// Keyed by the venue's own token id, so a squadron looks up `market.yes_token` and
+/// `market.no_token` directly and never matches team names in the patrol. The
+/// ledger already resolved the game and the polarity when it matched the market.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SportsLine {
+    pub league: String,
+    pub sport_key: String,
+    pub odds_event_id: String,
+    /// Kick-off, the only start time in the system: a sports market's close time is
+    /// a week after the game on MLB and kick-off itself on football and soccer.
+    pub commence: DateTime<Utc>,
+    /// The outcome this token pays on ("Chelsea FC", "Draw"), as the venue names it.
+    pub outcome_label: String,
+    /// Vig-free consensus probability across the books that quoted this outcome.
+    pub consensus: f64,
+    pub num_books: i64,
+    /// Highest minus lowest book probability: a wide line is a soft line.
+    pub dispersion: Option<f64>,
+    /// Age of the oldest book quote behind `consensus`, at `odds_at`.
+    pub max_book_age_secs: Option<i64>,
+    /// When the odds were read. A consumer judges staleness from this, not from
+    /// when it happened to look at the board.
+    pub odds_at: DateTime<Utc>,
+    /// Change in `consensus` since this token's previous line, when there was one:
+    /// the line movement that [E32] wanted, per outcome rather than per feed.
+    pub drift: Option<f64>,
+}
+
+impl SportsLine {
+    /// How old the consensus is now, in seconds.
+    pub fn age_secs(&self, now: DateTime<Utc>) -> i64 { (now - self.odds_at).num_seconds().max(0) }
+    /// Seconds until kick-off; negative once the game is under way.
+    pub fn secs_to_start(&self, now: DateTime<Utc>) -> i64 { (self.commence - now).num_seconds() }
+}
+
+/// Both sides of one market, already mapped to the venue's YES and NO tokens.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SportsMarketLine {
+    pub yes: Option<SportsLine>,
+    pub no: Option<SportsLine>,
+}
+
+impl SportsMarketLine {
+    /// The line for one side (0 = YES, 1 = NO).
+    pub fn side(&self, side: usize) -> Option<&SportsLine> {
+        if side == 0 { self.yes.as_ref() } else { self.no.as_ref() }
+    }
+    /// Kick-off, from whichever side the board holds.
+    pub fn commence(&self) -> Option<DateTime<Utc>> {
+        self.yes.as_ref().or(self.no.as_ref()).map(|l| l.commence)
+    }
+}
+
+/// Token id -> its line. Published by the ledger after every odds snapshot.
+pub type SportsBoard = HashMap<String, SportsLine>;
+
+fn board_tx() -> &'static watch::Sender<Arc<SportsBoard>> {
+    static TX: std::sync::OnceLock<watch::Sender<Arc<SportsBoard>>> = std::sync::OnceLock::new();
+    TX.get_or_init(|| watch::channel(Arc::new(SportsBoard::new())).0)
+}
+
+/// The current board. Cheap: an `Arc` clone of the last published map.
+pub fn board() -> Arc<SportsBoard> { board_tx().borrow().clone() }
+
+/// The lines for one market's two tokens, or `None` when the board knows neither
+/// (any non-sports market, and a sports market the ledger has not matched).
+pub fn line_for(yes_token: &str, no_token: &str) -> Option<SportsMarketLine> {
+    let b = board();
+    let (yes, no) = (b.get(yes_token).cloned(), b.get(no_token).cloned());
+    (yes.is_some() || no.is_some()).then_some(SportsMarketLine { yes, no })
+}
+
+/// Fold one snapshot's rows into the board and publish it.
+///
+/// Lines for games that kicked off more than `BOARD_RETAIN_SECS` ago are dropped, so
+/// the board stays the size of the current slate rather than the season.
+pub fn publish_rows(rows: &[db::SportsLedgerRow], now: DateTime<Utc>) {
+    // `send_replace`, not `send`: the board has no long-lived receiver (readers call
+    // `board()`), and `send` fails when every receiver has been dropped, which would
+    // leave the board permanently empty.
+    board_tx().send_replace(Arc::new(fold_rows(&board(), rows, now)));
+}
+
+/// `prev` with this snapshot's lines folded in and finished games dropped.
+pub fn fold_rows(prev: &SportsBoard, rows: &[db::SportsLedgerRow], now: DateTime<Utc>) -> SportsBoard {
+    let mut next: SportsBoard = prev.clone();
+    next.retain(|_, l| (now - l.commence).num_seconds() < BOARD_RETAIN_SECS);
+    for r in rows {
+        let (Some(commence), Some(odds_at)) = (parse_time(&r.commence), parse_time(&r.ts)) else { continue };
+        // Every snapshot covers every matched game of its sport, so a row with no
+        // consensus is the books saying they quote nothing on this outcome right
+        // now (11% of rows, 25% on college football, typically suspended in play).
+        // Dropping the line says that; keeping the old one would serve a pre-game
+        // number as an in-play reading.
+        let Some(consensus) = r.consensus else {
+            next.remove(&r.token_id);
+            continue;
+        };
+        let drift = prev.get(&r.token_id)
+            .filter(|p| p.odds_at < odds_at)
+            .map(|p| consensus - p.consensus);
+        next.insert(r.token_id.clone(), SportsLine {
+            league: r.league.clone(),
+            sport_key: r.sport_key.clone(),
+            odds_event_id: r.odds_event_id.clone(),
+            commence,
+            outcome_label: r.outcome_label.clone(),
+            consensus,
+            num_books: r.num_books,
+            dispersion: r.dispersion,
+            max_book_age_secs: r.max_book_age_secs,
+            odds_at,
+            drift,
+        });
+    }
+    next
+}
+
+/// Telemetry for the sports feed, from the board rather than from a tracked event.
+///
+/// The Control Tower's sports panel was fed by the Sports Raptor's nearest-event
+/// singleton, which is paused while the ledger owns the Odds API budget, so the
+/// panel read "disconnected" while the ledger was in fact reading odds every few
+/// minutes. These fields are a display summary of the board, and the game shown is
+/// simply the next one to kick off. They are not a trading signal: a consumer reads
+/// its own market's line from `line_for`, with that line's own freshness.
+pub fn report_board_health(
+    tx: &watch::Sender<HashMap<String, crate::api::server::AssetRaptorHealth>>,
+    now: DateTime<Utc>,
+) {
+    let board = board();
+    // Liveness is about the FEED, not about one game: the newest odds on the board.
+    // A feed that stopped answering publishes nothing, so this ages and goes false.
+    let freshest = board.values().map(|l| l.odds_at).max();
+    let live = freshest.is_some_and(|t| (now - t).num_seconds() <= BOARD_FRESH_SECS);
+    // The game shown is the next to kick off, tie-broken by label so the panel does
+    // not flip between the two sides of the same game from one publish to the next.
+    let next = board.values()
+        .min_by(|a, b| (a.commence < now, (a.commence - now).num_seconds().abs(), &a.outcome_label)
+            .cmp(&(b.commence < now, (b.commence - now).num_seconds().abs(), &b.outcome_label)))
+        .cloned();
+    let games: HashSet<&str> = board.values().map(|l| l.odds_event_id.as_str()).collect();
+    let n_games = games.len();
+    tx.send_modify(|map| {
+        let h = map.entry(crate::raptors::sports::SPORTS_HEALTH_KEY.to_string()).or_default();
+        h.sports_connected = live;
+        match &next {
+            Some(l) => {
+                h.sports_line_drift = l.drift.and_then(Decimal::from_f64_retain).unwrap_or_default().round_dp(6);
+                h.sports_consensus_prob = Decimal::from_f64_retain(l.consensus).unwrap_or_default().round_dp(6);
+                h.sports_book_dispersion = l.dispersion.and_then(Decimal::from_f64_retain).unwrap_or_default().round_dp(6);
+                h.sports_num_books = Decimal::from(l.num_books);
+                h.sports_event = format!("{} ({} game(s) on the board)", l.outcome_label, n_games);
+                h.sports_reference = l.outcome_label.clone();
+                h.sports_sport = l.league.to_uppercase();
+                h.sports_commence = l.commence.to_rfc3339();
+                h.sports_books = format!("{} book(s), oldest quote {}s", l.num_books, l.max_book_age_secs.unwrap_or(-1));
+            }
+            None => {
+                h.sports_consensus_prob = Decimal::ZERO;
+                h.sports_line_drift = Decimal::ZERO;
+                h.sports_book_dispersion = Decimal::ZERO;
+                h.sports_num_books = Decimal::ZERO;
+                h.sports_event = String::new();
+                h.sports_reference = String::new();
+                h.sports_sport = String::new();
+                h.sports_commence = String::new();
+                h.sports_books = String::new();
+            }
+        }
+    });
 }
 
 /// Pair Polymarket games with Odds API events: same league, start times within
@@ -611,6 +794,7 @@ struct LedgerState {
 pub async fn run_sports_ledger(
     http: Arc<reqwest::Client>,
     mut config_rx: watch::Receiver<Arc<DynamicConfig>>,
+    raptor_health_tx: Arc<watch::Sender<HashMap<String, crate::api::server::AssetRaptorHealth>>>,
 ) {
     let mut st = LedgerState::default();
     let mut was_enabled = false;
@@ -623,17 +807,28 @@ pub async fn run_sports_ledger(
                 "disabled"
             });
             was_enabled = cfg.sports_ledger_enabled;
+            if !cfg.sports_ledger_enabled {
+                // Switched off means no lines, not lines that quietly age out over
+                // the next six hours: `StrategyContext.sports` must be None at once.
+                board_tx().send_replace(Arc::new(SportsBoard::new()));
+            }
         }
         if cfg.sports_ledger_enabled {
             match std::env::var(config::SPORTS_ODDS_KEY_ENV).ok().filter(|k| !k.is_empty()) {
-                Some(key) => tick(&http, &key, &cfg, &mut st).await,
+                Some(key) => tick(&http, &key, &cfg, &mut st, &raptor_health_tx).await,
                 None if !st.warned_no_key => {
                     warn!("🏈 Sports ledger enabled but {} is not set — nothing to record", config::SPORTS_ODDS_KEY_ENV);
                     st.warned_no_key = true;
                 }
-                None => {}
+                None => {
+                    board_tx().send_replace(Arc::new(SportsBoard::new()));
+                }
             }
         }
+        // Every tick, not only after a paid snapshot: a feed that has stopped
+        // answering publishes nothing, and a panel fed only by publishes would keep
+        // reporting the last success forever ([B43]).
+        report_board_health(&raptor_health_tx, Utc::now());
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(TICK_SECS)) => {}
             _ = config_rx.changed() => {}
@@ -641,7 +836,13 @@ pub async fn run_sports_ledger(
     }
 }
 
-async fn tick(http: &reqwest::Client, api_key: &str, cfg: &DynamicConfig, st: &mut LedgerState) {
+async fn tick(
+    http: &reqwest::Client,
+    api_key: &str,
+    cfg: &DynamicConfig,
+    st: &mut LedgerState,
+    raptor_health_tx: &watch::Sender<HashMap<String, crate::api::server::AssetRaptorHealth>>,
+) {
     let now = Utc::now();
     // After a restart the in-memory snapshot times are gone, and a target taken
     // minutes before the restart would read as due again and be paid for twice.
@@ -652,6 +853,18 @@ async fn tick(http: &reqwest::Client, api_key: &str, cfg: &DynamicConfig, st: &m
                 if let Some(t) = parse_time(&ts) {
                     st.last_snapshot.entry(sport_key).and_modify(|v| if t > *v { *v = t }).or_insert(t);
                 }
+            }
+        }
+        // The slate this instance already paid for: without it the board is empty
+        // until the next paid snapshot of each sport, which on a free-tier key can
+        // be the whole game (default offsets are two hours and ten minutes out).
+        if let Some(pool) = db::pool() {
+            let from = (now - ChronoDuration::seconds(BOARD_RETAIN_SECS)).to_rfc3339();
+            let to = (now + ChronoDuration::seconds(LOOKAHEAD_SECS)).to_rfc3339();
+            let rows = db::sports_ledger_board_rows(pool, &from, &to).await;
+            if !rows.is_empty() {
+                publish_rows(&rows, now);
+                info!("🏈 Sports ledger: board seeded with {} line(s) from the recorded rows", board().len());
             }
         }
         st.seeded = true;
@@ -698,6 +911,9 @@ async fn tick(http: &reqwest::Client, api_key: &str, cfg: &DynamicConfig, st: &m
                 st.spent_today += last.unwrap_or(cost);
                 if remaining_after.is_some() { st.remaining = remaining_after; }
                 let n_games = rows.iter().map(|r| r.odds_event_id.as_str()).collect::<HashSet<_>>().len();
+                // The board is what squadrons read; the rows are what the research
+                // reads. Both come from this one paid call.
+                publish_rows(&rows, now);
                 if let Some(pool) = db::pool() {
                     db::record_sports_ledger_rows(pool, &rows).await;
                 }
@@ -724,6 +940,91 @@ mod tests {
     use super::*;
 
     fn t(s: &str) -> DateTime<Utc> { parse_time(s).unwrap() }
+
+    fn row(token: &str, label: &str, consensus: Option<f64>, commence: &str, ts: &str) -> db::SportsLedgerRow {
+        db::SportsLedgerRow {
+            ts: ts.into(), league: "mlb".into(), sport_key: "baseball_mlb".into(),
+            odds_event_id: "e1".into(), pm_slug: "mlb-min-laa-2026-09-19".into(),
+            condition_id: "0xabc".into(), token_id: token.into(), outcome_label: label.into(),
+            odds_outcome: label.into(), commence: commence.into(), secs_to_start: 600,
+            consensus, num_books: 7, dispersion: Some(0.0052), max_book_age_secs: Some(83),
+            pm_bid: Some(0.49), pm_ask: Some(0.50), pm_bid_size: Some(100.0), pm_ask_size: Some(200.0),
+            credits_remaining: Some(99_000),
+        }
+    }
+
+    /// A snapshot becomes one line per outcome token, and a squadron finds its own
+    /// market by the tokens it already holds: no team-name matching in the patrol.
+    #[test]
+    fn a_snapshot_becomes_a_line_per_token() {
+        let now = t("2026-09-19T23:00:00Z");
+        let b = fold_rows(&SportsBoard::new(), &[
+            row("tok-yes", "Minnesota Twins", Some(0.4981), "2026-09-20T01:38:00Z", "2026-09-19T23:00:00Z"),
+            row("tok-no", "Los Angeles Angels", Some(0.5018), "2026-09-20T01:38:00Z", "2026-09-19T23:00:00Z"),
+            // No consensus (every book pulled the game): no line, rather than a zero.
+            row("tok-none", "Draw", None, "2026-09-20T01:38:00Z", "2026-09-19T23:00:00Z"),
+        ], now);
+        assert_eq!(b.len(), 2, "the outcome with no consensus carries no line");
+        let yes = b.get("tok-yes").expect("a line for the YES token");
+        assert_eq!(yes.outcome_label, "Minnesota Twins");
+        assert_eq!(yes.secs_to_start(now), 2 * 3600 + 38 * 60, "kick-off is 2h38m away");
+        assert_eq!(yes.age_secs(t("2026-09-19T23:02:05Z")), 125);
+        assert_eq!(yes.num_books, 7);
+        let line = SportsMarketLine { yes: b.get("tok-yes").cloned(), no: b.get("tok-no").cloned() };
+        assert!((line.side(1).unwrap().consensus - 0.5018).abs() < 1e-9, "NO is the other token's line");
+        assert_eq!(line.commence(), Some(t("2026-09-20T01:38:00Z")));
+    }
+
+    /// The board is the current slate, not the season: a game that started long ago
+    /// is dropped when the next snapshot folds in.
+    #[test]
+    fn finished_games_leave_the_board() {
+        let old = row("old-tok", "Chelsea FC", Some(0.6), "2026-09-19T12:00:00Z", "2026-09-19T11:00:00Z");
+        let new = row("new-tok", "Arsenal", Some(0.55), "2026-09-19T20:00:00Z", "2026-09-19T19:00:00Z");
+        let b = fold_rows(&SportsBoard::new(), &[old], t("2026-09-19T11:00:00Z"));
+        assert!(b.contains_key("old-tok"));
+        let b = fold_rows(&b, &[new.clone()], t("2026-09-19T17:00:00Z"));
+        assert!(b.contains_key("old-tok"), "five hours after kick-off it is still within the window");
+        let b = fold_rows(&b, &[new], t("2026-09-19T19:00:00Z"));
+        assert!(!b.contains_key("old-tok"), "seven hours after kick-off it is gone");
+        assert!(b.contains_key("new-tok"));
+    }
+
+    /// Books withdraw a line in play (11% of production rows, 25% on college
+    /// football): the token leaves the board, so a consumer sees no line rather
+    /// than the pre-game number served as the current one.
+    #[test]
+    fn a_withdrawn_line_leaves_the_board() {
+        let pre = row("tok", "Arkansas", Some(0.42), "2026-09-19T16:00:00Z", "2026-09-19T14:00:00Z");
+        let b = fold_rows(&SportsBoard::new(), &[pre], t("2026-09-19T14:00:00Z"));
+        assert!(b.contains_key("tok"));
+        let withdrawn = row("tok", "Arkansas", None, "2026-09-19T16:00:00Z", "2026-09-19T17:15:00Z");
+        let b = fold_rows(&b, &[withdrawn], t("2026-09-19T17:15:00Z"));
+        assert!(!b.contains_key("tok"), "the books quote nothing, so the board holds nothing");
+    }
+
+    /// A token's line movement is its own consensus change between snapshots, which
+    /// is the per-outcome drift [E32] asked for.
+    #[test]
+    fn a_line_carries_its_own_drift() {
+        let first = row("tok", "Arsenal", Some(0.50), "2026-09-19T20:00:00Z", "2026-09-19T18:00:00Z");
+        let b = fold_rows(&SportsBoard::new(), &[first], t("2026-09-19T18:00:00Z"));
+        assert_eq!(b["tok"].drift, None, "nothing to compare the first reading with");
+        let second = row("tok", "Arsenal", Some(0.56), "2026-09-19T20:00:00Z", "2026-09-19T19:00:00Z");
+        let b = fold_rows(&b, &[second], t("2026-09-19T19:00:00Z"));
+        assert!((b["tok"].drift.unwrap() - 0.06).abs() < 1e-9, "drift {:?}", b["tok"].drift);
+    }
+
+    /// The published board is what `line_for` reads, and a market the ledger never
+    /// matched has no line at all.
+    #[test]
+    fn the_published_board_answers_by_token() {
+        publish_rows(&[row("pub-yes", "Arsenal", Some(0.61), "2026-09-20T01:38:00Z", "2026-09-19T23:00:00Z")], t("2026-09-19T23:00:00Z"));
+        let line = line_for("pub-yes", "pub-no").expect("the YES token is on the board");
+        assert!((line.yes.unwrap().consensus - 0.61).abs() < 1e-9);
+        assert!(line.no.is_none(), "the other token was not matched");
+        assert!(line_for("a-btc-token", "another").is_none(), "no line for a market the ledger never matched");
+    }
 
     /// Names as each side published them on 2026-09-11.
     #[test]

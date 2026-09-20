@@ -1435,6 +1435,7 @@ pub async fn lookup_open_position_strategy(pool: &SqlitePool, token_id_str: &str
 /// Provides the time-series data the Control Tower chart will query.
 /// One sports line ledger row: one outcome of one matched game at one snapshot.
 #[derive(Debug, Clone)]
+#[derive(sqlx::FromRow)]
 pub struct SportsLedgerRow {
     pub ts: String,
     pub league: String,
@@ -1508,6 +1509,27 @@ pub async fn sports_ledger_last_snapshots(pool: &SqlitePool) -> Vec<(String, Str
     )
     .fetch_all(pool).await
     .unwrap_or_default()
+}
+
+/// The newest ledger row per outcome token whose game is in `[from, to]` and whose
+/// books quoted a consensus: what the sports board holds, so a restart serves the
+/// slate it already paid for instead of waiting for the next snapshot ([E63]).
+///
+/// SQLite picks the row of the `MAX(ts)` for each group, which is what the bare
+/// columns here rely on.
+pub async fn sports_ledger_board_rows(pool: &SqlitePool, from: &str, to: &str) -> Vec<SportsLedgerRow> {
+    sqlx::query_as::<_, SportsLedgerRow>(
+        "SELECT ts, league, sport_key, odds_event_id, pm_slug, condition_id, token_id, outcome_label,
+                odds_outcome, commence, secs_to_start, consensus, num_books, dispersion, max_book_age_secs,
+                pm_bid, pm_ask, pm_bid_size, pm_ask_size, credits_remaining
+           FROM sports_line_ledger
+          WHERE consensus IS NOT NULL AND commence BETWEEN ? AND ?
+          GROUP BY token_id
+         HAVING ts = MAX(ts)"
+    )
+    .bind(from).bind(to)
+    .fetch_all(pool).await
+    .unwrap_or_else(|e| { warn!("⚠️ sports board seed read failed: {}", e); Vec::new() })
 }
 
 pub async fn record_sports_line_result(pool: &SqlitePool, condition_id: &str, token_id: &str, outcome_label: &str, resolved_price: f64) {

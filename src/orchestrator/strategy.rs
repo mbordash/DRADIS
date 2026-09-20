@@ -74,6 +74,24 @@ pub struct StrategyContext {
     /// the lock and refuse to open a second pair on the same market (hold-to-settle,
     /// no churn). `None` for venues/tests that don't supply it.
     pub arb_market_lockouts: Option<crate::state::ArbMarketLockouts>,
+    /// Bookmaker consensus for this market's two tokens, when the sports line
+    /// ledger has matched the game ([E63]).
+    ///
+    /// Mapped to YES and NO by the ledger, which resolved the game and the polarity
+    /// when it matched the market, so no viper matches team names. `no` is absent on
+    /// the per-outcome shape ("Will X win?"), where only the Yes token is keyed and
+    /// P(NO) is 1 − `yes.consensus`.
+    ///
+    /// `None` on every non-sports market, on a sports market the ledger has not
+    /// matched, and once the ledger is switched off (it clears the board). **Today
+    /// the ledger discovers Polymarket International only**, so this is always
+    /// `None` on Polymarket US and Kalshi, whose market ids it never sees.
+    ///
+    /// Carries its own freshness (`odds_at`, `max_book_age_secs`) and kick-off time:
+    /// a consumer must judge staleness itself, since a line read minutes ago
+    /// describes a different game state, and a token whose books have withdrawn
+    /// leaves the board rather than keeping its last value.
+    pub sports: Option<crate::raptors::sports_ledger::SportsMarketLine>,
 }
 
 /// Trait that all strategies must implement.
