@@ -710,6 +710,69 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
     ).execute(pool).await?;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sports_line_ledger_market ON sports_line_ledger(condition_id, ts)")
         .execute(pool).await;
+
+    // [E63] A snapshot pass is not instantaneous: one paid odds call is followed
+    // by a CLOB book read per outcome, so a single `ts` timestamped the book
+    // consensus and the Polymarket quote as if they were simultaneous when they
+    // can be minutes apart. Any lead/lag statistic read off `ts` alone would be
+    // measuring our own fetch order. `odds_at` is when the paid odds response
+    // returned, `pm_at` when this outcome's book returned; `ts` stays the pass
+    // key that groups a snapshot together.
+    //
+    // `overround` and `raw_consensus` keep the pre-de-vig figures: `consensus`
+    // is proportionally de-vigged, which carries a known favorite-longshot bias,
+    // and without the raw per-book prices no other de-vig (Shin, power) can be
+    // computed after the fact. These columns plus `sports_line_books` below make
+    // the recorded history re-derivable instead of locked to one method.
+    //
+    // These ALTERs must stay AFTER the CREATE above; see the deployment_queue
+    // note further down for what happens when a migration runs ahead of its table.
+    for col in [
+        "odds_at TEXT",
+        "pm_at TEXT",
+        "overround REAL",
+        "raw_consensus REAL",
+    ] {
+        let _ = sqlx::query(&format!("ALTER TABLE sports_line_ledger ADD COLUMN {col}"))
+            .execute(pool).await;
+    }
+
+    // Per-book raw moneyline quotes behind each ledger row, before any vig is
+    // removed. One row per book per outcome per snapshot.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS sports_line_books (
+            ts               TEXT NOT NULL,
+            odds_at          TEXT,
+            league           TEXT NOT NULL,
+            sport_key        TEXT NOT NULL,
+            odds_event_id    TEXT NOT NULL,
+            condition_id     TEXT NOT NULL,
+            token_id         TEXT NOT NULL,
+            outcome_label    TEXT NOT NULL,
+            book_key         TEXT NOT NULL,
+            decimal_odds     REAL NOT NULL,
+            raw_implied      REAL NOT NULL,
+            overround        REAL NOT NULL,
+            book_last_update TEXT,
+            PRIMARY KEY (ts, token_id, book_key)
+        )"
+    ).execute(pool).await?;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sports_line_books_market ON sports_line_books(condition_id, ts)")
+        .execute(pool).await;
+
+    // The day's Odds API spend, so a restart does not hand the ledger a fresh
+    // daily allowance. Without it an engine restarted mid-day reads `spent_today`
+    // as zero and may spend the day's budget twice, which on a free-tier key is
+    // the difference between covering a slate and running dry before kickoff.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS sports_ledger_budget (
+            day                 TEXT PRIMARY KEY,
+            day_start_remaining INTEGER,
+            spent_today         INTEGER NOT NULL,
+            updated_at          TEXT    NOT NULL
+        )"
+    ).execute(pool).await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS sports_line_results (
             condition_id   TEXT NOT NULL,
@@ -1457,27 +1520,140 @@ pub struct SportsLedgerRow {
     pub pm_bid_size: Option<f64>,
     pub pm_ask_size: Option<f64>,
     pub credits_remaining: Option<i64>,
+    /// When the paid odds response returned, and when this outcome's Polymarket
+    /// book returned. Both `None` on rows written before [E63] split them out of
+    /// the single pass timestamp.
+    pub odds_at: Option<String>,
+    pub pm_at: Option<String>,
+    /// Mean per-book sum of raw implied probabilities (the vig), and the mean
+    /// raw implied probability of this outcome before that vig is removed.
+    ///
+    /// These are descriptive summaries, NOT a way back to `consensus`:
+    /// `consensus` is the mean of the per-book ratios, while dividing these two
+    /// gives the ratio of the means, which is a different number. Nor do they
+    /// support an alternative de-vig, which needs every outcome's raw price per
+    /// book. To re-derive anything, join `sports_line_books`.
+    pub overround: Option<f64>,
+    pub raw_consensus: Option<f64>,
 }
 
-pub async fn record_sports_ledger_rows(pool: &SqlitePool, rows: &[SportsLedgerRow]) {
+/// One bookmaker's raw moneyline quote for one outcome of one snapshot, kept so
+/// a de-vig method other than the proportional one can be applied later.
+#[derive(Debug, Clone)]
+pub struct SportsLedgerBookRow {
+    pub ts: String,
+    pub odds_at: Option<String>,
+    pub league: String,
+    pub sport_key: String,
+    pub odds_event_id: String,
+    pub condition_id: String,
+    pub token_id: String,
+    pub outcome_label: String,
+    pub book_key: String,
+    pub decimal_odds: f64,
+    pub raw_implied: f64,
+    pub overround: f64,
+    pub book_last_update: Option<String>,
+}
+
+/// Record a snapshot's ledger rows in one transaction, returning how many
+/// landed. All-or-nothing on purpose: a half-written pass would report a book
+/// consensus for some outcomes of a game and not others, and nothing downstream
+/// could tell that from a game that genuinely had fewer books.
+pub async fn record_sports_ledger_rows(pool: &SqlitePool, rows: &[SportsLedgerRow]) -> usize {
+    if rows.is_empty() { return 0; }
+    let mut tx = match pool.begin().await {
+        Ok(t) => t,
+        Err(e) => { warn!("❌ DB sports_line_ledger transaction failed to open: {}", e); return 0; }
+    };
+    let mut written = 0usize;
     for r in rows {
         if let Err(e) = sqlx::query(
             "INSERT INTO sports_line_ledger
                 (ts, league, sport_key, odds_event_id, pm_slug, condition_id, token_id, outcome_label,
                  odds_outcome, commence, secs_to_start, consensus, num_books, dispersion, max_book_age_secs,
-                 pm_bid, pm_ask, pm_bid_size, pm_ask_size, credits_remaining)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                 pm_bid, pm_ask, pm_bid_size, pm_ask_size, credits_remaining,
+                 odds_at, pm_at, overround, raw_consensus)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&r.ts).bind(&r.league).bind(&r.sport_key).bind(&r.odds_event_id).bind(&r.pm_slug)
         .bind(&r.condition_id).bind(&r.token_id).bind(&r.outcome_label).bind(&r.odds_outcome)
         .bind(&r.commence).bind(r.secs_to_start).bind(r.consensus).bind(r.num_books).bind(r.dispersion)
         .bind(r.max_book_age_secs).bind(r.pm_bid).bind(r.pm_ask).bind(r.pm_bid_size).bind(r.pm_ask_size)
         .bind(r.credits_remaining)
-        .execute(pool).await
+        .bind(&r.odds_at).bind(&r.pm_at).bind(r.overround).bind(r.raw_consensus)
+        .execute(&mut *tx).await
         {
-            warn!("❌ DB sports_line_ledger insert failed: {}", e);
-            return;
+            warn!("❌ DB sports_line_ledger insert failed after {written} of {} row(s); the whole snapshot is rolled back: {}", rows.len(), e);
+            return 0;
         }
+        written += 1;
+    }
+    match tx.commit().await {
+        Ok(()) => written,
+        Err(e) => { warn!("❌ DB sports_line_ledger commit failed, {written} row(s) discarded: {}", e); 0 }
+    }
+}
+
+/// Raw per-book quotes behind a snapshot. Duplicates are ignored so a retried
+/// pass cannot double-write a book's quote for the same snapshot key.
+pub async fn record_sports_ledger_book_rows(pool: &SqlitePool, rows: &[SportsLedgerBookRow]) -> usize {
+    if rows.is_empty() { return 0; }
+    let mut tx = match pool.begin().await {
+        Ok(t) => t,
+        Err(e) => { warn!("❌ DB sports_line_books transaction failed to open: {}", e); return 0; }
+    };
+    let mut written = 0usize;
+    for r in rows {
+        if let Err(e) = sqlx::query(
+            "INSERT OR IGNORE INTO sports_line_books
+                (ts, odds_at, league, sport_key, odds_event_id, condition_id, token_id, outcome_label,
+                 book_key, decimal_odds, raw_implied, overround, book_last_update)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(&r.ts).bind(&r.odds_at).bind(&r.league).bind(&r.sport_key).bind(&r.odds_event_id)
+        .bind(&r.condition_id).bind(&r.token_id).bind(&r.outcome_label)
+        .bind(&r.book_key).bind(r.decimal_odds).bind(r.raw_implied).bind(r.overround)
+        .bind(&r.book_last_update)
+        .execute(&mut *tx).await
+        {
+            warn!("❌ DB sports_line_books insert failed after {written} of {} quote(s); the whole snapshot is rolled back: {}", rows.len(), e);
+            return 0;
+        }
+        written += 1;
+    }
+    match tx.commit().await {
+        Ok(()) => written,
+        Err(e) => { warn!("❌ DB sports_line_books commit failed, {written} quote(s) discarded: {}", e); 0 }
+    }
+}
+
+/// The recorded Odds API spend for `day` (as `YYYY-MM-DD`): what the quota read
+/// at the day's first call, and how many credits have been spent since.
+pub async fn sports_ledger_budget(pool: &SqlitePool, day: &str) -> Option<(Option<i64>, i64)> {
+    sqlx::query_as::<_, (Option<i64>, i64)>(
+        "SELECT day_start_remaining, spent_today FROM sports_ledger_budget WHERE day = ?"
+    )
+    .bind(day)
+    .fetch_optional(pool).await
+    .unwrap_or_default()
+}
+
+/// Record the day's spend so a restart resumes the same daily allowance.
+pub async fn record_sports_ledger_budget(pool: &SqlitePool, day: &str, day_start_remaining: Option<i64>, spent_today: i64, updated_at: &str) {
+    if let Err(e) = sqlx::query(
+        "INSERT INTO sports_ledger_budget (day, day_start_remaining, spent_today, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(day) DO UPDATE SET
+            day_start_remaining = MAX(COALESCE(sports_ledger_budget.day_start_remaining, excluded.day_start_remaining),
+                                      COALESCE(excluded.day_start_remaining, sports_ledger_budget.day_start_remaining)),
+            spent_today         = excluded.spent_today,
+            updated_at          = excluded.updated_at"
+    )
+    .bind(day).bind(day_start_remaining).bind(spent_today).bind(updated_at)
+    .execute(pool).await
+    {
+        warn!("❌ DB sports_ledger_budget write failed: {}", e);
     }
 }
 
@@ -1521,7 +1697,8 @@ pub async fn sports_ledger_board_rows(pool: &SqlitePool, from: &str, to: &str) -
     sqlx::query_as::<_, SportsLedgerRow>(
         "SELECT ts, league, sport_key, odds_event_id, pm_slug, condition_id, token_id, outcome_label,
                 odds_outcome, commence, secs_to_start, consensus, num_books, dispersion, max_book_age_secs,
-                pm_bid, pm_ask, pm_bid_size, pm_ask_size, credits_remaining
+                pm_bid, pm_ask, pm_bid_size, pm_ask_size, credits_remaining,
+                odds_at, pm_at, overround, raw_consensus
            FROM sports_line_ledger
           WHERE consensus IS NOT NULL AND commence BETWEEN ? AND ?
           GROUP BY token_id
@@ -4642,6 +4819,111 @@ mod reconcile_tests {
 
     /// The sports ledger's two read paths against a real schema. Pending results
     /// come back oldest game first, skip markets already resolved (a 0.5 tie or
+    /// [E63] A restart must not hand the ledger a fresh daily allowance: the
+    /// day's spend is recorded, and the day's opening quota is kept as first
+    /// written so a later write cannot overwrite it with a lower reading.
+    #[tokio::test]
+    async fn sports_ledger_budget_survives_a_restart() {
+        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        init_schema(&pool).await.unwrap();
+
+        assert_eq!(sports_ledger_budget(&pool, "2026-09-20").await, None, "no spend recorded yet");
+
+        record_sports_ledger_budget(&pool, "2026-09-20", Some(99_900), 3, "2026-09-20T13:00:00+00:00").await;
+        assert_eq!(sports_ledger_budget(&pool, "2026-09-20").await, Some((Some(99_900), 3)));
+
+        // A second call the same day: spend accumulates, the opening quota stays
+        // put. Were it overwritten, every restart would reset the day's budget to
+        // whatever the quota happened to read at that moment.
+        record_sports_ledger_budget(&pool, "2026-09-20", Some(99_000), 9, "2026-09-20T14:00:00+00:00").await;
+        assert_eq!(sports_ledger_budget(&pool, "2026-09-20").await, Some((Some(99_900), 9)));
+
+        // A quota that GREW must raise the day's opening reading. This is the
+        // plan upgrade of 2026-09-18: the day opened on a nearly exhausted free
+        // tier, so the allowance was ~0. Keeping the first reading forever would
+        // hold the ledger at zero spend until 00:00 UTC with no way out from the
+        // engine, which is worse than the double-spend the persistence prevents.
+        record_sports_ledger_budget(&pool, "2026-09-20", Some(100_000), 9, "2026-09-20T15:00:00+00:00").await;
+        assert_eq!(sports_ledger_budget(&pool, "2026-09-20").await, Some((Some(100_000), 9)));
+
+        // A different day is a clean slate.
+        assert_eq!(sports_ledger_budget(&pool, "2026-09-21").await, None);
+    }
+
+    /// [E63] A snapshot is recorded whole or not at all. A half-written pass
+    /// would show a book consensus for some outcomes of a game and not others,
+    /// and nothing downstream could tell that from a game that genuinely had
+    /// fewer books quoting it.
+    #[tokio::test]
+    async fn a_failed_book_insert_rolls_back_the_whole_snapshot() {
+        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        init_schema(&pool).await.unwrap();
+
+        let book = |key: &str, odds: f64| SportsLedgerBookRow {
+            ts: "2026-09-20T13:00:00+00:00".into(), odds_at: None,
+            league: "nfl".into(), sport_key: "americanfootball_nfl".into(),
+            odds_event_id: "e1".into(), condition_id: "0xabc".into(), token_id: "tok-a".into(),
+            outcome_label: "Texans".into(), book_key: key.into(),
+            decimal_odds: odds, raw_implied: 1.0 / odds, overround: 1.045, book_last_update: None,
+        };
+        // Force a failure on the third row, after two good ones have been
+        // inserted. Any mid-batch error does the same thing; SQLITE_BUSY from a
+        // concurrent writer on this shard is the one that will actually happen,
+        // since the engine trades against the same database while a pass runs.
+        sqlx::query(
+            "CREATE TRIGGER fail_on_broken BEFORE INSERT ON sports_line_books
+             WHEN NEW.book_key = 'broken' BEGIN SELECT RAISE(ABORT, 'forced'); END"
+        ).execute(&pool).await.unwrap();
+
+        let written = record_sports_ledger_book_rows(&pool, &[
+            book("draftkings", 1.74),
+            book("fanduel", 1.72),
+            book("broken", 1.90),
+        ]).await;
+
+        assert_eq!(written, 0, "a failed batch reports nothing written");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sports_line_books").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0, "the two good rows must not survive the failure");
+
+        // The same batch without the row that trips the trigger lands whole.
+        let written = record_sports_ledger_book_rows(&pool, &[book("draftkings", 1.74), book("fanduel", 1.72)]).await;
+        assert_eq!(written, 2);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sports_line_books").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 2);
+    }
+
+    /// [E63] The raw per-book quotes behind a snapshot are recorded, and a
+    /// repeated pass cannot double-write the same book's quote.
+    #[tokio::test]
+    async fn sports_ledger_book_rows_record_once_per_book_and_snapshot() {
+        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        init_schema(&pool).await.unwrap();
+
+        let book = |key: &str, odds: f64| SportsLedgerBookRow {
+            ts: "2026-09-20T13:00:00+00:00".into(),
+            odds_at: Some("2026-09-20T13:00:02+00:00".into()),
+            league: "nfl".into(), sport_key: "americanfootball_nfl".into(),
+            odds_event_id: "e1".into(), condition_id: "0xabc".into(), token_id: "tok-a".into(),
+            outcome_label: "Texans".into(), book_key: key.into(),
+            decimal_odds: odds, raw_implied: 1.0 / odds, overround: 1.045,
+            book_last_update: Some("2026-09-20T12:59:00+00:00".into()),
+        };
+        record_sports_ledger_book_rows(&pool, &[book("draftkings", 1.74), book("fanduel", 1.72)]).await;
+        // The same pass recorded again: the primary key absorbs it.
+        record_sports_ledger_book_rows(&pool, &[book("draftkings", 1.74)]).await;
+
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sports_line_books").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 2, "one row per book per outcome per snapshot");
+
+        let (odds, raw, over): (f64, f64, f64) = sqlx::query_as(
+            "SELECT decimal_odds, raw_implied, overround FROM sports_line_books WHERE book_key = 'fanduel'"
+        ).fetch_one(&pool).await.unwrap();
+        assert!((odds - 1.72).abs() < 1e-12);
+        assert!((raw - 1.0 / 1.72).abs() < 1e-12, "raw implied is kept before the vig is removed");
+        // What the raw parts are for: the de-vig can be redone from them.
+        assert!((raw / over - 0.5563).abs() < 1e-3, "proportional de-vig re-derives from the stored parts");
+    }
+
     /// cancellation included) and games outside the look-back window; the last
     /// snapshot per sport is what a restarted ledger seeds from so it does not
     /// buy a snapshot it already has.
@@ -4659,6 +4941,7 @@ mod reconcile_tests {
             odds_outcome: token.into(), commence: commence.into(), secs_to_start: 0, consensus: Some(0.5),
             num_books: 3, dispersion: Some(0.01), max_book_age_secs: Some(10), pm_bid: Some(0.49), pm_ask: Some(0.5),
             pm_bid_size: Some(10.0), pm_ask_size: Some(10.0), credits_remaining: Some(250),
+            odds_at: Some(ts.into()), pm_at: Some(ts.into()), overround: Some(1.05), raw_consensus: Some(0.525),
         };
         record_sports_ledger_rows(&pool, &[
             row("2026-09-11T20:00:00+00:00", "baseball_mlb", "c-late", "late-a", "2026-09-11T19:00:00+00:00"),

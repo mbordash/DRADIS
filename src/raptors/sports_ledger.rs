@@ -44,7 +44,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
-use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+
 use rust_decimal::Decimal;
 use serde_json::Value;
 use tokio::sync::watch;
@@ -371,7 +371,13 @@ pub fn fold_rows(prev: &SportsBoard, rows: &[db::SportsLedgerRow], now: DateTime
     let mut next: SportsBoard = prev.clone();
     next.retain(|_, l| (now - l.commence).num_seconds() < BOARD_RETAIN_SECS);
     for r in rows {
-        let (Some(commence), Some(odds_at)) = (parse_time(&r.commence), parse_time(&r.ts)) else { continue };
+        // The real odds-arrival time when the row has one, falling back to the
+        // pass timestamp for rows written before [E63] separated them. A pass
+        // runs for minutes, so on later sports `ts` understates the age of the
+        // board's readings and orders drift by when we started rather than by
+        // when the books actually moved.
+        let odds_at = r.odds_at.as_deref().and_then(parse_time).or_else(|| parse_time(&r.ts));
+        let (Some(commence), Some(odds_at)) = (parse_time(&r.commence), odds_at) else { continue };
         // Every snapshot covers every matched game of its sport, so a row with no
         // consensus is the books saying they quote nothing on this outcome right
         // now (11% of rows, 25% on college football, typically suspended in play).
@@ -566,24 +572,92 @@ pub fn may_spend(remaining: i64, reserve: i64, spent_today: i64, allowance: i64,
     remaining - cost >= reserve && spent_today + cost <= allowance
 }
 
+/// One bookmaker's raw h2h quote for `odds_name`: its decimal odds, the implied
+/// probability before the vig is removed, and that book's overround (the sum of
+/// its raw implied probabilities across the market's outcomes).
+///
+/// The vig-free probability is `raw_implied / overround`, which is the
+/// proportional de-vig the consensus has always used. Returning the parts rather
+/// than only the quotient is what lets a different method be applied later to
+/// rows already recorded.
+pub fn book_quote_for(book: &Value, odds_name: &str) -> Option<(f64, f64, f64)> {
+    let outcomes = book.get("markets").and_then(Value::as_array)?
+        .iter().find(|m| m.get("key").and_then(Value::as_str) == Some("h2h"))?
+        .get("outcomes").and_then(Value::as_array)?;
+    let mut raw: Vec<(&str, f64, f64)> = Vec::new();
+    for o in outcomes {
+        let name = o.get("name").and_then(Value::as_str)?;
+        let odds = o.get("price").and_then(Value::as_f64).filter(|p| *p > 1.0)?;
+        raw.push((name, odds, 1.0 / odds));
+    }
+    // A one-sided market has no vig to remove and no meaningful overround.
+    if raw.len() < 2 { return None; }
+    let overround: f64 = raw.iter().map(|(_, _, p)| *p).sum();
+    if overround <= 0.0 { return None; }
+    raw.iter().find(|(name, _, _)| *name == odds_name)
+        .map(|(_, odds, implied)| (*odds, *implied, overround))
+}
+
+/// What one snapshot knows about one outcome's book consensus.
+#[derive(Debug, Clone, Default)]
+pub struct BookConsensus {
+    /// Vig-free consensus probability (proportional de-vig, averaged over books).
+    pub consensus: Option<f64>,
+    pub num_books: i64,
+    pub dispersion: Option<f64>,
+    pub max_book_age_secs: Option<i64>,
+    /// Mean per-book overround, and the mean raw implied probability of this
+    /// outcome before that overround is divided out.
+    pub overround: Option<f64>,
+    pub raw_consensus: Option<f64>,
+    /// Every contributing book's raw quote: (book_key, decimal_odds,
+    /// raw_implied, overround, last_update).
+    pub quotes: Vec<(String, f64, f64, f64, Option<String>)>,
+    /// Books that contributed to the consensus but carry no identifier. Their
+    /// raw quotes are NOT recorded: the per-book table is keyed by book, so
+    /// storing them all under one placeholder would silently keep just the
+    /// first and look like a complete set.
+    pub unkeyed_books: i64,
+}
+
 /// Vig-free consensus for one outcome across books, with book count,
-/// max-minus-min dispersion and the oldest book quote's age in seconds.
-pub fn consensus_for(books: Option<&Vec<Value>>, odds_name: &str, now: DateTime<Utc>) -> (Option<f64>, i64, Option<f64>, Option<i64>) {
+/// max-minus-min dispersion, the oldest book quote's age in seconds, and the
+/// raw per-book quotes the consensus was reduced from.
+///
+/// `now` should be when the odds response returned, not when the pass began:
+/// the quote ages are about the feed, and a pass takes minutes.
+pub fn consensus_for(books: Option<&Vec<Value>>, odds_name: &str, now: DateTime<Utc>) -> BookConsensus {
+    let mut out = BookConsensus::default();
     let mut probs: Vec<f64> = Vec::new();
-    let mut oldest: Option<i64> = None;
+    let mut raws: Vec<f64> = Vec::new();
+    let mut overrounds: Vec<f64> = Vec::new();
     for book in books.map(Vec::as_slice).unwrap_or(&[]) {
-        let Some(p) = crate::raptors::sports::vig_free_prob_for(book, odds_name).and_then(|d| d.to_f64()) else { continue };
-        probs.push(p);
-        if let Some(t) = book.get("last_update").and_then(Value::as_str).and_then(parse_time) {
+        let Some((odds, raw_implied, overround)) = book_quote_for(book, odds_name) else { continue };
+        probs.push(raw_implied / overround);
+        raws.push(raw_implied);
+        overrounds.push(overround);
+        let last_update = book.get("last_update").and_then(Value::as_str).map(str::to_string);
+        if let Some(t) = last_update.as_deref().and_then(parse_time) {
             let age = (now - t).num_seconds().max(0);
-            oldest = Some(oldest.map_or(age, |o| o.max(age)));
+            out.max_book_age_secs = Some(out.max_book_age_secs.map_or(age, |o| o.max(age)));
+        }
+        match book.get("key").and_then(Value::as_str)
+            .or_else(|| book.get("title").and_then(Value::as_str))
+        {
+            Some(key) => out.quotes.push((key.to_string(), odds, raw_implied, overround, last_update)),
+            None => out.unkeyed_books += 1,
         }
     }
-    if probs.is_empty() { return (None, 0, None, oldest); }
+    if probs.is_empty() { return out; }
     let n = probs.len();
-    let mean = probs.iter().sum::<f64>() / n as f64;
-    let disp = probs.iter().cloned().fold(f64::MIN, f64::max) - probs.iter().cloned().fold(f64::MAX, f64::min);
-    (Some(mean), n as i64, Some(disp), oldest)
+    out.consensus = Some(probs.iter().sum::<f64>() / n as f64);
+    out.raw_consensus = Some(raws.iter().sum::<f64>() / n as f64);
+    out.overround = Some(overrounds.iter().sum::<f64>() / n as f64);
+    out.dispersion = Some(
+        probs.iter().cloned().fold(f64::MIN, f64::max) - probs.iter().cloned().fold(f64::MAX, f64::min)
+    );
+    out.num_books = n as i64;
+    out
 }
 
 /// Best bid and ask, with size at each, from a CLOB `/book` response.
@@ -640,9 +714,14 @@ async fn refresh_catalog(
     };
     let mut games = Vec::new();
     let mut remaining = None;
+    // Per-league coverage, logged at info once per refresh. A league that matches
+    // nothing looks identical to a quiet league in the totals, so the operator
+    // needs to see each one: "nfl 16/16" against "mlb 0/12" is the difference
+    // between no games today and a matcher that has stopped working.
+    let mut coverage: Vec<String> = Vec::new();
     for (code, sport_key) in leagues {
         let Some(sid) = series.get(code) else {
-            debug!("🏈 Sports ledger: Polymarket has no league '{code}'");
+            coverage.push(format!("{code} n/a (not a Polymarket league)"));
             continue;
         };
         // Gamma pages at 100 events; a league lists past, live and future games.
@@ -661,44 +740,97 @@ async fn refresh_catalog(
                 Err(e) => { debug!("🏈 Sports ledger: Gamma events for '{code}' failed: {e}"); break; }
             }
         }
-        if pm.is_empty() { continue; }
+        if pm.is_empty() {
+            coverage.push(format!("{code} 0/0"));
+            continue;
+        }
         // Free: /events does not count against the quota but still reports it.
         let odds = match get_json(http, &format!("{ODDS}/sports/{sport_key}/events"), Some(api_key), &[]).await {
             Ok((v, r, _)) => { remaining = r.or(remaining); parse_odds_events(&v) }
-            Err(e) => { debug!("🏈 Sports ledger: Odds API events for '{sport_key}' failed: {e}"); continue; }
+            Err(e) => {
+                coverage.push(format!("{code} 0/{} (odds events failed)", pm.len()));
+                debug!("🏈 Sports ledger: Odds API events for '{sport_key}' failed: {e}");
+                continue;
+            }
         };
         let matched = match_games(&pm, &odds, sport_key);
+        coverage.push(format!("{code} {}/{}", matched.len(), pm.len()));
         debug!("🏈 Sports ledger: {code} → {sport_key}: {} Polymarket games, {} Odds API events, {} matched", pm.len(), odds.len(), matched.len());
         games.extend(matched);
+    }
+    if !coverage.is_empty() {
+        info!("🏈 Sports ledger coverage (matched/Polymarket games): {}", coverage.join(" · "));
     }
     (games, remaining)
 }
 
-async fn snapshot(
+/// The snapshot's single paid call. Kept separate from the row building below
+/// so the caller can record the spend the moment the credits are gone, rather
+/// than after the minutes of free reads that follow.
+///
+/// Returns the odds payload, when it arrived, the quota left and what this call
+/// actually cost.
+async fn fetch_odds(
     http: &reqwest::Client,
     api_key: &str,
     sport_key: &str,
     regions: &str,
-    games: &[MatchedGame],
-    now: DateTime<Utc>,
-) -> Result<(Vec<db::SportsLedgerRow>, Option<i64>, Option<i64>), String> {
+) -> Result<(Value, DateTime<Utc>, Option<i64>, Option<i64>), String> {
     let (odds, remaining, last) = get_json(
         http, &format!("{ODDS}/sports/{sport_key}/odds"), Some(api_key),
         &[("regions", regions), ("markets", "h2h"), ("oddsFormat", "decimal")],
     ).await?;
+    // Everything after this is free reads that take their own time, so the odds
+    // are as of here and not as of the pass start.
+    Ok((odds, Utc::now(), remaining, last))
+}
+
+async fn build_snapshot_rows(
+    http: &reqwest::Client,
+    odds: &Value,
+    odds_time: DateTime<Utc>,
+    sport_key: &str,
+    games: &[MatchedGame],
+    now: DateTime<Utc>,
+    remaining: Option<i64>,
+) -> (Vec<db::SportsLedgerRow>, Vec<db::SportsLedgerBookRow>) {
+    let odds_at = odds_time.to_rfc3339();
     let by_id: HashMap<&str, &Value> = odds.as_array().map(Vec::as_slice).unwrap_or(&[]).iter()
         .filter_map(|e| Some((e.get("id")?.as_str()?, e)))
         .collect();
     let ts = now.to_rfc3339();
     let mut rows = Vec::new();
+    let mut book_rows = Vec::new();
+    let mut unkeyed = 0i64;
     for g in games.iter().filter(|g| g.sport_key == sport_key) {
         let books = by_id.get(g.odds_event_id.as_str()).and_then(|e| e.get("bookmakers")).and_then(Value::as_array);
         for o in &g.outcomes {
-            let (consensus, num_books, dispersion, max_book_age_secs) = consensus_for(books, &o.odds_name, now);
+            let c = consensus_for(books, &o.odds_name, odds_time);
             let (pm_bid, pm_bid_size, pm_ask, pm_ask_size) = match get_json(http, CLOB_BOOK, None, &[("token_id", o.pm.token_id.as_str())]).await {
                 Ok((b, _, _)) => best_levels(&b),
                 Err(_) => (None, None, None, None),
             };
+            // Per outcome, because the book read above is one of many and the
+            // last one of a pass can be minutes after the first.
+            let pm_at = Utc::now().to_rfc3339();
+            unkeyed += c.unkeyed_books;
+            for (book_key, decimal_odds, raw_implied, overround, book_last_update) in &c.quotes {
+                book_rows.push(db::SportsLedgerBookRow {
+                    ts: ts.clone(),
+                    odds_at: Some(odds_at.clone()),
+                    league: g.league.clone(),
+                    sport_key: sport_key.to_string(),
+                    odds_event_id: g.odds_event_id.clone(),
+                    condition_id: o.pm.condition_id.clone(),
+                    token_id: o.pm.token_id.clone(),
+                    outcome_label: o.pm.label.clone(),
+                    book_key: book_key.clone(),
+                    decimal_odds: *decimal_odds,
+                    raw_implied: *raw_implied,
+                    overround: *overround,
+                    book_last_update: book_last_update.clone(),
+                });
+            }
             rows.push(db::SportsLedgerRow {
                 ts: ts.clone(),
                 league: g.league.clone(),
@@ -711,13 +843,23 @@ async fn snapshot(
                 odds_outcome: o.odds_name.clone(),
                 commence: g.commence.to_rfc3339(),
                 secs_to_start: (g.commence - now).num_seconds(),
-                consensus, num_books, dispersion, max_book_age_secs,
+                consensus: c.consensus,
+                num_books: c.num_books,
+                dispersion: c.dispersion,
+                max_book_age_secs: c.max_book_age_secs,
                 pm_bid, pm_ask, pm_bid_size, pm_ask_size,
                 credits_remaining: remaining,
+                odds_at: Some(odds_at.clone()),
+                pm_at: Some(pm_at),
+                overround: c.overround,
+                raw_consensus: c.raw_consensus,
             });
         }
     }
-    Ok((rows, remaining, last))
+    if unkeyed > 0 {
+        warn!("🏈 Sports ledger [{sport_key}]: {unkeyed} book quote(s) had no bookmaker key and were not recorded —                their consensus contribution stands but they are missing from sports_line_books");
+    }
+    (rows, book_rows)
 }
 
 /// What `token` paid when its Gamma market resolved, or `None` while it is open
@@ -884,8 +1026,28 @@ async fn tick(
         st.day = Some(today);
         st.spent_today = 0;
         st.day_start_remaining = st.remaining;
+        // A restart hands a fresh in-memory state a spend of zero, which would
+        // grant the day's allowance a second time. The recorded spend for this
+        // day is the truth; on a genuine rollover there is no row and the reset
+        // above stands.
+        if let Some(pool) = db::pool() {
+            if let Some((recorded_start, spent)) = db::sports_ledger_budget(pool, &today.to_string()).await {
+                st.spent_today = spent;
+                st.day_start_remaining = recorded_start.or(st.day_start_remaining);
+                if spent > 0 {
+                    info!("🏈 Sports ledger: resuming today's budget — {spent} credit(s) already spent");
+                }
+            }
+        }
     }
     if st.day_start_remaining.is_none() { st.day_start_remaining = st.remaining; }
+    // A quota that GREW mid-day (a plan upgrade, or a key swapped for a larger
+    // one) must raise the day's opening reading. The allowance is computed from
+    // it, so leaving it at the old low reading pins the ledger at zero spend
+    // until 00:00 UTC with nothing the operator can do from the engine.
+    if let (Some(remaining), Some(day_start)) = (st.remaining, st.day_start_remaining) {
+        if remaining > day_start { st.day_start_remaining = Some(remaining); }
+    }
 
     let offsets = parse_offsets_mins(&cfg.sports_ledger_snapshot_offsets_mins);
     let regions = cfg.sports_odds_regions.clone();
@@ -906,19 +1068,34 @@ async fn tick(
             st.last_snapshot.insert(sport_key, now);
             continue;
         }
-        match snapshot(http, api_key, &sport_key, &regions, &st.games, now).await {
-            Ok((rows, remaining_after, last)) => {
+        match fetch_odds(http, api_key, &sport_key, &regions).await {
+            Ok((odds, odds_time, remaining_after, last)) => {
                 st.spent_today += last.unwrap_or(cost);
                 if remaining_after.is_some() { st.remaining = remaining_after; }
+                // The credits are spent the moment this response returns, and the
+                // free reads below take minutes. Record the spend first: stopping
+                // anywhere in that window (a deploy, the watchdog, an OOM) would
+                // otherwise lose it and hand the next start the day's budget again.
+                if let Some(pool) = db::pool() {
+                    db::record_sports_ledger_budget(
+                        pool, &today.to_string(), st.day_start_remaining, st.spent_today, &now.to_rfc3339(),
+                    ).await;
+                }
+                let (rows, book_rows) =
+                    build_snapshot_rows(http, &odds, odds_time, &sport_key, &st.games, now, st.remaining).await;
                 let n_games = rows.iter().map(|r| r.odds_event_id.as_str()).collect::<HashSet<_>>().len();
                 // The board is what squadrons read; the rows are what the research
                 // reads. Both come from this one paid call.
                 publish_rows(&rows, now);
+                let (mut wrote_rows, mut wrote_books) = (0, 0);
                 if let Some(pool) = db::pool() {
-                    db::record_sports_ledger_rows(pool, &rows).await;
+                    wrote_rows = db::record_sports_ledger_rows(pool, &rows).await;
+                    wrote_books = db::record_sports_ledger_book_rows(pool, &book_rows).await;
                 }
-                info!("🏈 Sports ledger [{sport_key}]: {} row(s) across {n_games} game(s) | credits remaining {} (spent today {} of {allowance})",
-                      rows.len(), st.remaining.map_or("?".to_string(), |r| r.to_string()), st.spent_today);
+                // Written, not merely built: a rolled-back snapshot must not read
+                // in the log as a recorded one.
+                info!("🏈 Sports ledger [{sport_key}]: recorded {wrote_rows}/{} row(s) across {n_games} game(s), {wrote_books}/{} book quote(s) | credits remaining {} (spent today {} of {allowance})",
+                      rows.len(), book_rows.len(), st.remaining.map_or("?".to_string(), |r| r.to_string()), st.spent_today);
             }
             Err(e) => warn!("🏈 Sports ledger [{sport_key}]: snapshot failed: {e}"),
         }
@@ -950,6 +1127,7 @@ mod tests {
             consensus, num_books: 7, dispersion: Some(0.0052), max_book_age_secs: Some(83),
             pm_bid: Some(0.49), pm_ask: Some(0.50), pm_bid_size: Some(100.0), pm_ask_size: Some(200.0),
             credits_remaining: Some(99_000),
+            odds_at: Some(ts.into()), pm_at: Some(ts.into()), overround: Some(1.04), raw_consensus: consensus.map(|c| c * 1.04),
         }
     }
 
@@ -1183,18 +1361,43 @@ mod tests {
     fn consensus_removes_the_vig_per_book_and_reads_the_three_way_draw() {
         let now = t("2026-09-11T18:00:00Z");
         let books: Vec<Value> = serde_json::from_value(serde_json::json!([
-            {"last_update": "2026-09-11T17:59:30Z", "markets": [{"key": "h2h", "outcomes": [
+            {"key": "draftkings", "last_update": "2026-09-11T17:59:30Z", "markets": [{"key": "h2h", "outcomes": [
                 {"name": "Rennes", "price": 2.5}, {"name": "Draw", "price": 3.4}, {"name": "Marseille", "price": 2.9}]}]},
-            {"last_update": "2026-09-11T17:58:00Z", "markets": [{"key": "h2h", "outcomes": [
+            {"key": "fanduel", "last_update": "2026-09-11T17:58:00Z", "markets": [{"key": "h2h", "outcomes": [
                 {"name": "Rennes", "price": 2.4}, {"name": "Draw", "price": 3.5}, {"name": "Marseille", "price": 3.0}]}]}
         ])).unwrap();
-        let (p, n, disp, age) = consensus_for(Some(&books), "Draw", now);
-        assert_eq!(n, 2);
-        let p = p.unwrap();
+        let c = consensus_for(Some(&books), "Draw", now);
+        assert_eq!(c.num_books, 2);
+        let p = c.consensus.unwrap();
         assert!((0.25..0.30).contains(&p), "draw consensus {p}");
-        assert!(disp.unwrap() < 0.02);
-        assert_eq!(age, Some(120), "oldest quote is two minutes old");
-        assert_eq!(consensus_for(Some(&books), "Lyon", now).1, 0);
+        assert!(c.dispersion.unwrap() < 0.02);
+        assert_eq!(c.max_book_age_secs, Some(120), "oldest quote is two minutes old");
+        assert_eq!(consensus_for(Some(&books), "Lyon", now).num_books, 0);
+
+        // [E63] The raw parts must reconstruct the de-vigged consensus: both
+        // books price a three-way market at an overround above 1, and the stored
+        // raw figures are what a different de-vig would start from.
+        assert!(c.overround.unwrap() > 1.0, "three-way book overround {:?}", c.overround);
+        assert!(c.raw_consensus.unwrap() > p, "raw prob must exceed the de-vigged one");
+        assert_eq!(c.quotes.len(), 2, "one raw quote per contributing book");
+        for (_, odds, raw_implied, overround, _) in &c.quotes {
+            assert!((raw_implied - 1.0 / odds).abs() < 1e-12, "raw implied is 1/decimal odds");
+            assert!(*overround > 1.0);
+        }
+        assert_eq!(c.unkeyed_books, 0);
+
+        // A book with no identifier still counts toward the consensus, but its
+        // raw quote is not recorded: the per-book table is keyed by book, so a
+        // shared placeholder would keep only the first and read as a full set.
+        let anonymous: Vec<Value> = serde_json::from_value(serde_json::json!([
+            {"last_update": "2026-09-11T17:59:30Z", "markets": [{"key": "h2h", "outcomes": [
+                {"name": "Rennes", "price": 2.5}, {"name": "Draw", "price": 3.4}, {"name": "Marseille", "price": 2.9}]}]}
+        ])).unwrap();
+        let a = consensus_for(Some(&anonymous), "Draw", now);
+        assert_eq!(a.num_books, 1, "it still contributes to the consensus");
+        assert!(a.consensus.is_some());
+        assert!(a.quotes.is_empty(), "but no per-book row is written for it");
+        assert_eq!(a.unkeyed_books, 1, "and it is counted so the gap is reportable");
     }
 
     /// Both closed-market shapes as Gamma served them on 2026-09-11.
@@ -1253,6 +1456,7 @@ mod live_gamma_tests {
             commence: "2026-09-11T22:40:00+00:00".into(), secs_to_start: 1781, consensus: None, num_books: 9,
             dispersion: None, max_book_age_secs: None, pm_bid: None, pm_ask: None, pm_bid_size: None,
             pm_ask_size: None, credits_remaining: None,
+            odds_at: None, pm_at: None, overround: None, raw_consensus: None,
         };
         db::record_sports_ledger_rows(&pool, &[
             row("114532502496137932693089688451118145455360814432114926570975463361514518351293", "Colorado Rockies"),
