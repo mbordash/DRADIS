@@ -114,8 +114,14 @@ const STRUCTURAL_MIN_TREES: usize = 5;
 /// Market bootstrap resamples for the return interval.
 const BOOTSTRAP_RESAMPLES: usize = 400;
 
-/// Seconds a taker print counts as evidence of the current ask.
-const ASK_LOOKBACK_SECS: i64 = 20;
+/// Seconds a taker print counts as evidence of the entry price, before the
+/// decision minute under [`EntryRule::LastBefore`] and after it under
+/// [`EntryRule::FirstAfter`].
+const ENTRY_PRINT_SECS: i64 = 20;
+/// Latest an entry may be under [`EntryRule::FirstAfter`]: past this the viper
+/// would have abandoned the minute (`DECISION_STALE_SECS`), so a row entered
+/// later describes a trade it could not have taken.
+const ENTRY_LATEST_SECS: i64 = 60;
 /// Half the measured spread: the ask is never below mid plus this.
 const HALF_SPREAD: f64 = 0.005;
 /// Shares a print must carry to lift a resting take-profit (`orderMinSize`).
@@ -317,9 +323,47 @@ fn rfc3339(t: i64) -> String {
 
 // ── Row builder: the harness's `build_holdout.py`, on the viper's feature code ──
 
+/// Which price a labeled trade is bought at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryRule {
+    // The stamp written on a model file and compared before serving lives in
+    // `stamp()` below; a file without it predates [B47] and reads as `e1`.
+    /// The reference harness's rule: the most recent print-implied ask in the 20 s
+    /// BEFORE the minute, else the last price-history sample plus half a spread.
+    ///
+    /// Kept because the fixture rows in `testdata/gboost_planb_rows.json` come from
+    /// that harness, and reproducing them is what proves the engine's builder and
+    /// the research code agree. It is not what production trains on: with no print
+    /// (64% of eligible rows) it buys at a mid a median 53 s old, from before the
+    /// move the decision reacts to, and in the store that unobtainable price was the
+    /// only profitable sub-population ([B47]).
+    LastBefore,
+    /// The first price the market actually showed at or after the minute: a print
+    /// within 20 s, else the first price-history sample plus half a spread, and
+    /// only while a live decision could still have acted. The exit simulation
+    /// starts from that moment.
+    ///
+    /// The reference harness has not been ported to this rule, so the fixture test
+    /// cross-checks `LastBefore` only; this rule's evidence is its unit test and
+    /// the store censuses recorded in [B47].
+    FirstAfter,
+}
+
+impl EntryRule {
+    /// The token stamped on a model file and compared by `plan_mismatch`.
+    pub fn stamp(&self) -> &'static str {
+        match self { EntryRule::LastBefore => "e1", EntryRule::FirstAfter => "e2" }
+    }
+}
+
 /// The plan the labels are built for, from the squadron's knobs.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
+    /// Defaults to the old rule when absent, so a report written before [B47]
+    /// reads as what it was, and `plan_changed` sees the transition and retrains.
+    #[serde(default = "entry_rule_before_b47")]
+    pub entry: EntryRule,
     pub tp: f64,
     pub sl: f64,
     pub tp_ceiling: f64,
@@ -331,10 +375,13 @@ pub struct Plan {
     pub last_minute: i64,
 }
 
+fn entry_rule_before_b47() -> EntryRule { EntryRule::LastBefore }
+
 impl Plan {
     pub fn from_config(dc: &DynamicConfig, fee: f64) -> Self {
         let f = |d: rust_decimal::Decimal| d.to_f64().unwrap_or(0.0);
         Self {
+            entry: EntryRule::FirstAfter,
             tp: f(dc.gboost_planb_take_profit_pct),
             sl: f(dc.gboost_planb_stop_loss_pct),
             tp_ceiling: f(dc.gboost_planb_tp_ceiling),
@@ -347,8 +394,13 @@ impl Plan {
         }
     }
     /// The plan as stamped on a model file, and as the viper compares it.
+    ///
+    /// Carries the label generation, so a model trained on the old entry price is
+    /// refused rather than served: `e1` bought at a stale mid the book never
+    /// showed, `e2` buys at the first observable price at or after the decision
+    /// minute ([B47]).
     pub fn label(&self) -> String {
-        format!("tp{:.4}_sl{:.4}_band{:.4}-{:.4}", self.tp, self.sl, self.lo, self.hi)
+        format!("tp{:.4}_sl{:.4}_band{:.4}-{:.4}_{}", self.tp, self.sl, self.lo, self.hi, self.entry.stamp())
     }
 }
 
@@ -446,32 +498,67 @@ pub fn build_market_rows(w: i64, rec: &MarketRecord, bars: &[Bar], funding: &[(i
         let t = w + 60 * k;
         let (Some(mid_up), Some(mid_dn)) = (mid_at(0, t), mid_at(1, t)) else { continue };
         let j_hi = tape_ts.partition_point(|ts| *ts <= t);
-        let mut ask = [0.0f64; 2];
+        // The entry each side is labeled on: the first price the market actually
+        // showed at or after the decision minute, and when it showed it ([B47]).
+        //
+        // The old rule looked BACKWARD, and with no print in the 20 s before the
+        // minute it bought at the last history sample plus half a spread:
+        // a price a median 53 s old, from before the move the decision is reacting
+        // to. That entry was the only profitable sub-population in the store
+        // (58.1% win against 38.4% when repriced at the next real sample), so the
+        // model's edge was measured at prices the book never offered.
+        let mut entry: [Option<(i64, f64)>; 2] = [None, None];
         for side in 0..2 {
             let other = 1 - side;
             let mid_s = if side == 0 { mid_up } else { mid_dn };
-            // Executable ask: the most recent print-implied ask within the lookback,
-            // never below mid plus half the spread.
-            let mut ask_ev: Option<f64> = None;
-            let mut jj = j_hi as i64 - 1;
-            while jj >= 0 && t - tape_ts[jj as usize] <= ASK_LOOKBACK_SECS {
-                let x = tape[jj as usize];
-                if x.o as usize == side && x.side == "BUY" {
-                    ask_ev = Some(x.p);
-                    break;
+            match plan.entry {
+                EntryRule::LastBefore => {
+                    let mut ask_ev: Option<f64> = None;
+                    let mut jj = j_hi as i64 - 1;
+                    while jj >= 0 && t - tape_ts[jj as usize] <= ENTRY_PRINT_SECS {
+                        let x = tape[jj as usize];
+                        if x.o as usize == side && x.side == "BUY" { ask_ev = Some(x.p); break; }
+                        if x.o as usize == other && x.side == "SELL" { ask_ev = Some(1.0 - x.p); break; }
+                        jj -= 1;
+                    }
+                    let a = match ask_ev {
+                        Some(ev) => (mid_s + HALF_SPREAD).max(ev),
+                        None => mid_s + HALF_SPREAD,
+                    };
+                    entry[side] = Some((t, a));
                 }
-                if x.o as usize == other && x.side == "SELL" {
-                    ask_ev = Some(1.0 - x.p);
-                    break;
+                EntryRule::FirstAfter => {
+                    // A taker print soon after the minute is an ask someone paid.
+                    for x in &tape[j_hi..] {
+                        if x.ts > t + ENTRY_PRINT_SECS || x.ts >= w_end { break; }
+                        let px = if x.o as usize == side && x.side == "BUY" {
+                            x.p
+                        } else if x.o as usize == other && x.side == "SELL" {
+                            1.0 - x.p
+                        } else {
+                            continue;
+                        };
+                        entry[side] = Some((x.ts, px));
+                        break;
+                    }
+                    // Otherwise the first history sample after the minute, plus half a
+                    // spread, but only while a live decision could still have acted:
+                    // a feature vector at t paired with an entry minutes later (0.38%
+                    // of side-minutes, history gaps) is not a trade anyone could take.
+                    if let Some(&(ts, p)) = hist[side].iter().find(|(ts, _)| *ts > t) {
+                        if ts < w_end && ts <= t + ENTRY_LATEST_SECS && entry[side].is_none_or(|(et, _)| ts < et) {
+                            entry[side] = Some((ts, p + HALF_SPREAD));
+                        }
+                    }
                 }
-                jj -= 1;
             }
-            let a = match ask_ev {
-                Some(ev) => (mid_s + HALF_SPREAD).max(ev),
-                None => mid_s + HALF_SPREAD,
-            };
-            ask[side] = a.min(0.995);
         }
+        // A side with no observable entry in time is not a trade anyone could have
+        // taken; the minute then contributes no row for either side (2 minutes in
+        // 123,451 in the production store).
+        let (Some((entry_t_up, ask_up)), Some((entry_t_dn, ask_dn))) = (entry[0], entry[1]) else { continue };
+        let entry_t = [entry_t_up, entry_t_dn];
+        let ask = [ask_up.min(0.995), ask_dn.min(0.995)];
         let fr = last_at(funding, t).map(|(_, r)| r);
         let inputs = DecisionInputs {
             w,
@@ -492,8 +579,13 @@ pub fn build_market_rows(w: i64, rec: &MarketRecord, bars: &[Bar], funding: &[(i
             // at the same second, as the harness ordered them.
             let mut ev: Vec<(i64, u8, f64, f64)> = Vec::new(); // (t, class: 0 bid/mid 1 askhit, px, size)
             let mut mids_tag: Vec<bool> = Vec::new();
+            // The position exists from the moment it was bought, not from the
+            // decision minute: an exit cannot fire on a price that came first.
+            // Under `LastBefore` the two are the same instant, as the harness had it.
+            let from = entry_t[side];
             for x in &tape[j_hi..] {
                 if x.ts >= w_end { break; }
+                if x.ts <= from { continue; }
                 let (cls, px) = if x.o as usize == side && x.side == "BUY" {
                     (1u8, x.p)
                 } else if x.o as usize == other && x.side == "SELL" {
@@ -506,7 +598,7 @@ pub fn build_market_rows(w: i64, rec: &MarketRecord, bars: &[Bar], funding: &[(i
                 ev.push((x.ts, cls, px, x.s));
                 mids_tag.push(false);
             }
-            let hi_ = hist[side].partition_point(|(ts, _)| *ts <= t);
+            let hi_ = hist[side].partition_point(|(ts, _)| *ts <= from);
             for (tt, pp) in &hist[side][hi_..] {
                 if *tt >= w_end { break; }
                 ev.push((*tt, 0, *pp, 1e9));
@@ -1078,6 +1170,7 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
         ("venue", TRAINED_VENUE.into()),
         ("asset", inputs.asset.to_ascii_lowercase()),
         ("label", inputs.plan.label()),
+        ("entry_rule", inputs.plan.entry.stamp().to_string()),
         ("plan_tp", format!("{:?}", inputs.plan.tp)),
         ("plan_sl", format!("{:?}", inputs.plan.sl)),
         ("plan_min_ask", format!("{:?}", inputs.plan.lo)),
@@ -1877,6 +1970,9 @@ mod tests {
             margin: 0.10,
             first_minute: 5,
             last_minute: 45,
+            // The fixture rows come from the reference harness, which buys at the
+            // price before the minute; production trains on `FirstAfter` ([B47]).
+            entry: EntryRule::LastBefore,
         }
     }
 
@@ -2005,7 +2101,7 @@ mod tests {
         let dir = DataDir { root: tmp.join("pipeline") };
         let serving = tmp.join("btc-gboost_planb_v1.json");
         let rows = synthetic_rows(60, 7);
-        let plan = Plan { tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45 };
+        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45 };
         let now = rows.last().unwrap().w + 3600 + 60;
         // Write the rows as a fake market store would not exercise the fetchers; call
         // the cycle on already-built rows through the same fit/stamp/write path.
@@ -2084,7 +2180,7 @@ mod tests {
     /// First qualifying minute per market and side, and only eligible rows count.
     #[test]
     fn the_rule_takes_the_first_qualifying_minute_per_market_and_side() {
-        let plan = Plan { tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45 };
+        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45 };
         let mk = |w, k, side, ret| TrainingRow { w, k, side, ask: 0.5, features: [0.0; N_FEATURES], y: ret > 0.0, ret, exit: ExitKind::Tp, exit_t: 0, elig: true };
         let rows = vec![mk(0, 10, 0, 0.1), mk(0, 5, 0, 0.3), mk(0, 7, 1, -0.1), mk(3600, 20, 0, 0.2)];
         let refs: Vec<&TrainingRow> = rows.iter().collect();
@@ -2096,6 +2192,59 @@ mod tests {
         assert!((s.mean_ret - 0.1).abs() < 1e-12, "minute 5's return and side 1's, not minute 10's: {}", s.mean_ret);
         assert!((s.win - 0.5).abs() < 1e-12);
         assert!(s.ci_lo <= s.mean_ret && s.mean_ret <= s.ci_hi);
+    }
+
+    /// A labeled trade is bought at the first price the market showed at or after the
+    /// decision minute, and its exits start from that moment ([B47]).
+    ///
+    /// The old rule bought at a price from BEFORE the minute (a print in the previous
+    /// 20 s, else a mid a median 53 s old), so the label could take a price the book
+    /// no longer offered, and a print that arrived before the trade could end it.
+    #[test]
+    fn the_label_buys_at_the_first_price_shown_after_the_minute() {
+        let w = 1_780_286_400;
+        let t = w + 60 * 5; // the only decision minute in this plan
+        let bars: Vec<Bar> = (0..125)
+            .map(|i| { let o = w - 62 * 60 + 60 * i; Bar { open_s: o, open: 100.0, high: 100.0, low: 100.0, close: 100.0 } })
+            .collect();
+        let samples: Vec<HistPoint> = (0..50).map(|i| HistPoint { t: w + 60 * i + 9, p: 0.50 }).collect();
+        let mut rec = MarketRecord {
+            outcome_prices: Some("[\"1\", \"0\"]".into()), // Up won
+            hist: HashMap::from([("0".to_string(), samples.clone()), ("1".to_string(), samples)]),
+            // An early print: every market has a tape, and this one is old enough to be
+            // nobody's entry and nobody's exit.
+            tape: vec![Print { ts: w + 1, side: "BUY".into(), o: 1, p: 0.50, s: 1.0 }],
+            ..Default::default()
+        };
+        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.40, hi: 0.75, fee: 0.0, margin: 0.10, first_minute: 5, last_minute: 5 };
+        let up_of = |rows: &[TrainingRow]| rows.iter().find(|r| r.side == 0).cloned().expect("a row for the Up side");
+
+        // No print in the minute: the entry is the first sample AFTER it, plus half a spread.
+        let rows = build_market_rows(w, &rec, &bars, &[], &plan);
+        assert_eq!(rows.len(), 2, "one row per side");
+        assert!((up_of(&rows).ask - (0.50 + HALF_SPREAD)).abs() < 1e-12, "ask {}", up_of(&rows).ask);
+
+        // A print 5 s into the minute is what that trade paid, and it comes first.
+        rec.tape.push(Print { ts: t + 5, side: "BUY".into(), o: 0, p: 0.62, s: 10.0 });
+        let rows = build_market_rows(w, &rec, &bars, &[], &plan);
+        assert!((up_of(&rows).ask - 0.62).abs() < 1e-12, "ask {}", up_of(&rows).ask);
+
+        // A sale at 0.20 three seconds into the minute, before the Up side's entry
+        // exists at t+9: it cannot stop a position that has not been bought.
+        rec.tape = vec![Print { ts: w + 1, side: "BUY".into(), o: 1, p: 0.50, s: 1.0 },
+                        Print { ts: t + 3, side: "SELL".into(), o: 0, p: 0.20, s: 100.0 }];
+        let row = up_of(&build_market_rows(w, &rec, &bars, &[], &plan));
+        assert!((row.ask - (0.50 + HALF_SPREAD)).abs() < 1e-12, "a sale is not an ask: {}", row.ask);
+        assert_eq!(row.exit, ExitKind::Settle, "an exit cannot fire before the entry exists");
+        assert!(row.y, "Up won this market");
+
+        // The reference rule buys at the minute itself, so the same sale stops it: that
+        // is what the harness fixture pins, and the stamp tells the two rules apart.
+        let old = Plan { entry: EntryRule::LastBefore, ..plan };
+        let row = up_of(&build_market_rows(w, &rec, &bars, &[], &old));
+        assert_eq!(row.exit, ExitKind::Sl, "under LastBefore the sale is inside the position");
+        assert!(!row.y);
+        assert_ne!(plan.label(), old.label(), "the stamp must tell the two rules apart");
     }
 
     /// A whole training cycle on the research harness's own June to July 2026 market
@@ -2139,7 +2288,7 @@ mod tests {
         funding.sort_by_key(|x| x.0);
         write_json_atomically(&dir.funding(), &funding).unwrap();
         let serving = tmp.join("btc-gboost_planb_v1.json");
-        let plan = Plan { tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45 };
+        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45 };
         let inputs = CycleInputs {
             asset: "btc".into(), dir: dir.clone(), serving_path: serving.clone(), plan, now: last_w + 3600 + 1800,
             window_days: 120, holdout_days: 14, min_trades: 30, min_win: 0.53, budget: 2.0, auto_adopt: true, threads: fit_threads(),
@@ -2185,7 +2334,7 @@ mod tests {
             Err(e) => { println!("funding unavailable here ({e}); rows will carry none"); Vec::new() }
         };
         let bars: Vec<Bar> = bars_from_day(&prev).chain(bars_from_day(&day)).collect();
-        let plan = Plan { tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45 };
+        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45 };
         let rows = build_market_rows(w, &rec, &bars, &funding, &plan);
         println!("rows: {} ({} eligible); first: ask {:.3} y {} exit {:?}", rows.len(), rows.iter().filter(|r| r.elig).count(), rows[0].ask, rows[0].y, rows[0].exit);
         assert!(rows.len() >= 60);

@@ -111,19 +111,22 @@ const DETAIL_REFRESH_SECS: u64 = 2;
 /// not a profile constant.
 const STRUCTURAL_MIN_TREES: usize = 5;
 
-/// Seconds after a minute boundary before that minute is scored, so the CLOB
-/// price history holds every point the training rows will later hold for it.
-/// Points were measured visible 2 to 7 s after their own timestamps
-/// (2026-09-19, 14 points); 15 s leaves margin inside `DECISION_STALE_SECS`.
-const HISTORY_SETTLE_SECS: i64 = 15;
+/// Oldest order-book snapshot a decision may be scored, sized and priced on.
+const MAX_SNAPSHOT_AGE_SECS: i64 = 10;
+
+/// Seconds after a minute boundary before that minute is scored.
+///
+/// The history point a decision uses is the last sample at or before the minute,
+/// and samples land a few seconds into a minute (mode :03 to :06, tail to :19), so
+/// the point is around a minute old and publication lag (2 to 7 s) almost never
+/// decides which point is chosen: 0.027% of samples fall in a minute's last 7 s
+/// (measured over 360k samples in the production store). Waiting longer only
+/// let the ask drift away from the price the model scored ([B48]), so the decision
+/// is taken as soon as the closed bar is available, as it was before [B46].
+const HISTORY_SETTLE_SECS: i64 = BAR_SETTLE_SECS;
 /// History fetched per decision: enough before the minute for the 5-minute mid
 /// and its staleness limit.
 const HISTORY_LOOKBACK_SECS: i64 = 900;
-/// Oldest book snapshot from which a minute's `ask` feature is recorded. Training
-/// reads the ask at the minute boundary; the decision now waits for the history,
-/// so the feature is taken from the first fresh tick of the minute rather than at
-/// decision time. The price actually paid is still the ask at decision time.
-const MINUTE_ASK_MAX_AGE_SECS: i64 = 10;
 
 /// Number of model inputs.
 pub const N_FEATURES: usize = 29;
@@ -493,6 +496,9 @@ pub struct PlanBModel {
     pub zeroed: Vec<usize>,
     /// `[tp, sl, min_ask, max_ask]` the labels were built with, when stamped.
     pub plan: Option<[f64; 4]>,
+    /// Which price the labels bought at (`entry_rule` stamp). `None` on a model
+    /// written before the stamp existed, which means the old rule ([B47]).
+    pub entry_rule: Option<String>,
     pub trained_by: Option<String>,
     pub created_at: Option<String>,
     /// End of the calibration slice: the newest market the model has seen.
@@ -542,10 +548,15 @@ pub fn load_model(path: &std::path::Path) -> std::result::Result<PlanBModel, Str
         (Some(n), Some(r), Some(w)) => Some(format!("holdout {n} trades at {:+.2}% per trade, win {w:.3}", r * 100.0)),
         _ => None,
     };
+    // Which price the labels bought at. A model without the stamp predates [B47]
+    // and was labeled on an entry the book never showed, so it is named as `e1`
+    // rather than trusted: `plan_mismatch` refuses whatever does not match the
+    // configured rule.
+    let entry_rule = Some(meta("entry_rule").unwrap_or_else(|| "e1".to_string()));
     let trained_by = meta("trained_by");
     let created_at = meta("created_at");
     let calibrated_through = meta("calibrated_through");
-    Ok(PlanBModel { booster, platt_a, platt_b, version, trees, zeroed, plan, trained_by, created_at, calibrated_through, holdout_summary })
+    Ok(PlanBModel { booster, platt_a, platt_b, version, trees, zeroed, plan, entry_rule, trained_by, created_at, calibrated_through, holdout_summary })
 }
 
 impl PlanBModel {
@@ -553,7 +564,17 @@ impl PlanBModel {
     pub fn needs_funding(&self) -> bool { !self.zeroed.contains(&FUNDING_COLUMN) }
 
     /// The plan the model was built for differs from the configured one.
-    pub fn plan_mismatch(&self, tp: f64, sl: f64, lo: f64, hi: f64) -> Option<String> {
+    ///
+    /// The entry rule is part of the plan: a model labeled on the old entry price
+    /// answers a different question from the one the engine now trades, and serving
+    /// it would keep the [B47] artifact alive. An unstamped model is `e1`.
+    pub fn plan_mismatch(&self, tp: f64, sl: f64, lo: f64, hi: f64, entry_rule: &str) -> Option<String> {
+        if self.entry_rule.as_deref().unwrap_or("e1") != entry_rule {
+            return Some(format!(
+                "model {} was labeled with entry rule {}, and the engine trades {}; a model for the configured rule is needed",
+                self.version, self.entry_rule.as_deref().unwrap_or("e1"), entry_rule,
+            ));
+        }
         let p = self.plan?;
         let same = |a: f64, b: f64| (a - b).abs() < 1e-9;
         if same(p[0], tp) && same(p[1], sl) && same(p[2], lo) && same(p[3], hi) {
@@ -620,8 +641,6 @@ struct PlanBGlobals {
     model: StdMutex<ModelSlot>,
     data: StdMutex<MinuteData>,
     history: StdMutex<HistorySlot>,
-    /// Each minute's asks from its first fresh tick, keyed by (condition id, minute).
-    minute_asks: StdMutex<HashMap<(String, i64), [f64; 2]>>,
     decided: StdMutex<HashSet<(String, i64)>>,
     attempted: StdMutex<HashSet<(String, usize)>>,
     below_minimum_noted: StdMutex<HashSet<String>>,
@@ -974,7 +993,8 @@ impl Strategy for GboostPlanBStrategy {
         }
         let f = |d: Decimal| d.to_f64().unwrap_or(0.0);
         if let Some(m) = &model {
-            if let Some(why) = m.plan_mismatch(f(dc.gboost_planb_take_profit_pct), f(dc.gboost_planb_stop_loss_pct), f(dc.gboost_planb_min_ask), f(dc.gboost_planb_max_ask)) {
+            let plan = crate::vipers::gboost_planb_train::Plan::from_config(dc, f(crate::venues::taker_fee_rate()));
+            if let Some(why) = m.plan_mismatch(f(dc.gboost_planb_take_profit_pct), f(dc.gboost_planb_stop_loss_pct), f(dc.gboost_planb_min_ask), f(dc.gboost_planb_max_ask), plan.entry.stamp()) {
                 idle(&format!("{why}; waiting for the pipeline to train a model for the configured plan"));
                 return Ok(StrategySignal::NoSignal);
             }
@@ -995,15 +1015,6 @@ impl Strategy for GboostPlanBStrategy {
         }
         let cid = market.condition_id.clone();
         let minute_start = w + (now_s - w) / 60 * 60;
-
-        // Record each minute's asks from the first fresh tick after its boundary: the
-        // model's `ask` input matches training's ask at the minute, not at decision time.
-        if (now - snap.timestamp).num_seconds() <= MINUTE_ASK_MAX_AGE_SECS {
-            let mut asks = lock(&g.minute_asks);
-            asks.entry((cid.clone(), minute_start))
-                .or_insert([snap.yes_ask.to_f64().unwrap_or(0.0), snap.no_ask.to_f64().unwrap_or(0.0)]);
-            asks.retain(|(_, m), _| now_s - m < 7200);
-        }
 
         let k = (now_s - w) / 60;
         let t = minute_start;
@@ -1030,31 +1041,41 @@ impl Strategy for GboostPlanBStrategy {
             }
             return Ok(StrategySignal::NoSignal);
         };
-        let Some((bars, funding)) = ensure_minute_data(g, t, model.needs_funding()) else {
-            idle(if model.needs_funding() { "waiting for Binance bars and the settled funding rate" } else { "waiting for Binance bars" });
-            return Ok(StrategySignal::NoSignal);
-        };
-
+        // Both fetches are kicked off in the same tick: serialized, a slow Binance
+        // host could spend the whole decision window before the history is asked for.
+        let minute_data = ensure_minute_data(g, t, model.needs_funding());
         // The market's own price, from the same CLOB history and the same rule the
         // training rows use ([B46]), never from the order book.
         let tokens = [market.yes_token.as_str().to_string(), market.no_token.as_str().to_string()];
-        let Some(hist) = ensure_price_history(g, &cid, tokens, t) else {
+        let history = ensure_price_history(g, &cid, tokens, t);
+        let Some((bars, funding)) = minute_data else {
+            idle(if model.needs_funding() { "waiting for Binance bars and the settled funding rate" } else { "waiting for Binance bars" });
+            return Ok(StrategySignal::NoSignal);
+        };
+        let Some(hist) = history else {
             idle("waiting for the Polymarket price history");
             return Ok(StrategySignal::NoSignal);
         };
         let at = |side: usize, x: i64| crate::vipers::gboost_planb_train::history_mid_at(&hist[side], x);
         let (mid_now, mid_m1, mid_m5) = ([at(0, t), at(1, t)], [at(0, t - 60), at(1, t - 60)], [at(0, t - 300), at(1, t - 300)]);
-        // The price paid and the break-even it is judged against: the book now.
+        // A book old enough to be another market's is not this decision's price: the
+        // removed per-minute recording was the only place the snapshot's age was
+        // checked, and the ask below is scored, sized and paid on ([B48] review).
+        if (now - snap.timestamp).num_seconds() > MAX_SNAPSHOT_AGE_SECS {
+            idle("waiting for a fresh order book");
+            return Ok(StrategySignal::NoSignal);
+        }
+        // ONE ask: what the model is asked about, what the gate judges, what is paid
+        // ([B48]). Scoring an earlier ask than the order uses bought 3 to 5 ¢ above the
+        // scored price on both 2026-09-19 trades, and the bias has a mechanism: the
+        // model's strongest signal is a market lagging Binance, whose ask is rising.
         let ask = [snap.yes_ask.to_f64().unwrap_or(0.0), snap.no_ask.to_f64().unwrap_or(0.0)];
-        // The model's `ask` input: the minute's first fresh ask, as in training; the
-        // current ask only if the minute had no fresh tick (e.g. just after a restart).
-        let feature_ask = lock(&g.minute_asks).get(&(cid.clone(), t)).copied().unwrap_or(ask);
         {
             let mut decided = lock(&g.decided);
             decided.insert((cid.clone(), t));
             decided.retain(|(_, dt)| now_s - dt < 7200);
         }
-        let inputs = DecisionInputs { w, t, bars: &bars, mid_now, mid_m1, mid_m5, ask: feature_ask, funding };
+        let inputs = DecisionInputs { w, t, bars: &bars, mid_now, mid_m1, mid_m5, ask, funding };
         let features = match build_features(&inputs) {
             Ok(f) => f,
             Err(gap) => {
@@ -1476,17 +1497,25 @@ mod tests {
         let _ = json;
         // Exercise the comparison on the struct directly; loading is covered by the
         // trainer's stamped-model test.
-        let m = |plan: Option<[f64; 4]>| {
+        let m_with = |plan: Option<[f64; 4]>, entry_rule: Option<String>| {
             // A booster is needed only to construct the struct; the smallest fit will do.
             let data = vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
             let matrix = Matrix::new(&data, 4, 2);
             let mut b = PerpetualBooster::default().set_iteration_limit(Some(1)).set_num_threads(Some(1));
             b.fit(&matrix, &[0.0, 1.0, 0.0, 1.0], None, None).unwrap();
-            PlanBModel { booster: b, platt_a: 1.0, platt_b: 0.0, version: "t".into(), trees: 1, zeroed: vec![23, 24, 25, 26], plan, trained_by: None, created_at: None, calibrated_through: None, holdout_summary: None }
+            PlanBModel { booster: b, platt_a: 1.0, platt_b: 0.0, version: "t".into(), trees: 1, zeroed: vec![23, 24, 25, 26], plan, entry_rule, trained_by: None, created_at: None, calibrated_through: None, holdout_summary: None }
         };
-        assert!(m(Some(REFERENCE_PLAN)).plan_mismatch(0.20, 0.11, 0.43, 0.75).is_none());
-        assert!(m(Some(REFERENCE_PLAN)).plan_mismatch(0.15, 0.11, 0.43, 0.75).is_some());
-        assert!(m(None).plan_mismatch(0.15, 0.11, 0.43, 0.75).is_none(), "an unstamped model cannot be compared");
+        let m = |plan: Option<[f64; 4]>| m_with(plan, Some("e2".to_string()));
+        assert!(m(Some(REFERENCE_PLAN)).plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2").is_none());
+        assert!(m(Some(REFERENCE_PLAN)).plan_mismatch(0.15, 0.11, 0.43, 0.75, "e2").is_some());
+        assert!(m(None).plan_mismatch(0.15, 0.11, 0.43, 0.75, "e2").is_none(), "an unstamped plan cannot be compared");
+        // The entry rule is refused on its own, and a model with no stamp is the old
+        // rule, whatever its numbers say ([B47]).
+        let why = m(Some(REFERENCE_PLAN)).plan_mismatch(0.20, 0.11, 0.43, 0.75, "e1").expect("an e2 model is refused for an e1 plan");
+        assert!(why.contains("entry rule"), "{why}");
+        let unstamped = m_with(Some(REFERENCE_PLAN), None);
+        assert!(unstamped.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2").is_some(), "a model from before the stamp is e1 and must be refused");
+        assert!(unstamped.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e1").is_none());
         assert!(m(Some(REFERENCE_PLAN)).needs_funding());
         let mut z = m(Some(REFERENCE_PLAN));
         z.zeroed.push(FUNDING_COLUMN);
