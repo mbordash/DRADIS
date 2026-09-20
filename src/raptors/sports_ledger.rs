@@ -695,6 +695,45 @@ async fn get_json(http: &reqwest::Client, url: &str, api_key: Option<&str>, extr
     Ok((json, remaining, last))
 }
 
+/// The Odds API splits a league's preseason into its own sport key, and carries
+/// no preseason games under the regular-season key at all. Polymarket does not:
+/// it prices preseason games in the same league series as the rest. So a league
+/// configured as `nhl=icehockey_nhl` silently matched nothing through the whole
+/// of preseason, while Polymarket priced a full slate every night.
+///
+/// Only the `_preseason` sibling is taken, and only while the API reports it
+/// active. The other siblings a league accretes are not games of that league:
+/// `_championship_winner`, `_super_bowl_winner` and `_world_series_winner` are
+/// season-long futures, and `_women`, `_summer_league`, `_all_stars`, `_fcs` and
+/// `_qualification` are different competitions. Matching a league's moneylines
+/// against any of those would pair a game with something that is not that game.
+const PRESEASON_SUFFIX: &str = "_preseason";
+
+/// Sport keys the Odds API currently reports as active. Free: `/sports` does not
+/// count against the quota. An empty set on failure means the caller falls back
+/// to the configured key alone, which is the behavior before this existed.
+async fn active_odds_sports(http: &reqwest::Client, api_key: &str) -> HashSet<String> {
+    match get_json(http, &format!("{ODDS}/sports"), Some(api_key), &[]).await {
+        Ok((v, _, _)) => v.as_array().map(Vec::as_slice).unwrap_or(&[]).iter()
+            .filter(|s| s.get("active").and_then(Value::as_bool) == Some(true))
+            .filter_map(|s| s.get("key").and_then(Value::as_str).map(str::to_string))
+            .collect(),
+        Err(e) => {
+            warn!("🏈 Sports ledger: Odds API /sports failed ({e}) — preseason keys not considered this pass");
+            HashSet::new()
+        }
+    }
+}
+
+/// The sport keys to look for one league's games under: the configured key, plus
+/// its preseason key while that is active.
+fn sport_keys_for(sport_key: &str, active: &HashSet<String>) -> Vec<String> {
+    let mut keys = vec![sport_key.to_string()];
+    let pre = format!("{sport_key}{PRESEASON_SUFFIX}");
+    if active.contains(&pre) { keys.push(pre); }
+    keys
+}
+
 async fn refresh_catalog(
     http: &reqwest::Client,
     api_key: &str,
@@ -714,6 +753,7 @@ async fn refresh_catalog(
     };
     let mut games = Vec::new();
     let mut remaining = None;
+    let active = active_odds_sports(http, api_key).await;
     // Per-league coverage, logged at info once per refresh. A league that matches
     // nothing looks identical to a quiet league in the totals, so the operator
     // needs to see each one: "nfl 16/16" against "mlb 0/12" is the difference
@@ -744,19 +784,47 @@ async fn refresh_catalog(
             coverage.push(format!("{code} 0/0"));
             continue;
         }
-        // Free: /events does not count against the quota but still reports it.
-        let odds = match get_json(http, &format!("{ODDS}/sports/{sport_key}/events"), Some(api_key), &[]).await {
-            Ok((v, r, _)) => { remaining = r.or(remaining); parse_odds_events(&v) }
-            Err(e) => {
-                coverage.push(format!("{code} 0/{} (odds events failed)", pm.len()));
-                debug!("🏈 Sports ledger: Odds API events for '{sport_key}' failed: {e}");
-                continue;
+        // A league's games may sit under more than one Odds API sport key (the
+        // regular-season key and, in its window, the preseason one). Each key is
+        // tried against the games still unmatched, so a game is claimed once and
+        // carries the key it was actually found under: that is the key the paid
+        // snapshot call will use for it.
+        let mut unmatched: Vec<PmGame> = pm.clone();
+        let mut matched_here = 0usize;
+        let mut failed_keys = 0usize;
+        let mut found_under: Vec<String> = Vec::new();
+        let keys = sport_keys_for(sport_key, &active);
+        let multi = keys.len() > 1;
+        for key in &keys {
+            if unmatched.is_empty() { break; }
+            // Free: /events does not count against the quota but still reports it.
+            let odds = match get_json(http, &format!("{ODDS}/sports/{key}/events"), Some(api_key), &[]).await {
+                Ok((v, r, _)) => { remaining = r.or(remaining); parse_odds_events(&v) }
+                Err(e) => {
+                    failed_keys += 1;
+                    debug!("🏈 Sports ledger: Odds API events for '{key}' failed: {e}");
+                    continue;
+                }
+            };
+            let matched = match_games(&unmatched, &odds, key);
+            debug!("🏈 Sports ledger: {code} → {key}: {} Polymarket games, {} Odds API events, {} matched",
+                   unmatched.len(), odds.len(), matched.len());
+            if !matched.is_empty() {
+                if multi { found_under.push(format!("{}×{key}", matched.len())); }
+                let claimed: HashSet<&str> = matched.iter().map(|m| m.pm_slug.as_str()).collect();
+                unmatched.retain(|g| !claimed.contains(g.slug.as_str()));
+                matched_here += matched.len();
+                games.extend(matched);
             }
+        }
+        let note = if failed_keys == keys.len() {
+            " (odds events failed)".to_string()
+        } else if found_under.len() > 1 {
+            format!(" [{}]", found_under.join(" + "))
+        } else {
+            String::new()
         };
-        let matched = match_games(&pm, &odds, sport_key);
-        coverage.push(format!("{code} {}/{}", matched.len(), pm.len()));
-        debug!("🏈 Sports ledger: {code} → {sport_key}: {} Polymarket games, {} Odds API events, {} matched", pm.len(), odds.len(), matched.len());
-        games.extend(matched);
+        coverage.push(format!("{code} {matched_here}/{}{note}", pm.len()));
     }
     if !coverage.is_empty() {
         info!("🏈 Sports ledger coverage (matched/Polymarket games): {}", coverage.join(" · "));
@@ -1323,6 +1391,62 @@ mod tests {
         assert!(match_games(&parse_pm_games(&soccer_event(), "fl1", now), &late, "k").is_empty(), "45 minutes apart is a different game");
     }
 
+    /// [E63] The NHL preseason gap, as production reported it on 2026-09-20:
+    /// `nhl 0/15`, fifteen Polymarket games matching nothing, for weeks.
+    ///
+    /// The Odds API carries no preseason game under `icehockey_nhl`; its earliest
+    /// event was nine days out, while every one of those fifteen games was live
+    /// on `icehockey_nhl_preseason` that night.
+    #[test]
+    fn a_league_finds_its_games_under_the_preseason_key_too() {
+        let active: HashSet<String> = ["icehockey_nhl", "icehockey_nhl_preseason", "icehockey_nhl_championship_winner"]
+            .iter().map(|s| s.to_string()).collect();
+
+        let keys = sport_keys_for("icehockey_nhl", &active);
+        assert_eq!(keys, vec!["icehockey_nhl", "icehockey_nhl_preseason"],
+                   "the preseason key is taken; the season-long futures key is not");
+
+        // Inactive preseason (the rest of the year) costs nothing and adds nothing.
+        let season_only: HashSet<String> = ["icehockey_nhl"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(sport_keys_for("icehockey_nhl", &season_only), vec!["icehockey_nhl"]);
+
+        // Real shapes from that night. Polymarket says 17:00:00 and names the
+        // teams short and away-first; the Odds API says 17:08:11 and names them
+        // in full, home-first.
+        let now = t("2026-09-20T15:00:00Z");
+        let pm = parse_pm_games(&serde_json::json!([{
+            "slug": "nhl-nyi-njd-2026-09-20", "title": "Islanders vs. Devils",
+            "startTime": "2026-09-20T17:00:00Z",
+            "markets": [{
+                "sportsMarketType": "moneyline", "closed": false, "conditionId": "0xnhl",
+                "outcomes": "[\"Islanders\", \"Devils\"]",
+                "clobTokenIds": "[\"tok-nyi\", \"tok-njd\"]"
+            }]
+        }]), "nhl", now);
+        assert_eq!(pm.len(), 1, "Polymarket prices the preseason game");
+
+        let season = parse_odds_events(&serde_json::json!([
+            {"id": "e-reg", "home_team": "Carolina Hurricanes", "away_team": "Florida Panthers",
+             "commence_time": "2026-09-29T21:00:47Z"}
+        ]));
+        assert!(match_games(&pm, &season, "icehockey_nhl").is_empty(),
+                "this is the gap: the regular-season feed has nothing for tonight");
+
+        let preseason = parse_odds_events(&serde_json::json!([
+            {"id": "e-pre", "home_team": "New Jersey Devils", "away_team": "New York Islanders",
+             "commence_time": "2026-09-20T17:08:11Z"}
+        ]));
+        let matched = match_games(&pm, &preseason, "icehockey_nhl_preseason");
+        assert_eq!(matched.len(), 1, "and this is the fix");
+        // The game carries the key it was found under, which is the key its paid
+        // snapshot call must use.
+        assert_eq!(matched[0].sport_key, "icehockey_nhl_preseason");
+        let names: Vec<(&str, &str)> = matched[0].outcomes.iter()
+            .map(|o| (o.pm.label.as_str(), o.odds_name.as_str())).collect();
+        assert_eq!(names, [("Islanders", "New York Islanders"), ("Devils", "New Jersey Devils")],
+                   "the sides are paired across the two naming conventions, not by position");
+    }
+
     fn game(sport: &str, start: &str) -> MatchedGame {
         MatchedGame { league: "x".into(), sport_key: sport.into(), odds_event_id: "e".into(), pm_slug: "s".into(), commence: t(start), outcomes: vec![] }
     }
@@ -1439,6 +1563,45 @@ mod tests {
 #[cfg(test)]
 mod live_gamma_tests {
     use super::*;
+
+    /// End-to-end against the live free endpoints, which cost no credits: does
+    /// the real NHL slate actually match now? Run it with
+    /// `ODDS_API_KEY=... cargo test nhl_preseason_matches_live -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "live Gamma and Odds API: network"]
+    async fn nhl_preseason_matches_live() {
+        let Ok(key) = std::env::var("ODDS_API_KEY") else { return };
+        let http = reqwest::Client::new();
+        let now = Utc::now();
+
+        let (pm_json, _, _) = get_json(&http, &format!("{GAMMA}/events"), None,
+            &[("series_id", "10346"), ("closed", "false"), ("active", "true"), ("limit", "100")])
+            .await.expect("gamma events");
+        let pm = parse_pm_games(&pm_json, "nhl", now);
+        println!("Polymarket NHL games in window: {}", pm.len());
+
+        let active = active_odds_sports(&http, &key).await;
+        let keys = sport_keys_for("icehockey_nhl", &active);
+        println!("sport keys tried: {keys:?}");
+
+        let mut unmatched = pm.clone();
+        let mut total = 0usize;
+        for k in &keys {
+            let (v, _, _) = get_json(&http, &format!("{ODDS}/sports/{k}/events"), Some(&key), &[])
+                .await.expect("odds events");
+            let odds = parse_odds_events(&v);
+            let matched = match_games(&unmatched, &odds, k);
+            println!("  {k}: {} events, {} matched", odds.len(), matched.len());
+            let claimed: HashSet<&str> = matched.iter().map(|m| m.pm_slug.as_str()).collect();
+            unmatched.retain(|g| !claimed.contains(g.slug.as_str()));
+            total += matched.len();
+        }
+        println!("matched {total}/{} ; unmatched slugs: {:?}",
+                 pm.len(), unmatched.iter().map(|g| &g.slug).collect::<Vec<_>>());
+        if !pm.is_empty() {
+            assert!(total > 0, "no NHL game matched under any key — the gap is still open");
+        }
+    }
 
     /// The 2026-09-11 Colorado Rockies at Detroit Tigers game, as the production
     /// ledger recorded it. Gamma hides a closed market unless the query asks for
