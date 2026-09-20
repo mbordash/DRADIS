@@ -1,6 +1,6 @@
 # DRADIS
 
-> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Kalshi & Polymarket. Nine autonomous Viper strategies, a Raptor recon layer (Price, Funding, Derivatives, Tide "Institutional Pulse", Horizon "TradFi Velocity", a venue-neutral Sports line-movement scout, and a venue-neutral Tennis event-state scout), a Squadron deployment framework, a CAG async dispatch layer with concurrent multi-asset support, a real-time Next.js Control Tower, and an LLM Advisor (Ollama local/remote, OpenAI-compatible, or Anthropic) that delivers optimization recommendations via Telegram & OpenClaw — and can propose or autonomously apply live config changes under a tiered, guard-railed autonomy policy.
+> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Kalshi & Polymarket. Nine autonomous Viper strategies, a Raptor recon layer (Price, Funding, Derivatives, Tide "Institutional Pulse", Horizon "TradFi Velocity", a Sports book-consensus scout, and a venue-neutral Tennis event-state scout), a Squadron deployment framework, a CAG async dispatch layer with concurrent multi-asset support, a real-time Next.js Control Tower, and an LLM Advisor (Ollama local/remote, OpenAI-compatible, or Anthropic) that delivers optimization recommendations via Telegram & OpenClaw — and can propose or autonomously apply live config changes under a tiered, guard-railed autonomy policy.
 
 ![Rust](https://img.shields.io/badge/Rust-1.95+-orange?logo=rust&logoColor=white)
 ![Tokio](https://img.shields.io/badge/Tokio-async%20runtime-darkgreen?logo=rust&logoColor=white)
@@ -378,7 +378,7 @@ Raptors are intentionally dumb: **fetch, normalize, broadcast** — no trading l
 | **Derivatives Raptor**         | Binance Perpetuals FAPI | Open-interest delta + taker CVD ratio (positioning pressure, all-asset) | `src/raptors/derivatives.rs` |
 | **Tide Raptor**                | Alpaca IEX + synthetic iNAV | "Institutional Pulse" + coherence from spot-BTC-ETF (IBIT/FBTC/ARKB) premium vs iNAV — BTC-only, US-hours | `src/raptors/tide.rs` |
 | **Horizon Raptor**             | Alpaca IEX (shared)     | TradFi velocity (SPY/QQQ), macro coherence (BTC↔QQQ), VIX proxy (UVXY) — BTC-only, US-hours | `src/raptors/horizon.rs` |
-| **Sports Raptor**              | The Odds API (h2h)      | Vig-free consensus probability, line drift, book dispersion — venue-neutral (US + intl), **observe-only** | `src/raptors/sports.rs` |
+| **Sports Raptor**              | The Odds API (h2h)      | Vig-free cross-book consensus, drift and dispersion per matched moneyline, keyed by outcome token — Polymarket Intl, **recording only** | `src/raptors/sports_ledger.rs` |
 | **Tennis Raptor**              | Live Tennis API (REST)  | Live tennis event state: score, serving side, break-point flag, feed staleness — venue-neutral, **observe-only** | `src/raptors/tennis.rs` |
 | *(future)* **Politics Raptor** | Polling aggregators     | Approval drift, event probability shifts                | —                        |
 
@@ -386,7 +386,7 @@ When multiple Raptors are active, Basis, Momentum and TrendCapture use them as c
 
 The **Tide** and **Horizon** Raptors share a single Alpaca IEX WebSocket connection (free tier allows only one per account). Tide tracks BTC-specific institutional flow (ETF premium); Horizon tracks TradFi macro regime (equity velocity, VIX). Together they enable divergence detection — e.g., equities selling off but BTC ETFs at premium suggests institutional flight *into* crypto.
 
-The **Sports Raptor** is the first non-crypto scout: a single venue-neutral instance shared by both the US and intl pipelines. It polls The Odds API (keyed on `ODDS_API_KEY`), reduces the nearest-commencing event's cross-book moneyline to a vig-free consensus, and broadcasts line drift + book dispersion. It runs **observe-only** — it publishes telemetry but no Viper consumes it for sizing yet — and degrades silently to a neutral snapshot when no API key is set.
+The **Sports Raptor** is the first non-crypto scout. It matches each Polymarket International sports moneyline to a bookmaker event, reduces that event's cross-book h2h odds to a vig-free consensus, and publishes one line per outcome token, so a squadron reads its own game rather than whichever game happens to be next. Every snapshot is recorded with the raw per-book prices behind it, so the history can be re-analyzed rather than taken on trust. It runs **recording only** — no Viper consumes it for sizing yet — and stays idle without `ODDS_API_KEY`.
 
 The **Tennis Raptor** reads the event itself rather than the betting line: it polls the Live Tennis API's live-match endpoint (keyed on `LIVETENNIS_API_KEY`), tracks one live match (sticky by id, otherwise the freshest score), and broadcasts sets/games/points, the serving side, and a derived break-point flag (receiver at AD, or receiver at 40 vs a server below 40 — never in tiebreaks). Feed health follows the same stale-feed-reads-as-disconnected rule as the other scouts: a score older than `TENNIS_SCORE_STALENESS_SECS` reports `tennis_connected = false` alongside its age, so a consumer widens or pulls, never holds. Honest tier facts: the free tier is 30 req/min / 100 req/day — the default `TENNIS_POLL_SECS = 900` fits all-day polling inside the free cap, while ~60s polling gives near point-level tracking for only ~100 minutes/day (develop-and-test, or following a few matches; sustained fast polling needs a paid tier). The provider's push WebSocket and model win-probability fields are top-tier features and are **not** used — this raptor is free-tier REST only, observe-only, and degrades silently to a neutral snapshot without a key.
 
@@ -431,7 +431,7 @@ Markets are classified into domains that determine which Raptors and Vipers are 
 | Market Class | Raptors | Vipers |
 |--------------|---------|--------|
 | `crypto` | Price, Funding, Derivatives, Tide | All nine Vipers |
-| `sports` | Sports (line movement) | Arbitrage, Maker (venue-agnostic) |
+| `sports` | Sports (cross-book consensus) | Arbitrage, Maker (venue-agnostic) |
 | `politics` | Politics (roadmap) | Arbitrage, Maker (venue-agnostic) |
 
 Classification is data-driven via the `market_class_rule` table — add a new mapping (e.g., `tennis → sports`) with one INSERT, no code change.
@@ -732,7 +732,7 @@ LLM_OUTCOME_HORIZON_SECS=7200    # when applied changes get outcome-scored
 - Rust 1.95+ (or Docker)
 - Telegram bot token (optional)
 - Alpaca API key/secret (optional — free tier; powers both **Tide** and **Horizon** Raptors from one connection. Without it both cards stay idle.)
-- The Odds API key (optional — free tier; only needed for the **Sports Raptor**'s line-movement feed. Without it the Sports Raptor pill stays idle.)
+- The Odds API key (optional — free tier; only needed for the **Sports Raptor**'s book-consensus feed. Without it the Sports Raptor pill stays idle.)
 
 **Polymarket International build (`intl_clob`) only:**
 - A Polygon wallet with USDC and MATIC
@@ -762,13 +762,17 @@ ALPACA_API_SECRET_KEY=your-secret-key
 
 Tide feeds the Basis tide veto and the **Convergence** Viper. Horizon (TradFi velocity, macro coherence, VIX proxy/velocity) drives preventative gates on **Maker** (VIX-spike / coherent-TradFi-flow quote suppression) and **TrendCapture** (fade veto when TradFi confirms the drift) — the gates run observe-first and enforce once calibrated (`MAKER_HORIZON_GATE_ENFORCE`, `TRENDREVERSAL_HORIZON_VETO_ENFORCE`). Omit the keys and both run idle (neutral snapshots, offline pills).
 
-### Sports Raptor (line movement) — optional
+### Sports Raptor (cross-book consensus) — optional
 
-The Sports Raptor is a venue-neutral, **observe-only** scout shared by both the US
-and intl pipelines. It polls [The Odds API](https://the-odds-api.com) (free tier),
-reduces the nearest-commencing event's cross-book moneyline to a vig-free consensus
-probability, and broadcasts **line drift** (movement since the previous poll) and
-**book dispersion** (soft-line disagreement). To enable it, add your key to `.env`:
+The Sports Raptor matches every Polymarket International sports moneyline to a
+[The Odds API](https://the-odds-api.com) event and records the vig-free cross-book
+consensus against Polymarket's own bid and ask, one line per outcome token, plus
+**drift** (movement since that game's previous snapshot) and **book dispersion**
+(soft-line disagreement). It is **recording only** — no Viper trades on it yet. On
+Kalshi and Polymarket US it reports telemetry but feeds no strategy, because
+discovery and prices come from Polymarket. Snapshots are taken at fixed offsets
+before each kick-off and budgeted against your key's own quota, so it runs on the
+free tier as well as a paid plan. To enable it, add your key to `.env`:
 
 ```bash
 ODDS_API_KEY=your-the-odds-api-key

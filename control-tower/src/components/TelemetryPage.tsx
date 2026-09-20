@@ -127,9 +127,9 @@ function toRow(s: TelemetrySample): Row {
   };
 }
 
-// The Sports Raptor is venue-neutral and polls on its own (~2h) cadence; its telemetry
-// is de-duplicated server-side, so it gets its own sparse, multi-day chart row type
-// independent of the crypto asset samples.
+// The Sports Raptor snapshots each game at fixed offsets before kick-off rather than
+// on a clock, so its telemetry is sparse and de-duplicated server-side; it gets its own
+// multi-day chart row type independent of the crypto asset samples.
 interface SportsRow {
   t: number;
   time: string;
@@ -705,8 +705,8 @@ export default function TelemetryPage({ availableAssets, venue }: { availableAss
     { refreshInterval: live ? POLL_MS : 0, revalidateOnFocus: false, keepPreviousData: true },
   );
 
-  // The Sports Raptor is venue-neutral and publishes under a fixed "sports" key,
-  // independent of the selected crypto asset. It polls every ~2h and its telemetry is
+  // The Sports Raptor publishes under a fixed "sports" key, independent of the selected
+  // crypto asset. It snapshots at fixed offsets before kick-off and its telemetry is
   // de-duplicated server-side (one point per change/heartbeat), so a modest fixed
   // request spans many days of readable movement regardless of the crypto window.
   const { data: sportsSamples } = useSWR(
@@ -999,10 +999,11 @@ export default function TelemetryPage({ availableAssets, venue }: { availableAss
         <div className="card px-5 py-4 border border-emerald-500/20 bg-[#0d0d1a]">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
             <div>
-              <p className="label-muted text-xs">🏟️ Sports Raptor — Cross-Book Consensus</p>
+              <p className="label-muted text-xs">🏟️ Sports Raptor — Cross-Book Consensus Board</p>
               <p className="text-[11px] text-gray-500 mt-0.5">
-                Venue-neutral observe-only feed (The Odds API). Vig-free consensus of the nearest
-                priced event — shared by every deployed squadron across every venue.
+                Recording feed (The Odds API) against Polymarket International. Every matched
+                moneyline is kept as a line keyed to its own outcome token, so a squadron reads its
+                own game. The reading below is the next game to start.
               </p>
             </div>
             <div className="flex items-center gap-3 text-[10px] font-mono shrink-0">
@@ -1014,6 +1015,17 @@ export default function TelemetryPage({ availableAssets, venue }: { availableAss
           </div>
 
           {/* Which event / outcome / books the numbers describe */}
+          {!sportsLast?.sports_connected && sportsLast && !sportsLast.sports_enabled ? (
+            <p className="text-[11px] font-mono text-gray-500">
+              Switched off. Turn on <span className="text-gray-400">Sports Line Ledger</span> under
+              Setup → Engine to start recording.
+            </p>
+          ) : !sportsLast?.sports_connected && sportsLast && !sportsLast.sports_has_key ? (
+            <p className="text-[11px] font-mono text-gray-500">
+              No <span className="text-gray-400">ODDS_API_KEY</span> set — the feed is on but has
+              nothing to read.
+            </p>
+          ) : null}
           {sportsLast?.sports_connected && sportsLast?.sports_event ? (
             <div className="mb-4 rounded-lg border border-[#1e1e32] bg-[#0a0a14] px-4 py-3">
               <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
@@ -1048,9 +1060,7 @@ export default function TelemetryPage({ availableAssets, venue }: { availableAss
             </div>
           ) : (
             <div className="mb-4 rounded-lg border border-[#1e1e32] bg-[#0a0a14] px-4 py-3 text-[11px] font-mono text-gray-600">
-              No priced event yet — the raptor tracks the nearest upcoming game with live odds
-              (polls every ~2h to stay inside the free-tier budget).
-            </div>
+              No matched game on the board yet — the raptor snapshots each game at fixed offsets before kick-off, so a line appears as its game approaches.</div>
           )}
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -1063,7 +1073,7 @@ export default function TelemetryPage({ availableAssets, venue }: { availableAss
             />
             <SignalChart<SportsRow>
               title="Line Drift & Book Dispersion"
-              subtitle="Δconsensus vs prior poll (signed) + cross-book spread"
+              subtitle="Δconsensus vs that game's prior snapshot (signed) + cross-book spread"
               data={sportsRows}
               zeroLine
               series={[
@@ -1076,12 +1086,13 @@ export default function TelemetryPage({ availableAssets, venue }: { availableAss
         </div>
 
         <p className="text-[10px] font-mono text-gray-600">
-          The Sports Raptor observes only — no Viper trades on it yet. It polls The Odds API on a
-          slow (~2h) cadence to stay inside the free-tier budget (~500 requests/month), so the trend
-          fills in gradually. <span className="text-gray-500">Consensus</span> is the vig-free cross-book
-          implied probability of the reference outcome; <span className="text-gray-500">drift</span> is its
-          move since the prior poll; <span className="text-gray-500">dispersion</span> is how much the
-          books disagree — a proxy for soft, potentially mispriced lines.
+          The Sports Raptor records only — no Viper trades on it yet. It snapshots each matched
+          game at fixed offsets before kick-off and budgets spend against the key's own quota, so it
+          runs on the free tier (~500 requests/month) as well as a paid plan.{' '}
+          <span className="text-gray-500">Consensus</span> is the vig-free cross-book implied
+          probability of the outcome shown; <span className="text-gray-500">drift</span> is its move
+          since that game's previous snapshot; <span className="text-gray-500">dispersion</span> is
+          how much the books disagree — a proxy for soft, potentially mispriced lines.
         </p>
 
         {/* ── Tennis Raptor — live event state ────────────────────────────── */}

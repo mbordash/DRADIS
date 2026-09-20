@@ -220,14 +220,11 @@ export interface DynamicConfig {
 
   // Raptor polling — live cadence + budget thresholds for the two credentialed,
   // budget-metered Raptors. Numbers, not Decimal strings.
-  sports_poll_secs:                 number;
-  sports_low_budget_warn:           number;
   tennis_poll_secs:                 number;
   tennis_low_budget_warn:           number;
 
   // Raptor feed selectors — free-text provider identifiers, passed through to
   // the upstream API verbatim and NOT validated by DRADIS.
-  sports_odds_sport:                string;
   sports_odds_regions:              string;
   sports_ledger_enabled:            boolean;
   sports_ledger_leagues:            string;
@@ -449,6 +446,8 @@ export interface AssetRaptorHealth {
 
   // ── Sports Raptor — line movement (The Odds API, observe-only) ──
   sports_connected?:      boolean; // fresh cross-book consensus this poll
+  sports_enabled?:        boolean; // operator switched the feed on
+  sports_has_key?:        boolean; // ODDS_API_KEY present
   sports_consensus_prob?: number;  // vig-free consensus implied prob (0..1)
   sports_line_drift?:     number;  // Δ consensus vs previous poll (signed)
   sports_book_dispersion?: number; // spread of per-book implied probs (0..1)
@@ -494,6 +493,8 @@ export interface TelemetrySample {
 
   // ── Sports Raptor — line movement (The Odds API, observe-only) ──
   sports_connected:      boolean;
+  sports_enabled?:       boolean; // operator switched the feed on
+  sports_has_key?:       boolean; // ODDS_API_KEY present
   sports_consensus_prob: number;  // vig-free consensus implied prob (0..1)
   sports_line_drift:     number;  // Δ consensus vs previous poll (signed)
   sports_book_dispersion: number; // spread of per-book implied probs (0..1)

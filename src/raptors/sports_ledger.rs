@@ -36,9 +36,15 @@
 //! not move a full point in 71 pre-game game-hours of five-minute polls, which
 //! is why a handful of pre-game snapshots per game loses little.
 //!
-//! When the ledger is enabled it owns the Odds API budget, and the Sports Raptor
-//! stops polling: its single global consensus has no consumer and would spend
-//! the same quota.
+//! This IS the Sports Raptor as of [E63]. The polling raptor it replaced picked
+//! one nearest-commencing event across all sports and published that same global
+//! snapshot to every squadron, which no viper could use and nothing recorded; it
+//! was deleted rather than left spending the same Odds API quota.
+//!
+//! Scope: discovery and prices are Polymarket International (Gamma + CLOB), so
+//! the board is keyed by Gamma token ids and `StrategyContext.sports` is `None`
+//! on Kalshi and Polymarket US. Extending the recorder to those venues is open
+//! work; until then this telemetry is honest but venue-specific.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -53,6 +59,42 @@ use tracing::{debug, info, warn};
 use crate::config;
 use crate::helpers::db;
 use crate::helpers::dynamic_config::DynamicConfig;
+
+/// Fixed health-map key the sports signal publishes its telemetry under,
+/// alongside the per-asset crypto entries ("btc"/"eth"/…). Venue-neutral: one
+/// entry, not one per asset.
+///
+/// Moved here from the retired polling Sports Raptor ([E63]): the ledger is the
+/// Sports Raptor now, and this is the key operators already know it by.
+pub const SPORTS_HEALTH_KEY: &str = "sports";
+
+/// Blank out any `apiKey=...` value in a string destined for a log.
+///
+/// The Odds API takes its credential in the query string, so every URL this
+/// module builds carries the operator's key. Anything that renders such a URL —
+/// most notably `reqwest::Error`'s `Display`, which names the request it failed
+/// on — would otherwise write that key to disk in plain text.
+///
+/// Deliberately operates on the rendered STRING rather than the URL, because the
+/// leak arrives inside an error message with surrounding prose, not as a bare
+/// URL that could be parsed and rebuilt.
+pub fn redact_url_secrets(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("apiKey=") {
+        let (head, tail) = rest.split_at(i + "apiKey=".len());
+        out.push_str(head);
+        out.push_str("<redacted>");
+        // The value runs to the next query separator or whitespace; whatever
+        // follows (`&markets=...`, a closing paren, trailing prose) is kept.
+        let end = tail
+            .find(|c: char| c == '&' || c == '#' || c.is_whitespace() || c == ')')
+            .unwrap_or(tail.len());
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
 
 const GAMMA: &str = "https://gamma-api.polymarket.com";
 const ODDS: &str = "https://api.the-odds-api.com/v4";
@@ -418,6 +460,8 @@ pub fn fold_rows(prev: &SportsBoard, rows: &[db::SportsLedgerRow], now: DateTime
 pub fn report_board_health(
     tx: &watch::Sender<HashMap<String, crate::api::server::AssetRaptorHealth>>,
     now: DateTime<Utc>,
+    enabled: bool,
+    has_key: bool,
 ) {
     let board = board();
     // Liveness is about the FEED, not about one game: the newest odds on the board.
@@ -433,8 +477,10 @@ pub fn report_board_health(
     let games: HashSet<&str> = board.values().map(|l| l.odds_event_id.as_str()).collect();
     let n_games = games.len();
     tx.send_modify(|map| {
-        let h = map.entry(crate::raptors::sports::SPORTS_HEALTH_KEY.to_string()).or_default();
+        let h = map.entry(SPORTS_HEALTH_KEY.to_string()).or_default();
         h.sports_connected = live;
+        h.sports_enabled = enabled;
+        h.sports_has_key = has_key;
         match &next {
             Some(l) => {
                 h.sports_line_drift = l.drift.and_then(Decimal::from_f64_retain).unwrap_or_default().round_dp(6);
@@ -683,11 +729,11 @@ async fn get_json(http: &reqwest::Client, url: &str, api_key: Option<&str>, extr
     let resp = tokio::time::timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS), req.send())
         .await
         .map_err(|_| format!("timed out after {HTTP_TIMEOUT_SECS}s"))?
-        .map_err(|e| crate::raptors::sports::redact_url_secrets(&e.to_string()))?;
+        .map_err(|e| redact_url_secrets(&e.to_string()))?;
     let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).and_then(|s| s.trim().parse::<f64>().ok()).map(|f| f as i64);
     let (remaining, last) = (header("x-requests-remaining"), header("x-requests-last"));
     let status = resp.status();
-    let body = resp.text().await.map_err(|e| crate::raptors::sports::redact_url_secrets(&e.to_string()))?;
+    let body = resp.text().await.map_err(|e| redact_url_secrets(&e.to_string()))?;
     if !status.is_success() {
         return Err(format!("HTTP {status}: {}", body.chars().take(200).collect::<String>()));
     }
@@ -1015,7 +1061,7 @@ pub async fn run_sports_ledger(
         let cfg = config_rx.borrow().clone();
         if cfg.sports_ledger_enabled != was_enabled {
             info!("🏈 Sports ledger {}", if cfg.sports_ledger_enabled {
-                "enabled — recording book consensus against Polymarket for matched sports moneylines (no trading); the Sports Raptor stops polling"
+                "enabled — recording cross-book consensus against Polymarket International for matched sports moneylines (no trading)"
             } else {
                 "disabled"
             });
@@ -1041,7 +1087,12 @@ pub async fn run_sports_ledger(
         // Every tick, not only after a paid snapshot: a feed that has stopped
         // answering publishes nothing, and a panel fed only by publishes would keep
         // reporting the last success forever ([B43]).
-        report_board_health(&raptor_health_tx, Utc::now());
+        report_board_health(
+            &raptor_health_tx,
+            Utc::now(),
+            cfg.sports_ledger_enabled,
+            std::env::var(config::SPORTS_ODDS_KEY_ENV).ok().is_some_and(|k| !k.is_empty()),
+        );
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(TICK_SECS)) => {}
             _ = config_rx.changed() => {}
@@ -1634,5 +1685,43 @@ mod live_gamma_tests {
             .fetch_all(&pool).await.unwrap();
         assert_eq!(prices.len(), 2, "both outcomes of a finished game resolve");
         assert_eq!(prices.iter().sum::<f64>(), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::redact_url_secrets;
+
+    /// The shape the leak actually arrives in: a `reqwest::Error` names the URL
+    /// it failed on, and this provider's URL carries the credential.
+    #[test]
+    fn a_transport_error_does_not_carry_the_key() {
+        let leak = "error sending request for url \
+                    (https://api.the-odds-api.com/v4/sports/soccer_epl/odds?regions=uk\
+&markets=h2h&oddsFormat=decimal&apiKey=abcd1234deadbeef)";
+        let safe = redact_url_secrets(leak);
+        assert!(!safe.contains("abcd1234deadbeef"), "key survived redaction: {safe}");
+        assert!(safe.contains("apiKey=<redacted>"), "{safe}");
+        // Everything around the secret must survive, or the log stops being useful.
+        assert!(safe.contains("error sending request"));
+        assert!(safe.contains("soccer_epl"));
+        assert!(safe.ends_with(')'), "trailing context lost: {safe}");
+    }
+
+    /// The key is not always last in the query string.
+    #[test]
+    fn a_key_followed_by_more_parameters_is_redacted() {
+        let safe = redact_url_secrets("...?apiKey=SECRET&markets=h2h&oddsFormat=decimal");
+        assert!(!safe.contains("SECRET"));
+        assert_eq!(safe, "...?apiKey=<redacted>&markets=h2h&oddsFormat=decimal");
+    }
+
+    /// More than one occurrence, and text with none at all.
+    #[test]
+    fn every_occurrence_goes_and_clean_text_is_untouched() {
+        let safe = redact_url_secrets("a apiKey=one b apiKey=two c");
+        assert!(!safe.contains("one") && !safe.contains("two"), "{safe}");
+        assert_eq!(redact_url_secrets("HTTP 401: quota reached"), "HTTP 401: quota reached");
+        assert_eq!(redact_url_secrets(""), "");
     }
 }

@@ -541,22 +541,8 @@ async fn run() -> Result<()> {
     // squadron showed the Sports Raptor as linked, because the taxonomy maps the
     // `sports` class to it, while nothing ever fed the channel.
     //
-    // Both degrade to a default snapshot without their API key, so spawning them
-    // unconditionally costs nothing when unconfigured.
     // Supervised, matching how the intl block used to run them: a raptor that
     // exits or panics is respawned rather than leaving the channel silent.
-    let (sports_tx, sports_rx) =
-        watch::channel(dradis::raptors::sports::SportsSnapshot::default());
-    {
-        let http = Arc::clone(&shared_http);
-        let health = Arc::clone(&raptor_health_tx);
-        let cfg = config_rx.clone();
-        spawn_supervised("sports-raptor", move || {
-            dradis::raptors::sports::run_sports_raptor(
-                Arc::clone(&http), sports_tx.clone(), Arc::clone(&health), cfg.clone(),
-            )
-        });
-    }
     // Sports line ledger: off by default, research data only (no trading).
     {
         let http = Arc::clone(&shared_http);
@@ -629,10 +615,11 @@ async fn run() -> Result<()> {
             cag.clone(),
         ));
 
-        // Sports and Tennis are spawned once above and shared across venues;
-        // this block used to start its own pair, which meant two Odds API
-        // consumers on one key whenever more than one venue could run.
-        let (us_sports_rx, us_tennis_rx) = (sports_rx.clone(), tennis_rx.clone());
+        // Tennis is spawned once above and shared across venues; this block used
+        // to start its own, which meant two consumers on one key whenever more
+        // than one venue could run. (Sports no longer has a per-venue receiver:
+        // the ledger publishes one board that every squadron reads.)
+        let us_tennis_rx = tennis_rx.clone();
 
         // ── Connect the custodial US retail venue + run the arb loop (Step 3c) ──
         // Best-effort connect: a failure (missing creds, gateway down) is logged
@@ -712,7 +699,6 @@ async fn run() -> Result<()> {
                     Arc::clone(&raptor_health_tx),
                     Arc::clone(&markets_tx),
                     Arc::clone(&process_heartbeat_secs),
-                    us_sports_rx,
                     us_tennis_rx,
                     cancel,
                 ).await;
@@ -760,7 +746,6 @@ async fn run() -> Result<()> {
                     Arc::clone(&raptor_health_tx),
                     Arc::clone(&markets_tx),
                     Arc::clone(&process_heartbeat_secs),
-                    sports_rx.clone(),
                     tennis_rx.clone(),
                     cancel,
                 ).await;
@@ -1103,7 +1088,7 @@ async fn run() -> Result<()> {
             });
         }
 
-        let mut raptor_signals = SquadronRaptors::full(oracle_rx, velocity_rx, drift_rx, funding_rx, deriv_rx, tide_rx, horizon_rx, Some(sports_rx.clone()));
+        let mut raptor_signals = SquadronRaptors::full(oracle_rx, velocity_rx, drift_rx, funding_rx, deriv_rx, tide_rx, horizon_rx);
         // Attach the venue-neutral Tennis Raptor feed (observe-only) the same
         // way the US general wing attaches its sports feed.
         raptor_signals.tennis = Some(tennis_rx.clone());
@@ -1184,7 +1169,6 @@ async fn run() -> Result<()> {
             cag:            cag.clone(),
             default_session: session.clone(),
             markets_tx:     Arc::clone(&markets_tx),
-            sports_raptor:  Some(sports_rx.clone()),
             tg_token:       env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
             tg_chat_id:     env::var("TELEGRAM_CHAT_ID").unwrap_or_default(),
             tw_api_key:     env::var("X_API_KEY").unwrap_or_default(),

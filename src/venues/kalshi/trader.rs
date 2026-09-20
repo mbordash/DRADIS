@@ -55,7 +55,6 @@ use crate::orchestrator::{
 };
 use crate::raptors::derivatives::DerivativesSnapshot;
 use crate::raptors::horizon::HorizonSnapshot;
-use crate::raptors::sports::SportsSnapshot;
 use crate::raptors::tennis::TennisSnapshot;
 use crate::raptors::tide::TideSnapshot;
 use crate::squadron::{CryptoAsset, Squadron, SquadronConfig, SquadronRaptors, SquadronState};
@@ -429,7 +428,6 @@ pub async fn run_kalshi_trader(
     // whichever venue is running. Kalshi previously received neither, so its
     // sports squadron showed the Sports Raptor as linked — the taxonomy maps
     // `sports` to it — while nothing ever fed the channel.
-    sports_rx: watch::Receiver<SportsSnapshot>,
     tennis_rx: watch::Receiver<TennisSnapshot>,
     cancel: CancellationToken,
 ) {
@@ -452,7 +450,6 @@ pub async fn run_kalshi_trader(
             raptor_health_tx: Arc::clone(&raptor_health_tx),
             markets_tx: Arc::clone(&markets_tx),
             process_heartbeat_secs: Arc::clone(&process_heartbeat_secs),
-            sports_rx: sports_rx.clone(),
             tennis_rx: tennis_rx.clone(),
         }),
         cag.clone(),
@@ -499,7 +496,6 @@ pub async fn run_kalshi_trader(
             None,
             None,
             Some(&mut last_rotation_squadron),
-            &sports_rx,
             &tennis_rx,
         ).await;
         market_cancel.cancel();
@@ -571,7 +567,6 @@ struct KalshiDeploymentRunner {
     raptor_health_tx: Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
     markets_tx: Arc<watch::Sender<HashMap<String, String>>>,
     process_heartbeat_secs: Arc<AtomicU64>,
-    sports_rx: watch::Receiver<SportsSnapshot>,
     tennis_rx: watch::Receiver<TennisSnapshot>,
 }
 
@@ -611,7 +606,6 @@ impl crate::venues::deployment::DeploymentRunner for KalshiDeploymentRunner {
             Some(class),
             name,
             None,
-            &self.sports_rx,
             &self.tennis_rx,
         ).await;
         info!("📋 Deployed {class} squadron finished: {outcome:?}");
@@ -873,7 +867,6 @@ async fn trade_one_market(
     // that lands on a DIFFERENT underlying can retire it. `None` for pinned
     // deployments, which do not rotate.
     last_rotation_squadron: Option<&mut Option<String>>,
-    sports_rx: &watch::Receiver<SportsSnapshot>,
     tennis_rx: &watch::Receiver<TennisSnapshot>,
 ) -> MarketOutcome {
     let asset = KALSHI_ASSET;
@@ -897,7 +890,7 @@ async fn trade_one_market(
     };
 
     // ── Register the squadron so the Control Tower lists it ─────────────────
-    let squadron = register_kalshi_squadron(cag, &pair, &raptors, deployed_as, squadron_name, sports_rx, tennis_rx, cancel);
+    let squadron = register_kalshi_squadron(cag, &pair, &raptors, deployed_as, squadron_name, tennis_rx, cancel);
     let squadron_id = squadron.id.clone();
     // Previous tick's ghost mode, so the registry is swept on the LIVE edge rather
     // than on every live tick: a level-triggered clear takes the registry's global
@@ -2201,7 +2194,6 @@ fn register_kalshi_squadron(
     r: &CryptoRaptors,
     deployed_as: Option<&str>,
     squadron_name: Option<&str>,
-    sports_rx: &watch::Receiver<SportsSnapshot>,
     tennis_rx: &watch::Receiver<TennisSnapshot>,
     // The token the trade loop selects on, so a stand-down actually stops it.
     cancel: &CancellationToken,
@@ -2219,7 +2211,6 @@ fn register_kalshi_squadron(
         // when crypto was the only one, but the venue now runs a sports squadron
         // and the taxonomy links `sports` to this raptor, so the Control Tower
         // listed it while nothing fed the channel.
-        Some(sports_rx.clone()),
     );
     let mut raptors = raptors;
     raptors.tennis = Some(tennis_rx.clone());

@@ -856,7 +856,7 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
         ("derivatives", "Derivatives Raptor (open interest + CVD)", 1),
         ("tide",     "Tide Raptor (ETF institutional pulse)",  1),
         ("horizon",  "Horizon Raptor (TradFi velocity / VIX proxy)", 1),
-        ("sports",   "Sports Raptor (line movement, observe-only)", 1),
+        ("sports",   "Sports Raptor (cross-book consensus board, Polymarket Intl, recording only)", 1),
         ("politics", "Politics Raptor (roadmap)",              0),
     ] {
         sqlx::query("INSERT OR IGNORE INTO raptor_kind (id, display, implemented) VALUES (?, ?, ?)")
@@ -865,7 +865,7 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
     // Self-heal DBs seeded before the Sports Raptor was implemented (INSERT OR
     // IGNORE above won't flip an existing row's `implemented` flag / display).
     sqlx::query("UPDATE raptor_kind SET implemented = 1, display = ? WHERE id = 'sports'")
-        .bind("Sports Raptor (line movement, observe-only)")
+        .bind("Sports Raptor (cross-book consensus board, Polymarket Intl, recording only)")
         .execute(pool).await?;
 
     // viper_kind — venue_agnostic = 1 for pure order-book strategies.

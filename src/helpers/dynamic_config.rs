@@ -240,11 +240,8 @@ fn default_convergence_tp_fee_margin_mult() -> Decimal { config::CONVERGENCE_TP_
 fn default_convergence_resting_tp_enabled() -> bool    { config::CONVERGENCE_RESTING_TP_ENABLED         }
 fn default_fairvalue_obi_adverse_block()    -> Decimal { config::FAIRVALUE_OBI_ADVERSE_BLOCK           }
 fn default_fairvalue_obi_clear_secs()       -> u64     { config::FAIRVALUE_OBI_CLEAR_SECS              }
-fn default_sports_poll_secs()               -> u64     { config::SPORTS_POLL_SECS                      }
-fn default_sports_low_budget_warn()         -> i64     { config::SPORTS_ODDS_LOW_BUDGET_WARN           }
 fn default_tennis_poll_secs()               -> u64     { config::TENNIS_POLL_SECS                      }
 fn default_tennis_low_budget_warn()         -> i64     { config::TENNIS_LOW_BUDGET_WARN                }
-fn default_sports_odds_sport()              -> String  { config::SPORTS_ODDS_SPORT.to_string()         }
 fn default_sports_odds_regions()            -> String  { config::SPORTS_ODDS_REGIONS.to_string()       }
 fn default_sports_ledger_enabled()          -> bool    { config::SPORTS_LEDGER_ENABLED                 }
 fn default_sports_ledger_leagues()          -> String  { config::SPORTS_LEDGER_LEAGUES.to_string()     }
@@ -1028,14 +1025,6 @@ pub struct DynamicConfig {
     #[serde(default = "default_fairvalue_obi_clear_secs")]
     pub fairvalue_obi_clear_secs:         u64,
 
-    /// Seconds between Sports Raptor (The Odds API) polls.
-    #[serde(default = "default_sports_poll_secs")]
-    pub sports_poll_secs:                 u64,
-    /// Warn when The Odds API reports this many requests left in the quota.
-    /// Sized for the tier you are on — the free tier's ~500/month makes 50 a
-    /// useful warning, while a paid plan would warn constantly at that value.
-    #[serde(default = "default_sports_low_budget_warn")]
-    pub sports_low_budget_warn:           i64,
     /// Seconds between Tennis Raptor (Live Tennis API) polls.
     #[serde(default = "default_tennis_poll_secs")]
     pub tennis_poll_secs:                 u64,
@@ -1050,10 +1039,6 @@ pub struct DynamicConfig {
     // upstream API, not by DRADIS — so a wrong value is accepted here and
     // rejected (or silently ignored) by the provider. The Setup UI warns about
     // that; getting the identifier right is the operator's responsibility.
-    /// The Odds API sport key, e.g. `upcoming` (next games across all in-season
-    /// sports) or a specific key like `americanfootball_nfl`.
-    #[serde(default = "default_sports_odds_sport")]
-    pub sports_odds_sport:                String,
     /// Comma-separated bookmaker regions for the odds query: `us`, `us2`, `uk`,
     /// `eu`, `au`.
     #[serde(default = "default_sports_odds_regions")]
@@ -1306,11 +1291,8 @@ impl Default for DynamicConfig {
 
             fairvalue_obi_adverse_block:      config::FAIRVALUE_OBI_ADVERSE_BLOCK,
             fairvalue_obi_clear_secs:         config::FAIRVALUE_OBI_CLEAR_SECS,
-            sports_poll_secs:                 config::SPORTS_POLL_SECS,
-            sports_low_budget_warn:           config::SPORTS_ODDS_LOW_BUDGET_WARN,
             tennis_poll_secs:                 config::TENNIS_POLL_SECS,
             tennis_low_budget_warn:           config::TENNIS_LOW_BUDGET_WARN,
-            sports_odds_sport:                config::SPORTS_ODDS_SPORT.to_string(),
             sports_odds_regions:              config::SPORTS_ODDS_REGIONS.to_string(),
             sports_ledger_enabled:            config::SPORTS_LEDGER_ENABLED,
             sports_ledger_leagues:            config::SPORTS_LEDGER_LEAGUES.to_string(),

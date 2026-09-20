@@ -407,7 +407,6 @@ where
             raptor_signals.derivatives.clone().expect("derivatives raptor always present"),
             raptor_signals.tide.clone(),
             raptor_signals.horizon.clone(),
-            raptor_signals.sports.clone(),
         );
         // The observe-only Tennis Raptor feed rides along when deployed
         // (attached post-construction so `full()`'s signature stays stable).

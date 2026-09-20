@@ -395,9 +395,8 @@ impl Squadron {
         let oracle_rx   = self.raptors.oracle.clone();
         let velocity_rx = self.raptors.velocity.clone();
         let drift_rx    = self.raptors.drift.clone();
-        // Funding is optional BY CONSTRUCTION: `SquadronRaptors::empty()` and
-        // `sports_only()` both leave it None, and between them those cover every
-        // politics and sports squadron. This used to
+        // Funding is optional BY CONSTRUCTION: `SquadronRaptors::empty()` leaves
+        // it None, and that covers every politics and sports squadron. This used to
         // `.expect("funding raptor always present")`, so the first tick of any
         // non-crypto squadron panicked the patrol task — the comment asserted an
         // invariant the type had already refused to make.

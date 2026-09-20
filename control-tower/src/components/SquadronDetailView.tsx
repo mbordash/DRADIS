@@ -74,8 +74,8 @@ const RAPTOR_META: Record<
   },
   sports:  {
     label: 'Sports Raptor', flag: 'sports_connected', dot: 'bg-fuchsia-400', text: 'text-fuchsia-300',
-    source: 'The Odds API (line movement)', healthKey: 'sports',
-    offlineText: 'Idle (no key)', offlineDot: 'bg-gray-600', offlineClass: 'text-gray-500',
+    source: 'The Odds API (book consensus board)', healthKey: 'sports',
+    offlineText: 'Idle', offlineDot: 'bg-gray-600', offlineClass: 'text-gray-500',
   },
 };
 

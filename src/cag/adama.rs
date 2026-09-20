@@ -48,7 +48,6 @@ use crate::helpers::dynamic_config::DynamicConfig;
 // thing on every venue, and it did not while this lived here.
 use crate::venues::deployment::apply_viper_budgets;
 use crate::squadron::{Squadron, SquadronConfig, SquadronRaptors, CryptoAsset, PatrolContext};
-use crate::squadron::raptors::SportsRaptorHandle;
 use crate::state::MarketConfig;
 use crate::tasks::market_monitor::MarketState;
 use crate::venues::core::MarketId;
@@ -79,7 +78,6 @@ pub struct AdamaInfrastructure<P> {
     pub markets_tx: Arc<watch::Sender<HashMap<String, String>>>,
 
     // ── Raptor handles ───────────────────────────────────────────────────────
-    pub sports_raptor: Option<SportsRaptorHandle>,
 
     // ── Notification credentials ─────────────────────────────────────────────
     pub tg_token: String,
@@ -317,14 +315,11 @@ where
 
     fn build_raptors_for_type(&self, market_type: &str) -> SquadronRaptors {
         match market_type {
-            "sports" => {
-                if let Some(ref sports) = self.sports_raptor {
-                    SquadronRaptors::sports_only(sports.clone())
-                } else {
-                    warn!("Sports raptor not available, using empty raptors");
-                    SquadronRaptors::empty()
-                }
-            }
+            // Sports squadrons carry no signal channel of their own. The sports
+            // signal is a board keyed by outcome token, published once by the
+            // ledger and read through `StrategyContext.sports`, so a squadron
+            // does not need a receiver and cannot be handed the wrong game.
+            "sports" => SquadronRaptors::empty(),
             "crypto" => {
                 warn!("Crypto markets should use run_market_loop, not Adama");
                 SquadronRaptors::empty()

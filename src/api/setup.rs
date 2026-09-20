@@ -239,11 +239,11 @@ const RAPTOR_SOURCES: &[RaptorSource] = &[
     },
     RaptorSource {
         id: "sports", name: "Sports Raptor", source: "The Odds API",
-        blurb: "Head-to-head line movement and consensus probability. Observe-only — published to telemetry, not consumed by Viper sizing. Free tier is ~500 requests/month.",
+        blurb: "Matches every Polymarket International sports moneyline to a bookmaker event and records the vig-free cross-book consensus against Polymarket's own price, keyed by outcome token. Recording only — no Viper trades on it yet, and on Kalshi and Polymarket US it reports telemetry but feeds no strategy, because discovery and prices come from Polymarket. Snapshots are taken at fixed offsets before each kick-off and budgeted against the key's own quota, so it runs on the free 500-request tier as well as a paid one.",
         tier: "optional", keys: &["ODDS_API_KEY"],
         test_kind: Some("odds"), signup_url: Some("https://the-odds-api.com"),
-        poll_field: Some("sports_poll_secs"), free_quota: Some((500, "month")),
-        selector_fields: &["sports_odds_sport", "sports_odds_regions"],
+        poll_field: None, free_quota: Some((500, "month")),
+        selector_fields: &["sports_odds_regions"],
         region_note: None,
     },
     RaptorSource {

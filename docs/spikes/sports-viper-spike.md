@@ -25,6 +25,12 @@ Every claim below is tagged as one of:
 
 ### 1.1 The Sports Raptor
 
+> **Superseded 2026-09-20 ([E63]).** `src/raptors/sports.rs` has been deleted. The
+> Sports Raptor is now `src/raptors/sports_ledger.rs`: a board of matched moneylines
+> keyed by outcome token, read through `StrategyContext.sports`, snapshotting at fixed
+> offsets before kick-off instead of polling on a clock. The description below records
+> the state this spike was written against.
+
 `src/raptors/sports.rs` polls The Odds API (`ODDS_API_KEY`, free tier) for the configured sport key (default `upcoming`, region `us`, market `h2h`), every `sports_poll_secs` (default 7200s, 2 hours). Each poll it selects the **single nearest-commencing event that has priced h2h odds across all sports**, removes each book's two-way overround by normalizing `1/decimal_odds` to sum to 1, averages the reference (first-listed) outcome across books, and publishes:
 
 | field | meaning |

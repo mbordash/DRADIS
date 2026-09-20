@@ -697,17 +697,13 @@ pub const HORIZON_QUOTE_STALENESS_SECS: u64 = 30;
 /// between BTC velocity and QQQ velocity. 10 minutes = 600s.
 pub const HORIZON_CORRELATION_WINDOW_SECS: u64 = 600;
 
-// ── Sports Raptor (The Odds API line-movement feed) ──────────────────────────
+// ── Sports Raptor (The Odds API cross-book consensus feed) ──────────────────────────
 //
 /// Env var carrying the The Odds API (the-odds-api.com) key. Absent ⇒ the Sports
 /// Raptor runs idle/observe-only: it seeds a neutral snapshot, reports
 /// `sports_connected = false`, and publishes no line-movement signal.
 pub const SPORTS_ODDS_KEY_ENV: &str = "ODDS_API_KEY";
 
-/// Sport key polled by the Sports Raptor. `upcoming` returns the next games
-/// across all in-season sports — a broad, always-populated market-mood sample.
-/// Override with a specific key (e.g. `americanfootball_nfl`) for a focused feed.
-pub const SPORTS_ODDS_SPORT: &str = "upcoming";
 
 /// Comma-separated bookmaker regions for the odds query (`us`, `uk`, `eu`, `au`).
 pub const SPORTS_ODDS_REGIONS: &str = "us";
@@ -715,14 +711,6 @@ pub const SPORTS_ODDS_REGIONS: &str = "us";
 /// Seconds between Sports Raptor polls. The Odds API free tier is quota-limited
 /// (~500 requests/month), so poll conservatively — line movement is a slow signal.
 ///
-/// Do the arithmetic before lowering this: 86_400 / SPORTS_POLL_SECS requests a
-/// day, times ~30. At 7200s that is 12/day (~360/month) and fits the free tier
-/// with headroom. At 300s it is 288/day (~8_640/month) — seventeen times over,
-/// which exhausts a fresh key in under two days and then leaves the Sports
-/// Raptor dark behind an HTTP 429. Raise it, don't lower it, unless the operator
-/// is on a paid plan.
-pub const SPORTS_POLL_SECS: u64 = 7200;
-pub const SPORTS_ODDS_LOW_BUDGET_WARN: i64 = 50;
 
 /// Sports line ledger: Phase 0 of the sports spike. Records the sportsbook
 /// consensus against Polymarket prices for every matched sports moneyline, and

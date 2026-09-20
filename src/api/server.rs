@@ -166,9 +166,17 @@ pub struct AssetRaptorHealth {
     /// 5-second rate of change of UVXY (VIX velocity).
     pub vix_velocity:        Decimal,
 
-    // ── Live Sports Raptor signal snapshot (The Odds API line movement) ──────
+    // ── Live Sports Raptor signal snapshot (The Odds API cross-book consensus) ──
     /// Sports Raptor has a fresh cross-book consensus this poll (observe-only).
     pub sports_connected:     bool,
+    /// Whether the operator switched the sports feed on, and whether its API key
+    /// is present. Without these an idle panel cannot say WHY it is idle, and the
+    /// Control Tower rendered "Idle (no key)" at an operator who had set the key
+    /// and simply left the feed off ([B43]).
+    #[serde(default)]
+    pub sports_enabled:       bool,
+    #[serde(default)]
+    pub sports_has_key:       bool,
     /// Vig-free consensus implied prob of the tracked event's reference outcome (0..1).
     pub sports_consensus_prob: Decimal,
     /// Δ consensus_prob since the previous poll for the same event (signed line drift).
@@ -266,8 +274,12 @@ pub struct TelemetrySample {
     pub fbtc_premium_bps:    Decimal,
     pub arkb_premium_bps:    Decimal,
 
-    // ── Sports Raptor (line movement) ──
+    // ── Sports Raptor (cross-book consensus board) ──
     pub sports_connected:      bool,
+    #[serde(default)]
+    pub sports_enabled:        bool,
+    #[serde(default)]
+    pub sports_has_key:        bool,
     pub sports_consensus_prob: Decimal,
     pub sports_line_drift:     Decimal,
     pub sports_book_dispersion: Decimal,
@@ -322,7 +334,8 @@ pub type TelemetryHistory = Arc<Mutex<HashMap<String, VecDeque<TelemetrySample>>
 const TELEMETRY_SAMPLE_SECS: u64 = 2;
 /// Retention cap per asset (samples). 1800 × 2s = 1 hour of scrubable history.
 const TELEMETRY_HISTORY_CAP: usize = 1800;
-/// The Sports Raptor polls every ~2h (`config::SPORTS_POLL_SECS`), so sampling it at
+/// The sports board changes only when a snapshot is taken (at fixed offsets
+/// before each kick-off, hours apart), so sampling it at
 /// the 2s crypto cadence would store thousands of identical points and flatline its
 /// chart. Its samples are de-duplicated (stored only on a value change, or once per
 /// heartbeat), so a much larger cap spans many days for a trivial memory cost.
@@ -360,7 +373,7 @@ async fn run_telemetry_sampler(
         for (asset, h) in snapshot.iter() {
             let buf = hist.entry(asset.clone()).or_default();
 
-            // De-duplicate the slow Sports feed: it polls every ~2h, so storing it at
+            // De-duplicate the slow Sports feed: it snapshots hours apart, so storing it at
             // the 2s crypto cadence would fill the buffer with identical points and
             // render a flat line. Keep a point only when a signal actually changes, or
             // once per heartbeat so the series still advances in time.
@@ -373,6 +386,8 @@ async fn run_telemetry_sampler(
                             || last.sports_num_books       != h.sports_num_books
                             || last.sports_event           != h.sports_event
                             || last.sports_connected       != h.sports_connected
+                            || last.sports_enabled         != h.sports_enabled
+                            || last.sports_has_key         != h.sports_has_key
                     }
                     None => true,
                 };
@@ -433,6 +448,8 @@ async fn run_telemetry_sampler(
                 fbtc_premium_bps:    h.fbtc_premium_bps,
                 arkb_premium_bps:    h.arkb_premium_bps,
                 sports_connected:      h.sports_connected,
+                sports_enabled:        h.sports_enabled,
+                sports_has_key:        h.sports_has_key,
                 sports_consensus_prob: h.sports_consensus_prob,
                 sports_line_drift:     h.sports_line_drift,
                 sports_book_dispersion: h.sports_book_dispersion,

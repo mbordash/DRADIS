@@ -24,14 +24,13 @@
 /// channels are cloned cheaply into each squadron that needs them — a Raptor
 /// is never duplicated just because two squadrons target the same asset.
 ///
-/// Optional Raptors (funding, and future sports/politics) are `Option<_>` so
+/// Optional Raptors (funding, and a future politics one) are `Option<_>` so
 /// that a squadron can be assembled with only the signals it actually needs.
 use rust_decimal::Decimal;
 use tokio::sync::watch;
 
 use crate::raptors::derivatives::DerivativesSnapshot;
 use crate::raptors::tide::TideSnapshot;
-use crate::raptors::sports::SportsSnapshot;
 use crate::raptors::tennis::TennisSnapshot;
 use crate::raptors::horizon::HorizonSnapshot;
 
@@ -68,18 +67,13 @@ pub struct SquadronRaptors {
     /// `None` when the Horizon Raptor is not deployed.
     pub horizon: Option<watch::Receiver<HorizonSnapshot>>,
 
-    /// Line-movement / consensus-probability snapshot from the Sports Raptor
-    /// (The Odds API). A *macro / observe-only* signal shared by the US and intl
-    /// pipelines — not yet consumed by Viper sizing (telemetry observation phase).
-    /// `None` when the Sports Raptor is not deployed for this squadron.
-    pub sports: Option<watch::Receiver<SportsSnapshot>>,
 
     /// Live tennis event-state snapshot from the Tennis Raptor (Live Tennis
     /// API). A *macro / observe-only* signal shared by all pipelines — not yet
     /// consumed by Viper sizing (telemetry observation phase). `None` when the
     /// Tennis Raptor is not deployed for this squadron. Attached after
-    /// construction (`raptors.tennis = Some(rx)`), the same way the US general
-    /// wing attaches its sports feed, so the constructor signatures stay stable.
+    /// construction (`raptors.tennis = Some(rx)`), so the constructor
+    /// signatures stay stable.
     pub tennis: Option<watch::Receiver<TennisSnapshot>>,
 
     /// Whether `oracle`, `velocity` and `drift` are fed by a real Price Raptor.
@@ -101,8 +95,11 @@ pub struct SquadronRaptors {
 
 impl SquadronRaptors {
     /// Compose a full squadron raptor bundle from all available signal channels.
-    /// `tide`, `horizon`, and `sports` are optional — `tide` is BTC-only; `horizon`
-    /// and `sports` require their respective Alpaca/Odds API keys.
+    /// `tide` and `horizon` are optional — `tide` is BTC-only, and `horizon`
+    /// requires an Alpaca key.
+    ///
+    /// No sports channel: the sports signal is a board keyed by outcome token,
+    /// read through `StrategyContext.sports`, not a per-squadron snapshot ([E63]).
     pub fn full(
         oracle:      watch::Receiver<Decimal>,
         velocity:    watch::Receiver<(Decimal, Decimal, Decimal)>,
@@ -111,7 +108,6 @@ impl SquadronRaptors {
         derivatives: watch::Receiver<DerivativesSnapshot>,
         tide:        Option<watch::Receiver<TideSnapshot>>,
         horizon:     Option<watch::Receiver<HorizonSnapshot>>,
-        sports:      Option<watch::Receiver<SportsSnapshot>>,
     ) -> Self {
         Self {
             oracle,
@@ -121,42 +117,21 @@ impl SquadronRaptors {
             derivatives: Some(derivatives),
             tide,
             horizon,
-            sports,
             tennis: None,
             has_price_feed: true,
         }
     }
 
-    /// Compose a price-only bundle (no Funding / Derivatives / Tide / Horizon / Sports Raptor).
+    /// Compose a price-only bundle (no Funding / Derivatives / Tide / Horizon).
     /// Suitable for momentum-only deployments where macro signals are not consumed.
     pub fn price_only(
         oracle:   watch::Receiver<Decimal>,
         velocity: watch::Receiver<(Decimal, Decimal, Decimal)>,
         drift:    watch::Receiver<(Decimal, Decimal, Decimal)>,
     ) -> Self {
-        Self { oracle, velocity, drift, funding: None, derivatives: None, tide: None, horizon: None, sports: None, tennis: None, has_price_feed: true }
+        Self { oracle, velocity, drift, funding: None, derivatives: None, tide: None, horizon: None, tennis: None, has_price_feed: true }
     }
 
-    /// Compose a sports-only bundle for Admiral Adama sports market squadrons.
-    /// Uses placeholder channels for price signals (sports markets don't use crypto oracles).
-    pub fn sports_only(sports: SportsRaptorHandle) -> Self {
-        let (_, oracle_rx) = watch::channel(Decimal::ZERO);
-        let (_, velocity_rx) = watch::channel((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
-        let (_, drift_rx) = watch::channel((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
-        Self {
-            oracle: oracle_rx,
-            velocity: velocity_rx,
-            drift: drift_rx,
-            funding: None,
-            derivatives: None,
-            tide: None,
-            horizon: None,
-            sports: Some(sports),
-            tennis: None,
-            // Placeholder channels above; there is no Price Raptor here.
-            has_price_feed: false,
-        }
-    }
 
     /// Create an empty raptor bundle with placeholder channels.
     /// Used for market types that don't have implemented raptors yet (e.g. politics).
@@ -172,7 +147,6 @@ impl SquadronRaptors {
             derivatives: None,
             tide: None,
             horizon: None,
-            sports: None,
             tennis: None,
             // Placeholder channels above; there is no Price Raptor here.
             has_price_feed: false,
@@ -180,8 +154,6 @@ impl SquadronRaptors {
     }
 }
 
-/// Handle to a Sports Raptor signal channel — cloneable for sharing across squadrons.
-pub type SportsRaptorHandle = watch::Receiver<SportsSnapshot>;
 
 
 #[cfg(test)]
@@ -196,8 +168,6 @@ mod price_feed_tests {
     fn placeholder_bundles_report_no_price_feed() {
         assert!(!SquadronRaptors::empty().has_price_feed);
 
-        let (_tx, sports_rx) = watch::channel(SportsSnapshot::default());
-        assert!(!SquadronRaptors::sports_only(sports_rx).has_price_feed);
     }
 
     #[test]
