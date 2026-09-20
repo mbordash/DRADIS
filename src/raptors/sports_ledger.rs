@@ -810,7 +810,10 @@ async fn refresh_catalog(
             debug!("🏈 Sports ledger: {code} → {key}: {} Polymarket games, {} Odds API events, {} matched",
                    unmatched.len(), odds.len(), matched.len());
             if !matched.is_empty() {
-                if multi { found_under.push(format!("{}×{key}", matched.len())); }
+                // Name the key whenever it is not the league's configured one.
+                // "nhl 6/14" alone does not say the games were found under the
+                // preseason feed, which is the whole point of having looked.
+                if multi && key != sport_key { found_under.push(format!("{}×{key}", matched.len())); }
                 let claimed: HashSet<&str> = matched.iter().map(|m| m.pm_slug.as_str()).collect();
                 unmatched.retain(|g| !claimed.contains(g.slug.as_str()));
                 matched_here += matched.len();
@@ -819,7 +822,7 @@ async fn refresh_catalog(
         }
         let note = if failed_keys == keys.len() {
             " (odds events failed)".to_string()
-        } else if found_under.len() > 1 {
+        } else if !found_under.is_empty() {
             format!(" [{}]", found_under.join(" + "))
         } else {
             String::new()

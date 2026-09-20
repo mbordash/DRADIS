@@ -680,6 +680,11 @@ export default function TelemetryPage({ availableAssets, venue }: { availableAss
 
   const [windowMins, setWindowMins] = useState(15);
   const [live, setLive] = useState(true);
+  // Tide and Horizon both read the US cash session. Outside it the ETF premiums
+  // are stale and both signals are deliberately held at zero, so their panels
+  // are two large cards of dashes. They collapse to one line until the open,
+  // with a toggle for when the operator does want to look.
+  const [showClosedRaptors, setShowClosedRaptors] = useState(false);
   const [range, setRange] = useState<{ startIndex: number; endIndex: number } | null>(null);
   const [assetClass, setAssetClass] = useState<TelemetryClass>(isUs ? 'sports' : 'crypto');
   // setupStatus loads async — if the venue resolves to US after mount, move the
@@ -876,14 +881,46 @@ export default function TelemetryPage({ availableAssets, venue }: { availableAss
         <Scrubber data={rows} range={range} onChange={setRange} />
       )}
 
+      {/* Tide and Horizon are BTC-only and both follow the US cash session.
+          Out of hours they collapse into a single line rather than two idle
+          cards, which is the difference between a page that says "closed" and a
+          page that looks broken. */}
+      {asset === 'btc' && latest && !latest.tideOpen && !latest.horizonOpen && !showClosedRaptors && (
+        <div className="card p-3 border border-indigo-500/20 flex items-center justify-between gap-3">
+          <div>
+            <p className="label-muted text-[10px]">🌊 Tide Raptor · 🌅 Horizon Raptor</p>
+            <p className="text-[10px] text-gray-600 font-mono">
+              US cash session closed — ETF premiums are stale and both signals are held at zero until the open.
+            </p>
+          </div>
+          <button
+            onClick={() => setShowClosedRaptors(true)}
+            className="shrink-0 text-[11px] font-mono px-3 py-1 rounded-lg border bg-indigo-500/10 border-indigo-500/30 text-indigo-300 hover:bg-indigo-500/20 transition-colors"
+          >
+            Show anyway
+          </button>
+        </div>
+      )}
+
       {/* Institutional Pulse — Tide Raptor (BTC-only, consumed by Convergence/GBoost/Basis) */}
-      {asset === 'btc' && latest && (
+      {asset === 'btc' && latest && (latest.tideOpen || showClosedRaptors) && (
         <TideCard data={viewRows} latest={latest} />
       )}
 
       {/* TradFi Velocity — Horizon Raptor (BTC-only, consumed by Maker/TrendReversal gates) */}
-      {asset === 'btc' && latest && (
+      {asset === 'btc' && latest && (latest.horizonOpen || showClosedRaptors) && (
         <HorizonCard data={viewRows} latest={latest} />
+      )}
+
+      {/* Once revealed, let the operator put them away again without waiting for
+          the close. Only offered while the session is actually shut. */}
+      {asset === 'btc' && latest && !latest.tideOpen && !latest.horizonOpen && showClosedRaptors && (
+        <button
+          onClick={() => setShowClosedRaptors(false)}
+          className="self-start text-[11px] font-mono px-3 py-1 rounded-lg border bg-gray-500/10 border-gray-500/30 text-gray-400 hover:bg-gray-500/20 transition-colors"
+        >
+          Hide closed-session raptors
+        </button>
       )}
 
       {/* Signal charts */}
