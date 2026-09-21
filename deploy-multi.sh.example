@@ -171,6 +171,8 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" "${CT_USERNA
     docker run -d \
         --restart unless-stopped \
         --name dradis \
+        `# See deploy-live.sh: 1024 FDs is not enough for a long-lived engine.` \
+        --ulimit nofile=65536:65536 \
         --network dradis-net \
         --env-file .env \
         -e ASSETS=btc,eth,sol \

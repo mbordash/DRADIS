@@ -297,6 +297,25 @@ pub struct Squadron {
     /// previous generation of tasks drains when they observe cancellation.
     /// `cancel_ws()` fires it; `patrol()` fires it on stand-down.
     ws_cancel: CancellationToken,
+
+    /// The current generation of orderbook tasks, so the next generation can
+    /// wait for them to release their subscriptions before taking its own.
+    ///
+    /// The market connection is shared and refcounts each token, so a token
+    /// that persists across a rotation (the daily maker market keeps its
+    /// tokens for the whole day) is held by the outgoing task until it drops
+    /// its guard. `subscribe_markets` cancels and re-spawns in one synchronous
+    /// call, and the scheduler decides whether the old task's drop or the new
+    /// task's subscribe runs first. If the new task wins, the SDK sees a
+    /// refcount of two, sends nothing, the venue sends no `book`, and that feed
+    /// publishes zeros until the next trade on the market. The new generation
+    /// therefore waits for this one to finish first (`previous_generation_drained`).
+    ///
+    /// Only the `intl_clob` venue keeps WS tasks here — Polymarket US and
+    /// Kalshi drive their own feeds from `src/venues/*/ws.rs` — so the field is
+    /// gated rather than left unread on two of the three builds.
+    #[cfg(feature = "intl_clob")]
+    ws_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 /// Reduce an operator-chosen name to something safe to embed in an id.
@@ -408,6 +427,8 @@ impl Squadron {
             // Split-venue by default: only the event-market deploy path sets it.
             single_market: false,
             ws_cancel: CancellationToken::new(),
+            #[cfg(feature = "intl_clob")]
+            ws_tasks: Vec::new(),
         }
     }
 
@@ -513,6 +534,9 @@ impl Squadron {
     ) -> MarketPriceFeeds {
         // Cancel any WS tasks from a previous call (e.g. prior market rotation).
         self.ws_cancel.cancel();
+        // The outgoing tasks release their tokens on the shared connection as
+        // they observe the cancel; the new tasks subscribe only after that.
+        let drained = previous_generation_drained(std::mem::take(&mut self.ws_tasks));
 
         // Fresh token for this generation of WS tasks.
         let cancel = CancellationToken::new();
@@ -525,16 +549,16 @@ impl Squadron {
         let (no_tx,  no_rx)  = watch::channel(default_feed);
 
         if hourly_yes_token != U256::ZERO {
-            spawn_ws_task(hourly_yes_token, yes_tx, cancel.clone(), "hourly");
-            spawn_ws_task(hourly_no_token,  no_tx,  cancel.clone(), "hourly");
+            self.ws_tasks.push(spawn_ws_task(hourly_yes_token, yes_tx, cancel.clone(), "hourly", drained.clone()));
+            self.ws_tasks.push(spawn_ws_task(hourly_no_token,  no_tx,  cancel.clone(), "hourly", drained.clone()));
         }
 
         // ── Maker/window market feeds (optional) ─────────────────────────────
         let (maker_yes, maker_no) = if let Some((mk_yes, mk_no)) = maker {
             let (mk_yes_tx, mk_yes_rx) = watch::channel(default_feed);
             let (mk_no_tx,  mk_no_rx)  = watch::channel(default_feed);
-            spawn_ws_task(mk_yes, mk_yes_tx, cancel.clone(), "maker");
-            spawn_ws_task(mk_no,  mk_no_tx,  cancel.clone(), "maker");
+            self.ws_tasks.push(spawn_ws_task(mk_yes, mk_yes_tx, cancel.clone(), "maker", drained.clone()));
+            self.ws_tasks.push(spawn_ws_task(mk_no,  mk_no_tx,  cancel.clone(), "maker", drained.clone()));
             (Some(mk_yes_rx), Some(mk_no_rx))
         } else {
             (None, None)
@@ -586,24 +610,89 @@ impl Squadron {
 /// before the `book` it belongs after, and the book would then be rebuilt
 /// without it.
 ///
-/// The `SubscriptionManager` is returned alongside the stream because the
-/// connection lives only as long as a `ConnectionManager` clone does; the
-/// caller keeps both for the life of the subscription.
+/// A [`MarketSubscription`] guard is returned alongside the stream: the venue
+/// subscription lasts exactly as long as the caller holds it, and dropping it
+/// unsubscribes this token from the shared connection.
+///
+/// One connection is shared by every token in the process, because a
+/// `ConnectionManager` cannot be closed. Until 2026-09-21 this function built a
+/// fresh one per token per reconnect, and each one lived forever: the SDK has
+/// no `close`/`shutdown` method and no `Drop` impl, its connection loop's only
+/// command branch is `Some(text) = sender_rx.recv()` — which, when the manager
+/// is dropped and the channel closes, simply stops matching and leaves the loop
+/// running — and `start_reconnection_handler` spawns a task holding an
+/// `Arc<SubscriptionManager>` that waits forever on the connection's own state
+/// channel, so the manager could never be dropped in the first place. A
+/// squadron opens four of these and re-opens them on every hourly rotation, so
+/// the engine leaked about four sockets an hour: the demo instance reached the
+/// container's 1024-descriptor limit after eleven days, and every API accept
+/// then failed with "No file descriptors available (os error 24)" while the
+/// engine went on trading.
+///
+/// Sharing is safe for the ordering reason above: `subscribe_market` gives each
+/// call its own stream filtered to its own asset ids, so a token still sees
+/// every message type in venue order. Per-entry filtering of `price_change`
+/// batches (which may carry other tokens) already happens at the call site.
+///
+/// The trade-off is that one dropped connection now interrupts every feed at
+/// once rather than one. That is what `start_reconnection_handler` is for — it
+/// re-sends the subscriptions once the manager's backoff reconnects — and each
+/// task's own restart loop still covers a stream that ends.
 #[cfg(feature = "intl_clob")]
-fn open_market_stream(
-    token: U256,
-) -> polymarket_client_sdk_v2::Result<(
-    Arc<SubscriptionManager>,
-    impl futures::Stream<Item = polymarket_client_sdk_v2::Result<WsMessage>>,
-)> {
+fn shared_market_subscriptions() -> polymarket_client_sdk_v2::Result<Arc<SubscriptionManager>> {
+    static SHARED: std::sync::OnceLock<std::sync::Mutex<Option<Arc<SubscriptionManager>>>> =
+        std::sync::OnceLock::new();
+    let cell = SHARED.get_or_init(|| std::sync::Mutex::new(None));
+    // Poisoned only if a previous caller panicked between taking the lock and
+    // storing the manager; the stored value is still sound, so recover rather
+    // than take the whole market feed down with it.
+    let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = guard.as_ref() {
+        return Ok(Arc::clone(existing));
+    }
     let interest = Arc::new(InterestTracker::new());
     let connection = ConnectionManager::new(
         INTL_MARKET_WS_ENDPOINT.to_string(), WsConfig::default(), Arc::clone(&interest),
     )?;
     let subscriptions = Arc::new(SubscriptionManager::new(connection, interest));
     subscriptions.start_reconnection_handler();
+    info!("📡  Market WS: opened the shared orderbook connection to {}", INTL_MARKET_WS_ENDPOINT);
+    *guard = Some(Arc::clone(&subscriptions));
+    Ok(subscriptions)
+}
+
+/// One token's subscription on the shared market connection, unsubscribed when
+/// dropped.
+///
+/// A guard rather than a bare `unsubscribe_market` call at each exit because
+/// `spawn_ws_task` leaves its subscription by three routes — cancellation on
+/// market rotation, a stream error that restarts it, and a panic — and a token
+/// left subscribed would keep receiving a market the squadron no longer trades.
+#[cfg(feature = "intl_clob")]
+struct MarketSubscription {
+    subscriptions: Arc<SubscriptionManager>,
+    token: U256,
+}
+
+#[cfg(feature = "intl_clob")]
+impl Drop for MarketSubscription {
+    fn drop(&mut self) {
+        if let Err(e) = self.subscriptions.unsubscribe_market(&[self.token]) {
+            warn!("⚠️ WS unsubscribe failed for token {}: {}", self.token, e);
+        }
+    }
+}
+
+#[cfg(feature = "intl_clob")]
+fn open_market_stream(
+    token: U256,
+) -> polymarket_client_sdk_v2::Result<(
+    MarketSubscription,
+    impl futures::Stream<Item = polymarket_client_sdk_v2::Result<WsMessage>>,
+)> {
+    let subscriptions = shared_market_subscriptions()?;
     let stream = subscriptions.subscribe_market(vec![token])?;
-    Ok((subscriptions, stream))
+    Ok((MarketSubscription { subscriptions, token }, stream))
 }
 
 /// One `price_change` entry as the local book understands it. `None` when the
@@ -653,6 +742,25 @@ fn log_hold_lifted(venue: &str, token: U256, hold: &Hold, lifted_by: &str, now: 
     }
 }
 
+/// A future every task of the next generation can await: resolves once every
+/// task of the previous generation has finished (or panicked). Clonable so all
+/// four new tasks share one.
+#[cfg(feature = "intl_clob")]
+type Drained = futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
+
+/// How long a new orderbook task waits for its predecessors before subscribing
+/// regardless. They leave on the first poll after the cancel, so this is a
+/// bound on a wedged task, not an expected wait.
+#[cfg(feature = "intl_clob")]
+const PREVIOUS_GENERATION_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// See [`Drained`]. An empty previous generation (first deployment) resolves at once.
+#[cfg(feature = "intl_clob")]
+fn previous_generation_drained(previous: Vec<tokio::task::JoinHandle<()>>) -> Drained {
+    use futures::FutureExt as _;
+    futures::future::join_all(previous).map(|_| ()).boxed().shared()
+}
+
 /// Spawn one auto-reconnecting WebSocket orderbook subscriber task.
 ///
 /// Pushes `PriceState` updates into `tx`.  Stops cleanly when `cancel` fires.
@@ -671,12 +779,30 @@ fn spawn_ws_task(
     tx:     watch::Sender<PriceState>,
     cancel: CancellationToken,
     venue:  &'static str,
-) {
+    previous_generation: Drained,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Let the outgoing generation release its tokens first: a token still
+        // held when this task subscribes is multiplexed by the SDK without a
+        // request, and the venue then sends no `book` until the market's next
+        // trade. Bounded, so a wedged predecessor cannot hold the feed hostage.
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            waited = tokio::time::timeout(PREVIOUS_GENERATION_DRAIN, previous_generation) => {
+                if waited.is_err() {
+                    warn!(
+                        "⚠️ WS subscriber for {} token {}: the previous generation did not release its subscriptions within {:?}; subscribing anyway — if it still holds this token, no fresh book arrives until the market's next trade",
+                        venue, token, PREVIOUS_GENERATION_DRAIN
+                    );
+                }
+            }
+        }
         loop {
             if cancel.is_cancelled() { return; }
 
-            let (_subscriptions, stream) = match open_market_stream(token) {
+            // Held for this iteration: dropping it unsubscribes the token.
+            let (_subscription, stream) = match open_market_stream(token) {
                 Ok(s)  => s,
                 Err(e) => {
                     warn!(
@@ -801,7 +927,7 @@ fn spawn_ws_task(
                 _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]
@@ -940,6 +1066,75 @@ mod live_book_probe {
             let s = Decimal::from_str(l["size"].as_str()?).ok()?;
             (s > Decimal::ZERO).then_some((p, s))
         }).collect()
+    }
+
+    /// Dropping the guard releases the token, so opening and dropping the same
+    /// market repeatedly — which is what an hourly rotation does four times —
+    /// leaves nothing subscribed behind.
+    ///
+    /// This is the 2026-09-21 descriptor leak in miniature. The whole
+    /// connection leaked then, because a fresh `ConnectionManager` was built
+    /// per token and the SDK has no way to close one; that part is now
+    /// structural (a single shared connection) and cannot be asserted from a
+    /// test, but the subscription refcount can, and a token left subscribed
+    /// would keep a market the squadron no longer trades on the feed.
+    ///
+    /// No venue is contacted: the manager's connection task fails to reach the
+    /// network under test and the refcounts it asserts are local.
+    #[tokio::test]
+    async fn dropping_a_market_subscription_releases_the_token() {
+        use polymarket_client_sdk_v2::clob::ws::ChannelType;
+        // The SDK's connection task panics on a missing provider; installing it
+        // keeps the failure to "cannot connect", which is what we want here.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let shared = shared_market_subscriptions().expect("shared manager");
+        let token = U256::from(0x5144_4f4eu64);
+        assert!(!shared.has_subscriptions(ChannelType::Market),
+            "a fresh shared manager should hold no market subscriptions");
+
+        for pass in 1..=3 {
+            let (guard, stream) = open_market_stream(token).expect("subscribe");
+            assert!(shared.has_subscriptions(ChannelType::Market),
+                "pass {pass}: the token should be subscribed while the guard is held");
+            drop(guard);
+            drop(stream);
+            assert!(!shared.has_subscriptions(ChannelType::Market),
+                "pass {pass}: dropping the guard must release the token — a leak here is \
+                 a market the squadron no longer trades still on the feed");
+        }
+    }
+
+    /// The next generation's wait resolves only after the previous
+    /// generation's tasks have finished, including one that panics, and an
+    /// empty previous generation resolves at once. This is the ordering that
+    /// keeps a token persisting across a rotation (the daily maker tokens)
+    /// from being re-subscribed while the outgoing task still holds it.
+    #[tokio::test]
+    async fn next_generation_waits_for_the_previous_one_to_finish() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use futures::FutureExt as _;
+        let released = Arc::new(AtomicBool::new(false));
+        let cancel = CancellationToken::new();
+        let (r, c) = (Arc::clone(&released), cancel.clone());
+        let old = tokio::spawn(async move {
+            c.cancelled().await;
+            r.store(true, Ordering::SeqCst);
+        });
+        let panicked = tokio::spawn(async { panic!("a predecessor that dies still counts as finished") });
+        let drained = previous_generation_drained(vec![old, panicked]);
+
+        let (probe, probe_drained) = (Arc::clone(&released), drained.clone());
+        let observer = tokio::spawn(async move {
+            probe_drained.await;
+            probe.load(Ordering::SeqCst)
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(drained.clone().now_or_never().is_none(), "must not resolve while the old task still runs");
+
+        cancel.cancel();
+        assert!(observer.await.expect("observer"), "resolved only after the old task released");
+        assert!(previous_generation_drained(Vec::new()).now_or_never().is_some(), "empty generation resolves at once");
     }
 
     #[tokio::test]

@@ -17,7 +17,8 @@
 /// Price Raptor — Binance Spot WebSocket price feed.
 ///
 /// Connects to the Binance `<symbol>@ticker` stream for the configured crypto pair
-/// and broadcasts the following signals via `watch` channels:
+/// (documented update speed 1000ms, so about one sample per second) and
+/// broadcasts the following signals via `watch` channels:
 ///
 /// │ Channel        │ Type                           │ Description                        │
 /// │────────────────│────────────────────────────────│────────────────────────────────────│
@@ -49,6 +50,87 @@ use std::sync::Arc;
 use crate::config;
 use crate::api::server::AssetRaptorHealth;
 use crate::helpers::volatility::{normalized_hist_vol, range_pct};
+
+/// The prior sample nearest `window_ms` ago, as `(age_ms, price)`: chosen among
+/// the samples older than the tick just pushed (the newest entry), ties to the
+/// older sample. `None` when that tick is the only sample.
+///
+/// Binance's `<symbol>@ticker` stream publishes once per 1000ms (its documented
+/// update speed; production telemetry shows ~3,585 samples per hour), so a
+/// window of `MOMENTUM_SHORT_WINDOW_SECS` = 1s holds, on most ticks, only the
+/// tick that was just pushed. The rule this replaces — the oldest sample
+/// younger than the window, compared in whole seconds — therefore selected the
+/// current tick whenever the previous one was 1000ms or older and reported a 1s
+/// velocity of exactly zero, and selected the previous tick only when WebSocket
+/// jitter delivered it at 999ms or less. On 2026-09-21 Momentum's "1s velocity
+/// not confirming" gate read 0.00 beside a 5s velocity of $233 and an
+/// acceleration of $211 (05:26:23 ET), then $134 one second later: a lottery
+/// on delivery jitter, not a measurement.
+///
+/// Nearest-to-window is stream-rate agnostic: with one tick per second it is
+/// the previous tick, with a real-time trade stream it is the print nearest one
+/// window ago. Compared in milliseconds so a 1001ms sample is one millisecond
+/// off, not a second. Whether the anchor is close enough to stand for the
+/// window is [`short_window_start`]'s decision.
+pub fn short_window_anchor(
+    history: &VecDeque<(Instant, Decimal)>,
+    now: Instant,
+    window_ms: u128,
+) -> Option<(u128, Decimal)> {
+    let n = history.len();
+    if n < 2 {
+        return None;
+    }
+    let mut best: Option<(u128, u128, Decimal)> = None;
+    for (t, p) in history.iter().take(n - 1) {
+        let age = now.saturating_duration_since(*t).as_millis();
+        let off = age.abs_diff(window_ms);
+        match best {
+            Some((best_off, _, _)) if best_off <= off => {}
+            _ => best = Some((off, age, *p)),
+        }
+    }
+    best.map(|(_, age, p)| (age, p))
+}
+
+/// How far the anchor's age may sit from the window, either side, and still
+/// stand for it: half the window (500ms for the 1s window).
+///
+/// Without a bound the nearest anchor is whatever the 5s history holds. In a
+/// feed gap — samples at 4,900ms and now — that is a 4.9-second delta reported
+/// as a one-second velocity, which confirms a move that may already be over,
+/// and it does so precisely when the feed is degraded: the old rule vetoed
+/// there (it read zero), so an unbounded anchor inverted the gate's behavior
+/// in gaps. Half a window admits ordinary delivery jitter on the 1000ms
+/// ticker and refuses a missed tick (2,000ms) outright; a real-time stream
+/// always has a print inside it. Symmetric because a much younger anchor is
+/// not a one-second measurement either — it understates, which only makes the
+/// gate stricter, but "unconfirmed" is the honest reading for both.
+pub const SHORT_WINDOW_ANCHOR_TOLERANCE_MS: u128 = 500;
+
+/// The price the short-window velocity is measured from, or `None` when no
+/// prior sample sits within [`SHORT_WINDOW_ANCHOR_TOLERANCE_MS`] of the window.
+///
+/// `None` means "no one-second measurement exists on this tick", and the
+/// raptor then publishes a 1s velocity of zero: the value Momentum's
+/// confirmation gate already treats as not confirming (`velocity_1s >=
+/// short_min` with a positive `short_min`). DRADIS prefers honest idleness to
+/// degraded activity; a gap in the feed is not evidence that the last second
+/// carried the move. The raptor also says so in the log, throttled, so a gap
+/// is visible rather than indistinguishable from a flat second.
+pub fn short_window_start(
+    history: &VecDeque<(Instant, Decimal)>,
+    now: Instant,
+    window_ms: u128,
+    tolerance_ms: u128,
+) -> Option<Decimal> {
+    short_window_anchor(history, now, window_ms)
+        .filter(|(age, _)| age.abs_diff(window_ms) <= tolerance_ms)
+        .map(|(_, p)| p)
+}
+
+/// How often an unusable short-window anchor is written to the log.
+const SHORT_WINDOW_GAP_LOG_SECS: u64 = 60;
 
 pub async fn run_price_raptor(
     crypto_filter: String,
@@ -82,6 +164,8 @@ pub async fn run_price_raptor(
     let mut last_vol_log = Instant::now()
         .checked_sub(Duration::from_secs(3600))
         .unwrap_or_else(Instant::now);
+    // Throttle for the short-window gap warning; seeded in the past likewise.
+    let mut last_gap_log = last_vol_log;
 
     loop {
         // Bounded connect: an unbounded `connect_async().await` can hang forever on a
@@ -135,14 +219,31 @@ pub async fn run_price_raptor(
                                             price - start_price
                                         } else { dec!(0) };
 
-                                        // Short velocity (1s window)
-                                        let velocity_1s = {
-                                            let cutoff = config::MOMENTUM_SHORT_WINDOW_SECS;
-                                            let start_1s = price_history.iter()
-                                                .find(|(t, _)| now.duration_since(*t).as_secs() < cutoff);
-                                            match start_1s {
-                                                Some((_, p)) => price - p,
-                                                None => velocity_5s,
+                                        // Short velocity (1s window) — measured from the prior
+                                        // sample nearest one window ago, when one sits close
+                                        // enough to stand for it; zero (unconfirmed) otherwise.
+                                        // See `short_window_anchor` and `short_window_start`.
+                                        let window_ms = u128::from(config::MOMENTUM_SHORT_WINDOW_SECS) * 1000;
+                                        let anchor = short_window_anchor(&price_history, now, window_ms);
+                                        let anchor_age_ms = anchor.map_or(0, |(age, _)| age);
+                                        let velocity_1s = match short_window_start(
+                                            &price_history, now, window_ms, SHORT_WINDOW_ANCHOR_TOLERANCE_MS,
+                                        ) {
+                                            Some(p) => price - p,
+                                            None => {
+                                                // A gap (or a fresh connection): say so, throttled, so
+                                                // the zero below is not mistaken for a flat second.
+                                                if now.duration_since(last_gap_log).as_secs() >= SHORT_WINDOW_GAP_LOG_SECS {
+                                                    last_gap_log = now;
+                                                    warn!(
+                                                        "⚠️ Price Raptor [{}]: no {}s-window anchor — nearest prior sample is {}ms old \
+                                                         (accepted {}–{}ms); 1s velocity reads 0 (unconfirmed) until the feed catches up",
+                                                        crypto_filter.to_uppercase(), config::MOMENTUM_SHORT_WINDOW_SECS, anchor_age_ms,
+                                                        window_ms.saturating_sub(SHORT_WINDOW_ANCHOR_TOLERANCE_MS),
+                                                        window_ms + SHORT_WINDOW_ANCHOR_TOLERANCE_MS,
+                                                    );
+                                                }
+                                                dec!(0)
                                             }
                                         };
 
@@ -216,6 +317,7 @@ pub async fn run_price_raptor(
                                             h.oracle_price = price;
                                             h.velocity_5s  = velocity_5s;
                                             h.velocity_1s  = velocity_1s;
+                                            h.velocity_1s_anchor_ms = anchor_age_ms;
                                             h.acceleration = acceleration;
                                             h.drift_60m    = drift_60m;
                                             h.drift_10m    = drift_10m;
@@ -271,5 +373,137 @@ pub async fn run_price_raptor(
         prev_velocity = dec!(0);
         price_history_10m.clear();
         tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+#[cfg(test)]
+mod short_window_tests {
+    use super::*;
+
+    const TOL: u128 = SHORT_WINDOW_ANCHOR_TOLERANCE_MS;
+
+    fn hist(now: Instant, ages_ms: &[u64]) -> VecDeque<(Instant, Decimal)> {
+        // Oldest first, newest (the current tick, age 0) last; price = age so
+        // the chosen sample can be read back from the returned price.
+        let mut v: VecDeque<(Instant, Decimal)> = VecDeque::new();
+        let mut sorted = ages_ms.to_vec();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        for a in sorted {
+            v.push_back((now - Duration::from_millis(a), Decimal::from(a)));
+        }
+        v
+    }
+
+    /// One tick per second: the previous tick is the start whether jitter
+    /// delivered it at 999ms or 1001ms. This is the 2026-09-21 defect: the old
+    /// rule chose the current tick at 1001ms and reported 0.00.
+    #[test]
+    fn one_tick_per_second_uses_the_previous_tick_regardless_of_jitter() {
+        let now = Instant::now();
+        assert_eq!(short_window_start(&hist(now, &[2002, 1001, 0]), now, 1000, TOL), Some(Decimal::from(1001)));
+        assert_eq!(short_window_start(&hist(now, &[1998, 999, 0]), now, 1000, TOL), Some(Decimal::from(999)));
+        assert_eq!(short_window_start(&hist(now, &[3000, 2000, 1000, 0]), now, 1000, TOL), Some(Decimal::from(1000)));
+    }
+
+    /// The tick just pushed is never its own anchor: alone it yields `None`.
+    #[test]
+    fn the_current_tick_is_never_the_anchor() {
+        let now = Instant::now();
+        assert_eq!(short_window_anchor(&hist(now, &[0]), now, 1000), None);
+        assert!(short_window_anchor(&VecDeque::new(), now, 1000).is_none());
+        assert_eq!(short_window_start(&hist(now, &[0]), now, 1000, TOL), None);
+    }
+
+    /// A feed gap yields no start: samples at 4,900ms and now would otherwise
+    /// report a 4.9-second delta as a one-second velocity and pass the
+    /// confirmation gate exactly when the old rule vetoed it. A missed tick
+    /// (2,000ms) is refused the same way. The anchor itself is still reported
+    /// so the raptor can name the gap in its log line.
+    #[test]
+    fn a_gap_yields_no_start_but_names_the_nearest_sample() {
+        let now = Instant::now();
+        assert_eq!(short_window_start(&hist(now, &[4900, 0]), now, 1000, TOL), None);
+        assert_eq!(short_window_anchor(&hist(now, &[4900, 0]), now, 1000), Some((4900, Decimal::from(4900))));
+        assert_eq!(short_window_start(&hist(now, &[3000, 2000, 0]), now, 1000, TOL), None);
+    }
+
+    /// The bound is inclusive and symmetric: 1,500ms and 500ms stand for the
+    /// window, 1,501ms and 499ms do not.
+    #[test]
+    fn the_anchor_bound_is_inclusive_and_symmetric() {
+        let now = Instant::now();
+        assert_eq!(short_window_start(&hist(now, &[1500, 0]), now, 1000, TOL), Some(Decimal::from(1500)));
+        assert_eq!(short_window_start(&hist(now, &[1501, 0]), now, 1000, TOL), None);
+        assert_eq!(short_window_start(&hist(now, &[500, 0]), now, 1000, TOL), Some(Decimal::from(500)));
+        assert_eq!(short_window_start(&hist(now, &[499, 0]), now, 1000, TOL), None);
+    }
+
+    /// A real-time stream picks the print nearest one window ago; ties go to
+    /// the older sample.
+    #[test]
+    fn real_time_stream_picks_the_nearest_print_and_ties_go_older() {
+        let now = Instant::now();
+        assert_eq!(
+            short_window_start(&hist(now, &[1500, 1200, 1050, 900, 400, 100, 0]), now, 1000, TOL),
+            Some(Decimal::from(1050)),
+        );
+        assert_eq!(short_window_start(&hist(now, &[1100, 900, 0]), now, 1000, TOL), Some(Decimal::from(1100)));
+    }
+}
+
+/// Runs the raptor against Binance itself. Ignored by default (network); run
+/// with `cargo test live_binance -- --ignored --nocapture`.
+///
+/// This is the check the 2026-09-21 defect needed and no unit test can give:
+/// on the real 1000ms `@ticker` cadence, whenever the last price differs from
+/// the previous tick's, the 1s velocity must be that tick-to-tick delta, never
+/// a zero produced by the window missing the previous sample. Over ~20 ticks
+/// the old rule read zero on roughly half of them.
+#[cfg(test)]
+mod live_binance_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "connects to Binance"]
+    async fn live_binance_short_window_tracks_the_previous_tick() {
+        let (oracle_tx, oracle_rx) = watch::channel(dec!(0));
+        let (velocity_tx, mut velocity_rx) = watch::channel((dec!(0), dec!(0), dec!(0)));
+        let (drift_tx, _drift_rx) = watch::channel((dec!(0), dec!(0), dec!(0)));
+        let health = Arc::new(watch::channel(HashMap::new()).0);
+        let raptor = tokio::spawn(run_price_raptor("btc".into(), oracle_tx, velocity_tx, drift_tx, health));
+
+        let mut prev_price: Option<Decimal> = None;
+        let mut prev_at: Option<Instant> = None;
+        let mut checked = 0usize;
+        let mut moved = 0usize;
+        let mut zero_on_move = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(40);
+        while Instant::now() < deadline && checked < 25 {
+            if tokio::time::timeout(Duration::from_secs(20), velocity_rx.changed()).await.is_err() {
+                break;
+            }
+            let (v5, v1, _) = *velocity_rx.borrow();
+            let price = *oracle_rx.borrow();
+            let at = Instant::now();
+            if let (Some(prev), Some(prev_t)) = (prev_price, prev_at) {
+                checked += 1;
+                let gap_ms = at.duration_since(prev_t).as_millis();
+                // A tick that arrived outside the anchor bound is a gap by
+                // design (the raptor reports 0, unconfirmed); only a zero on an
+                // in-bound tick is the defect.
+                let in_bound = gap_ms.abs_diff(1000) <= SHORT_WINDOW_ANCHOR_TOLERANCE_MS;
+                if price != prev && in_bound {
+                    moved += 1;
+                    if v1 == dec!(0) { zero_on_move += 1; }
+                    println!("tick: price={price} prev={prev} v5={v5} v1={v1} tick_delta={} gap={gap_ms}ms", price - prev);
+                }
+            }
+            prev_price = Some(price);
+            prev_at = Some(at);
+        }
+        raptor.abort();
+        assert!(checked >= 10, "only {checked} ticks received; Binance unreachable from here?");
+        assert!(moved >= 3, "price moved on only {moved} of {checked} ticks; rerun in a livelier tape");
+        assert_eq!(zero_on_move, 0, "1s velocity read 0.00 on {zero_on_move} of {moved} ticks where the price moved");
     }
 }

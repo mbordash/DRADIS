@@ -80,12 +80,24 @@ echo 1 | sudo tee /proc/irq/<IRQ_NUM>/smp_affinity
 
 ## Docker Ulimits
 
+The deploy scripts (`deploy-demo.sh`, `deploy-live.sh`, `deploy-multi.sh.example`)
+and the AMI's `deploy/ami/docker-compose.yml` already set `nofile` to 65536, so a
+standard deployment needs nothing here. The recipe below is for a hand-rolled
+`docker run`, and it adds the memory-lock limit on top.
+
+Raising `nofile` is not optional tuning. Docker defaults a container to a 1024
+open-file soft limit, and the engine holds a socket per venue connection while the
+API listener needs one per inbound request. Past 1024, every accept fails with
+`No file descriptors available (os error 24)`: the engine goes on trading, but the
+Control Tower reports "DRADIS engine unreachable" on every view. The demo instance
+reached that state after roughly 11 days of uptime on 2026-09-20.
+
 Raise file descriptor and memory-lock limits for the container:
 
 ```bash
 docker run -d --restart unless-stopped \
   --cpuset-cpus="2,3" \
-  --ulimit nofile=65535:65535 \
+  --ulimit nofile=65536:65536 \
   --ulimit memlock=-1:-1 \
   --name dradis-btc \
   --env-file .env \

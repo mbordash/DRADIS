@@ -52,6 +52,17 @@ services:
       - ./logs:/app/logs
     ports:
       - "127.0.0.1:9000:9000"
+    # Docker defaults a container to a 1024 open-file soft limit, which a
+    # long-lived engine exhausts: it holds a socket per venue connection and the
+    # API listener needs one per inbound request. Past 1024 every accept fails
+    # with "No file descriptors available (os error 24)" — the engine keeps
+    # trading, but the Control Tower shows "DRADIS engine unreachable" on every
+    # view, which is how the demo box presented after 11 days of uptime. An
+    # operator instance runs for months, so it would reach this on its own.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     networks: [dradis-net]
 
   control-tower:

@@ -216,7 +216,14 @@ pub const STRIKE_BUFFER_PCT: Decimal = dec!(0.001);
 
 /// Lower max entry price — better risk/reward at conservative prices.
 pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.82);
-pub const MAX_MOMENTUM_CROSSING_ENTRY_PRICE: Decimal = dec!(0.52);
+/// Strike-crossing entry (oracle past the strike but inside the strike buffer)
+/// is OFF in this profile. The buffer above exists so this profile only trades
+/// well away from the strike; the crossing branch is a deliberate bypass of it.
+/// It was also unreachable as shipped: a 0.52 cap under the 0.72 floor is an
+/// empty set, and at the 10% target the fee share cap refuses every price under
+/// ~$0.71 anyway. Seeds the `momentum_crossing_max_entry_price` Control Tower
+/// setting; set it above Min Entry there to switch the branch on.
+pub const MAX_MOMENTUM_CROSSING_ENTRY_PRICE: Decimal = dec!(0);
 pub const MOMENTUM_MIN_ENTRY_PRICE: Decimal = dec!(0.72);  // Conservative: 72-82c band. Below 72c the round-trip fee exceeds 40% of the
 // 10% target; above 82c a 10% gain would breach the 0.90 take-profit ceiling.
 pub const MOMENTUM_CATASTROPHIC_SL_PCT: Decimal = dec!(0.15); // Conservative: 1.5x the 10% stop-loss — a true last-resort floor

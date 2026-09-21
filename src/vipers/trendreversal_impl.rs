@@ -466,6 +466,7 @@ impl Strategy for TrendReversalStrategyImpl {
                 {
                     debug!(" TrendReversal BULL→fade blocked: buy_ask={:.3} within ±{:.2} of $0.50 (max-fee coin-flip zone)",
                         buy_ask, config::TRENDREVERSAL_MIN_EDGE_FROM_FAIR);
+                    idle("fade coin-flip zone (bought ask near $0.50)");
                     return Ok(StrategySignal::NoSignal);
                 }
 
@@ -482,6 +483,7 @@ impl Strategy for TrendReversalStrategyImpl {
                         if config::TRENDREVERSAL_HORIZON_VETO_ENFORCE { "" } else { " (observe — would veto)" },
                         ctx.snapshot.tradfi_velocity, config::TRENDREVERSAL_HORIZON_TRADFI_CONFIRM, ctx.snapshot.macro_coherence);
                     if config::TRENDREVERSAL_HORIZON_VETO_ENFORCE {
+                        idle("Horizon veto (TradFi confirms the trend)");
                         return Ok(StrategySignal::NoSignal);
                     }
                 }
@@ -494,6 +496,7 @@ impl Strategy for TrendReversalStrategyImpl {
                 if buy_spread > dc.trendcapture_max_token_spread_pct {
                     debug!(" TrendReversal BULL→fade blocked: bought-token spread {:.1}% > max {:.1}% (ask={:.3} bid={:.3}) — hollow bid would force instant SL",
                         buy_spread * dec!(100), dc.trendcapture_max_token_spread_pct * dec!(100), buy_ask, buy_bid);
+                    idle("bought-token spread too wide");
                     return Ok(StrategySignal::NoSignal);
                 }
 
@@ -511,6 +514,7 @@ impl Strategy for TrendReversalStrategyImpl {
                     let intended_shares = if entry_price > dec!(0) { size / entry_price } else { dec!(0) };
                     if let Some(reason) = crate::vipers::entry_liquidity_gate(secs_left, intended_shares, buy_bid_depth) {
                         debug!(" TrendReversal BULL→fade blocked: {}", reason);
+                        idle(&reason);
                         return Ok(StrategySignal::NoSignal);
                     }
                     // INFO (fires once per actual entry): audit trail for post-trade
@@ -576,6 +580,7 @@ impl Strategy for TrendReversalStrategyImpl {
                 {
                     debug!(" TrendReversal BEAR→fade blocked: buy_ask={:.3} within ±{:.2} of $0.50 (max-fee coin-flip zone)",
                         buy_ask, config::TRENDREVERSAL_MIN_EDGE_FROM_FAIR);
+                    idle("fade coin-flip zone (bought ask near $0.50)");
                     return Ok(StrategySignal::NoSignal);
                 }
 
@@ -589,6 +594,7 @@ impl Strategy for TrendReversalStrategyImpl {
                         if config::TRENDREVERSAL_HORIZON_VETO_ENFORCE { "" } else { " (observe — would veto)" },
                         ctx.snapshot.tradfi_velocity, config::TRENDREVERSAL_HORIZON_TRADFI_CONFIRM, ctx.snapshot.macro_coherence);
                     if config::TRENDREVERSAL_HORIZON_VETO_ENFORCE {
+                        idle("Horizon veto (TradFi confirms the trend)");
                         return Ok(StrategySignal::NoSignal);
                     }
                 }
@@ -601,6 +607,7 @@ impl Strategy for TrendReversalStrategyImpl {
                 if buy_spread > dc.trendcapture_max_token_spread_pct {
                     debug!(" TrendReversal BEAR→fade blocked: bought-token spread {:.1}% > max {:.1}% (ask={:.3} bid={:.3}) — hollow bid would force instant SL",
                         buy_spread * dec!(100), dc.trendcapture_max_token_spread_pct * dec!(100), buy_ask, buy_bid);
+                    idle("bought-token spread too wide");
                     return Ok(StrategySignal::NoSignal);
                 }
 
@@ -617,6 +624,7 @@ impl Strategy for TrendReversalStrategyImpl {
                     let intended_shares = if entry_price > dec!(0) { size / entry_price } else { dec!(0) };
                     if let Some(reason) = crate::vipers::entry_liquidity_gate(secs_left, intended_shares, buy_bid_depth) {
                         debug!(" TrendReversal BEAR→fade blocked: {}", reason);
+                        idle(&reason);
                         return Ok(StrategySignal::NoSignal);
                     }
                     // INFO (fires once per actual entry): audit trail — see BULL note.

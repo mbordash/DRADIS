@@ -742,10 +742,22 @@ impl Squadron {
                 // the Control Tower card resolves its attached market.
                 .replace("trendreversal", "trendcapture");
             strategy_markets_map.insert(status_key, market_name_attached.clone());
-            info!(
-                "  - {} => venue={} | market=\"{}\" | budget=${} | risk={}",
-                sn, venue, market_name_attached, strategy.max_exposure(), strategy.risk_model(),
-            );
+            // A viper that is off says so where its budget would go. This line
+            // printed `budget=$4.0` for a GBoost the operator had switched off
+            // 29 hours earlier, and was read as evidence it was live.
+            let kind = crate::orchestrator::registry::strategy_name_to_kind(&sn);
+            let switched_off = dynamic_config.read().unwrap().viper_enabled(kind) == Some(false);
+            if switched_off {
+                info!(
+                    "  - {} => venue={} | market=\"{}\" | DISABLED (enable_{}=false) | risk={}",
+                    sn, venue, market_name_attached, kind, strategy.risk_model(),
+                );
+            } else {
+                info!(
+                    "  - {} => venue={} | market=\"{}\" | budget=${} | risk={}",
+                    sn, venue, market_name_attached, strategy.max_exposure(), strategy.risk_model(),
+                );
+            }
         }
         let _ = markets_tx.send(strategy_markets_map);
 

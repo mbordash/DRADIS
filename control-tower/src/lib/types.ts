@@ -86,6 +86,7 @@ export interface DynamicConfig {
   momentum_max_exposure_usdc:   string;
   momentum_max_entry_price:      string;
   momentum_min_entry_price:      string;
+  momentum_crossing_max_entry_price: string;
   momentum_threshold_pct:        string;
   momentum_max_entry_ask_sum:    string;
   momentum_obi_adverse_block:    string;

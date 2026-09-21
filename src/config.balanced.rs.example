@@ -202,6 +202,10 @@ pub const MOMENTUM_TP_FEE_MARGIN_MULT: Decimal = dec!(1.35);
 pub const STRIKE_BUFFER_PCT: Decimal = dec!(0.0001);
 
 pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.78);
+/// Strike-crossing entry cap (oracle past the strike but inside the strike
+/// buffer). Seeds the `momentum_crossing_max_entry_price` Control Tower
+/// setting; 0 turns the branch off. Keep it at or above MOMENTUM_MIN_ENTRY_PRICE
+/// or the branch is inert (Momentum says so in its gate line and on its card).
 pub const MAX_MOMENTUM_CROSSING_ENTRY_PRICE: Decimal = dec!(0.62);
 pub const MOMENTUM_MIN_ENTRY_PRICE: Decimal = dec!(0.58);  // Balanced: 58-78c band. Below 58c the round-trip fee exceeds 40% of the
 // 15% target; above 78c a 15% gain would breach the 0.90 take-profit ceiling.

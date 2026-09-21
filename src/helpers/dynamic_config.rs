@@ -290,6 +290,7 @@ fn default_maker_resting_exit_reprice_threshold() -> Decimal { config::MAKER_RES
 
 fn default_momentum_max_entry_price()       -> Decimal { config::MAX_MOMENTUM_ENTRY_PRICE              }
 fn default_momentum_min_entry_price()       -> Decimal { config::MOMENTUM_MIN_ENTRY_PRICE              }
+fn default_momentum_crossing_max_entry_price() -> Decimal { config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE }
 fn default_momentum_threshold_pct()         -> Decimal { config::MOMENTUM_THRESHOLD_PCT                }
 fn default_momentum_max_entry_ask_sum()     -> Decimal { config::MOMENTUM_MAX_ENTRY_ASK_SUM            }
 fn default_momentum_obi_adverse_block()     -> Decimal { config::MOMENTUM_OBI_ADVERSE_BLOCK            }
@@ -484,6 +485,17 @@ pub struct DynamicConfig {
     pub momentum_max_entry_price:      Decimal,
     #[serde(default = "default_momentum_min_entry_price")]
     pub momentum_min_entry_price:      Decimal,
+    /// Highest ask the strike-crossing entry pays: the oracle is past the
+    /// strike but still inside the strike buffer, so the primary branch's
+    /// buffer condition does not hold. Zero disables the branch. Seeded from
+    /// `MAX_MOMENTUM_CROSSING_ENTRY_PRICE`, which until 2026-09-21 was read
+    /// straight from the compile-time constant while the floor beside it was
+    /// this hot-reloadable knob: on the production build the two had drifted
+    /// to a cap of 0.52 under a floor of 0.58, an empty set no Control Tower
+    /// setting could repair. Momentum names an inert branch in its gate line
+    /// and on its card (`crossing_branch_inert`).
+    #[serde(default = "default_momentum_crossing_max_entry_price")]
+    pub momentum_crossing_max_entry_price: Decimal,
     #[serde(default = "default_momentum_threshold_pct")]
     pub momentum_threshold_pct:        Decimal,
     #[serde(default = "default_momentum_max_entry_ask_sum")]
@@ -1119,6 +1131,7 @@ impl Default for DynamicConfig {
             momentum_max_exposure_usdc:    config::MOMENTUM_MAX_EXPOSURE_USDC,
             momentum_max_entry_price:      config::MAX_MOMENTUM_ENTRY_PRICE,
             momentum_min_entry_price:      config::MOMENTUM_MIN_ENTRY_PRICE,
+            momentum_crossing_max_entry_price: config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE,
             momentum_threshold_pct:        config::MOMENTUM_THRESHOLD_PCT,
             momentum_max_entry_ask_sum:    config::MOMENTUM_MAX_ENTRY_ASK_SUM,
             momentum_obi_adverse_block:    config::MOMENTUM_OBI_ADVERSE_BLOCK,
@@ -1579,6 +1592,29 @@ impl DynamicConfig {
         updated.save_as(actor).await;
         info!("⚙️  DynamicConfig hot-patched and persisted (by {actor})");
         Ok(Arc::new(updated))
+    }
+
+    /// Whether the viper of registry kind `kind` (`strategy_name_to_kind`) is
+    /// switched on in this config; `None` for a kind with no switch.
+    ///
+    /// The startup attachment banner reads this so a viper that is off prints
+    /// as off. It used to print a budget for every attached viper, and on
+    /// 2026-09-21 `GboostStrategy => ... budget=$4.0` was read as evidence that
+    /// GBoost was live for a move it never scored: the operator had switched it
+    /// off 29 hours earlier.
+    pub fn viper_enabled(&self, kind: &str) -> Option<bool> {
+        Some(match kind {
+            "arbitrage"    => self.enable_arbitrage,
+            "maker"        => self.enable_maker,
+            "momentum"     => self.enable_momentum,
+            "time_decay"   => self.enable_time_decay,
+            "basis"        => self.enable_basis,
+            "gboost"       => self.enable_gboost,
+            "convergence"  => self.enable_convergence,
+            "fairvalue"    => self.enable_fairvalue,
+            "trendcapture" => self.enable_trendcapture,
+            _ => return None,
+        })
     }
 
     // ── Squadron-scoped config methods ─────────────────────────────────────────

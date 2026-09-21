@@ -104,6 +104,8 @@ const REFERENCE_LABEL: &str = "B_aggr20";
 const REFERENCE_PLAN: [f64; 4] = [0.20, 0.11, 0.43, 0.75];
 /// How often the pipeline's status line is refreshed on the card.
 const DETAIL_REFRESH_SECS: u64 = 2;
+/// How often one holding reason is written to the log (the card refreshes live).
+const GATE_LOG_INTERVAL_SECS: u64 = 300;
 
 /// Fewest trees a loaded model file may have. A calibrated export of a real fit
 /// has dozens; a file with fewer is a nothing-fit or a broken export, and is
@@ -959,7 +961,17 @@ impl GboostPlanBStrategy {
 impl Strategy for GboostPlanBStrategy {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config;
-        let idle = |r: &str| crate::helpers::viper_status::report_reason(&ctx.crypto_filter, STRATEGY_NAME, r);
+        // "Why no trades?" registry feed plus a throttled info line, so a hold
+        // is recoverable from the log afterwards. Before 2026-09-21 this path
+        // reported only to the registry: a disabled GBoost wrote nothing for
+        // three hours across a +2.5% BTC move, and the startup banner's budget
+        // line was the only trace of it, read as evidence it was live.
+        let idle = |r: &str| {
+            crate::helpers::viper_status::report_reason(&ctx.crypto_filter, STRATEGY_NAME, r);
+            if crate::vipers::gate_log_permitted(STRATEGY_NAME, &ctx.crypto_filter, r, GATE_LOG_INTERVAL_SECS) {
+                info!("🔒 GBoost gate: {}", r);
+            }
+        };
         if !dc.enable_gboost {
             idle("disabled in config");
             return Ok(StrategySignal::NoSignal);

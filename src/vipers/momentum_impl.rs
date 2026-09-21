@@ -111,7 +111,92 @@ impl MomentumStrategyImpl {
 /// a gate that admitted a trade against one target while the exit chased another
 /// would be checking the wrong arithmetic.
 pub fn base_take_profit(entry_price: Decimal, configured_target: Decimal) -> Decimal {
-    if entry_price >= dec!(0.70) { dec!(0.05) } else { configured_target }
+    if entry_price >= MOMENTUM_FLAT_TP_ENTRY_FLOOR { MOMENTUM_FLAT_TP_TARGET } else { configured_target }
+}
+
+/// Entry price from which `base_take_profit` plans the flat target instead of
+/// the configured one, and that flat target.
+pub const MOMENTUM_FLAT_TP_ENTRY_FLOOR: Decimal = dec!(0.70);
+pub const MOMENTUM_FLAT_TP_TARGET: Decimal = dec!(0.05);
+
+/// Price tick the entry band is measured on.
+const BAND_TICK: Decimal = dec!(0.01);
+
+/// How often the card's band/crossing detail line is refreshed, and how often
+/// a band that is narrower than the operator configured is written to the log.
+const BAND_DETAIL_REFRESH_SECS: u64 = 60;
+const BAND_WARN_INTERVAL_SECS: u64 = 3600;
+
+/// True when the fee gate admits an entry at `ask` under this plan.
+fn fee_admits(ask: Decimal, target: Decimal, max_fee_ratio: Decimal) -> bool {
+    crate::vipers::fee_dominated_entry(ask, base_take_profit(ask, target), max_fee_ratio).is_none()
+}
+
+/// Why the strike-crossing entry branch cannot fire under this configuration,
+/// or `None` when some price it admits would pass the fee gate.
+///
+/// The branch pays at most `cap`, at least `min_entry`, and only what the fee
+/// gate admits. Its cap lived in a compile-time constant while the floor was a
+/// Control Tower knob, and on the production build of 2026-09-21 the two had
+/// drifted to 0.52 under 0.58: both sides dead, and the gate line folded that
+/// into "ask above max entry" so nothing said the branch could never fire. The
+/// conservative profile shipped it dead on its own (0.52 under a 0.72 floor).
+/// The fee share cap kills it a second way: at a 15% target and a 40% cap no
+/// price under ~$0.57 is admitted, whatever the floor says. Fee share falls as
+/// the price rises within each target regime (`base_take_profit` switches to
+/// the flat target at `MOMENTUM_FLAT_TP_ENTRY_FLOOR`), so the branch is live
+/// iff the best price of either regime inside `[min_entry, cap]` is admitted.
+pub fn crossing_branch_inert(cap: Decimal, min_entry: Decimal, target: Decimal, max_fee_ratio: Decimal) -> Option<String> {
+    if cap <= Decimal::ZERO {
+        return Some("off (cap 0)".to_string());
+    }
+    if cap < min_entry {
+        return Some(format!("cap {:.2} below min entry {:.2}", cap, min_entry));
+    }
+    let best_low = cap.min(MOMENTUM_FLAT_TP_ENTRY_FLOOR - BAND_TICK);
+    let low_live = best_low >= min_entry && fee_admits(best_low, target, max_fee_ratio);
+    let high_live = cap >= MOMENTUM_FLAT_TP_ENTRY_FLOOR && fee_admits(cap, target, max_fee_ratio);
+    if low_live || high_live {
+        None
+    } else {
+        Some(format!(
+            "fee-dominated at every price {:.2}–{:.2} (fee share cap {:.0}%)",
+            min_entry, cap, max_fee_ratio * dec!(100),
+        ))
+    }
+}
+
+/// The entry prices the fee gate admits inside the configured band, as closed
+/// intervals on the cent grid, lowest first.
+///
+/// The configured band says 0.58–0.78; the flat 5% target above $0.70 with a
+/// 40% fee share cap refuses everything from $0.70 to $0.85, so the band the
+/// operator can actually be filled in is 0.58–0.69. The Control Tower showed
+/// the configured pair as if it were reachable. This is what the card and the
+/// gate line report instead.
+pub fn effective_entry_band(min_entry: Decimal, max_entry: Decimal, target: Decimal, max_fee_ratio: Decimal) -> Vec<(Decimal, Decimal)> {
+    let mut out: Vec<(Decimal, Decimal)> = Vec::new();
+    let lo = min_entry.max(BAND_TICK).round_dp(2);
+    let hi = max_entry.min(Decimal::ONE - BAND_TICK).round_dp(2);
+    let mut p = lo;
+    let mut open: Option<Decimal> = None;
+    while p <= hi {
+        let admitted = fee_admits(p, target, max_fee_ratio);
+        match (admitted, open) {
+            (true, None) => open = Some(p),
+            (false, Some(start)) => { out.push((start, p - BAND_TICK)); open = None; }
+            _ => {}
+        }
+        p += BAND_TICK;
+    }
+    if let Some(start) = open { out.push((start, hi)); }
+    out
+}
+
+/// "0.58–0.69" / "0.58–0.69, 0.86–0.90" / "none".
+pub fn format_band(band: &[(Decimal, Decimal)]) -> String {
+    if band.is_empty() { return "none".to_string(); }
+    band.iter().map(|(a, b)| format!("{:.2}–{:.2}", a, b)).collect::<Vec<_>>().join(", ")
 }
 
 /// Advance or reset a token's "reversed since" clock and return how long, in
@@ -158,42 +243,11 @@ impl Default for MomentumStrategyImpl {
     fn default() -> Self { Self::new() }
 }
 
-/// Throttle for Momentum's gate log lines: `(asset, key) → last logged at`.
-///
-/// Process-global rather than a field on the strategy for the same reason as
-/// TimeDecay's: patrol rebuilds every strategy object on each market rotation,
-/// which would reset per-instance state every hour.
-///
-/// Keyed per reason rather than on "last reason" alone. Momentum's commonest
-/// transition is velocity crossing its trigger and falling back, which can
-/// happen several times a second in a choppy tape; a last-reason throttle would
-/// log every one of those flips.
-///
-/// Nested `asset → key → last logged at` so both lookups borrow `&str`: this
-/// runs on every patrol tick, and a tuple key would allocate two Strings per
-/// tick just to ask whether to stay quiet.
-fn momentum_gate_log_state()
-    -> &'static Mutex<HashMap<String, HashMap<String, std::time::Instant>>>
-{
-    static REG: std::sync::OnceLock<Mutex<HashMap<String, HashMap<String, std::time::Instant>>>> =
-        std::sync::OnceLock::new();
-    REG.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 /// True when a gate line for `key` on `asset` should be written now: it has not
-/// been logged within `interval_secs`. Records the emit when it returns true.
-/// Allocates only when it returns true.
+/// been logged within `interval_secs`. The shared per-reason registry in
+/// `crate::vipers::gate_log_permitted`, keyed under this strategy's name.
 fn momentum_gate_log_permitted(asset: &str, key: &str, interval_secs: u64) -> bool {
-    let mut reg = match momentum_gate_log_state().lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let quiet = reg.get(asset)
-        .and_then(|by_key| by_key.get(key))
-        .is_some_and(|at| at.elapsed().as_secs() < interval_secs);
-    if quiet { return false; }
-    reg.entry(asset.to_string()).or_default().insert(key.to_string(), std::time::Instant::now());
-    true
+    crate::vipers::gate_log_permitted("MomentumStrategy", asset, key, interval_secs)
 }
 
 /// Feed the "why no trades?" registry with `ui_reason` (unchanged from what the
@@ -230,6 +284,8 @@ pub struct SpikeGates {
     pub min_entry: Decimal,
     pub max_entry: Decimal,
     pub crossing_max: Decimal,
+    /// The crossing branch cannot fire under this config (`crossing_branch_inert`).
+    pub crossing_inert: bool,
     pub short_ok: bool,
     pub accel_ok: bool,
     pub window_blocks: bool,
@@ -262,7 +318,11 @@ pub fn spike_blockers(g: &SpikeGates) -> Vec<&'static str> {
                 if !beyond_strike {
                     out.push("oracle on wrong side of strike");
                 } else if !beyond_buffer {
-                    out.push("ask above crossing cap (oracle inside strike buffer)");
+                    out.push(if g.crossing_inert {
+                        "crossing branch inert (oracle inside strike buffer)"
+                    } else {
+                        "ask above crossing cap (oracle inside strike buffer)"
+                    });
                 } else {
                     out.push("ask above max entry");
                 }
@@ -301,6 +361,38 @@ impl Strategy for MomentumStrategyImpl {
         if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
             idle("session drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Effective band and crossing-branch state ─────────────────────────
+        // What the fee gate actually admits inside the configured band, and
+        // whether the crossing branch can fire at all, on the card (detail line)
+        // every minute and in the log hourly when either differs from what the
+        // operator configured. Computed only when the throttle admits it.
+        let crossing_max = dc.momentum_crossing_max_entry_price;
+        let crossing_inert = crossing_branch_inert(
+            crossing_max, dc.momentum_min_entry_price, dc.momentum_target_profit_pct, dc.momentum_max_fee_to_target_ratio);
+        if momentum_gate_log_permitted(asset, "band detail", BAND_DETAIL_REFRESH_SECS) {
+            let band = effective_entry_band(
+                dc.momentum_min_entry_price, dc.momentum_max_entry_price,
+                dc.momentum_target_profit_pct, dc.momentum_max_fee_to_target_ratio);
+            let configured = format!("{:.2}–{:.2}", dc.momentum_min_entry_price, dc.momentum_max_entry_price);
+            let reachable = format_band(&band);
+            let crossing_txt = match &crossing_inert {
+                Some(why) => format!("off: {why}"),
+                None => format!("≤{:.2}", crossing_max),
+            };
+            crate::helpers::viper_status::report_detail(asset, "MomentumStrategy", Some(format!(
+                "entry band {reachable} (configured {configured}) | crossing {crossing_txt}")));
+            if (reachable != configured || crossing_inert.is_some())
+                && momentum_gate_log_permitted(asset, "band warning", BAND_WARN_INTERVAL_SECS)
+            {
+                tracing::warn!(
+                    "⚠️ Momentum entry band: configured {configured}, reachable {reachable} \
+                     (target {:.0}%, flat {:.0}% from ${:.2}, fee share cap {:.0}%) | crossing branch {crossing_txt}",
+                    dc.momentum_target_profit_pct * dec!(100), MOMENTUM_FLAT_TP_TARGET * dec!(100),
+                    MOMENTUM_FLAT_TP_ENTRY_FLOOR, dc.momentum_max_fee_to_target_ratio * dec!(100),
+                );
+            }
         }
 
         let velocity = ctx.snapshot.velocity;
@@ -657,7 +749,7 @@ impl Strategy for MomentumStrategyImpl {
 
             // Secondary "strike-crossing" entry
             if velocity > threshold && binance_price > strike
-                && yes_ask <= config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE
+                && yes_ask <= crossing_max
                 && yes_ask >= dc.momentum_min_entry_price
                 && short_ok_bull && accel_ok_bull && !window_blocks_bull && !fee_blocks_bull && !obi_blocks_bull && !obi_exhausted_bull && !obi_swing_blocks_bull && !drift_blocks_bull
             {
@@ -667,7 +759,7 @@ impl Strategy for MomentumStrategyImpl {
                     pair_params: None,
                 });
             } else if velocity < -threshold && binance_price < strike
-                && no_ask <= config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE
+                && no_ask <= crossing_max
                 && no_ask >= dc.momentum_min_entry_price
                 && short_ok_bear && accel_ok_bear && !window_blocks_bear && !fee_blocks_bear && !obi_blocks_bear && !obi_exhausted_bear && !obi_swing_blocks_bear && !drift_blocks_bear
             {
@@ -725,7 +817,7 @@ impl Strategy for MomentumStrategyImpl {
             SpikeGates {
                 bull, strike: strike_price.map(|s| (binance_price, s, strike_buffer)),
                 ask: yes_ask, min_entry: dc.momentum_min_entry_price, max_entry: dc.momentum_max_entry_price,
-                crossing_max: config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE,
+                crossing_max, crossing_inert: crossing_inert.is_some(),
                 short_ok: short_ok_bull, accel_ok: accel_ok_bull, window_blocks: window_blocks_bull,
                 fee_blocks: fee_blocks_bull, obi_adverse: obi_blocks_bull, obi_exhausted: obi_exhausted_bull,
                 obi_swing: obi_swing_blocks_bull, drift_blocks: drift_blocks_bull,
@@ -734,7 +826,7 @@ impl Strategy for MomentumStrategyImpl {
             SpikeGates {
                 bull, strike: strike_price.map(|s| (binance_price, s, strike_buffer)),
                 ask: no_ask, min_entry: dc.momentum_min_entry_price, max_entry: dc.momentum_max_entry_price,
-                crossing_max: config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE,
+                crossing_max, crossing_inert: crossing_inert.is_some(),
                 short_ok: short_ok_bear, accel_ok: accel_ok_bear, window_blocks: window_blocks_bear,
                 fee_blocks: fee_blocks_bear, obi_adverse: obi_blocks_bear, obi_exhausted: obi_exhausted_bear,
                 obi_swing: obi_swing_blocks_bear, drift_blocks: drift_blocks_bear,
@@ -759,7 +851,7 @@ impl Strategy for MomentumStrategyImpl {
             let (obi, swing) = if bull { (yes_obi, yes_obi_swing) } else { (no_obi, no_obi_swing) };
             format!(
                 "{} spike held by [{}] | vel={:.2} trigger=±{:.2} 1s={:.2} (need {:.2}) accel={:.3} \
-                 | oracle=${:.2} strike={} | {}_ask={:.3} (entry {:.2}–{:.2}, crossing ≤{:.2}) \
+                 | oracle=${:.2} strike={} | {}_ask={:.3} (entry {:.2}–{:.2}, crossing {}) \
                  | OBI={:.2} (adverse <{:.2}, exhausted >{:.2}) swing={:.2} (max {:.2}) \
                  | drift10m={:.2} (block {:.2}) | daily YES mid={}{}",
                 side,
@@ -767,7 +859,8 @@ impl Strategy for MomentumStrategyImpl {
                 velocity, threshold, velocity_1s, short_min, acceleration,
                 binance_price, strike_txt,
                 if bull { "yes" } else { "no" }, gates.ask,
-                dc.momentum_min_entry_price, dc.momentum_max_entry_price, config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE,
+                dc.momentum_min_entry_price, dc.momentum_max_entry_price,
+                match &crossing_inert { Some(why) => format!("off: {why}"), None => format!("≤{:.2}", crossing_max) },
                 obi, dc.momentum_obi_adverse_block, dc.momentum_obi_exhaustion_block,
                 swing, config::MOMENTUM_OBI_SWING_BLOCK,
                 drift_10m, drift_block_mag, window_txt,
@@ -1318,7 +1411,7 @@ mod tests {
             bull: true,
             strike: Some((dec!(78100), dec!(78000), dec!(8))),
             ask: dec!(0.65), min_entry: dec!(0.58), max_entry: dec!(0.78), crossing_max: dec!(0.62),
-            short_ok: true, accel_ok: true, window_blocks: false, fee_blocks: false,
+            crossing_inert: false, short_ok: true, accel_ok: true, window_blocks: false, fee_blocks: false,
             obi_adverse: false, obi_exhausted: false, obi_swing: false, drift_blocks: false,
         }
     }
@@ -1370,6 +1463,63 @@ mod tests {
         ]);
         g.strike = None;
         assert!(!spike_blockers(&g).contains(&"daily window against"));
+    }
+
+    /// An inert crossing branch is named as such inside the buffer, instead of
+    /// hiding behind a cap the operator could never satisfy.
+    #[test]
+    fn spike_blockers_names_an_inert_crossing_branch() {
+        let mut g = clean_bull_spike();
+        g.strike = Some((dec!(78004), dec!(78000), dec!(8)));   // inside buffer
+        g.ask = dec!(0.60);
+        g.crossing_max = dec!(0.52);
+        g.crossing_inert = true;
+        assert_eq!(spike_blockers(&g), vec!["crossing branch inert (oracle inside strike buffer)"]);
+        // Beyond the buffer the primary branch owns the price test, unchanged.
+        g.strike = Some((dec!(78100), dec!(78000), dec!(8)));
+        assert!(spike_blockers(&g).is_empty());
+    }
+
+    /// The production configuration of 2026-09-21 — a 0.52 cap under a 0.58
+    /// floor — is inert, and so is a cap the fee gate refuses at every price it
+    /// admits; a cap at or above the floor with an admissible price is live.
+    /// Fee rates differ by venue (0.06 on Polymarket US, 0.07 elsewhere), so
+    /// the fee-dominated case uses a price both rates refuse.
+    #[test]
+    fn crossing_branch_inert_names_each_dead_configuration() {
+        assert_eq!(crossing_branch_inert(dec!(0), dec!(0.58), dec!(0.15), dec!(0.40)).as_deref(), Some("off (cap 0)"));
+        assert_eq!(
+            crossing_branch_inert(dec!(0.52), dec!(0.58), dec!(0.15), dec!(0.40)).as_deref(),
+            Some("cap 0.52 below min entry 0.58"),
+        );
+        let fee = crossing_branch_inert(dec!(0.45), dec!(0.43), dec!(0.15), dec!(0.40))
+            .expect("6.6%+ round trip is over 40% of a 15% target at every price up to $0.45");
+        assert!(fee.starts_with("fee-dominated at every price 0.43–0.45"), "{fee}");
+        assert_eq!(crossing_branch_inert(dec!(0.62), dec!(0.58), dec!(0.15), dec!(0.40)), None, "balanced: 0.58–0.62 is live");
+        assert_eq!(crossing_branch_inert(dec!(0.75), dec!(0.43), dec!(0.20), dec!(0.40)), None, "aggressive: live");
+        // A cap above the flat-target floor is judged at the best price of BOTH
+        // regimes: 0.69 at the configured target is admitted even though 0.75
+        // at the flat 5% target is not.
+        assert_eq!(crossing_branch_inert(dec!(0.75), dec!(0.58), dec!(0.15), dec!(0.40)), None);
+    }
+
+    /// The configured 0.58–0.78 band is reachable only up to 0.69: from $0.70
+    /// the flat 5% target makes the round trip more than 40% of the plan until
+    /// the mid-0.80s, which the 0.78 ceiling never reaches. Widen the ceiling
+    /// and a second, high interval appears.
+    #[test]
+    fn effective_entry_band_stops_at_the_flat_target_floor() {
+        let band = effective_entry_band(dec!(0.58), dec!(0.78), dec!(0.15), dec!(0.40));
+        assert_eq!(band, vec![(dec!(0.58), dec!(0.69))]);
+        assert_eq!(format_band(&band), "0.58–0.69");
+        let wide = effective_entry_band(dec!(0.58), dec!(0.90), dec!(0.15), dec!(0.40));
+        assert_eq!(wide.len(), 2, "{wide:?}");
+        assert_eq!(wide[0], (dec!(0.58), dec!(0.69)));
+        assert!(wide[1].0 >= dec!(0.83) && wide[1].0 <= dec!(0.86), "{wide:?}");
+        assert_eq!(wide[1].1, dec!(0.90));
+        assert_eq!(format_band(&[]), "none");
+        // A band the fee gate admits in full reports exactly the configured pair.
+        assert_eq!(format_band(&effective_entry_band(dec!(0.58), dec!(0.69), dec!(0.15), dec!(0.40))), "0.58–0.69");
     }
 
     /// Each reason logs once per interval, independently: two reasons flapping

@@ -285,9 +285,11 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Hard cap on total momentum capital at risk.").min(0.0).step(0.5).unit("USDC"));
         // Advanced
         v.push(F::new(g, e, "momentum_max_entry_price", "Max Entry", "price", true,
-            "Highest price the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
+            "Highest price the strategy will pay to enter. The fee gate can bind first: above $0.70 the take-profit target is a flat 5%, so with the default 40% fee share cap no entry between $0.70 and $0.85 is admitted. The Momentum card shows the band that is actually reachable.").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "momentum_min_entry_price", "Min Entry", "price", true,
-            "Lowest price the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
+            "Lowest price the strategy will pay to enter. Below this the round-trip fee dominates the take-profit target; the fee share cap refuses those entries on its own.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "momentum_crossing_max_entry_price", "Crossing Max Entry", "price", true,
+            "Highest price for the strike-crossing entry: the oracle is past the strike but still inside the strike buffer. 0 turns that branch off. The branch is inert when this is below Min Entry or fee-dominated at every price it admits; the gate line and the Momentum card say so.").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "momentum_threshold_pct", "Velocity Threshold", "decimal", true,
             "Minimum oracle velocity (fractional) required to trigger entry.").range(0.0, 0.1).step(0.0005));
         v.push(F::new(g, e, "momentum_max_entry_ask_sum", "Max Entry Ask Sum", "decimal", true,

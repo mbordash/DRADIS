@@ -39,6 +39,48 @@ use tracing::info;
 
 static LAST_DRAWDOWN_REJECT_LOG: AtomicU64 = AtomicU64::new(0);
 
+/// Registry behind [`gate_log_permitted`]: `strategy → asset → key → last logged at`.
+///
+/// Nested maps so every lookup borrows `&str`: this runs on every patrol tick
+/// for every viper, and a tuple key would allocate three Strings per tick just
+/// to ask whether to stay quiet. Process-global rather than a field on the
+/// strategy because patrol rebuilds every strategy object on each market
+/// rotation, which would reset per-instance state every hour.
+type GateLogKeys = std::collections::HashMap<String, std::time::Instant>;
+type GateLogAssets = std::collections::HashMap<String, GateLogKeys>;
+fn gate_log_state() -> &'static std::sync::Mutex<std::collections::HashMap<String, GateLogAssets>> {
+    static REG: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, GateLogAssets>>> =
+        std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// True when a throttled gate line for `key` from `strategy` on `asset` may be
+/// written now: none has been written for that key within `interval_secs`.
+/// Records the emit when it returns true; allocates only then.
+///
+/// The "why no trades?" registry (`viper_status::report_reason`) is a live
+/// snapshot with no history, so a viper that reports only there leaves nothing
+/// on disk about what held it. Momentum and TimeDecay each grew their own copy
+/// of this throttle; this is the shared one. Keyed per reason rather than on
+/// "last reason" alone: Momentum's commonest transition is velocity crossing
+/// its trigger and falling back, several times a second in a choppy tape, and
+/// a last-reason throttle would log every one of those flips.
+pub fn gate_log_permitted(strategy: &str, asset: &str, key: &str, interval_secs: u64) -> bool {
+    let mut reg = match gate_log_state().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let quiet = reg.get(strategy)
+        .and_then(|by_asset| by_asset.get(asset))
+        .and_then(|by_key| by_key.get(key))
+        .is_some_and(|at| at.elapsed().as_secs() < interval_secs);
+    if quiet { return false; }
+    reg.entry(strategy.to_string()).or_default()
+        .entry(asset.to_string()).or_default()
+        .insert(key.to_string(), std::time::Instant::now());
+    true
+}
+
 /// Shared risk utility for all strategies to check global drawdown.
 pub fn is_drawdown_limit_hit(session_pnl: Decimal, starting_collateral: Decimal) -> bool {
     let max_dd = config::max_session_drawdown(starting_collateral);

@@ -119,8 +119,14 @@ pub struct AssetRaptorHealth {
     pub oracle_price:  Decimal,
     /// 5-second price velocity (Δprice over the 5s window).
     pub velocity_5s:   Decimal,
-    /// 1-second price velocity (short window).
+    /// 1-second price velocity (short window). Zero when no prior sample sat
+    /// close enough to one second ago to measure it (`velocity_1s_anchor_ms`).
     pub velocity_1s:   Decimal,
+    /// Age, in ms, of the prior sample nearest one second ago on the last tick;
+    /// 0 with no prior sample. Outside the raptor's accepted band the 1s
+    /// velocity above is 0 (unconfirmed), not a flat second — so a gap in the
+    /// feed can be told apart from a quiet one here.
+    pub velocity_1s_anchor_ms: u128,
     /// Acceleration — rate of change of 5s velocity.
     pub acceleration:  Decimal,
     /// 60-minute drift (Δprice over the trailing hour).
