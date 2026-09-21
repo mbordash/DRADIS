@@ -954,6 +954,9 @@ async fn trade_one_market(
     db::alias_pool(status_scope, asset);
     seed_squadron_config(&squadron_id, viper_budgets).await;
     let market_class = squadron.classify_and_link().await;
+    // Carried into every tick's StrategyContext: the class is what a viper
+    // asks to know what kind of market it is looking at.
+    let market_class_for_ctx = market_class.clone();
     // Filing dimensions for every row this market writes. `asset` above is
     // only the shard (one DB for all Kalshi squadrons); venue, class and
     // underlying are the attributes that actually describe the trade.
@@ -1290,6 +1293,7 @@ async fn trade_one_market(
         }
 
         let ctx = StrategyContext {
+            market_class: Some(market_class_for_ctx.clone()),
             market: market_cfg.clone(),
             snapshot: snapshot.clone(),
             positions: positions.clone(),

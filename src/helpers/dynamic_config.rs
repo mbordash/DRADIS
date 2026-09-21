@@ -244,6 +244,15 @@ fn default_tennis_poll_secs()               -> u64     { config::TENNIS_POLL_SEC
 fn default_tennis_low_budget_warn()         -> i64     { config::TENNIS_LOW_BUDGET_WARN                }
 fn default_sports_odds_regions()            -> String  { config::SPORTS_ODDS_REGIONS.to_string()       }
 fn default_sports_ledger_enabled()          -> bool    { config::SPORTS_LEDGER_ENABLED                 }
+fn default_enable_sports_fairvalue()        -> bool    { config::ENABLE_SPORTS_FAIRVALUE               }
+fn default_sports_fairvalue_min_edge()      -> Decimal { config::SPORTS_FAIRVALUE_MIN_EDGE             }
+fn default_sports_line_max_age_secs()       -> i64     { config::SPORTS_LINE_MAX_AGE_SECS              }
+fn default_sports_line_min_books()          -> i64     { config::SPORTS_LINE_MIN_BOOKS                 }
+fn default_sports_maker_max_dispersion()    -> Decimal { config::SPORTS_MAKER_MAX_DISPERSION           }
+fn default_sports_fairvalue_min_consensus() -> Decimal { config::SPORTS_FAIRVALUE_MIN_CONSENSUS        }
+fn default_sports_fairvalue_max_dispersion()-> Decimal { config::SPORTS_FAIRVALUE_MAX_DISPERSION       }
+fn default_sports_fairvalue_settle_hold()   -> bool    { config::SPORTS_FAIRVALUE_SETTLE_HOLD          }
+fn default_sports_fairvalue_catastrophic() -> bool    { config::SPORTS_FAIRVALUE_CATASTROPHIC_ARMED   }
 fn default_sports_ledger_leagues()          -> String  { config::SPORTS_LEDGER_LEAGUES.to_string()     }
 fn default_sports_ledger_offsets()          -> String  { config::SPORTS_LEDGER_SNAPSHOT_OFFSETS_MINS.to_string() }
 fn default_sports_ledger_credit_reserve()   -> i64     { config::SPORTS_LEDGER_CREDIT_RESERVE          }
@@ -1060,6 +1069,41 @@ pub struct DynamicConfig {
     /// Sports Raptor stops polling.
     #[serde(default = "default_sports_ledger_enabled")]
     pub sports_ledger_enabled:            bool,
+    /// Let FairValue price a sports moneyline from the bookmaker consensus.
+    /// Off by default: the favorite-side hypothesis is pre-registered and
+    /// unfinished, and a pass licenses a sized trial rather than
+    /// consensus-as-fair on every sports market.
+    #[serde(default = "default_enable_sports_fairvalue")]
+    pub enable_sports_fairvalue:          bool,
+    /// Smallest consensus-minus-ask edge a sports FairValue entry needs.
+    #[serde(default = "default_sports_fairvalue_min_edge")]
+    pub sports_fairvalue_min_edge:        Decimal,
+    /// A board line older than this is not acted on, by any consumer.
+    #[serde(default = "default_sports_line_max_age_secs")]
+    pub sports_line_max_age_secs:         i64,
+    /// Fewest bookmakers behind a consensus a consumer will act on.
+    #[serde(default = "default_sports_line_min_books")]
+    pub sports_line_min_books:            i64,
+    /// Maker will not quote a game whose books disagree by more than this.
+    #[serde(default = "default_sports_maker_max_dispersion")]
+    pub sports_maker_max_dispersion:      Decimal,
+    /// Smallest consensus a sports FairValue entry will buy: the pre-registered
+    /// hypothesis is favorite-side only and the longshot side is its negative
+    /// control. Below 0.55 leaves that scope entirely.
+    #[serde(default = "default_sports_fairvalue_min_consensus")]
+    pub sports_fairvalue_min_consensus:   Decimal,
+    /// Widest book disagreement a sports FairValue entry will accept.
+    #[serde(default = "default_sports_fairvalue_max_dispersion")]
+    pub sports_fairvalue_max_dispersion:  Decimal,
+    /// Hold a sports position to settlement instead of stopping it out on
+    /// price; the catastrophic floor stays armed.
+    #[serde(default = "default_sports_fairvalue_settle_hold")]
+    pub sports_fairvalue_settle_hold:     bool,
+    /// Keep the catastrophic floor armed on a sports position. The
+    /// pre-registered return has no stop at all, so a run measuring exactly
+    /// that hypothesis can disarm even this.
+    #[serde(default = "default_sports_fairvalue_catastrophic")]
+    pub sports_fairvalue_catastrophic_armed: bool,
     /// `code=sport_key` pairs: Polymarket league code (Gamma /sports) to The Odds API sport key.
     #[serde(default = "default_sports_ledger_leagues")]
     pub sports_ledger_leagues:            String,
@@ -1308,6 +1352,15 @@ impl Default for DynamicConfig {
             tennis_low_budget_warn:           config::TENNIS_LOW_BUDGET_WARN,
             sports_odds_regions:              config::SPORTS_ODDS_REGIONS.to_string(),
             sports_ledger_enabled:            config::SPORTS_LEDGER_ENABLED,
+            enable_sports_fairvalue:          config::ENABLE_SPORTS_FAIRVALUE,
+            sports_fairvalue_min_edge:        config::SPORTS_FAIRVALUE_MIN_EDGE,
+            sports_line_max_age_secs:         config::SPORTS_LINE_MAX_AGE_SECS,
+            sports_line_min_books:            config::SPORTS_LINE_MIN_BOOKS,
+            sports_maker_max_dispersion:      config::SPORTS_MAKER_MAX_DISPERSION,
+            sports_fairvalue_min_consensus:   config::SPORTS_FAIRVALUE_MIN_CONSENSUS,
+            sports_fairvalue_max_dispersion:  config::SPORTS_FAIRVALUE_MAX_DISPERSION,
+            sports_fairvalue_settle_hold:     config::SPORTS_FAIRVALUE_SETTLE_HOLD,
+            sports_fairvalue_catastrophic_armed: config::SPORTS_FAIRVALUE_CATASTROPHIC_ARMED,
             sports_ledger_leagues:            config::SPORTS_LEDGER_LEAGUES.to_string(),
             sports_ledger_snapshot_offsets_mins: config::SPORTS_LEDGER_SNAPSHOT_OFFSETS_MINS.to_string(),
             sports_ledger_credit_reserve:     config::SPORTS_LEDGER_CREDIT_RESERVE,

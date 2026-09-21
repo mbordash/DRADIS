@@ -728,6 +728,52 @@ pub const SPORTS_LEDGER_LEAGUES: &str = "mlb=baseball_mlb,nfl=americanfootball_n
 pub const SPORTS_LEDGER_SNAPSHOT_OFFSETS_MINS: &str = "-120,-10";
 /// Odds API credits the ledger never spends into.
 pub const SPORTS_LEDGER_CREDIT_RESERVE: i64 = 25;
+// ── Sports consumers: the board as a trading signal ─────────────────────────
+// The ledger records; these decide what reads it. Off by default because the
+// favorite-side hypothesis is pre-registered and unfinished, and a pass there
+// licenses a sized trial rather than consensus-as-fair on every sports market.
+/// Let FairValue price a sports moneyline from the bookmaker consensus instead
+/// of its crypto model (which needs a strike, an oracle and a vol estimate that
+/// a game does not have).
+pub const ENABLE_SPORTS_FAIRVALUE: bool = false;
+/// Smallest consensus-minus-ask edge FairValue will enter a sports market on.
+pub const SPORTS_FAIRVALUE_MIN_EDGE: Decimal = dec!(0.03);
+/// A board line older than this describes a different game state, so no
+/// consumer acts on it. Shared by FairValue and Maker.
+pub const SPORTS_LINE_MAX_AGE_SECS: i64 = 300;
+/// Fewest bookmakers behind a consensus a consumer will act on: a two-book
+/// consensus is one book's opinion and a de-vig artifact.
+pub const SPORTS_LINE_MIN_BOOKS: i64 = 5;
+/// Maker refuses to quote a game whose books disagree by more than this
+/// (highest minus lowest book probability). A wide line is a soft line.
+pub const SPORTS_MAKER_MAX_DISPERSION: Decimal = dec!(0.08);
+/// Smallest consensus a sports FairValue entry will buy. The pre-registered
+/// hypothesis is favorite-side only (`consensus >= 0.55`); the longshot side is
+/// its declared negative control, and proportional de-vig inflates consensus
+/// exactly there, so a few cents of "edge" on a cheap outcome is the artifact
+/// rather than a signal. Never set below 0.55 without amending the
+/// pre-registration, which restarts its sample.
+pub const SPORTS_FAIRVALUE_MIN_CONSENSUS: Decimal = dec!(0.55);
+/// Widest book disagreement FairValue will enter on. A wide line is a soft
+/// line: the books do not know the price, so neither does the consensus.
+pub const SPORTS_FAIRVALUE_MAX_DISPERSION: Decimal = dec!(0.06);
+/// Hold a sports position to settlement rather than stopping it out on price.
+/// The pre-registered hypothesis is defined as "pre-game, hold to settlement,
+/// return net of the taker fee", so a percentage stop does not merely exit
+/// early — it measures a different strategy. A 0.70 favorite that dips to 0.60
+/// on one bad drive is a 14% mark against a position the thesis says to hold.
+/// The catastrophic floor stays armed as insurance against a stale line.
+pub const SPORTS_FAIRVALUE_SETTLE_HOLD: bool = true;
+/// Keep the catastrophic floor armed on a sports position. The pre-registered
+/// return has no stop in it at all — it is "hold to settlement, net of the
+/// taker fee" — so a run that means to measure that hypothesis exactly can
+/// disarm even this. Left on by default: a line that has gone stale mid-game
+/// is the case the floor exists for.
+pub const SPORTS_FAIRVALUE_CATASTROPHIC_ARMED: bool = true;
+
+
+
+
 /// Day of the month (UTC) the Odds API quota resets; spend is spread evenly until then.
 pub const SPORTS_LEDGER_QUOTA_RESET_DAY: u32 = 1;
 

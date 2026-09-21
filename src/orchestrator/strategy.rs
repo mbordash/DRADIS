@@ -49,6 +49,14 @@ pub struct StrategyContext {
     /// positions. Distinct from `crypto_filter`: that is the underlying used for
     /// threshold lookups and is shared by every squadron on the same asset.
     pub squadron_id: String,
+    /// Market taxonomy for this squadron: `crypto` | `sports` | `politics`.
+    ///
+    /// The durable answer to "what kind of market is this?", which the board
+    /// cannot be: a sports line leaves the board six hours after kick-off, so
+    /// a posture derived from `sports.is_some()` silently changes under a
+    /// position that is still open. `None` on the venue paths that build a
+    /// context without a classified squadron.
+    pub market_class: Option<String>,
     /// Timestamp when the bot started trading the current market.
     /// Used by strategies to enforce a minimum market maturation period before entry.
     pub market_started_at: DateTime<Utc>,

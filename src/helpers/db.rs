@@ -895,7 +895,14 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
         ("crypto", "arbitrage"), ("crypto", "maker"), ("crypto", "momentum"),
         ("crypto", "gboost"),    ("crypto", "basis"), ("crypto", "time_decay"),
         ("crypto", "trendcapture"), ("crypto", "convergence"), ("crypto", "fairvalue"),
-        ("sports",   "arbitrage"), ("sports",   "maker"),
+        // FairValue prices a moneyline from the sports board's bookmaker
+        // consensus (`sports_entry`), which is the only model that can price a
+        // game — the crypto one needs a strike, an oracle and a vol estimate.
+        // `INSERT OR IGNORE` means an existing instance picks this row up on
+        // its next startup. The viper still idles unless `enable_sports_fairvalue`
+        // is on and the ledger is producing lines. Politics is deliberately not
+        // here: it has no signal source yet (see the roadmap's politics spike).
+        ("sports",   "arbitrage"), ("sports",   "maker"), ("sports", "fairvalue"),
         ("politics", "arbitrage"), ("politics", "maker"),
         ("unknown",  "arbitrage"), ("unknown",  "maker"),
     ] {

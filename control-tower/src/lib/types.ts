@@ -228,6 +228,15 @@ export interface DynamicConfig {
   // the upstream API verbatim and NOT validated by DRADIS.
   sports_odds_regions:              string;
   sports_ledger_enabled:            boolean;
+  enable_sports_fairvalue?: boolean;
+  sports_fairvalue_min_edge?: string;
+  sports_line_max_age_secs?: number;
+  sports_line_min_books?: number;
+  sports_maker_max_dispersion?: string;
+  sports_fairvalue_min_consensus?: string;
+  sports_fairvalue_max_dispersion?: string;
+  sports_fairvalue_settle_hold?: boolean;
+  sports_fairvalue_catastrophic_armed?: boolean;
   sports_ledger_leagues:            string;
   sports_ledger_snapshot_offsets_mins: string;
   sports_ledger_credit_reserve:     number;

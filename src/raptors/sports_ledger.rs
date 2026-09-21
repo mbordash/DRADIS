@@ -998,6 +998,39 @@ pub fn resolved_price(market: &Value, token: &str) -> Option<f64> {
     ((price - 0.5).abs() < 1e-6 && resolved).then_some(0.5)
 }
 
+/// Settled prices for the given tokens of one market, by the same rule
+/// `capture_results` records results with: 0 or 1 outright, and 0.5 only when
+/// Gamma also reports `umaResolutionStatus: resolved`.
+///
+/// Exposed for the ghost-settlement path, which needs exactly this question and
+/// had been asking a worse one. Its own helper accepted "closed, past endDate,
+/// both outcomes 0.50", which on a survey of closed sports markets matched 472
+/// markets of which only 352 were resolved — the other 120 were closed,
+/// past-end placeholders at 0.5/0.5 that Gamma never resolved, and every one
+/// would have been booked as a tie. `endDate` is no help on a game market: it
+/// is kick-off, so every finished game is past it.
+///
+/// One request prices both sides, which is also one fewer round trip per
+/// undecided token than probing them separately.
+pub async fn settled_prices_for_market(
+    http: &reqwest::Client,
+    condition_id: &str,
+    tokens: &[String],
+) -> HashMap<String, f64> {
+    let mut out = HashMap::new();
+    let Ok((v, _, _)) = get_json(
+        http, &format!("{GAMMA}/markets"), None,
+        &[("condition_ids", condition_id), ("closed", "true")],
+    ).await else { return out };
+    let Some(market) = v.as_array().and_then(|a| a.first()) else { return out };
+    for token in tokens {
+        if let Some(px) = resolved_price(market, token) {
+            out.insert(token.clone(), px);
+        }
+    }
+    out
+}
+
 /// Record the resolution of every ledger market whose game started at least
 /// `RESULT_AFTER_START_SECS` ago and is now closed with a 0/1 price.
 async fn capture_results(http: &reqwest::Client, pool: &sqlx::SqlitePool, now: DateTime<Utc>) {

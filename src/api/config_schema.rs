@@ -996,6 +996,24 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         // which cannot save a switch or a number. "Global" is Setup's Engine card.
         v.push(F::new("Global", None, "sports_ledger_enabled", "Sports Line Ledger", "bool", false,
             "Record the sportsbook consensus against Polymarket prices for every matched sports moneyline, and each market's resolution. Research data for the sports spike's go/no-go statistics; nothing trades from it. While on, it owns The Odds API budget and it owns the Odds API budget. Enable it on ONE DRADIS instance per Odds API key: each instance budgets as if it had the whole quota."));
+        v.push(F::new("Global", None, "enable_sports_fairvalue", "Sports FairValue", "bool", false,
+            "Let FairValue price a sports moneyline from the bookmaker consensus instead of its crypto model, which needs a strike, an oracle and a volatility estimate a game does not have. Needs the Sports Line Ledger on and an Odds API key: without a line the viper simply idles. Off by default because the favorite-side hypothesis is still gathering its sample."));
+        v.push(F::new("Global", None, "sports_fairvalue_min_edge", "Sports FairValue Min Edge", "price", true,
+            "Smallest consensus-minus-ask gap FairValue will enter a sports market on. Polymarket sits AT consensus pre-game on average (mean gap under a cent), so a small number here does not mean more trades, it means acting on noise."));
+        v.push(F::new("Global", None, "sports_line_max_age_secs", "Sports Line Max Age", "int", true,
+            "A board line older than this is not acted on by any consumer. The odds are read on a snapshot schedule, not continuously, so a line minutes old describes a different game state."));
+        v.push(F::new("Global", None, "sports_line_min_books", "Sports Line Min Books", "int", true,
+            "Fewest bookmakers behind a consensus a consumer will act on. A two-book consensus is one book's opinion plus a de-vig artifact: books quoting identical odds de-vig differently because their overrounds differ."));
+        v.push(F::new("Global", None, "sports_maker_max_dispersion", "Sports Maker Max Dispersion", "price", true,
+            "Maker will not quote a game whose books disagree by more than this (highest minus lowest book probability). A wide line is a soft line: the books themselves do not know the price, so a passive quote is likelier to be picked off than filled."));
+        v.push(F::new("Global", None, "sports_fairvalue_min_consensus", "Sports Favorite Floor", "price", true,
+            "Smallest bookmaker consensus a sports FairValue entry will buy. The pre-registered hypothesis is favorite-side only (0.55 and above); the longshot side is its declared negative control, and the de-vig method inflates consensus exactly there, so cheap outcomes show an 'edge' that is an artifact. Setting this below 0.55 trades outside the hypothesis the evidence is being gathered for."));
+        v.push(F::new("Global", None, "sports_fairvalue_max_dispersion", "Sports FairValue Max Dispersion", "price", true,
+            "Widest book disagreement (highest minus lowest book probability) a sports FairValue entry will accept. A wide line is a soft line: if the books do not agree what the game is worth, neither does the consensus derived from them."));
+        v.push(F::new("Global", None, "sports_fairvalue_settle_hold", "Sports Hold To Settlement", "bool", true,
+            "Hold a sports position to settlement rather than stopping it out on price. The evidence being gathered is for a hold-to-settlement thesis, so a percentage stop measures a different strategy: a 0.70 favorite dipping to 0.60 on one bad drive is a 14% mark against a position the thesis says to hold. The catastrophic floor stays armed as insurance against a stale line."));
+        v.push(F::new("Global", None, "sports_fairvalue_catastrophic_armed", "Sports Catastrophic Floor", "bool", true,
+            "Keep the catastrophic floor armed on a sports position. The hypothesis being measured is hold-to-settlement with no stop at all, so a run that means to reproduce it exactly can disarm even this. Left on by default: a line that goes stale mid-game is the case the floor exists for."));
         v.push(F::new("Global", None, "sports_ledger_leagues", "Ledger Leagues", "string", true,
             "Comma-separated code=sport_key pairs mapping Polymarket's league code (Gamma /sports, e.g. mlb, fl1) to The Odds API sport key (e.g. baseball_mlb). Discovery is free; only snapshots cost credits. ⚠️ Not validated — an unknown code or key simply matches no games."));
         v.push(F::new("Global", None, "sports_ledger_snapshot_offsets_mins", "Ledger Snapshot Offsets", "string", true,

@@ -686,6 +686,16 @@ pub fn spawn_cleanup_task(
     hourly_no_token:      crate::venues::core::MarketId,
     hourly_market_name:   String,
     hourly_market_close_time: Option<chrono::DateTime<chrono::Utc>>,
+    // One market, no rotation (see `Squadron::single_market`). An event
+    // squadron's stated close is not a deadline its positions must clear: a
+    // sports market's close time is kick-off itself on football and soccer but
+    // a week later on MLB, so dropping positions 60s before it removed a live
+    // football position from the map at kick-off — invisible to `evaluate_exit`
+    // (no catastrophic floor), to exposure and to no-pyramiding — while the
+    // identical MLB position was never touched. Retirement already trusts the
+    // venue's `accepting_orders` over the stated close for exactly this reason
+    // (`event_market_retire_reason`); the cleanup follows it.
+    single_market:        bool,
     maker_market_config:  Option<MarketConfig>,
     tg_token:             String,
     tg_chat_id:           String,
@@ -711,7 +721,8 @@ pub fn spawn_cleanup_task(
                     // Returns the list of confirmed-fill orphans so we can attempt FAK sells
                     // OUTSIDE the timeout — sell latency does not count against the 45 s cap.
                     let orphan_exits = match tokio::time::timeout(Duration::from_secs(45), async {
-                        if hourly_yes_token != crate::venues::intl::market_id_from_u256(U256::ZERO) {
+                        if !single_market
+                            && hourly_yes_token != crate::venues::intl::market_id_from_u256(U256::ZERO) {
                             crate::tasks::cleanup::cleanup_expired_positions(
                                 Arc::clone(&positions),
                                 hourly_market_name.clone(),
@@ -720,7 +731,7 @@ pub fn spawn_cleanup_task(
                                 &asset,
                             ).await;
                         }
-                        if let Some(ref mk) = maker_market_config {
+                        if let Some(ref mk) = maker_market_config.as_ref().filter(|_| !single_market) {
                             crate::tasks::cleanup::cleanup_expired_positions(
                                 Arc::clone(&positions),
                                 mk.market_name.clone(),

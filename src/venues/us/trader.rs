@@ -1031,6 +1031,9 @@ async fn trade_one_market(
     // Classify the market's domain and link it to its eligible raptors/vipers via
     // the shared, venue-neutral taxonomy (same path intl uses).
     let market_class = squadron.classify_and_link().await;
+    // Carried into every tick's StrategyContext: the class is what a viper
+    // asks to know what kind of market it is looking at.
+    let market_class_for_ctx = market_class.clone();
     // Filing dimensions for this market's rows. The general wing hunts sports
     // and politics, which have no underlying instrument at all — `None` here is
     // the correct value, not a missing one.
@@ -1405,6 +1408,7 @@ async fn trade_one_market(
         }
 
         let ctx = StrategyContext {
+            market_class: Some(market_class_for_ctx.clone()),
             market: market_cfg.clone(),
             snapshot: snapshot.clone(),
             positions: positions.clone(),

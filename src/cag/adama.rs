@@ -733,9 +733,209 @@ where
         let found = crate::api::server::fetch_markets_by_type(
             &self.infra.shared_http, class, horizon, min_liquidity_usd,
         ).await;
+
+        // Sports: deploy onto a game the board actually has a line for, and
+        // that has not kicked off.
+        //
+        // Only while the ledger is producing lines. It ships off and needs an
+        // Odds API key; an operator without either gets the volume choice, said
+        // out loud, because that squadron's sports-aware gates will be dark. With
+        // the ledger live, an empty board is a restart (the board is restored
+        // from the DB on the ledger's first tick, within a minute) or a slate
+        // with no game inside the first snapshot offset yet, and the next pass
+        // tries again: a squadron seeded by volume would keep its unmatched
+        // market for the life of the game. See `sports_market_on_board` for why
+        // neither an unmatched game nor one already in play is a fallback.
+        if class == "sports" {
+            if sports_ledger_produces_lines() {
+                let board = crate::raptors::sports_ledger::board();
+                let now = chrono::Utc::now();
+                let pick = sports_market_on_board(&found, &board, now);
+                return match pick.best {
+                    Some(m) => {
+                        info!("📋 Auto-deploy: sports market [{}] \"{}\" has a board line and has not started ({} of {} listed games on the board, {} of those pre-game)",
+                            m.condition_id, m.question, pick.on_board, found.len(), pick.pre_game);
+                        Some(m.condition_id.clone())
+                    }
+                    None => {
+                        info!("📋 Auto-deploy: no sports market to seed — {} listed, {} on the board ({} lines), {} of those not yet started; waiting rather than deploying a squadron with no line or a game already in play",
+                            found.len(), pick.on_board, board.len(), pick.pre_game);
+                        None
+                    }
+                };
+            }
+            info!("📋 Auto-deploy: sports ledger is off or has no Odds API key; selecting the sports market by volume — its sports-aware gates will have no line");
+        }
+
         found.into_iter()
             .max_by(|a, b| a.liquidity.total_cmp(&b.liquidity))
             .map(|m| m.condition_id)
+    }
+}
+
+/// Whether the sports ledger is in a state to put lines on the board: switched
+/// on in the live global config, with an Odds API key in the environment. Off,
+/// the ledger empties the board at once (`run_sports_ledger`), so an empty board
+/// under a live ledger means "nothing matched yet", not "no ledger".
+#[cfg(feature = "intl_clob")]
+fn sports_ledger_produces_lines() -> bool {
+    let enabled = crate::helpers::dynamic_config::global_config_tx()
+        .map(|tx| tx.borrow().sports_ledger_enabled)
+        .unwrap_or(crate::config::SPORTS_LEDGER_ENABLED);
+    enabled && std::env::var(crate::config::SPORTS_ODDS_KEY_ENV).ok().is_some_and(|k| !k.is_empty())
+}
+
+/// What the board says about the listed sports markets.
+#[cfg(feature = "intl_clob")]
+struct SportsSelection<'a> {
+    /// The highest-liquidity listed market that is on the board and has not
+    /// kicked off; `None` when there is no such market.
+    best: Option<&'a crate::api::server::AvailableMarket>,
+    /// Listed markets with a line on either side.
+    on_board: usize,
+    /// Of those, the ones whose kick-off is still ahead.
+    pre_game: usize,
+}
+
+/// The seeder's sports choice: the highest-liquidity listed market the board
+/// holds a line for whose game has not started, with the counts for the log.
+///
+/// The seeder used to take the highest-liquidity moneyline on the slate, which
+/// is not the same set as the games the ledger matched to a bookmaker
+/// consensus. A squadron seeded onto an unmatched game runs with
+/// `StrategyContext.sports` permanently `None`: every sports-aware gate is dark
+/// while the Control Tower shows a healthy sports squadron, which is the shape
+/// of bug that takes days to notice. Matching on either side's token because a
+/// line can withdraw from one outcome and not the other.
+///
+/// Pre-game only, because the board keeps a line for six hours after kick-off
+/// (`BOARD_RETAIN_SECS`) and the ledger snapshots in play for research, so a
+/// matched game may be under way or finished. The trading design is pre-game:
+/// the sports spike scopes in-play out of the first version (the free feed
+/// stops polling once a game starts, and the viper's pull rules go idle on
+/// `secs_to_start < 0`), so a squadron seeded in play is the "looks busy, does
+/// nothing" trade again, and one seeded on a finished game holds the sports
+/// slot until the venue stops accepting orders. When an in-play feed exists
+/// this becomes a choice; today it is not one.
+///
+/// Returning `None` when nothing qualifies is deliberate. Idle is already the
+/// seeder's answer to a thin slate ("a squadron on a market with no book looks
+/// busier and does nothing"), and an unmatched or in-play game is that same
+/// trade with the signal missing rather than the book. The next pass tries again.
+#[cfg(feature = "intl_clob")]
+fn sports_market_on_board<'a>(
+    found: &'a [crate::api::server::AvailableMarket],
+    board: &crate::raptors::sports_ledger::SportsBoard,
+    now: chrono::DateTime<chrono::Utc>,
+) -> SportsSelection<'a> {
+    let line = |m: &crate::api::server::AvailableMarket| {
+        board.get(&m.tokens.yes_id).or_else(|| board.get(&m.tokens.no_id))
+    };
+    let on_board = found.iter().filter(|m| line(m).is_some()).count();
+    let pre_game = |m: &&crate::api::server::AvailableMarket| line(m).is_some_and(|l| l.commence > now);
+    let best = found.iter().filter(pre_game)
+        .max_by(|a, b| a.liquidity.total_cmp(&b.liquidity));
+    SportsSelection { best, on_board, pre_game: found.iter().filter(pre_game).count() }
+}
+
+#[cfg(all(test, feature = "intl_clob"))]
+mod sports_seeder_tests {
+    use super::sports_market_on_board;
+    use crate::api::server::{AvailableMarket, AvailableMarketTokens};
+    use crate::raptors::sports_ledger::{SportsBoard, SportsLine};
+    use chrono::Utc;
+
+    fn market(cid: &str, yes: &str, no: &str, liquidity: f64) -> AvailableMarket {
+        AvailableMarket {
+            condition_id: cid.into(),
+            question: format!("{cid}?"),
+            market_class: "sports".into(),
+            end_date: None,
+            liquidity,
+            tokens: AvailableMarketTokens { yes_id: yes.into(), no_id: no.into() },
+        }
+    }
+
+    fn line_at(commence: chrono::DateTime<Utc>) -> SportsLine {
+        SportsLine {
+            league: "nfl".into(), sport_key: "americanfootball_nfl".into(),
+            odds_event_id: "e1".into(), commence, outcome_label: "Giants".into(),
+            consensus: 0.6, num_books: 8, dispersion: Some(0.01),
+            max_book_age_secs: Some(30), odds_at: Utc::now(), drift: None,
+        }
+    }
+
+    /// A line for a game that kicks off in two hours.
+    fn line() -> SportsLine { line_at(Utc::now() + chrono::Duration::hours(2)) }
+
+    /// The board, not volume, decides — the busiest game on the slate loses to a
+    /// thinner one the ledger actually matched. This is the seeder bug: volume
+    /// alone seeded squadrons whose `ctx.sports` was permanently `None`.
+    #[test]
+    fn a_matched_game_beats_a_busier_unmatched_one() {
+        let found = vec![
+            market("busy-unmatched", "yes-a", "no-a", 900_000.0),
+            market("quiet-matched",  "yes-b", "no-b",  10_000.0),
+        ];
+        let mut board = SportsBoard::new();
+        board.insert("yes-b".into(), line());
+        let pick = sports_market_on_board(&found, &board, Utc::now());
+        assert_eq!(pick.best.map(|m| m.condition_id.as_str()), Some("quiet-matched"));
+        assert_eq!((pick.on_board, pick.pre_game), (1, 1));
+    }
+
+    /// Among matched games, volume still decides.
+    #[test]
+    fn liquidity_breaks_the_tie_between_matched_games() {
+        let found = vec![
+            market("small", "yes-a", "no-a", 1_000.0),
+            market("large", "yes-b", "no-b", 50_000.0),
+        ];
+        let mut board = SportsBoard::new();
+        board.insert("yes-a".into(), line());
+        board.insert("no-b".into(), line());
+        let pick = sports_market_on_board(&found, &board, Utc::now());
+        assert_eq!(pick.best.map(|m| m.condition_id.as_str()), Some("large"));
+        assert_eq!(pick.on_board, 2, "a line on either side counts the market as matched");
+    }
+
+    /// A populated board that knows none of the listed games yields nothing, so
+    /// the seeder waits instead of deploying a squadron with no line.
+    #[test]
+    fn nothing_matched_selects_nothing() {
+        let found = vec![market("a", "yes-a", "no-a", 100.0), market("b", "yes-b", "no-b", 200.0)];
+        let mut board = SportsBoard::new();
+        board.insert("some-other-token".into(), line());
+        let pick = sports_market_on_board(&found, &board, Utc::now());
+        assert!(pick.best.is_none(), "an unmatched game is not a fallback");
+        assert_eq!((pick.on_board, pick.pre_game), (0, 0));
+    }
+
+    /// A game already under way, or finished but still on the board (lines
+    /// are kept six hours past kick-off), is neither chosen nor a fallback: a
+    /// thinner pre-game match wins, and with only in-play matches the seeder
+    /// waits. In play, the free feed stops and the viper's pull rules idle the
+    /// squadron; on a finished game it would hold the sports slot for nothing.
+    #[test]
+    fn a_game_in_play_or_finished_is_not_seeded() {
+        let now = Utc::now();
+        let found = vec![
+            market("in-play",  "yes-a", "no-a", 900_000.0),
+            market("finished", "yes-b", "no-b", 500_000.0),
+            market("pre-game", "yes-c", "no-c",   5_000.0),
+        ];
+        let mut board = SportsBoard::new();
+        board.insert("yes-a".into(), line_at(now - chrono::Duration::minutes(30)));
+        board.insert("no-b".into(),  line_at(now - chrono::Duration::hours(4)));
+        board.insert("yes-c".into(), line_at(now + chrono::Duration::minutes(90)));
+        let pick = sports_market_on_board(&found, &board, now);
+        assert_eq!(pick.best.map(|m| m.condition_id.as_str()), Some("pre-game"));
+        assert_eq!((pick.on_board, pick.pre_game), (3, 1));
+
+        board.remove("yes-c");
+        let pick = sports_market_on_board(&found, &board, now);
+        assert!(pick.best.is_none(), "in-play and finished games are not a fallback");
+        assert_eq!((pick.on_board, pick.pre_game), (2, 0));
     }
 }
 

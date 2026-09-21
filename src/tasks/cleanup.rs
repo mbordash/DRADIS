@@ -2027,3 +2027,213 @@ mod settlement_evidence_tests {
     }
 
 }
+
+/// How a simulated settlement learned its price, which decides what the trade
+/// row may claim. A resolution is a result; a tie is its own category; a mark
+/// booked past the deferral bound is neither and must not read as either.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PriceSource { Resolved, Tie, MarkFallback }
+
+/// Book simulated positions on an event market as settlements once the venue
+/// has stopped accepting orders, then drop them from the map.
+///
+/// **Polymarket International only.** Polymarket US runs its own deployment
+/// loop (`UsDeploymentRunner::run_pinned`) which never enters
+/// `Squadron::patrol`, so neither the venue-status retirement nor this booking
+/// exists there, and a ghost event squadron on that venue pins in exactly the
+/// way described below. Kalshi deploys crypto only, so it has no event squadron
+/// to pin. Fixing Polymarket US means giving its loop the same two things.
+///
+/// Ghost mode has no settlement path of its own: nothing anywhere books a
+/// simulated position at resolution, because the two mechanisms that close
+/// positions are chain-based and exclude ghost rows by design. On a rotating
+/// crypto squadron that was invisible — the next rotation swept the row and the
+/// map entry with it. An event squadron never rotates: it leaves by retirement,
+/// and retirement refuses while the squadron holds anything. So a simulated
+/// position on a sports or politics market stayed in the map forever, kept its
+/// `open_positions` row open at its last mark, and pinned the squadron, which
+/// blocked the class permanently — the seeder skips a class that already has a
+/// live squadron. One simulated game would end ghost trading for that class.
+///
+/// Gated on the venue's own "no longer accepting orders" rather than the stated
+/// close, for the reason retirement already trusts it: a sports market's close
+/// time is kick-off itself on football and soccer but a week later on MLB, so
+/// the stated close is not evidence that anything has settled.
+///
+/// `Unknown` defers rather than guessing, but only up to
+/// `venue_closed_for_secs >= db::SETTLEMENT_DEFER_MAX_SECS`, the same bound the
+/// live sweep uses. Without a bound the function reintroduced the pin it exists
+/// to remove: `resolution_for_token` answers `Unknown` for any price between
+/// $0.01 and $0.99, and Polymarket settles canceled and tied games at $0.50, so
+/// a simulated position on a tie would have deferred forever. Past the bound it
+/// books at Gamma's own price and names it in the reason.
+///
+/// The caller is expected to throttle this: it makes one Gamma request per
+/// distinct token per pass and each can stall for the HTTP timeout, so running
+/// it on every 75ms tick while a resolution is pending would be hundreds of
+/// requests a minute against a venue that has already rate-limited this engine.
+pub async fn settle_ghost_event_positions(
+    positions: &Arc<Mutex<crate::state::PositionMap>>,
+    http: &reqwest::Client,
+    asset: &str,
+    market_class: Option<&str>,
+    condition_id: &str,
+    yes_market: &MarketId,
+    no_market: &MarketId,
+    venue_closed_for_secs: i64,
+) -> usize {
+    use std::collections::HashMap as StdHashMap;
+
+    // Snapshot first: the resolution probe is network-bound and must not be
+    // awaited while the position map is locked — the patrol tick takes it.
+    let candidates: Vec<(crate::state::PositionKey, crate::state::Position)> = {
+        let map = positions.lock().await;
+        map.iter()
+            .filter(|(k, _)| k.market == *yes_market || k.market == *no_market)
+            .filter(|(_, p)| p.fill_confirmed_at.is_some() && p.shares > Decimal::ZERO)
+            .map(|(k, p)| (k.clone(), p.clone()))
+            .collect()
+    };
+    if candidates.is_empty() {
+        return 0;
+    }
+    let Some(pool) = crate::helpers::db::pool_for(asset) else { return 0 };
+
+    // One Gamma request for the market, which prices both sides, rather than a
+    // probe per token. The rule is the sports ledger's own `resolved_price`:
+    // 0 or 1 outright, and 0.5 only when Gamma also reports
+    // `umaResolutionStatus: resolved`.
+    //
+    // This replaced a helper of mine that asked "closed, past endDate, both
+    // outcomes 0.50". On a survey of closed sports markets that shape matched
+    // 472 markets of which only 352 were resolved; the other 120 were
+    // never-resolved placeholders sitting at 0.5/0.5, and every one would have
+    // been booked as a tie. `endDate` is worthless as a discriminator here —
+    // on a game market it is kick-off, so every finished game is past it.
+    let past_defer_bound = venue_closed_for_secs >= crate::helpers::db::SETTLEMENT_DEFER_MAX_SECS;
+    let mut resolved_px: StdHashMap<String, (Decimal, PriceSource)> = StdHashMap::new();
+    let mut tokens: Vec<String> = candidates.iter().map(|(k, _)| k.market.to_string()).collect();
+    tokens.sort();
+    tokens.dedup();
+    let settled_now = crate::raptors::sports_ledger::settled_prices_for_market(
+        http, condition_id, &tokens,
+    ).await;
+    let half = Decimal::new(5, 1);
+    for token in &tokens {
+        match settled_now.get(token).and_then(|p| Decimal::from_f64_retain(*p)) {
+            Some(px) => {
+                // A settled 0.5 is the tie or cancellation category, which the
+                // pre-registration counts separately from wins and losses.
+                let source = if px == half { PriceSource::Tie } else { PriceSource::Resolved };
+                resolved_px.insert(token.clone(), (px, source));
+            }
+            None if past_defer_bound => {
+                // Same trade-off the live sweep takes past this bound: a mark
+                // is not a result, but an unbounded defer is the pin this
+                // function exists to remove.
+                if let Some(px) = crate::helpers::market::open_market_mark_for_token(http, token).await {
+                    warn!(
+                        "👻 Simulated settlement: {} still undecided {}h after the venue closed — \
+                         falling back to the mark ${:.2}; this is not a resolution",
+                        token, venue_closed_for_secs / 3600, px,
+                    );
+                    resolved_px.insert(token.clone(), (px, PriceSource::MarkFallback));
+                }
+            }
+            None => {}
+        }
+    }
+    if resolved_px.is_empty() {
+        return 0;
+    }
+
+    let mut settled = 0usize;
+    for (key, pos) in candidates {
+        let token = key.market.to_string();
+        let Some(&(resolved, source)) = resolved_px.get(&token) else { continue };
+
+        // Remove before booking, and only if the position is still exactly as
+        // it was snapshotted. A resolved market keeps a residual bid for hours,
+        // so a simulated resting exit can fill against it during the probe
+        // above and book its own exit; booking a settlement from the stale
+        // snapshot would then record the same position twice, and the recorder
+        // guards settlements against settlements, not against exits.
+        {
+            let mut map = positions.lock().await;
+            match map.get(&key) {
+                Some(cur) if cur.shares == pos.shares && cur.avg_entry == pos.avg_entry => {
+                    map.remove(&key);
+                }
+                _ => continue,
+            }
+        }
+
+        // Fee by entry type, mirroring the live settlement paths: a taker entry
+        // paid the venue's quadratic schedule on the opening leg, a post-only
+        // maker entry paid nothing, and the live maker path books
+        // `Decimal::ZERO` with exactly that comment. Charging every strategy
+        // would overstate a simulated Maker or Arbitrage settlement by a fee
+        // the live books never show.
+        let taker_entry = match key.strategy.as_str() {
+            "FairValueStrategy" | "MomentumStrategy" | "GboostStrategy"
+                | "ConvergenceStrategy" | "TrendReversalStrategy" => true,
+            // Read from the constant rather than assumed: Basis enters as a
+            // maker on every shipped profile, but the switch is compile-time,
+            // and a profile that flips it should get the matching fee without
+            // anyone remembering to edit this list.
+            "BasisStrategy" => !crate::config::BASIS_ENTRY_AS_MAKER,
+            // Maker, Arbitrage and TimeDecay are maker-entry by construction.
+            _ => false,
+        };
+        let entry_fee = if taker_entry {
+            pos.avg_entry * pos.shares * crate::venues::entry_only_fee_pct(pos.avg_entry)
+        } else {
+            Decimal::ZERO
+        };
+        let pnl = (resolved - pos.avg_entry) * pos.shares - entry_fee;
+
+        let side = if key.market == *yes_market { "YES" } else { "NO" };
+        let outcome = match source {
+            PriceSource::Tie => "tied or canceled".to_string(),
+            // Not a result: say so in the row rather than dressing a mid-price
+            // up as a win or a tie. A 0.93 mark booked after a day is a genuine
+            // win the trial would otherwise drop from its tally, and a mark is
+            // not the 0.5 category either.
+            PriceSource::MarkFallback => "mark after 24h deferral".to_string(),
+            PriceSource::Resolved => {
+                if resolved > Decimal::new(5, 1) { "won".to_string() } else { "lost".to_string() }
+            }
+        };
+        let reason = format!("Settlement ({outcome} — simulated)");
+
+        // `ghost: true` so the row is marked simulated and cannot be read as
+        // real P&L, and the class carried so a sports settlement is labeled as
+        // one rather than left NULL.
+        let mut scope = crate::state::TradeScope::new(
+            asset, "", market_class.map(str::to_string), None,
+        );
+        scope.ghost = true;
+        let inserted = crate::helpers::db::record_settlement_trade_idempotent(
+            &pool, &scope, &key.strategy, &pos.market_name, side,
+            pos.avg_entry, resolved, pos.shares, pnl, entry_fee, &reason, None,
+        ).await;
+        if inserted {
+            info!(
+                "👻 Simulated settlement: {} {} {} | {} sh entry=${:.4} → resolved ${:.2} ({}) → pnl=${:.4}",
+                key.strategy, pos.market_name, side, pos.shares, pos.avg_entry, resolved, outcome, pnl,
+            );
+        }
+        // If the process dies between the removal above and this close, no
+        // later pass of this function recovers the row: ghost rows are never
+        // rehydrated into the map (`main.rs`, the startup sweep's own comment),
+        // so the token stops being a candidate. What recovers it is
+        // `close_stale_ghost_positions` at startup, which drops every ghost row
+        // from an earlier session — so the row survives only until the process
+        // next starts, which after a crash is immediately. That sweep is load
+        // bearing for this path and should not be removed on the belief that
+        // the settlement pass covers it.
+        crate::helpers::db::close_ghost_open_position(&pool, &token).await;
+        settled += 1;
+    }
+    settled
+}

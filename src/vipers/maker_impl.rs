@@ -561,6 +561,26 @@ fn maker_quote_oracle_drift(token_id: &str, oracle_now: Decimal) -> Option<Decim
     reg.get(token_id).map(|base| (oracle_now - base) / base)
 }
 
+
+/// The widest dispersion among this market's sides whose line is fresh enough
+/// and deep enough to be believed, with the line it came from.
+///
+/// Separated so the veto is evidence-based by construction: a stale or thin
+/// line has no opinion about whether the books agree, and a market with no line
+/// at all — every crypto market, and any game the ledger has not matched —
+/// yields `None` and leaves Maker quoting exactly as it did before.
+pub(crate) fn sports_widest_credible_dispersion<'a>(
+    sl: &'a crate::raptors::sports_ledger::SportsMarketLine,
+    max_age_secs: i64,
+    min_books: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<(f64, &'a crate::raptors::sports_ledger::SportsLine)> {
+    [sl.yes.as_ref(), sl.no.as_ref()].into_iter().flatten()
+        .filter(|l| l.age_secs(now) <= max_age_secs && l.num_books >= min_books)
+        .filter_map(|l| l.dispersion.map(|d| (d, l)))
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+}
+
 impl MakerStrategyImpl {
     pub fn new() -> Self {
         Self {
@@ -681,6 +701,35 @@ impl Strategy for MakerStrategyImpl {
         if !dc.enable_maker {
             crate::helpers::viper_status::report_reason(&ctx.crypto_filter, "MakerStrategy", "disabled in config");
             return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Sports: refuse a soft line ───────────────────────────────────────
+        // Dispersion is the highest minus the lowest book probability, so a wide
+        // one means the bookmakers themselves do not agree what the game is
+        // worth. Quoting passively into that is how a maker gets picked off
+        // rather than filled: the side that lifts the quote is the side that
+        // knows something, and the line moves against the resting order.
+        //
+        // Evidence-based, so it can only veto on evidence: a line that is stale
+        // or thin (the same freshness and book-count knobs FairValue reads) has
+        // no opinion, and Maker quotes as it always did. A market with no line
+        // at all — every crypto market, and any game the ledger has not matched
+        // — never reaches this gate.
+        if let Some(sl) = ctx.sports.as_ref() {
+            let now = chrono::Utc::now();
+            let widest = sports_widest_credible_dispersion(
+                sl, dc.sports_line_max_age_secs, dc.sports_line_min_books, now);
+            if let Some((d, l)) = widest {
+                let d_dec = rust_decimal::Decimal::from_f64_retain(d)
+                    .map(|x| x.round_dp(6)).unwrap_or_default();
+                if d_dec > dc.sports_maker_max_dispersion {
+                    self.log_gate(&ctx.crypto_filter, "sports_dispersion", &format!(
+                        "books disagree on {} {}: dispersion {:.4} > max {:.4} across {} books",
+                        l.league, l.outcome_label, d, dc.sports_maker_max_dispersion, l.num_books,
+                    )).await;
+                    return Ok(StrategySignal::NoSignal);
+                }
+            }
         }
 
         // ── Global Risk Check ────────────────────────────────────────────────
@@ -2411,5 +2460,58 @@ mod expiry_pull_tests {
                 assert_eq!(expiry_pull_due(secs, min), entry_refuses, "min={min} secs={secs}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sports_dispersion_tests {
+    use super::sports_widest_credible_dispersion;
+    use crate::raptors::sports_ledger::{SportsLine, SportsMarketLine};
+    use chrono::{Duration, Utc};
+
+    fn line(dispersion: Option<f64>, books: i64, age_secs: i64) -> SportsLine {
+        let now = Utc::now();
+        SportsLine {
+            league: "nfl".into(), sport_key: "americanfootball_nfl".into(),
+            odds_event_id: "e1".into(), commence: now + Duration::seconds(1800),
+            outcome_label: "Rams".into(), consensus: 0.7, num_books: books,
+            dispersion, max_book_age_secs: Some(30),
+            odds_at: now - Duration::seconds(age_secs), drift: None,
+        }
+    }
+
+    /// The veto reads the widest credible side, so one soft leg is enough.
+    #[test]
+    fn the_widest_credible_side_wins() {
+        let sl = SportsMarketLine {
+            yes: Some(line(Some(0.02), 10, 30)),
+            no:  Some(line(Some(0.09), 10, 30)),
+        };
+        let (d, _) = sports_widest_credible_dispersion(&sl, 300, 5, Utc::now()).expect("some");
+        assert!((d - 0.09).abs() < 1e-9);
+    }
+
+    /// Evidence-based by construction: a stale or thin line has no opinion, so
+    /// it cannot veto a quote. Without this the gate would fire hardest exactly
+    /// when the board is least informative.
+    #[test]
+    fn stale_and_thin_lines_do_not_veto() {
+        let now = Utc::now();
+        let stale = SportsMarketLine { yes: Some(line(Some(0.40), 10, 600)), no: None };
+        assert!(sports_widest_credible_dispersion(&stale, 300, 5, now).is_none(), "stale line vetoed");
+        let thin = SportsMarketLine { yes: Some(line(Some(0.40), 2, 30)), no: None };
+        assert!(sports_widest_credible_dispersion(&thin, 300, 5, now).is_none(), "thin line vetoed");
+        let credible = SportsMarketLine { yes: Some(line(Some(0.40), 10, 30)), no: None };
+        assert!(sports_widest_credible_dispersion(&credible, 300, 5, now).is_some());
+    }
+
+    /// A market with no dispersion recorded, and a market with no line at all,
+    /// both leave Maker quoting as before.
+    #[test]
+    fn no_dispersion_and_no_line_both_yield_nothing() {
+        let none_recorded = SportsMarketLine { yes: Some(line(None, 10, 30)), no: None };
+        assert!(sports_widest_credible_dispersion(&none_recorded, 300, 5, Utc::now()).is_none());
+        let empty = SportsMarketLine { yes: None, no: None };
+        assert!(sports_widest_credible_dispersion(&empty, 300, 5, Utc::now()).is_none());
     }
 }

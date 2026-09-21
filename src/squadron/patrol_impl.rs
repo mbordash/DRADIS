@@ -314,6 +314,10 @@ impl Squadron {
         // Resolved once and reused: `scope` files every row under it, and the
         // viper set below is selected from it.
         let market_class = self.classify_and_link().await;
+        // Kept for the tick's StrategyContext: the class is the durable answer
+        // to "what kind of market is this?", which the sports board cannot be
+        // (its lines expire six hours after kick-off).
+        let market_class_for_ctx = market_class.clone();
         let mut scope = TradeScope::new(
             asset_lc.clone(),
             crate::venues::intl::INTL_VENUE,
@@ -379,6 +383,8 @@ impl Squadron {
         // When the venue first said it was no longer accepting orders. Cleared
         // if it starts accepting again — a paused market is not a closed one.
         let mut venue_closed_since: Option<Instant> = None;
+        // Last ghost-settlement pass, throttled to the venue-status cadence.
+        let mut ghost_settle_probed_at: Option<Instant> = None;
 
         // Squadron's hourly market fields
         let hourly_yes_token         = self.market.yes_token.clone();
@@ -472,6 +478,7 @@ impl Squadron {
             hourly_no_token.clone(),
             hourly_market_name.clone(),
             hourly_market_close_time,
+            single_market,
             maker_market_config.clone(),
             tg_token.clone(),
             tg_chat_id.clone(),
@@ -1000,6 +1007,49 @@ impl Squadron {
                         }
                         let venue_closed_for = venue_closed_since.map(|t| t.elapsed().as_secs() as i64);
 
+                        // Ghost mode has no settlement of its own, and an event
+                        // squadron never rotates, so a simulated position would
+                        // sit in the map forever and — because retirement
+                        // refuses while holding — pin the squadron, blocking the
+                        // whole class for good. Book it against the venue's own
+                        // resolution once the venue stops accepting orders, the
+                        // same signal retirement trusts. `holding` was read
+                        // above and is deliberately not recomputed, so this
+                        // tick's retirement check still sees the position and
+                        // declines; the squadron retires on the next tick, once
+                        // `holding` reads the emptied map. A tick of delay on a
+                        // squadron whose market has closed costs nothing, and
+                        // re-reading the map here would mean taking its lock a
+                        // second time inside the same tick.
+                        // Throttled to the venue-status cadence: the booking
+                        // makes a Gamma request per distinct token per pass and
+                        // each can stall for the HTTP timeout, so running it on
+                        // every 75ms tick while a resolution is pending would be
+                        // hundreds of requests a minute at a venue that has
+                        // rate-limited this engine before.
+                        let ghost_settle_due = ghost_settle_probed_at
+                            .map_or(true, |t: Instant| t.elapsed().as_secs() >= EVENT_MARKET_STATUS_POLL_SECS);
+                        if holding
+                            && ghost_settle_due
+                            && venue_accepting_orders == Some(false)
+                            && crate::helpers::dynamic_config::ghosting_now()
+                        {
+                            ghost_settle_probed_at = Some(Instant::now());
+                            let n = crate::tasks::cleanup::settle_ghost_event_positions(
+                                &positions, &shared_http, &asset_lc,
+                                Some(market_class_for_ctx.as_str()),
+                                &hourly_condition_id,
+                                &hourly_yes_token, &hourly_no_token,
+                                venue_closed_for.unwrap_or(0),
+                            ).await;
+                            if n > 0 {
+                                info!(
+                                    "👻 Squadron [{}]: booked {} simulated settlement(s) on \"{}\" — releasing the squadron",
+                                    self.id, n, hourly_market_name,
+                                );
+                            }
+                        }
+
                         if let Some(reason) = event_market_retire_reason(
                             true, hourly_market_close_time, now, grace, holding,
                             venue_accepting_orders, venue_closed_for,
@@ -1424,6 +1474,7 @@ impl Squadron {
 
                     let ctx = StrategyContext {
                         squadron_id: squadron_id.clone(),
+                        market_class: Some(market_class_for_ctx.clone()),
                         market: hourly_market_config_for_ctx.clone(),
                         snapshot: hourly_snapshot.clone(),
                         positions: Arc::clone(&positions),

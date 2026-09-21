@@ -215,6 +215,15 @@ struct FairValueGlobals {
     /// bail, snipe and stop rules, and latching it would leave a position whose
     /// model collapsed with nothing armed.
     settle_hold_latched: StdMutex<HashMap<String, DateTime<Utc>>>,
+    /// Tokens whose position this viper opened on the sports model.
+    ///
+    /// Latched at entry rather than re-derived from the board, because the
+    /// board drops a line six hours after kick-off: a position still open then
+    /// would silently revert to the crypto rules — price stop re-armed, no
+    /// model veto, and the taker take-profit selling a winner at a $0.99 bid
+    /// instead of settling at $1.00. The posture a position was opened under
+    /// is a property of the position, not of what the board happens to hold now.
+    sports_opened: StdMutex<std::collections::HashSet<String>>,
     /// When each (condition_id, side) book last became — and has since stayed —
     /// clear of `fairvalue_obi_adverse_block`. Feeds the OBI clear dwell.
     obi_clear_since: StdMutex<HashMap<(String, bool), Instant>>,
@@ -296,6 +305,7 @@ impl FairValueGlobals {
             sl_counted:       StdMutex::new(HashMap::new()),
             veto_withdrawn:   StdMutex::new(HashMap::new()),
             settle_hold_latched: StdMutex::new(HashMap::new()),
+            sports_opened: StdMutex::new(std::collections::HashSet::new()),
             obi_clear_since:  StdMutex::new(HashMap::new()),
         }
     }
@@ -334,6 +344,51 @@ impl Default for FairValueStrategyImpl {
     fn default() -> Self {
         Self::new()
     }
+}
+
+
+/// One side's edge against the bookmaker consensus, or why it does not qualify.
+///
+/// The line-quality rules live here rather than inline because they are the
+/// board's own caveats turned into code: a line is a snapshot taken on a
+/// schedule, not a feed, so a consumer judges staleness itself; a consensus
+/// across two books is one book's opinion plus a de-vig artifact, since books
+/// quoting identical odds de-vig differently when their overrounds differ; and
+/// a line stays on the board for hours after kick-off, so "has a line" does not
+/// mean "is a pre-game market".
+
+pub(crate) struct SportsEdgeRules {
+    pub min_edge: Decimal,
+    /// Favorite floor. The pre-registered hypothesis is favorite-side only.
+    pub min_consensus: Decimal,
+    pub max_dispersion: Decimal,
+    pub max_age_secs: i64,
+    pub min_books: i64,
+}
+
+pub(crate) fn sports_side_edge(
+    l: &crate::raptors::sports_ledger::SportsLine,
+    ask: Decimal,
+    r: &SportsEdgeRules,
+    now: chrono::DateTime<Utc>,
+) -> std::result::Result<(Decimal, Decimal), &'static str> {
+    if l.secs_to_start(now) <= 0 { return Err("game already started"); }
+    if l.age_secs(now) > r.max_age_secs { return Err("line too old"); }
+    if l.num_books < r.min_books { return Err("too few books behind the consensus"); }
+    if ask <= dec!(0) || ask >= dec!(1) { return Err("no usable ask"); }
+    let fair = Decimal::from_f64_retain(l.consensus)
+        .map(|d| d.round_dp(6)).ok_or("consensus not representable")?;
+    // Favorite floor before the edge, because a longshot's "edge" is the de-vig
+    // artifact the pre-registration declares as its negative control: consensus
+    // sits above the venue mid in 98% of rows under $0.10 and 2% above $0.90.
+    if fair < r.min_consensus { return Err("longshot side (below the favorite floor)"); }
+    match l.dispersion.and_then(|d| Decimal::from_f64_retain(d).map(|x| x.round_dp(6))) {
+        Some(d) if d > r.max_dispersion => return Err("books disagree (dispersion above max)"),
+        _ => {}
+    }
+    let edge = fair - ask;
+    if edge < r.min_edge { return Err("edge below required"); }
+    Ok((edge, fair))
 }
 
 impl FairValueStrategyImpl {
@@ -908,7 +963,51 @@ impl FairValueStrategyImpl {
     }
 
     /// Drop the entry-fair record once a position is closed.
+    /// Remember that this position was opened on the sports model.
+    fn latch_sports_position(&self, asset: &str, token_id: &str) {
+        let mut reg = match globals(asset).sports_opened.lock() {
+            Ok(g) => g, Err(p) => p.into_inner(),
+        };
+        reg.insert(token_id.to_string());
+    }
+
+    /// Is this a sports position, for exit-posture purposes?
+    ///
+    /// The squadron's market class first, because it is stateless and survives
+    /// everything: a restart, and the board dropping the line six hours after
+    /// kick-off. The entry latch and the board are kept behind it as
+    /// belt-and-braces for a context built without a classified squadron — a
+    /// manually deployed market, or a venue path that does not carry the class.
+    ///
+    /// **The invariant that makes class-first safe**, and which a later change
+    /// must not break: the only way a FairValue position opens on a
+    /// sports-class market is `sports_entry`, which is unreachable without a
+    /// board line. So every FairValue position on a sports market has a
+    /// consensus behind it, and answering `true` on the class alone can never
+    /// apply the settlement hold to a position that has none. This is why the
+    /// venue constraint belongs at the entry and not here: on Kalshi and
+    /// Polymarket US the board is keyed by Polymarket International token ids,
+    /// so `ctx.sports` is always `None`, `sports_entry` is unreachable, and no
+    /// position exists to be mis-postured — while a Kalshi board, if one is
+    /// ever built, should get exactly this hold without a rule change.
+    fn sports_position(
+        &self,
+        asset: &str,
+        token_id: &str,
+        market_class: Option<&str>,
+        board_has_line: bool,
+    ) -> bool {
+        if market_class == Some("sports") {
+            return true;
+        }
+        let reg = match globals(asset).sports_opened.lock() {
+            Ok(g) => g, Err(p) => p.into_inner(),
+        };
+        reg.contains(token_id) || board_has_line
+    }
+
     fn clear_entry_fair(&self, asset: &str, token_id: &str) {
+        if let Ok(mut reg) = globals(asset).sports_opened.lock() { reg.remove(token_id); }
         let mut reg = match globals(asset).entry_fair.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
@@ -923,6 +1022,110 @@ impl FairValueStrategyImpl {
         dc.fairvalue_min_sigma_per_sqrt_sec
             .to_f64()
             .unwrap_or(config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC)
+    }
+
+
+    /// Price a sports moneyline from the bookmaker consensus.
+    ///
+    /// The crypto model cannot price a game: `fair_prob_for_side` needs a
+    /// strike, an oracle spot and a realized-vol estimate, none of which a
+    /// moneyline has, so `evaluate_entry` would idle at "no oracle price"
+    /// before it ever reached the strike check. When the board holds a line for
+    /// this market the vig-free consensus IS the fair value, and the decision
+    /// is that number against the ask.
+    ///
+    /// Off by default (`enable_sports_fairvalue`): the favorite-side hypothesis
+    /// is pre-registered and still gathering its sample, and a pass there
+    /// licenses a sized trial rather than consensus-as-fair on every sports
+    /// market. The gates below are the line-quality ones the board's own docs
+    /// insist a consumer applies for itself — a line is a snapshot, not a feed.
+    ///
+    /// **Exit posture.** `evaluate_exit` reads the same board: the side's
+    /// current consensus is its fair value, falling back to the entry
+    /// consensus once the line goes stale, so the model-reversal and bail
+    /// rules apply to a game as they do to an hourly. A sports position also
+    /// takes the settlement-hold posture outright rather than only when the
+    /// take-profit is unreachable (`sports_fairvalue_settle_hold`), because the
+    /// thesis it is entered on pays at settlement — a percentage stop would be
+    /// measuring a different strategy from the one the evidence is for. The
+    /// catastrophic floor stays armed either way.
+    async fn sports_entry(
+        &self,
+        ctx: &StrategyContext,
+        board_line: &crate::raptors::sports_ledger::SportsMarketLine,
+    ) -> Result<StrategySignal> {
+        let dc = &ctx.dynamic_config;
+        let idle = |r: &str| crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), r);
+        if !dc.enable_sports_fairvalue {
+            idle("sports FairValue switched off");
+            return Ok(StrategySignal::NoSignal);
+        }
+        let (market, snap) = (&ctx.market, &ctx.snapshot);
+        // The same staleness refusal and dwell bookkeeping the crypto path
+        // runs, and for the same reason: `finalize_entry` gates on a registry
+        // that only this writes.
+        if !self.book_live_and_dwell_recorded(ctx, market, snap) {
+            idle("snapshot stale");
+            return Ok(StrategySignal::NoSignal);
+        }
+        let now = Utc::now();
+
+        // Per side: the line has to be current, deep enough to be a consensus,
+        // and about a game that has not started. Reasons are collected so the
+        // card names the binding one rather than a generic "no signal".
+        let mut reason = "no line on either side";
+        let candidate = |is_yes: bool, reason: &mut &'static str| {
+            let l = board_line.side(if is_yes { 0 } else { 1 })?;
+            let ask = if is_yes { snap.yes_ask } else { snap.no_ask };
+            let rules = SportsEdgeRules {
+                min_edge: dc.sports_fairvalue_min_edge,
+                min_consensus: dc.sports_fairvalue_min_consensus,
+                max_dispersion: dc.sports_fairvalue_max_dispersion,
+                max_age_secs: dc.sports_line_max_age_secs,
+                min_books: dc.sports_line_min_books,
+            };
+            let (edge, fair) = match sports_side_edge(l, ask, &rules, now) {
+                Ok(v) => v,
+                Err(r) => { *reason = r; return None; }
+            };
+            Some((edge, fair, ask,
+                  if is_yes { market.yes_token.clone() } else { market.no_token.clone() },
+                  if is_yes { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 },
+                  l.clone()))
+        };
+        let yes = candidate(true, &mut reason);
+        let no  = candidate(false, &mut reason);
+        let Some((edge, fair, ask, token_id, fee_bps, line)) = (match (yes, no) {
+            (Some(y), Some(n)) => if y.0 >= n.0 { Some(y) } else { Some(n) },
+            (Some(y), None) => Some(y),
+            (None, Some(n)) => Some(n),
+            (None, None) => None,
+        }) else {
+            idle(reason);
+            return Ok(StrategySignal::NoSignal);
+        };
+        let want_yes = token_id == market.yes_token;
+
+        // Every remaining gate is the crypto path's, by calling it: exposure,
+        // no-pyramiding, sizing, collateral, the spread guard, the entry
+        // liquidity gate, the post-exit cooldown, the stop-loss circuit
+        // breaker, the edge persistence debounce and the OBI dwell. This used
+        // to be a parallel copy that had the first four and skipped the rest,
+        // which with a price stop and no cooldown meant a stopped-out position
+        // re-entered at once on a better ask and an unchanged consensus, and
+        // stopped again.
+        self.finalize_entry(
+            ctx, market, snap, want_yes, edge, dc.sports_fairvalue_min_edge, ask, token_id, fee_bps,
+            fair.to_f64().unwrap_or_default(),
+            EntryLog::Sports {
+                league: line.league.clone(),
+                outcome_label: line.outcome_label.clone(),
+                num_books: line.num_books,
+                dispersion: line.dispersion,
+                line_age_secs: line.age_secs(now),
+                secs_to_start: line.secs_to_start(now),
+            },
+        ).await
     }
 
     /// None when the model can't price (no strike/vol/time).
@@ -964,235 +1167,85 @@ impl FairValueStrategyImpl {
     }
 }
 
-#[async_trait]
-impl Strategy for FairValueStrategyImpl {
-    async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
+
+/// What an entry logs. The only thing that differs between the crypto model and
+/// the sports board once a side has been chosen, so it is the only thing the
+/// shared gate path is parameterized on.
+pub(crate) enum EntryLog {
+    Crypto { fair_yes: f64, d_sigma: f64, sigma: f64, sigma_realized: f64, strike: f64, secs_left: i64 },
+    Sports { league: String, outcome_label: String, num_books: i64, dispersion: Option<f64>, line_age_secs: i64, secs_to_start: i64 },
+}
+
+impl FairValueStrategyImpl {
+
+    /// Refuse a dark book, and record this tick's OBI dwell for both sides.
+    ///
+    /// Shared because `finalize_entry`'s OBI dwell gate reads a registry only
+    /// this writes. When the sports branch returned before this bookkeeping,
+    /// the dwell had no record for a game's market, `obi_dwell_satisfied`
+    /// answered false for a non-zero dwell, and every sports entry idled on
+    /// "OBI clear dwell — bid support too recent to trust" forever. The tests
+    /// could not see it: nothing drives `sports_entry` end to end. A gate whose
+    /// precondition is established somewhere else has to travel with it.
+    ///
+    /// Returns false when the snapshot is too old to price from, in which case
+    /// no dwell is recorded either — a dark book's OBI is not evidence.
+    fn book_live_and_dwell_recorded(
+        &self,
+        ctx: &StrategyContext,
+        market: &MarketConfig,
+        snap: &MarketSnapshot,
+    ) -> bool {
         let dc = &ctx.dynamic_config;
-        // "Why no trades?" registry feed (GET /api/vipers/status).
-        let idle = |r: &str| crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), r);
-        if !dc.enable_fairvalue {
-            idle("disabled in config");
-            return Ok(StrategySignal::NoSignal);
-        }
-        if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
-            idle("session drawdown limit hit");
-            return Ok(StrategySignal::NoSignal);
-        }
-
-        // ── Vol sampler feed (BEFORE structural gates) ───────────────────────
-        // Warmup must progress even while the venue/strike is temporarily
-        // unavailable, otherwise structural hiccups also stall the sampler.
-        let spot = match ctx.snapshot.oracle_price.to_f64() {
-            Some(s) if s > 0.0 => s,
-            _ => { idle("no oracle price"); return Ok(StrategySignal::NoSignal) },
-        };
-        let sigma_opt = self.update_and_read_sigma(&ctx.crypto_filter, spot);
-
-        // ── Venue selection ──────────────────────────────────────────────────
-        // The required edge is horizon-scaled: base × √(T/TAPER), capped at
-        // FAIRVALUE_EDGE_HORIZON_CAP. On the Window/Daily venue T is ~6-20 hours,
-        // which pins the requirement at the 0.25 cap — a 25% mispricing. Prod
-        // telemetry (2026-08-12, 478 evaluations over 16.5h): the best edge ever
-        // observed was 0.113 and the median was NEGATIVE, so daily-venue entries
-        // are not merely rare, they are arithmetically unreachable.
-        //
-        // The hourly venue's T taper resolves to roughly 0.03-0.10, which the
-        // observed edge distribution does reach. So prefer the hourly whenever it
-        // is structurally usable, and fall back to the daily only when it is not.
-        // `fairvalue_prefer_hourly` restores the old daily-first order if needed.
-        let (market, snap) = entry_book(ctx, dc.fairvalue_prefer_hourly);
-
-        // ── Structural requirements ──────────────────────────────────────────
-        let strike = match market.strike_price.and_then(|s| s.to_f64()) {
-            Some(s) if s > 0.0 => s,
-            _ => {
-                // An "Up or Down" market has no strike until its window opens
-                // (its strike IS the window's opening print), and the squadron
-                // is on it minutes before that. Say so, rather than reporting
-                // a market that merely lacks a strike: the two look identical
-                // from the registry and only one of them resolves itself.
-                let pre_open = market.market_close_time.is_some_and(|ct| {
-                    crate::helpers::time::hourly_window_reference_time(ct, Utc::now()).is_none()
-                });
-                idle(if pre_open { "window not open yet — no strike exists until the open" } else { "market has no strike price" });
-                return Ok(StrategySignal::NoSignal)
-            }
-        };
-        let secs_left = match market.market_close_time {
-            Some(ct) => (ct - Utc::now()).num_seconds(),
-            None => { idle("market has no close time"); return Ok(StrategySignal::NoSignal) },
-        };
-        if secs_left < config::FAIRVALUE_MIN_SECS_TO_EXPIRY {
-            idle("too close to expiry");
-            return Ok(StrategySignal::NoSignal);
-        }
         let snap_age = (Utc::now() - snap.timestamp).num_seconds();
         if snap_age > config::FAIRVALUE_MAX_SNAPSHOT_AGE_SECS {
-            idle("snapshot stale");
-            return Ok(StrategySignal::NoSignal);
+            return false;
         }
-        // OBI clear dwell bookkeeping, both sides, every tick this book is
-        // live — so by the time the edge has persisted its 45s the book's own
-        // history is already known, and a clean book costs no extra wait.
-        {
-            let now = Instant::now();
-            let mut since = globals(&ctx.crypto_filter).obi_clear_since.lock().unwrap();
-            for want_yes in [true, false] {
-                let clear = side_obi_of(snap, want_yes, dc.obi_use_whole_book) >= dc.fairvalue_obi_adverse_block;
-                obi_dwell_update(&mut since, &market.condition_id, want_yes, clear, now);
-            }
-            // Keys for markets this squadron no longer prices are dead weight.
-            let live: Vec<String> = std::iter::once(ctx.market.condition_id.clone())
-                .chain(ctx.maker_market.as_ref().map(|m| m.condition_id.clone()))
-                .collect();
-            since.retain(|(cid, _), _| live.contains(cid));
+        // Both sides, every tick this book is live — so by the time the edge has
+        // persisted its 45s the book's own history is already known, and a clean
+        // book costs no extra wait.
+        let now = Instant::now();
+        let mut since = globals(&ctx.crypto_filter).obi_clear_since.lock().unwrap();
+        for want_yes in [true, false] {
+            let clear = side_obi_of(snap, want_yes, dc.obi_use_whole_book) >= dc.fairvalue_obi_adverse_block;
+            obi_dwell_update(&mut since, &market.condition_id, want_yes, clear, now);
         }
+        // Keys for markets this squadron no longer prices are dead weight.
+        let live: Vec<String> = std::iter::once(ctx.market.condition_id.clone())
+            .chain(ctx.maker_market.as_ref().map(|m| m.condition_id.clone()))
+            .collect();
+        since.retain(|(cid, _), _| live.contains(cid));
+        true
+    }
 
-        // ── Model inputs: self-sampled realized vol (sampled above) ──────────
-        // The floor is applied here, not in the sampler, because its strength
-        // depends on how far out we are forecasting.
-        let floor = Self::sigma_floor(Self::min_sigma(dc), dc.fairvalue_sigma_floor_horizon_secs, secs_left);
-        let (sigma_realized, sigma) = match sigma_opt {
-            // warmup complete, oracle alive
-            Some(s) => (s, s.max(floor)),
-            None => {
-                // Warmup visibility: without this the viper is totally silent
-                // for the first FAIRVALUE_MIN_VOL_SAMPLES × SAMPLE_SECS.
-                let mut last = globals(&ctx.crypto_filter).last_diag_log_at.lock().unwrap();
-                let due = last.map_or(true, |t| t.elapsed().as_secs() >= config::DIAGNOSTIC_LOG_INTERVAL_SECS);
-                if due {
-                    *last = Some(Instant::now());
-                    let n = globals(&ctx.crypto_filter).vol_samples.lock().map(|s| s.len()).unwrap_or(0);
-                    tracing::info!(
-                        " FairValue: vol warmup {}/{} samples ({}s cadence)",
-                        n, config::FAIRVALUE_MIN_VOL_SAMPLES, config::FAIRVALUE_VOL_SAMPLE_SECS,
-                    );
-                }
-                idle("vol warmup in progress");
-                return Ok(StrategySignal::NoSignal);
-            }
-        };
-
-        // ── Fair value ────────────────────────────────────────────────────────
-        // `fair_yes` at the floored σ is the market-level model reading: it
-        // feeds the noise gate, the pin guards and the diagnostic exactly as
-        // before. Each side's EDGE is priced from `conservative_side_fairs`,
-        // the same pricing every exit rule reads.
-        let fair_yes = match fair_yes_probability(spot, strike, sigma, secs_left as f64) {
-            Some(p) => p,
-            None => { idle("fair value not computable"); return Ok(StrategySignal::NoSignal) },
-        };
-        let (fair_yes_side, fair_no_side) =
-            match Self::conservative_side_fairs(spot, strike, sigma_realized, floor, secs_left as f64) {
-                Some(f) => f,
-                None => { idle("fair value not computable"); return Ok(StrategySignal::NoSignal) },
-            };
-        let d_sigma = (spot / strike).ln() / (sigma * (secs_left as f64).sqrt());
-
-        // Fed before the guards below, for the same reason the vol sampler is:
-        // a gate that refuses entries must not also starve the measurement it
-        // will later be judged against.
-        //
-        // Deliberately fed the FLOORED fair value, not the per-side prices. For
-        // a favorite that is exactly the priced value. For a longshot the
-        // realized-vol price moves more with spot, so this understates its
-        // noise; that is accepted because `conservative_side_fairs` already
-        // leaves floor-priced longshots without edge, and feeding the per-side
-        // price would make the gate's yardstick jump whenever spot crosses the
-        // strike.
-        let fair_noise = self.update_and_read_fair_noise(&ctx.crypto_filter, &market.condition_id, fair_yes);
-
-        // ── Pin-risk guard (endgame coin-flip zone) ──────────────────────────
-        // Two separate refusals, both guarding the same hazard — buying a coin
-        // flip — but on different axes:
-        //   * endgame pin: near expiry a strike-hugging spot is unresolvable
-        //   * coin-flip floor: |d| below the threshold is noise at ANY horizon
-        let endgame_pin = secs_left < config::FAIRVALUE_PIN_GUARD_SECS
-            && d_sigma.abs() < config::FAIRVALUE_PIN_MIN_SIGMA;
-        let coin_flip = d_sigma.abs() < config::FAIRVALUE_MIN_ABS_SIGMA;
-        let pin_blocked = endgame_pin || coin_flip;
-
-        // ── Edge on each side (net of taker entry fee) ───────────────────────
-        let req_edge = Self::required_edge(dc, secs_left);
-        let to_dec = |p: f64| Decimal::from_f64_retain(p).map(|d| d.round_dp(10)).unwrap_or(dec!(0.5));
-        let fair_yes_dec = to_dec(fair_yes_side);
-        // Edge must clear the ROUND TRIP, not just the entry.
-        //
-        // Charging only the entry fee understated the true hurdle by roughly
-        // half. Measured over five Kalshi round trips on 2026-08-10: gross P&L
-        // −$0.07, fees −$1.05 — the fees were the entire loss. The exit fee is
-        // estimated at the model's own fair value, because that is where the
-        // contract trades if the thesis plays out. Holding to settlement pays
-        // no exit fee at all, so this errs conservative on purpose.
-        let fair_no_dec = to_dec(fair_no_side);
-        let yes_edge = Self::side_edge(fair_yes_dec, snap.yes_ask);
-        let no_edge = Self::side_edge(fair_no_dec, snap.no_ask);
-
-        // ── Periodic diagnostic (calibration visibility, throttled) ──────────
-        {
-            let mut last = globals(&ctx.crypto_filter).last_diag_log_at.lock().unwrap();
-            let due = last.map_or(true, |t| t.elapsed().as_secs() >= config::DIAGNOSTIC_LOG_INTERVAL_SECS);
-            if due {
-                *last = Some(Instant::now());
-                tracing::info!(
-                    " FairValue: fair(YES)={:.3} (d={:+.2}σ, σ/√s={:.2e} realized {:.2e}, T={}s, K=${:.2}) | yes_ask=${:.2} fair={:.3} edge={:+.3} | no_ask=${:.2} fair={:.3} edge={:+.3} | req={:.3} | noise{}={}{}",
-                    fair_yes, d_sigma, sigma, sigma_realized, secs_left, strike,
-                    snap.yes_ask, fair_yes_side, yes_edge, snap.no_ask, fair_no_side, no_edge, req_edge,
-                    config::FAIRVALUE_EDGE_NOISE_HORIZON_SECS,
-                    fair_noise.map_or_else(|| "warmup".to_string(), |n| format!("{:.3}", n)),
-                    match (endgame_pin, coin_flip) {
-                        (true, _) => " [PIN-GUARD]",
-                        (_, true) => " [COIN-FLIP]",
-                        _         => "",
-                    },
-                );
-            }
-        }
-
-        // ── Pick the better side, if any qualifies ───────────────────────────
-        let (want_yes, edge, ask, token_id, fee_bps) = if yes_edge >= no_edge {
-            (true, yes_edge, snap.yes_ask, market.yes_token.clone(), market.yes_fee_bps as u16)
-        } else {
-            (false, no_edge, snap.no_ask, market.no_token.clone(), market.no_fee_bps as u16)
-        };
-        if edge < req_edge || pin_blocked {
-            idle(match (endgame_pin, coin_flip) {
-                (true, _) => "pin-risk guard (endgame coin-flip)",
-                (_, true) => "coin-flip guard (|d| below floor)",
-                _         => "edge below required",
-            });
-            return Ok(StrategySignal::NoSignal);
-        }
-        if ask < dc.fairvalue_min_entry_price || ask > dc.fairvalue_max_entry_price {
-            idle("ask outside entry price band");
-            return Ok(StrategySignal::NoSignal);
-        }
-
-        // ── Edge vs the model's own noise ────────────────────────────────────
-        // `req_edge` scales with the forecast horizon but knows nothing about
-        // how steady the model has actually been on THIS market. Both matter:
-        // an 8¢ edge is meaningful when fair value has been drifting 2¢ per
-        // tick and meaningless when it has been swinging 18¢. On the 1AM ET
-        // market of 2026-08-14 fair(YES) travelled 0.118 → 0.808 in six minutes
-        // while the viper took two entries against a ~10¢ edge; both stopped
-        // out and the contract settled against the side it had bought.
-        if dc.fairvalue_edge_noise_multiple > dec!(0) {
-            match fair_noise {
-                Some(noise) => {
-                    let noise_dec = Decimal::from_f64_retain(noise).map(|d| d.round_dp(10)).unwrap_or(dec!(0));
-                    let required = dc.fairvalue_edge_noise_multiple * noise_dec;
-                    if edge < required {
-                        idle("edge below model noise");
-                        return Ok(StrategySignal::NoSignal);
-                    }
-                }
-                None => {
-                    idle("fair-value noise warmup");
-                    return Ok(StrategySignal::NoSignal);
-                }
-            }
-        }
-
+    /// Every gate that stands between a chosen side and a live order.
+    ///
+    /// Shared by both models deliberately. The sports entry first ran as a
+    /// parallel path that reimplemented exposure, sizing and collateral and
+    /// silently skipped the rest: the spread guard, the entry liquidity gate,
+    /// the post-exit cooldown, the stop-loss circuit breaker, the edge
+    /// persistence debounce and the OBI dwell. Each of those carries a dated
+    /// incident in its comment, and without the cooldown and the circuit
+    /// breaker a stopped-out position re-enters immediately — the ask is lower,
+    /// the model has not moved, so the edge is larger — and stops again. One
+    /// path means a gate earned by one model protects the other by default.
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_entry(
+        &self,
+        ctx: &StrategyContext,
+        market: &MarketConfig,
+        snap: &MarketSnapshot,
+        want_yes: bool,
+        edge: Decimal,
+        req_edge: Decimal,
+        ask: Decimal,
+        token_id: crate::venues::core::MarketId,
+        fee_bps: u16,
+        entry_fair: f64,
+        log: EntryLog,
+    ) -> Result<StrategySignal> {
+        let dc = &ctx.dynamic_config;
+        let idle = |r: &str| crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), r);
         // ── Spread guard: never buy into a position that is born stopped out ──
         // Entry crosses the spread at the ask, but every exit rule below marks
         // against the bid, so a wide book prices the position under water the
@@ -1364,32 +1417,53 @@ impl Strategy for FairValueStrategyImpl {
 
         let side = if want_yes { "YES" } else { "NO" };
         // Anchor the model-reversal exit to the thesis we are entering on.
-        let entry_fair = if want_yes { fair_yes_side } else { fair_no_side };
         self.record_entry_fair(&ctx.crypto_filter, token_id.as_str(), entry_fair);
+        if matches!(log, EntryLog::Sports { .. }) {
+            self.latch_sports_position(&ctx.crypto_filter, token_id.as_str());
+        }
         {
             // Throttled: a passed persistence gate re-fires every tick.
             let mut last = globals(&ctx.crypto_filter).last_entry_log_at.lock().unwrap();
             let due = last.map_or(true, |t| t.elapsed().as_secs() >= config::FAIRVALUE_ENTRY_LOG_THROTTLE_SECS);
             if due {
                 *last = Some(Instant::now());
-                tracing::info!(
-                    " FairValue {} entry: fair={:.3} ask=${:.2} edge={:+.3} (req {:.3}) | d={:+.2}σ T={}s K=${:.2} | shares={:.2}",
-                    side, entry_fair, ask, edge, req_edge, d_sigma, secs_left, strike, shares,
-                );
-                crate::helpers::metrics::stash_entry_signals_json(token_id.as_str(), serde_json::json!({
-                    "viper": "FairValue",
-                    "side": side,
-                    "fair_yes": fair_yes,
-                    "fair_side": entry_fair,
-                    "d_sigma": d_sigma,
-                    "sigma_per_sqrt_sec": sigma,
-                    "sigma_realized_per_sqrt_sec": sigma_realized,
-                    "strike": strike,
-                    "secs_left": secs_left,
-                    "ask": ask.to_string(),
-                    "edge": edge.to_string(),
-                    "required_edge": req_edge.to_string(),
-                }));
+                match &log {
+                    EntryLog::Crypto { fair_yes, d_sigma, sigma, sigma_realized, strike, secs_left } => {
+                        tracing::info!(
+                            " FairValue {} entry: fair={:.3} ask=${:.2} edge={:+.3} (req {:.3}) | d={:+.2}σ T={}s K=${:.2} | shares={:.2}",
+                            side, entry_fair, ask, edge, req_edge, d_sigma, secs_left, strike, shares,
+                        );
+                        crate::helpers::metrics::stash_entry_signals_json(token_id.as_str(), serde_json::json!({
+                            "viper": "FairValue", "model": "lognormal", "side": side,
+                            "fair_yes": fair_yes, "fair_side": entry_fair,
+                            "d_sigma": d_sigma, "sigma_per_sqrt_sec": sigma,
+                            "sigma_realized_per_sqrt_sec": sigma_realized,
+                            "strike": strike, "secs_left": secs_left,
+                            "ask": ask.to_string(), "edge": edge.to_string(),
+                            "required_edge": req_edge.to_string(),
+                        }));
+                    }
+                    EntryLog::Sports { league, outcome_label, num_books, dispersion, line_age_secs, secs_to_start } => {
+                        // "gross" is deliberate: the edge is consensus minus ask
+                        // with no fee netted, which is the pre-registration's own
+                        // edge definition. The return is netted at settlement.
+                        tracing::info!(
+                            " FairValue {} sports entry: consensus={:.3} ask=${:.2} gross edge={:+.3} (req {:.3}) | {} {} | {} books, dispersion {} | line {}s old, kick-off in {}s | shares={:.2}",
+                            side, entry_fair, ask, edge, req_edge, league, outcome_label, num_books,
+                            dispersion.map_or("n/a".to_string(), |d| format!("{d:.4}")),
+                            line_age_secs, secs_to_start, shares,
+                        );
+                        crate::helpers::metrics::stash_entry_signals_json(token_id.as_str(), serde_json::json!({
+                            "viper": "FairValue", "model": "sports_consensus", "side": side,
+                            "consensus": entry_fair, "num_books": num_books,
+                            "dispersion": dispersion, "league": league,
+                            "outcome_label": outcome_label,
+                            "line_age_secs": line_age_secs, "secs_to_start": secs_to_start,
+                            "ask": ask.to_string(), "gross_edge": edge.to_string(),
+                            "required_edge": req_edge.to_string(),
+                        }));
+                    }
+                }
             }
         }
 
@@ -1408,6 +1482,234 @@ impl Strategy for FairValueStrategyImpl {
             },
             pair_params: None,
         })
+    }
+}
+
+#[async_trait]
+impl Strategy for FairValueStrategyImpl {
+    async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
+        let dc = &ctx.dynamic_config;
+        // "Why no trades?" registry feed (GET /api/vipers/status).
+        let idle = |r: &str| crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), r);
+        if !dc.enable_fairvalue {
+            idle("disabled in config");
+            return Ok(StrategySignal::NoSignal);
+        }
+        if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
+            idle("session drawdown limit hit");
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Sports: the bookmaker consensus is the model ─────────────────────
+        // Before the vol sampler, because a game has no oracle price: the read
+        // below would idle at "no oracle price" and a sports squadron's
+        // FairValue would never say anything more useful than that.
+        if let Some(line) = ctx.sports.as_ref() {
+            return self.sports_entry(ctx, line).await;
+        }
+
+        // ── Vol sampler feed (BEFORE structural gates) ───────────────────────
+        // Warmup must progress even while the venue/strike is temporarily
+        // unavailable, otherwise structural hiccups also stall the sampler.
+        let spot = match ctx.snapshot.oracle_price.to_f64() {
+            Some(s) if s > 0.0 => s,
+            _ => { idle("no oracle price"); return Ok(StrategySignal::NoSignal) },
+        };
+        let sigma_opt = self.update_and_read_sigma(&ctx.crypto_filter, spot);
+
+        // ── Venue selection ──────────────────────────────────────────────────
+        // The required edge is horizon-scaled: base × √(T/TAPER), capped at
+        // FAIRVALUE_EDGE_HORIZON_CAP. On the Window/Daily venue T is ~6-20 hours,
+        // which pins the requirement at the 0.25 cap — a 25% mispricing. Prod
+        // telemetry (2026-08-12, 478 evaluations over 16.5h): the best edge ever
+        // observed was 0.113 and the median was NEGATIVE, so daily-venue entries
+        // are not merely rare, they are arithmetically unreachable.
+        //
+        // The hourly venue's T taper resolves to roughly 0.03-0.10, which the
+        // observed edge distribution does reach. So prefer the hourly whenever it
+        // is structurally usable, and fall back to the daily only when it is not.
+        // `fairvalue_prefer_hourly` restores the old daily-first order if needed.
+        let (market, snap) = entry_book(ctx, dc.fairvalue_prefer_hourly);
+
+        // ── Structural requirements ──────────────────────────────────────────
+        let strike = match market.strike_price.and_then(|s| s.to_f64()) {
+            Some(s) if s > 0.0 => s,
+            _ => {
+                // An "Up or Down" market has no strike until its window opens
+                // (its strike IS the window's opening print), and the squadron
+                // is on it minutes before that. Say so, rather than reporting
+                // a market that merely lacks a strike: the two look identical
+                // from the registry and only one of them resolves itself.
+                let pre_open = market.market_close_time.is_some_and(|ct| {
+                    crate::helpers::time::hourly_window_reference_time(ct, Utc::now()).is_none()
+                });
+                idle(if pre_open { "window not open yet — no strike exists until the open" } else { "market has no strike price" });
+                return Ok(StrategySignal::NoSignal)
+            }
+        };
+        let secs_left = match market.market_close_time {
+            Some(ct) => (ct - Utc::now()).num_seconds(),
+            None => { idle("market has no close time"); return Ok(StrategySignal::NoSignal) },
+        };
+        if secs_left < config::FAIRVALUE_MIN_SECS_TO_EXPIRY {
+            idle("too close to expiry");
+            return Ok(StrategySignal::NoSignal);
+        }
+        if !self.book_live_and_dwell_recorded(ctx, market, snap) {
+            idle("snapshot stale");
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Model inputs: self-sampled realized vol (sampled above) ──────────
+        // The floor is applied here, not in the sampler, because its strength
+        // depends on how far out we are forecasting.
+        let floor = Self::sigma_floor(Self::min_sigma(dc), dc.fairvalue_sigma_floor_horizon_secs, secs_left);
+        let (sigma_realized, sigma) = match sigma_opt {
+            // warmup complete, oracle alive
+            Some(s) => (s, s.max(floor)),
+            None => {
+                // Warmup visibility: without this the viper is totally silent
+                // for the first FAIRVALUE_MIN_VOL_SAMPLES × SAMPLE_SECS.
+                let mut last = globals(&ctx.crypto_filter).last_diag_log_at.lock().unwrap();
+                let due = last.map_or(true, |t| t.elapsed().as_secs() >= config::DIAGNOSTIC_LOG_INTERVAL_SECS);
+                if due {
+                    *last = Some(Instant::now());
+                    let n = globals(&ctx.crypto_filter).vol_samples.lock().map(|s| s.len()).unwrap_or(0);
+                    tracing::info!(
+                        " FairValue: vol warmup {}/{} samples ({}s cadence)",
+                        n, config::FAIRVALUE_MIN_VOL_SAMPLES, config::FAIRVALUE_VOL_SAMPLE_SECS,
+                    );
+                }
+                idle("vol warmup in progress");
+                return Ok(StrategySignal::NoSignal);
+            }
+        };
+
+        // ── Fair value ────────────────────────────────────────────────────────
+        // `fair_yes` at the floored σ is the market-level model reading: it
+        // feeds the noise gate, the pin guards and the diagnostic exactly as
+        // before. Each side's EDGE is priced from `conservative_side_fairs`,
+        // the same pricing every exit rule reads.
+        let fair_yes = match fair_yes_probability(spot, strike, sigma, secs_left as f64) {
+            Some(p) => p,
+            None => { idle("fair value not computable"); return Ok(StrategySignal::NoSignal) },
+        };
+        let (fair_yes_side, fair_no_side) =
+            match Self::conservative_side_fairs(spot, strike, sigma_realized, floor, secs_left as f64) {
+                Some(f) => f,
+                None => { idle("fair value not computable"); return Ok(StrategySignal::NoSignal) },
+            };
+        let d_sigma = (spot / strike).ln() / (sigma * (secs_left as f64).sqrt());
+
+        // Fed before the guards below, for the same reason the vol sampler is:
+        // a gate that refuses entries must not also starve the measurement it
+        // will later be judged against.
+        //
+        // Deliberately fed the FLOORED fair value, not the per-side prices. For
+        // a favorite that is exactly the priced value. For a longshot the
+        // realized-vol price moves more with spot, so this understates its
+        // noise; that is accepted because `conservative_side_fairs` already
+        // leaves floor-priced longshots without edge, and feeding the per-side
+        // price would make the gate's yardstick jump whenever spot crosses the
+        // strike.
+        let fair_noise = self.update_and_read_fair_noise(&ctx.crypto_filter, &market.condition_id, fair_yes);
+
+        // ── Pin-risk guard (endgame coin-flip zone) ──────────────────────────
+        // Two separate refusals, both guarding the same hazard — buying a coin
+        // flip — but on different axes:
+        //   * endgame pin: near expiry a strike-hugging spot is unresolvable
+        //   * coin-flip floor: |d| below the threshold is noise at ANY horizon
+        let endgame_pin = secs_left < config::FAIRVALUE_PIN_GUARD_SECS
+            && d_sigma.abs() < config::FAIRVALUE_PIN_MIN_SIGMA;
+        let coin_flip = d_sigma.abs() < config::FAIRVALUE_MIN_ABS_SIGMA;
+        let pin_blocked = endgame_pin || coin_flip;
+
+        // ── Edge on each side (net of taker entry fee) ───────────────────────
+        let req_edge = Self::required_edge(dc, secs_left);
+        let to_dec = |p: f64| Decimal::from_f64_retain(p).map(|d| d.round_dp(10)).unwrap_or(dec!(0.5));
+        let fair_yes_dec = to_dec(fair_yes_side);
+        // Edge must clear the ROUND TRIP, not just the entry.
+        //
+        // Charging only the entry fee understated the true hurdle by roughly
+        // half. Measured over five Kalshi round trips on 2026-08-10: gross P&L
+        // −$0.07, fees −$1.05 — the fees were the entire loss. The exit fee is
+        // estimated at the model's own fair value, because that is where the
+        // contract trades if the thesis plays out. Holding to settlement pays
+        // no exit fee at all, so this errs conservative on purpose.
+        let fair_no_dec = to_dec(fair_no_side);
+        let yes_edge = Self::side_edge(fair_yes_dec, snap.yes_ask);
+        let no_edge = Self::side_edge(fair_no_dec, snap.no_ask);
+
+        // ── Periodic diagnostic (calibration visibility, throttled) ──────────
+        {
+            let mut last = globals(&ctx.crypto_filter).last_diag_log_at.lock().unwrap();
+            let due = last.map_or(true, |t| t.elapsed().as_secs() >= config::DIAGNOSTIC_LOG_INTERVAL_SECS);
+            if due {
+                *last = Some(Instant::now());
+                tracing::info!(
+                    " FairValue: fair(YES)={:.3} (d={:+.2}σ, σ/√s={:.2e} realized {:.2e}, T={}s, K=${:.2}) | yes_ask=${:.2} fair={:.3} edge={:+.3} | no_ask=${:.2} fair={:.3} edge={:+.3} | req={:.3} | noise{}={}{}",
+                    fair_yes, d_sigma, sigma, sigma_realized, secs_left, strike,
+                    snap.yes_ask, fair_yes_side, yes_edge, snap.no_ask, fair_no_side, no_edge, req_edge,
+                    config::FAIRVALUE_EDGE_NOISE_HORIZON_SECS,
+                    fair_noise.map_or_else(|| "warmup".to_string(), |n| format!("{:.3}", n)),
+                    match (endgame_pin, coin_flip) {
+                        (true, _) => " [PIN-GUARD]",
+                        (_, true) => " [COIN-FLIP]",
+                        _         => "",
+                    },
+                );
+            }
+        }
+
+        // ── Pick the better side, if any qualifies ───────────────────────────
+        let (want_yes, edge, ask, token_id, fee_bps) = if yes_edge >= no_edge {
+            (true, yes_edge, snap.yes_ask, market.yes_token.clone(), market.yes_fee_bps as u16)
+        } else {
+            (false, no_edge, snap.no_ask, market.no_token.clone(), market.no_fee_bps as u16)
+        };
+        if edge < req_edge || pin_blocked {
+            idle(match (endgame_pin, coin_flip) {
+                (true, _) => "pin-risk guard (endgame coin-flip)",
+                (_, true) => "coin-flip guard (|d| below floor)",
+                _         => "edge below required",
+            });
+            return Ok(StrategySignal::NoSignal);
+        }
+        if ask < dc.fairvalue_min_entry_price || ask > dc.fairvalue_max_entry_price {
+            idle("ask outside entry price band");
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Edge vs the model's own noise ────────────────────────────────────
+        // `req_edge` scales with the forecast horizon but knows nothing about
+        // how steady the model has actually been on THIS market. Both matter:
+        // an 8¢ edge is meaningful when fair value has been drifting 2¢ per
+        // tick and meaningless when it has been swinging 18¢. On the 1AM ET
+        // market of 2026-08-14 fair(YES) travelled 0.118 → 0.808 in six minutes
+        // while the viper took two entries against a ~10¢ edge; both stopped
+        // out and the contract settled against the side it had bought.
+        if dc.fairvalue_edge_noise_multiple > dec!(0) {
+            match fair_noise {
+                Some(noise) => {
+                    let noise_dec = Decimal::from_f64_retain(noise).map(|d| d.round_dp(10)).unwrap_or(dec!(0));
+                    let required = dc.fairvalue_edge_noise_multiple * noise_dec;
+                    if edge < required {
+                        idle("edge below model noise");
+                        return Ok(StrategySignal::NoSignal);
+                    }
+                }
+                None => {
+                    idle("fair-value noise warmup");
+                    return Ok(StrategySignal::NoSignal);
+                }
+            }
+        }
+
+        let entry_fair = if want_yes { fair_yes_side } else { fair_no_side };
+        self.finalize_entry(
+            ctx, market, snap, want_yes, edge, req_edge, ask, token_id, fee_bps, entry_fair,
+            EntryLog::Crypto { fair_yes, d_sigma, sigma, sigma_realized, strike, secs_left },
+        ).await
     }
 
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
@@ -1471,10 +1773,25 @@ impl Strategy for FairValueStrategyImpl {
                 .market_close_time
                 .map(|ct| (ct - Utc::now()).num_seconds())
                 .unwrap_or(i64::MAX);
-            let fair_side = self.fair_prob_for_side(
-                &ctx.crypto_filter, market, snap, token_is_yes,
-                Self::min_sigma(dc), dc.fairvalue_sigma_floor_horizon_secs,
-            );
+            // ── Sports: the board is the model on exit too ───────────────────
+            // `fair_prob_for_side` returns None for a game — it needs a strike —
+            // which left every model rule inert and the position managed by the
+            // crypto price stops alone. That is the wrong instrument for a
+            // thesis defined as hold-to-settlement, not merely a blunt one. The
+            // current consensus is the fair value; when the line has gone stale
+            // the entry consensus stands, which is exactly what
+            // `reversal_baseline` already supplies for a restarted process.
+            let sports_side = ctx.sports.as_ref()
+                .and_then(|sl| sl.side(if token_is_yes { 0 } else { 1 }));
+            let fair_side = match sports_side {
+                Some(l) if l.age_secs(Utc::now()) <= dc.sports_line_max_age_secs
+                        && l.num_books >= dc.sports_line_min_books => Some(l.consensus),
+                Some(_) => Some(self.reversal_baseline(&ctx.crypto_filter, token_id.as_str(), avg_entry)),
+                None => self.fair_prob_for_side(
+                    &ctx.crypto_filter, market, snap, token_is_yes,
+                    Self::min_sigma(dc), dc.fairvalue_sigma_floor_horizon_secs,
+                ),
+            };
 
             // ── Settlement-snipe posture ─────────────────────────────────────
             // Entry × (1 + TP) at or above $1.00 is a take-profit that cannot
@@ -1482,9 +1799,40 @@ impl Strategy for FairValueStrategyImpl {
             // its only upside. Rule 4's percentage stop is then replaced by the
             // model's EV test (rule 3b); only the catastrophic floor survives.
             // Requires a model reading — without one the price stop stays armed.
-            let settle_snipe = dc.fairvalue_settle_snipe_hold
-                && Self::tp_unreachable(avg_entry, dc.fairvalue_target_profit_pct)
-                && fair_side.is_some();
+            // A sports position takes the settlement-hold posture outright, not
+            // only when the take-profit is unreachable: the thesis it was
+            // entered on pays at settlement, so the percentage stop would be
+            // measuring something else. The catastrophic floor survives either
+            // way (`price_stop_armed = !settle_snipe || catastrophic`).
+            // ── Sports posture: pre-game the board is the model; in play, hold ─
+            // The thesis a sports position is opened on pays at settlement, so
+            // every rule that realizes something else is measuring a different
+            // strategy. Three did: the taker take-profit (rule 1), the endgame
+            // bail (rule 3) and the snipe exit (rule 3b).
+            //
+            // Rule 3 was the worst of them, and its damage depended on an
+            // accident: a sports market's close time is kick-off itself on
+            // football and soccer but a week later on MLB, so at `secs_left <
+            // bail_secs` every football favorite under the bail probability was
+            // dumped two minutes before kick-off and stayed dumpable all game,
+            // while the same position on MLB was never touched. A posture that
+            // varies by how the venue dates the market is not a posture.
+            //
+            // So: hold. Rule 2 (model reversal) survives only while the line is
+            // pre-game and credible, because a consensus that collapses before
+            // kick-off means the trade the hypothesis describes no longer
+            // exists. Once the game is under way there is no live model — the
+            // ledger's in-play snapshots are an hour apart — and the entry
+            // consensus describes a game state that has gone, so nothing reads
+            // it. The catastrophic floor is the single armed exit, and even
+            // that is a knob because the pre-registered return has no stop.
+            let is_sports = self.sports_position(&ctx.crypto_filter, token_id.as_str(),
+                ctx.market_class.as_deref(), sports_side.is_some());
+            let sports_hold = dc.sports_fairvalue_settle_hold && is_sports;
+            let settle_snipe = fair_side.is_some()
+                && ((sports_side.is_some() && dc.sports_fairvalue_settle_hold)
+                    || (dc.fairvalue_settle_snipe_hold
+                        && Self::tp_unreachable(avg_entry, dc.fairvalue_target_profit_pct)));
 
             let exit_params = |price: Decimal| OrderParams {
                 token_id: token_id.clone(),
@@ -1507,8 +1855,9 @@ impl Strategy for FairValueStrategyImpl {
                 // with nothing armed for as long as the bid stays above the target.
                 // Re-deciding each tick lets a collapse fall through to this taker
                 // take-profit, as it always has.
-                let settle_hold = secs_left < dc.fairvalue_settle_hold_secs
-                    && fair_side.map_or(false, |p| p >= settle_hold_min_prob);
+                let settle_hold = sports_hold
+                    || (secs_left < dc.fairvalue_settle_hold_secs
+                        && fair_side.map_or(false, |p| p >= settle_hold_min_prob));
                 if !settle_hold {
                     self.arm_cooldown(&ctx.crypto_filter, token_id.as_str());
                     return Ok(StrategySignal::Exit {
@@ -1527,7 +1876,16 @@ impl Strategy for FairValueStrategyImpl {
             let baseline = self.reversal_baseline(&ctx.crypto_filter, token_id.as_str(), avg_entry);
             let decay_pct = dc.fairvalue_model_reversal_decay_pct.to_f64().unwrap_or(0.0);
             let reversal_floor = baseline * (1.0 - decay_pct);
+            // Rule 2 is off for a sports position: the pre-registered return is
+            // settlement and "every filter is listed", so an exit it does not
+            // define makes the trade unscorable against the pass bar. The
+            // protection it bought was nearly empty anyway — entry lands at the
+            // -10m snapshot, rule 2 needs 60s held and a fresh line, so it could
+            // only ever act on a 35% consensus collapse inside a few minutes
+            // before kick-off. A scratch-news exit is a dated amendment, not a
+            // default.
             if secs_held >= 60
+                && !sports_hold
                 && bid >= dc.fairvalue_min_exit_bid
                 && fair_side.map_or(false, |p| p < reversal_floor)
             {
@@ -1544,7 +1902,15 @@ impl Strategy for FairValueStrategyImpl {
             }
 
             // ── 3. Endgame bail-out — don't gamble a fading side on settlement ─
-            if secs_left < dc.fairvalue_bail_secs
+            // Keyed to `is_sports`, not to the hold: switching the hold off is a
+            // choice to manage a sports position on price, which rules 1, 4 and
+            // 5 can honor, but "endgame" has no meaning for a game market. The
+            // stated close is kick-off on football and soccer and a week later
+            // on MLB, so leaving this armed in the off state brings back the
+            // same asymmetry the hold exists to remove — every sub-bail-prob
+            // favorite dumped two minutes before kick-off, on football only.
+            if !is_sports
+                && secs_left < dc.fairvalue_bail_secs
                 && bid >= dc.fairvalue_min_exit_bid
                 && fair_side.map_or(false, |p| p < bail_prob)
             {
@@ -1567,6 +1933,7 @@ impl Strategy for FairValueStrategyImpl {
             // stop-out for the circuit breaker when it books a loss: the model
             // turned, which is the miscalibration the breaker exists to notice.
             if settle_snipe
+                && !sports_hold
                 && secs_held >= config::FAIRVALUE_MIN_HOLD_SECS_BEFORE_STOP_LOSS
                 && bid >= dc.fairvalue_min_exit_bid
             {
@@ -1603,10 +1970,20 @@ impl Strategy for FairValueStrategyImpl {
             // identically. Below the floor, hold and let the normal min-hold
             // gate decide once the book has had a chance to quote back.
             let catastrophic = profit_margin <= -(dc.fairvalue_stop_loss_pct * dec!(2))
-                && secs_held >= config::FAIRVALUE_MIN_HOLD_SECS_BEFORE_STOP_LOSS / 2;
+                && secs_held >= config::FAIRVALUE_MIN_HOLD_SECS_BEFORE_STOP_LOSS / 2
+                && (!sports_hold || dc.sports_fairvalue_catastrophic_armed);
             // In the settlement-snipe posture only the catastrophic floor is
             // armed; the percentage stop has been replaced by rule 3b.
-            let price_stop_armed = !settle_snipe || catastrophic;
+            //
+            // `sports_hold` is checked separately rather than through
+            // `settle_snipe`, whose sports arm reads the board (`sports_side`)
+            // and not the latch. A latched position whose line has left the
+            // board — six hours after kick-off, or a restart past that — has
+            // `sports_side: None` and `fair_side: None`, so `settle_snipe` is
+            // false and the percentage stop would re-arm on a position the
+            // hold is supposed to carry to settlement. The latch protected the
+            // other five rules and this one was reachable by the other path.
+            let price_stop_armed = (!settle_snipe && !sports_hold) || catastrophic;
             if price_stop_armed
                 && profit_margin <= -dc.fairvalue_stop_loss_pct
                 && (catastrophic || secs_held >= config::FAIRVALUE_MIN_HOLD_SECS_BEFORE_STOP_LOSS)
@@ -1750,7 +2127,17 @@ impl Strategy for FairValueStrategyImpl {
             // price does not exist and `resting_tp_price` returns nothing —
             // that position is managed to settlement by rule 3b. The consumer
             // is idempotent, so re-emitting every tick is the contract.
-            if dc.fairvalue_resting_tp_enabled
+            //
+            // A sports position rests nothing. That reasoning about the snipe
+            // posture does not carry: for sports `settle_snipe` is true by knob
+            // rather than because the target is unreachable, so a 0.70 entry
+            // still has a reachable 0.84 target and `resting_tp_price` would
+            // return it. The ask would then sit on the book and be lifted the
+            // first time the favorite ran in play — a sale before settlement,
+            // and a silent one, since the viper learns of it only when the
+            // position disappears.
+            if !sports_hold
+                && dc.fairvalue_resting_tp_enabled
                 && position.fill_effective_at(dc.ghost_mode).is_some()
                 && position.shares >= crate::venues::min_order_shares()
             {
@@ -2619,6 +3006,7 @@ mod entry_book_tests {
 
     fn ctx(hourly: MarketSnapshot, maker: MarketSnapshot) -> StrategyContext {
         StrategyContext {
+            market_class: None,
             squadron_id: "btc-open".to_string(),
             market: market("h-yes", "h-no", "Bitcoin Up or Down - September 2, 5PM ET", "cid-hourly"),
             snapshot: hourly,
@@ -3643,3 +4031,86 @@ mod obi_dwell_tests {
         assert!(obi_dwell_satisfied(&since, CID, true, t0, 0));
     }
 }
+
+#[cfg(test)]
+mod sports_consensus_tests {
+    use super::{sports_side_edge, SportsEdgeRules};
+    use crate::raptors::sports_ledger::SportsLine;
+    use chrono::{Duration, Utc};
+    use rust_decimal_macros::dec;
+
+    fn rules() -> SportsEdgeRules {
+        SportsEdgeRules {
+            min_edge: dec!(0.03), min_consensus: dec!(0.55),
+            max_dispersion: dec!(0.06), max_age_secs: 300, min_books: 5,
+        }
+    }
+
+    fn line(consensus: f64, books: i64, age_secs: i64, starts_in_secs: i64, dispersion: Option<f64>) -> SportsLine {
+        let now = Utc::now();
+        SportsLine {
+            league: "nfl".into(), sport_key: "americanfootball_nfl".into(),
+            odds_event_id: "e1".into(),
+            commence: now + Duration::seconds(starts_in_secs),
+            outcome_label: "Rams".into(),
+            consensus, num_books: books, dispersion,
+            max_book_age_secs: Some(30),
+            odds_at: now - Duration::seconds(age_secs), drift: None,
+        }
+    }
+
+    /// The favorite side, fresh, deep and pre-game, priced below consensus.
+    #[test]
+    fn a_fresh_deep_pre_game_favorite_prices_the_side() {
+        let l = line(0.726, 10, 30, 1800, Some(0.01));
+        let (edge, fair) = sports_side_edge(&l, dec!(0.68), &rules(), Utc::now()).expect("qualifies");
+        assert_eq!(fair, dec!(0.726));
+        assert_eq!(edge, dec!(0.046));
+    }
+
+    /// The longshot side is refused however large its apparent edge, because
+    /// that edge is the de-vig artifact the pre-registration treats as its
+    /// negative control. A 0.30 consensus against a 0.20 ask is a 10c "edge"
+    /// and exactly the trade the evidence says loses.
+    #[test]
+    fn the_longshot_side_is_refused_however_large_the_edge() {
+        let l = line(0.30, 12, 30, 1800, Some(0.01));
+        assert_eq!(sports_side_edge(&l, dec!(0.20), &rules(), Utc::now()).unwrap_err(),
+            "longshot side (below the favorite floor)");
+    }
+
+    /// Each remaining rule, named. A line outliving its game is the one that
+    /// bites in practice: the board keeps lines for six hours after kick-off.
+    #[test]
+    fn each_rule_names_itself() {
+        let now = Utc::now();
+        let cases: [(SportsLine, &str); 5] = [
+            (line(0.726, 10,  30,  -60, Some(0.01)), "game already started"),
+            (line(0.726, 10, 600, 1800, Some(0.01)), "line too old"),
+            (line(0.726,  2,  30, 1800, Some(0.01)), "too few books behind the consensus"),
+            (line(0.726, 10,  30, 1800, Some(0.20)), "books disagree (dispersion above max)"),
+            (line(0.700, 10,  30, 1800, Some(0.01)), "edge below required"),
+        ];
+        for (l, expected) in cases {
+            assert_eq!(sports_side_edge(&l, dec!(0.68), &rules(), now).unwrap_err(), expected);
+        }
+    }
+
+    /// A line with no dispersion recorded is not refused on that ground: the
+    /// gate binds on evidence of disagreement, not on its absence.
+    #[test]
+    fn a_missing_dispersion_does_not_refuse_the_side() {
+        let l = line(0.726, 10, 30, 1800, None);
+        assert!(sports_side_edge(&l, dec!(0.68), &rules(), Utc::now()).is_ok());
+    }
+
+    /// An ask at or past the payout bound is not a price to buy at.
+    #[test]
+    fn an_unusable_ask_is_refused_before_the_edge_is_computed() {
+        let l = line(0.99, 10, 30, 1800, Some(0.01));
+        for ask in [dec!(0), dec!(1)] {
+            assert_eq!(sports_side_edge(&l, ask, &rules(), Utc::now()).unwrap_err(), "no usable ask");
+        }
+    }
+}
+

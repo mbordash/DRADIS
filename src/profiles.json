@@ -214,6 +214,15 @@
         "tennis_poll_secs": 900,
         "tennis_low_budget_warn": 20,
         "sports_odds_regions": "us",
+        "enable_sports_fairvalue": false,
+        "sports_fairvalue_min_edge": "0.05",
+        "sports_line_max_age_secs": 300,
+        "sports_line_min_books": 6,
+        "sports_maker_max_dispersion": "0.05",
+        "sports_fairvalue_min_consensus": "0.60",
+        "sports_fairvalue_max_dispersion": "0.04",
+        "sports_fairvalue_settle_hold": true,
+        "sports_fairvalue_catastrophic_armed": true,
         "tennis_tour": ""
       }
     },
@@ -430,6 +439,15 @@
         "tennis_poll_secs": 900,
         "tennis_low_budget_warn": 20,
         "sports_odds_regions": "us",
+        "enable_sports_fairvalue": false,
+        "sports_fairvalue_min_edge": "0.03",
+        "sports_line_max_age_secs": 300,
+        "sports_line_min_books": 5,
+        "sports_maker_max_dispersion": "0.08",
+        "sports_fairvalue_min_consensus": "0.55",
+        "sports_fairvalue_max_dispersion": "0.06",
+        "sports_fairvalue_settle_hold": true,
+        "sports_fairvalue_catastrophic_armed": true,
         "tennis_tour": ""
       }
     },
@@ -646,6 +664,15 @@
         "tennis_poll_secs": 900,
         "tennis_low_budget_warn": 20,
         "sports_odds_regions": "us",
+        "enable_sports_fairvalue": false,
+        "sports_fairvalue_min_edge": "0.02",
+        "sports_line_max_age_secs": 300,
+        "sports_line_min_books": 4,
+        "sports_maker_max_dispersion": "0.12",
+        "sports_fairvalue_min_consensus": "0.55",
+        "sports_fairvalue_max_dispersion": "0.10",
+        "sports_fairvalue_settle_hold": true,
+        "sports_fairvalue_catastrophic_armed": true,
         "tennis_tour": ""
       }
     }
