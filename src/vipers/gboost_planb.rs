@@ -99,6 +99,8 @@ pub const TRAINED_VENUE: &str = "polymarket-intl";
 
 /// Column index of `funding`, the one input whose availability differs by instance.
 const FUNDING_COLUMN: usize = 22;
+/// `oi_d5`, `oi_d30`, `tlsr`, `tlsr15` in `FEATURE_NAMES`.
+pub const DERIV_COLUMNS: [usize; 4] = [23, 24, 25, 26];
 /// The first production model's `label` stamp and the plan it was built with.
 const REFERENCE_LABEL: &str = "B_aggr20";
 const REFERENCE_PLAN: [f64; 4] = [0.20, 0.11, 0.43, 0.75];
@@ -199,6 +201,81 @@ pub struct DecisionInputs<'a> {
     pub ask: [f64; 2],
     /// Last settled funding rate at or before `t`; `None` is a missing input.
     pub funding: Option<f64>,
+    /// The four derivatives columns at `t`, from [`deriv_features_at`]; `None` is a
+    /// missing input, as for funding.
+    pub oi_d5: Option<f64>,
+    pub oi_d30: Option<f64>,
+    pub tlsr: Option<f64>,
+    pub tlsr15: Option<f64>,
+}
+
+/// Binance futures-data series in the live API's stamp convention, oldest first:
+/// `(timestamp_secs, value)`. One shape for open interest (`sumOpenInterest`) and
+/// the taker buy/sell volume ratio (`buySellRatio`).
+pub type DerivSeries = Vec<(i64, f64)>;
+
+/// A `takerlongshortRatio` row stamped `T` aggregates the flow of `[T, T + 5m)`, so
+/// the last bucket a decision at `t` may read is the one stamped at or before
+/// `t - TLSR_BUCKET_SECS`: the last bucket COMPLETED by `t`.
+///
+/// This is the lookahead leak the research found on 2026-09-10 and corrected on
+/// 09-12 (`build_holdout.py:142`): reading the bucket stamped at or before `t` let
+/// the feature see taker aggression up to four minutes after the decision, and
+/// Spearman(side-signed log tlsr, label) fell from +0.320 to +0.035 once the
+/// completed bucket was used. The rule lives here, in the one function both the
+/// trainer and the viper call, so neither can drift from it.
+pub const TLSR_BUCKET_SECS: i64 = 300;
+
+/// The archive's `create_time` for open interest is the live API's stamp minus this:
+/// check 3 of the 2026-09-12 pre-registration matched `sum_open_interest` to the
+/// API on 8,352 of 8,352 overlapping buckets with the archive stamp shifted +300 s.
+/// The taker ratio's archive stamp already matches the API (offset 0).
+pub const OI_ARCHIVE_STAMP_SHIFT_SECS: i64 = 300;
+
+/// The four derivatives columns at decision time `t`, computed exactly as the
+/// research harness computes them (`gboost-phase1-2026-09-10/gb/build_dataset.py`
+/// lines 139-143, with the 09-12 `tlsr` correction from `build_holdout.py:142`):
+///
+/// * `oi_d5  = ln(oi_now / oi[io - 1])`, `oi_d30 = ln(oi_now / oi[io - 6])`: log
+///   ratios one and six BUCKETS back from the newest open-interest sample at or
+///   before `t` (index-based, as the harness; a gap in the series widens the
+///   lookback rather than shifting it).
+/// * `tlsr = buySellRatio` of the last bucket completed by `t` (stamp at or before
+///   `t - TLSR_BUCKET_SECS`).
+/// * `tlsr15 = mean of that bucket and the two before it` (`np.mean(tl_v[it-2:it+1])`),
+///   NOT the value fifteen minutes ago (`DESIGN_NOTES.md:36`).
+///
+/// Every column is `None` when the series does not reach: a missing input, never a
+/// zero, so `dead_columns` can see it.
+pub fn deriv_features_at(oi: &[(i64, f64)], tlsr: &[(i64, f64)], t: i64) -> DerivFeatures {
+    fn last_at(series: &[(i64, f64)], t: i64) -> Option<usize> {
+        let i = series.partition_point(|(ts, _)| *ts <= t);
+        (i > 0).then(|| i - 1)
+    }
+    let log_ratio = |now: f64, then: f64| (now > 0.0 && then > 0.0).then(|| (now / then).ln());
+    let (mut oi_d5, mut oi_d30) = (None, None);
+    if let Some(io) = last_at(oi, t) {
+        let now = oi[io].1;
+        if io >= 1 { oi_d5 = log_ratio(now, oi[io - 1].1); }
+        if io >= 6 { oi_d30 = log_ratio(now, oi[io - 6].1); }
+    }
+    let (mut tl_now, mut tl_15) = (None, None);
+    if let Some(it) = last_at(tlsr, t - TLSR_BUCKET_SECS) {
+        tl_now = Some(tlsr[it].1);
+        if it >= 2 {
+            tl_15 = Some((tlsr[it - 2].1 + tlsr[it - 1].1 + tlsr[it].1) / 3.0);
+        }
+    }
+    DerivFeatures { oi_d5, oi_d30, tlsr: tl_now, tlsr15: tl_15 }
+}
+
+/// The four derivatives columns, or the ones the series could not supply.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DerivFeatures {
+    pub oi_d5: Option<f64>,
+    pub oi_d30: Option<f64>,
+    pub tlsr: Option<f64>,
+    pub tlsr15: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,9 +351,12 @@ pub fn build_features(inp: &DecisionInputs) -> std::result::Result<[[f64; N_FEAT
             sig_min, rv15, range30,
             sgn * dist, sgn * z, z.abs(), fair_side, fair_side - ask, mid_s - fair_side, frac,
             inp.funding.unwrap_or(f64::NAN),
-            // oi_d5, oi_d30, tlsr, tlsr15: the engine cannot compute them, so no training row
-            // has them; every model stamps them zeroed and `predict` zeroes them.
-            f64::NAN, f64::NAN, f64::NAN, f64::NAN,
+            // oi_d5, oi_d30, tlsr, tlsr15: from `deriv_features_at`, `NaN` when the
+            // series did not reach. Until 2026-09-22 the engine could not compute
+            // them and every model stamped them zeroed; a model now keeps them live
+            // only when the training rows carried them end to end (`partial_columns`).
+            inp.oi_d5.unwrap_or(f64::NAN), inp.oi_d30.unwrap_or(f64::NAN),
+            inp.tlsr.unwrap_or(f64::NAN), inp.tlsr15.unwrap_or(f64::NAN),
             hour_utc, dow,
         ];
     }
@@ -565,6 +645,10 @@ impl PlanBModel {
     /// Whether a decision needs the settled funding rate, or the model zeroes it.
     pub fn needs_funding(&self) -> bool { !self.zeroed.contains(&FUNDING_COLUMN) }
 
+    /// Whether a decision needs the derivatives series (open interest and the taker
+    /// ratio), or the model zeroes all four of their columns.
+    pub fn needs_derivs(&self) -> bool { DERIV_COLUMNS.iter().any(|c| !self.zeroed.contains(c)) }
+
     /// The plan the model was built for differs from the configured one.
     ///
     /// The entry rule is part of the plan: a model labeled on the old entry price
@@ -626,6 +710,11 @@ struct MinuteData {
     funding: Option<(f64, i64)>,
     funding_fetched: Option<Instant>,
     funding_fetching: bool,
+    /// The newest open-interest and taker-ratio buckets, in the API's stamp
+    /// convention, refreshed on the funding cadence from the same host.
+    derivs: Option<(DerivSeries, DerivSeries)>,
+    derivs_fetched: Option<Instant>,
+    derivs_fetching: bool,
     last_warn: Option<Instant>,
 }
 
@@ -810,6 +899,38 @@ async fn fetch_funding() -> std::result::Result<(f64, i64), String> {
     parse_funding(&get_json("https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=1").await?)
 }
 
+/// One page of a Binance futures-data series, oldest first, in the API's stamps.
+pub fn parse_deriv_series(v: &serde_json::Value, field: &str) -> DerivSeries {
+    let mut out: DerivSeries = v.as_array().map(|rows| rows.iter().filter_map(|r| {
+        let t = r["timestamp"].as_i64()?;
+        let x = r[field].as_f64().or_else(|| r[field].as_str().and_then(|s| s.parse().ok()))?;
+        Some((t / 1000, x))
+    }).collect()).unwrap_or_default();
+    out.sort_by_key(|x| x.0);
+    out.dedup_by_key(|x| x.0);
+    out
+}
+
+/// The newest buckets of open interest and the taker buy/sell volume ratio.
+///
+/// `deriv_features_at` looks back six open-interest buckets and three completed
+/// taker buckets, so thirty 5-minute rows of each is ample. Same host as funding
+/// and no mirror, because these endpoints exist only on `fapi`; an instance it
+/// refuses (HTTP 451 from US addresses) gets `Err`, and the model it serves has
+/// these columns zeroed anyway, because its training rows' newest day could only
+/// have come from the same host (`partial_columns`).
+async fn fetch_derivs() -> std::result::Result<(DerivSeries, DerivSeries), String> {
+    let base = "https://fapi.binance.com/futures/data";
+    let oi = parse_deriv_series(
+        &get_json(&format!("{base}/openInterestHist?symbol=BTCUSDT&period=5m&limit=30")).await?, "sumOpenInterest");
+    let tl = parse_deriv_series(
+        &get_json(&format!("{base}/takerlongshortRatio?symbol=BTCUSDT&period=5m&limit=30")).await?, "buySellRatio");
+    if oi.is_empty() || tl.is_empty() {
+        return Err("empty open interest or taker ratio page".to_string());
+    }
+    Ok((oi, tl))
+}
+
 async fn fetch_price_history(tokens: &[String; 2], t: i64) -> std::result::Result<[Vec<(i64, f64)>; 2], String> {
     let url = |tok: &str| format!(
         "https://clob.polymarket.com/prices-history?market={tok}&startTs={}&endTs={}&fidelity=1",
@@ -868,8 +989,40 @@ fn ensure_price_history(g: &'static PlanBGlobals, cid: &str, tokens: [String; 2]
 
 /// Closed bars through `t` and the settled funding rate, fetching in the background
 /// until both are in hand. A model that zeroes funding does not wait for it.
-fn ensure_minute_data(g: &'static PlanBGlobals, t: i64, need_funding: bool) -> Option<(Vec<Bar>, Option<f64>)> {
+/// The bars, funding rate and derivatives columns a decision at `t` needs, or `None`
+/// while any input the model depends on is still on its way. `need_funding` and
+/// `need_derivs` are the model's own stamps: a model that zeroes a column never
+/// waits for it.
+fn ensure_minute_data(
+    g: &'static PlanBGlobals,
+    t: i64,
+    need_funding: bool,
+    need_derivs: bool,
+) -> Option<(Vec<Bar>, Option<f64>, DerivFeatures)> {
     let mut d = lock(&g.data);
+    let derivs_due = need_derivs
+        && !d.derivs_fetching
+        && d.derivs_fetched.is_none_or(|x| x.elapsed() >= Duration::from_secs(FUNDING_REFRESH_SECS));
+    if derivs_due {
+        d.derivs_fetching = true;
+        tokio::spawn(async move {
+            let result = fetch_derivs().await;
+            let mut d = lock(&g.data);
+            d.derivs_fetching = false;
+            match result {
+                Ok(series) => {
+                    d.derivs = Some(series);
+                    d.derivs_fetched = Some(Instant::now());
+                }
+                Err(e) => {
+                    d.derivs_fetched = Instant::now().checked_sub(Duration::from_secs(FUNDING_REFRESH_SECS - 30));
+                    if warn_due(&mut d.last_warn) {
+                        warn!("GBoost plan-B: open interest and taker ratio unavailable ({e}); decisions wait for them");
+                    }
+                }
+            }
+        });
+    }
     let funding_due = need_funding
         && !d.funding_fetching
         && d.funding_fetched.is_none_or(|x| x.elapsed() >= Duration::from_secs(FUNDING_REFRESH_SECS));
@@ -926,7 +1079,14 @@ fn ensure_minute_data(g: &'static PlanBGlobals, t: i64, need_funding: bool) -> O
     if need_funding && funding.is_none() {
         return None;
     }
-    (d.bars_t == Some(t)).then(|| (d.bars.clone(), funding))
+    // Same function the trainer scores rows with, on the same shape of series.
+    let derivs = d.derivs.as_ref()
+        .map(|(oi, tl)| deriv_features_at(oi, tl, t))
+        .unwrap_or_default();
+    if need_derivs && (derivs.oi_d5.is_none() || derivs.oi_d30.is_none() || derivs.tlsr.is_none() || derivs.tlsr15.is_none()) {
+        return None;
+    }
+    (d.bars_t == Some(t)).then(|| (d.bars.clone(), funding, derivs))
 }
 
 /// Why plan B does not trade on this build's venue, or `None` on the venue it was
@@ -1055,13 +1215,18 @@ impl Strategy for GboostPlanBStrategy {
         };
         // Both fetches are kicked off in the same tick: serialized, a slow Binance
         // host could spend the whole decision window before the history is asked for.
-        let minute_data = ensure_minute_data(g, t, model.needs_funding());
+        let minute_data = ensure_minute_data(g, t, model.needs_funding(), model.needs_derivs());
         // The market's own price, from the same CLOB history and the same rule the
         // training rows use ([B46]), never from the order book.
         let tokens = [market.yes_token.as_str().to_string(), market.no_token.as_str().to_string()];
         let history = ensure_price_history(g, &cid, tokens, t);
-        let Some((bars, funding)) = minute_data else {
-            idle(if model.needs_funding() { "waiting for Binance bars and the settled funding rate" } else { "waiting for Binance bars" });
+        let Some((bars, funding, derivs)) = minute_data else {
+            idle(match (model.needs_funding(), model.needs_derivs()) {
+                (true, true) => "waiting for Binance bars, the settled funding rate, open interest and taker flow",
+                (true, false) => "waiting for Binance bars and the settled funding rate",
+                (false, true) => "waiting for Binance bars, open interest and taker flow",
+                (false, false) => "waiting for Binance bars",
+            });
             return Ok(StrategySignal::NoSignal);
         };
         let Some(hist) = history else {
@@ -1087,7 +1252,10 @@ impl Strategy for GboostPlanBStrategy {
             decided.insert((cid.clone(), t));
             decided.retain(|(_, dt)| now_s - dt < 7200);
         }
-        let inputs = DecisionInputs { w, t, bars: &bars, mid_now, mid_m1, mid_m5, ask, funding };
+        let inputs = DecisionInputs {
+            w, t, bars: &bars, mid_now, mid_m1, mid_m5, ask, funding,
+            oi_d5: derivs.oi_d5, oi_d30: derivs.oi_d30, tlsr: derivs.tlsr, tlsr15: derivs.tlsr15,
+        };
         let features = match build_features(&inputs) {
             Ok(f) => f,
             Err(gap) => {
@@ -1466,6 +1634,7 @@ mod tests {
                 mid_m5: pair("m5"),
                 ask: [fixture["ask"][0].as_f64().unwrap(), fixture["ask"][1].as_f64().unwrap()],
                 funding: Some(fixture["funding"].as_f64().unwrap()),
+                oi_d5: None, oi_d30: None, tlsr: None, tlsr15: None,
             };
             let got = build_features(&inputs).expect("fixture inputs are complete");
             for side in 0..2 {
@@ -1495,7 +1664,7 @@ mod tests {
     fn missing_funding_is_missing_until_a_model_zeroes_it() {
         let bars: Vec<Bar> = (0..61).map(|i| Bar { open_s: 3600 + 60 * i, open: 1.0, high: 1.0, low: 1.0, close: 1.0 }).collect();
         let f = build_features(&DecisionInputs {
-            w: 3600 + 30 * 60, t: 3600 + 61 * 60, bars: &bars, mid_now: [Some(0.5), Some(0.5)], mid_m1: [None; 2], mid_m5: [None; 2], ask: [0.5, 0.5], funding: None,
+            w: 3600 + 30 * 60, t: 3600 + 61 * 60, bars: &bars, mid_now: [Some(0.5), Some(0.5)], mid_m1: [None; 2], mid_m5: [None; 2], ask: [0.5, 0.5], funding: None, oi_d5: None, oi_d30: None, tlsr: None, tlsr15: None,
         }).unwrap();
         assert!(f[0][22].is_nan() && f[1][22].is_nan());
         assert!((23..=26).all(|j| f[0][j].is_nan()));
@@ -1538,14 +1707,14 @@ mod tests {
     fn missing_history_or_mids_are_reported_not_guessed() {
         let bars: Vec<Bar> = (0..61).map(|i| Bar { open_s: 3600 + 60 * i, open: 1.0, high: 1.0, low: 1.0, close: 1.0 }).collect();
         let base = |bars: &[Bar]| build_features(&DecisionInputs {
-            w: 7200, t: 3600 + 61 * 60, bars, mid_now: [Some(0.5), Some(0.5)], mid_m1: [None; 2], mid_m5: [None; 2], ask: [0.5, 0.5], funding: Some(0.0),
+            w: 7200, t: 3600 + 61 * 60, bars, mid_now: [Some(0.5), Some(0.5)], mid_m1: [None; 2], mid_m5: [None; 2], ask: [0.5, 0.5], funding: Some(0.0), oi_d5: None, oi_d30: None, tlsr: None, tlsr15: None,
         });
         assert_eq!(base(&bars[1..]).unwrap_err(), FeatureGap::MissingBars);
         let mut with_strike = bars.clone();
         with_strike.retain(|b| b.open_s != 7200);
         assert_eq!(base(&with_strike).unwrap_err(), FeatureGap::MissingBars);
         let ok = build_features(&DecisionInputs {
-            w: 3600 + 30 * 60, t: 3600 + 61 * 60, bars: &bars, mid_now: [Some(0.5), None], mid_m1: [None; 2], mid_m5: [None; 2], ask: [0.5, 0.5], funding: Some(0.0),
+            w: 3600 + 30 * 60, t: 3600 + 61 * 60, bars: &bars, mid_now: [Some(0.5), None], mid_m1: [None; 2], mid_m5: [None; 2], ask: [0.5, 0.5], funding: Some(0.0), oi_d5: None, oi_d30: None, tlsr: None, tlsr15: None,
         });
         assert_eq!(ok.unwrap_err(), FeatureGap::MissingMid);
     }
@@ -1698,5 +1867,65 @@ mod tests {
         }
         assert!((model.platt_a - golden["platt_a"].as_f64().unwrap()).abs() < 1e-15);
         println!("{} rows matched; model {} with {} trees", rows.len(), model.version, model.trees);
+    }
+}
+
+#[cfg(test)]
+mod deriv_feature_tests {
+    use super::{deriv_features_at, DerivFeatures, TLSR_BUCKET_SECS};
+
+    /// 5-minute buckets given as `(minutes before t, value)`, returned oldest first.
+    fn series(t: i64, samples: &[(i64, f64)]) -> Vec<(i64, f64)> {
+        let mut v: Vec<(i64, f64)> = samples.iter().map(|(m, x)| (t - m * 60, *x)).collect();
+        v.sort_by_key(|x| x.0);
+        v
+    }
+
+    /// The harness's arithmetic, longhand: `oi_d5 = ln(oi_now / oi[io-1])`,
+    /// `oi_d30 = ln(oi_now / oi[io-6])`; `tlsr` is the last bucket completed by `t`
+    /// (stamped `t - 300` here, not the one stamped `t`), and `tlsr15` is the mean
+    /// of that bucket and the two before it.
+    #[test]
+    fn the_four_columns_match_build_dataset_py() {
+        let t = 1_700_000_000;
+        let oi = series(t, &[(30, 100.0), (25, 101.0), (20, 102.0), (15, 103.0), (10, 104.0), (5, 105.0), (0, 110.0)]);
+        // Buckets stamped t-15, t-10, t-5 are complete by t; the one stamped t is not.
+        let tl = series(t, &[(15, 0.90), (10, 1.00), (5, 1.10), (0, 5.00)]);
+        let f = deriv_features_at(&oi, &tl, t);
+        assert!((f.oi_d5.unwrap() - (110.0f64 / 105.0).ln()).abs() < 1e-12);
+        assert!((f.oi_d30.unwrap() - (110.0f64 / 100.0).ln()).abs() < 1e-12);
+        assert_eq!(f.tlsr, Some(1.10), "the bucket stamped at t is still open and must not be read");
+        assert!((f.tlsr15.unwrap() - (0.90 + 1.00 + 1.10) / 3.0).abs() < 1e-12, "a three-bucket mean, not a difference");
+    }
+
+    /// The completed-bucket rule is the 2026-09-12 leak correction: a bucket stamped
+    /// inside the last `TLSR_BUCKET_SECS` before `t` is not yet complete, and with
+    /// only two completed buckets there is no three-bucket mean.
+    #[test]
+    fn a_bucket_still_open_at_t_is_not_read() {
+        let t = 1_700_000_000;
+        let tl = series(t, &[(15, 0.9), (10, 1.0), (4, 7.0), (1, 9.0)]);
+        let f = deriv_features_at(&[], &tl, t);
+        assert_eq!(f.tlsr, Some(1.0));
+        assert_eq!(f.tlsr15, None);
+        let tl = series(t, &[(15, 0.9), (10, 1.0), (5, 1.1)]);
+        assert_eq!(deriv_features_at(&[], &tl, t + TLSR_BUCKET_SECS - 1).tlsr, Some(1.1));
+        assert_eq!(deriv_features_at(&[], &tl, t - 1).tlsr, Some(1.0), "at t-1 the bucket stamped t-5 is not complete");
+    }
+
+    /// A series that does not reach yields a missing input, never a zero or the
+    /// oldest sample; lookbacks are by bucket, so a gap widens them as in the harness;
+    /// only samples at or before `t` count.
+    #[test]
+    fn missing_history_is_none_and_lookbacks_are_by_bucket() {
+        let t = 1_700_000_000;
+        assert_eq!(deriv_features_at(&[], &[], t), DerivFeatures::default());
+        let oi = series(t, &[(5, 100.0), (0, 110.0)]);
+        let f = deriv_features_at(&oi, &[], t);
+        assert!(f.oi_d5.is_some() && f.oi_d30.is_none(), "one bucket back exists, six do not");
+        let oi = series(t, &[(20, 100.0), (0, 110.0)]);
+        assert!((deriv_features_at(&oi, &[], t).oi_d5.unwrap() - (110.0f64 / 100.0).ln()).abs() < 1e-12);
+        let oi = series(t, &[(5, 100.0), (0, 110.0), (-5, 999.0)]);
+        assert!((deriv_features_at(&oi, &[], t).oi_d5.unwrap() - (110.0f64 / 100.0).ln()).abs() < 1e-12);
     }
 }

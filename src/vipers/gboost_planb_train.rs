@@ -251,6 +251,11 @@ impl DataDir {
     pub fn klines(&self) -> PathBuf { self.root.join("klines") }
     pub fn kline_day(&self, day: chrono::NaiveDate) -> PathBuf { self.klines().join(format!("{day}.json")) }
     pub fn funding(&self) -> PathBuf { self.root.join("funding.json") }
+    /// Binance futures metrics (open interest, taker buy/sell ratio) by UTC day, from
+    /// the `data.binance.vision` daily archive, plus the live tail from `fapi`.
+    pub fn metrics(&self) -> PathBuf { self.root.join("metrics") }
+    pub fn metrics_day(&self, day: chrono::NaiveDate) -> PathBuf { self.metrics().join(format!("{day}.json")) }
+    pub fn metrics_live(&self) -> PathBuf { self.metrics().join("live.json") }
     pub fn candidate(&self) -> PathBuf { self.root.join("candidate.json") }
     pub fn archive(&self) -> PathBuf { self.root.join("archive").join("incumbent.json") }
     pub fn reports(&self) -> PathBuf { self.root.join("reports") }
@@ -298,6 +303,83 @@ struct KlineDay {
 
 fn bars_from_day(d: &KlineDay) -> impl Iterator<Item = Bar> + '_ {
     d.bars.iter().map(|b| Bar { open_s: b[0] as i64, open: b[1], high: b[2], low: b[3], close: b[4] })
+}
+
+/// One UTC day of Binance futures metrics, in the live API's stamp convention.
+///
+/// From `https://data.binance.vision/data/futures/um/daily/metrics/BTCUSDT/
+/// BTCUSDT-metrics-{day}.zip`: a zip of one CSV with 5-minute rows of
+/// `create_time, symbol, sum_open_interest, ..., sum_taker_long_short_vol_ratio`.
+/// The archive is the only source of these series beyond `fapi`'s 30-day retention,
+/// it is served to US addresses that `fapi` refuses, and check 3 of the 2026-09-12
+/// pre-registration matched it to the API (open interest exactly with the stamp
+/// shifted +300 s, the taker ratio within 0.24% at offset 0). A day is published
+/// the day after, so the newest day always comes from `fapi` (`metrics_live`).
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct MetricsDay {
+    day: String,
+    /// `(api_stamp_secs, sumOpenInterest)`, oldest first.
+    oi: Vec<(i64, f64)>,
+    /// `(api_stamp_secs, buySellRatio)`, oldest first.
+    tlsr: Vec<(i64, f64)>,
+}
+
+/// The two series from one archive CSV, in the API's stamps: the open-interest
+/// stamp is `create_time + OI_ARCHIVE_STAMP_SHIFT_SECS`, the taker ratio's is
+/// `create_time` itself (check 3). Rows that do not parse are skipped.
+pub fn parse_metrics_csv(text: &str) -> (Vec<(i64, f64)>, Vec<(i64, f64)>) {
+    use crate::vipers::gboost_planb::OI_ARCHIVE_STAMP_SHIFT_SECS;
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else { return (Vec::new(), Vec::new()) };
+    let cols: Vec<&str> = header.split(',').map(str::trim).collect();
+    let col = |name: &str| cols.iter().position(|c| *c == name);
+    let (Some(it), Some(ioi), Some(itl)) = (col("create_time"), col("sum_open_interest"), col("sum_taker_long_short_vol_ratio")) else {
+        return (Vec::new(), Vec::new());
+    };
+    let (mut oi, mut tl) = (Vec::new(), Vec::new());
+    for line in lines {
+        let f: Vec<&str> = line.split(',').map(str::trim).collect();
+        let Some(ts) = f.get(it).and_then(|v| chrono::NaiveDateTime::parse_from_str(v, "%Y-%m-%d %H:%M:%S").ok()) else { continue };
+        let t = ts.and_utc().timestamp();
+        if let Some(x) = f.get(ioi).and_then(|v| v.parse::<f64>().ok()) { oi.push((t + OI_ARCHIVE_STAMP_SHIFT_SECS, x)); }
+        if let Some(x) = f.get(itl).and_then(|v| v.parse::<f64>().ok()) { tl.push((t, x)); }
+    }
+    for v in [&mut oi, &mut tl] {
+        v.sort_by_key(|x| x.0);
+        v.dedup_by_key(|x| x.0);
+    }
+    (oi, tl)
+}
+
+/// The bytes of the first entry of a zip archive that stores one file, as the
+/// Binance archives do. Reads the local file header only (signature, method, name
+/// and extra lengths) and inflates with `flate2`; a `zip` dependency is not needed
+/// for a single stored-or-deflated entry.
+pub fn unzip_single_entry(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    if bytes.len() < 30 || bytes[0..4] != [0x50, 0x4b, 0x03, 0x04] {
+        return Err("not a zip local file header".to_string());
+    }
+    let u16_at = |i: usize| u16::from_le_bytes([bytes[i], bytes[i + 1]]) as usize;
+    let u32_at = |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
+    let method = u16_at(8);
+    let (csize, usize_) = (u32_at(18), u32_at(22));
+    let start = 30 + u16_at(26) + u16_at(28);
+    if start > bytes.len() { return Err("truncated zip header".to_string()); }
+    match method {
+        0 => bytes.get(start..start + usize_).map(|b| b.to_vec()).ok_or_else(|| "truncated stored entry".to_string()),
+        8 => {
+            // With a data descriptor (flag bit 3) the sizes are zero here; the
+            // decoder stops at the end of the deflate stream either way.
+            let end = if csize > 0 { (start + csize).min(bytes.len()) } else { bytes.len() };
+            let mut out = Vec::with_capacity(usize_.max(1024));
+            flate2::read::DeflateDecoder::new(&bytes[start..end])
+                .read_to_end(&mut out)
+                .map_err(|e| format!("inflate: {e}"))?;
+            Ok(out)
+        }
+        m => Err(format!("unsupported zip compression method {m}")),
+    }
 }
 
 // ── Market slugs and windows ─────────────────────────────────────────────────
@@ -467,7 +549,14 @@ pub fn parse_price_history(v: &serde_json::Value) -> Vec<(i64, f64)> {
 
 /// Every row of one market, exactly as the reference builder produced them, with the
 /// features from the viper's own `build_features`.
-pub fn build_market_rows(w: i64, rec: &MarketRecord, bars: &[Bar], funding: &[(i64, f64)], plan: &Plan) -> Vec<TrainingRow> {
+pub fn build_market_rows(
+    w: i64,
+    rec: &MarketRecord,
+    bars: &[Bar],
+    funding: &[(i64, f64)],
+    derivs: (&[(i64, f64)], &[(i64, f64)]),
+    plan: &Plan,
+) -> Vec<TrainingRow> {
     let mut out = Vec::new();
     if rec.missing || rec.tape.is_empty() {
         return out;
@@ -560,6 +649,8 @@ pub fn build_market_rows(w: i64, rec: &MarketRecord, bars: &[Bar], funding: &[(i
         let entry_t = [entry_t_up, entry_t_dn];
         let ask = [ask_up.min(0.995), ask_dn.min(0.995)];
         let fr = last_at(funding, t).map(|(_, r)| r);
+        // The same function the viper scores with, on the same series shape.
+        let dv = crate::vipers::gboost_planb::deriv_features_at(derivs.0, derivs.1, t);
         let inputs = DecisionInputs {
             w,
             t,
@@ -569,6 +660,7 @@ pub fn build_market_rows(w: i64, rec: &MarketRecord, bars: &[Bar], funding: &[(i
             mid_m5: [mid_at(0, t - 300), mid_at(1, t - 300)],
             ask,
             funding: fr,
+            oi_d5: dv.oi_d5, oi_d30: dv.oi_d30, tlsr: dv.tlsr, tlsr15: dv.tlsr15,
         };
         let Ok(features) = build_features(&inputs) else { continue };
 
@@ -905,6 +997,26 @@ fn predict_raw(b: &PerpetualBooster, x: &[[f64; N_FEATURES]], zeroed: &[usize]) 
 pub fn dead_columns(x: &[[f64; N_FEATURES]]) -> Vec<usize> {
     (0..N_FEATURES).filter(|&j| x.iter().all(|r| r[j].is_nan())).collect()
 }
+/// The share of rows a column must carry a value on, in every set it is judged on,
+/// to stay live. Below it the column is zeroed with the dead ones.
+pub const MIN_COLUMN_COVERAGE: f64 = 0.90;
+/// Columns whose coverage does not span the data: present on fewer than
+/// `min_coverage` of the rows of any non-empty set in `sets`.
+///
+/// `dead_columns` zeroes a column only when no row has it, so a series that
+/// covers the newest quarter of a 120-day window would stay live, and the
+/// booster splits missing values to a learned side (`create_missing_branch:
+/// false`): the presence of a value would then stand in for recency, and the
+/// holdout fold is the newest slice. That is the e1 entry-price artifact by
+/// another door. Judged per set (fit, calibration, holdout, and the newest day
+/// of the holdout), so a column the newest rows lack because `fapi` refused this
+/// instance is zeroed too; the model then never depends on a column the serving
+/// path could not supply.
+pub fn partial_columns(sets: &[&[[f64; N_FEATURES]]], min_coverage: f64) -> Vec<usize> {
+    (0..N_FEATURES).filter(|&j| sets.iter().any(|x| {
+        !x.is_empty() && (x.iter().filter(|r| !r[j].is_nan()).count() as f64) < min_coverage * x.len() as f64
+    })).collect()
+}
 
 /// What the gate decided and why.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -1013,6 +1125,7 @@ pub struct CycleInputs {
 pub fn load_rows(inputs: &CycleInputs) -> Result<(Vec<TrainingRow>, usize, Option<(i64, i64)>), String> {
     let from = floor_hour(inputs.now) - inputs.window_days * 86400;
     let funding: Vec<(i64, f64)> = read_json::<Vec<(i64, f64)>>(&inputs.dir.funding()).unwrap_or_default();
+    let (deriv_oi, deriv_tl) = load_metrics(&inputs.dir);
     let mut bars: HashMap<i64, Bar> = HashMap::new();
     if let Ok(entries) = std::fs::read_dir(inputs.dir.klines()) {
         for e in entries.flatten() {
@@ -1037,7 +1150,7 @@ pub fn load_rows(inputs: &CycleInputs) -> Result<(Vec<TrainingRow>, usize, Optio
     for w in ws {
         let Ok(rec) = read_json::<MarketRecord>(&inputs.dir.market(w)) else { continue };
         let slice: Vec<Bar> = ((w - 62 * 60)..(w + 3600)).step_by(60).filter_map(|o| bars.get(&o).copied()).collect();
-        let mut r = build_market_rows(w, &rec, &slice, &funding, &inputs.plan);
+        let mut r = build_market_rows(w, &rec, &slice, &funding, (&deriv_oi, &deriv_tl), &inputs.plan);
         if !r.is_empty() {
             markets += 1;
             first_w = first_w.min(w);
@@ -1110,7 +1223,20 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
 
     let xf: Vec<[f64; N_FEATURES]> = fit.iter().map(|r| r.features).collect();
     let yf: Vec<bool> = fit.iter().map(|r| r.y).collect();
-    let zeroed = dead_columns(&xf);
+    let xc_cov: Vec<[f64; N_FEATURES]> = cal.iter().map(|r| r.features).collect();
+    let xt_cov: Vec<[f64; N_FEATURES]> = test.iter().map(|r| r.features).collect();
+    let newest_day = floor_hour(inputs.now) - 86400;
+    let xr_cov: Vec<[f64; N_FEATURES]> = test.iter().filter(|r| r.w >= newest_day).map(|r| r.features).collect();
+    let mut zeroed = dead_columns(&xf);
+    let partial = partial_columns(&[&xf, &xc_cov, &xt_cov, &xr_cov], MIN_COLUMN_COVERAGE);
+    for j in partial {
+        if !zeroed.contains(&j) {
+            info!("GBoost plan-B pipeline [{}]: column {} does not span the fold (below {:.0}% coverage in fit, calibration, holdout or the newest day) and is zeroed",
+                inputs.asset, FEATURE_NAMES[j], MIN_COLUMN_COVERAGE * 100.0);
+            zeroed.push(j);
+        }
+    }
+    zeroed.sort_unstable();
     rep.zeroed_features = zeroed.iter().map(|&j| FEATURE_NAMES[j].to_string()).collect();
     let booster = match fit_booster(&xf, &yf, &zeroed, inputs.budget as f32, inputs.threads) {
         Ok(b) => b,
@@ -1285,6 +1411,84 @@ async fn get_json(url: &str) -> Result<serde_json::Value, String> {
 
 fn num(v: &serde_json::Value) -> Option<f64> {
     v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+/// GET raw bytes with the same pacing and backoff as `get_json`. `Ok(None)` on 404:
+/// for the daily archive that means "not published yet", which is not an error.
+async fn get_bytes(url: &str) -> Result<Option<Vec<u8>>, String> {
+    let mut last = String::new();
+    for attempt in 0..HTTP_ATTEMPTS {
+        match client().get(url).send().await {
+            Ok(r) if r.status().is_success() => {
+                tokio::time::sleep(Duration::from_millis(REQUEST_PAUSE_MS)).await;
+                return r.bytes().await.map(|b| Some(b.to_vec())).map_err(|e| e.to_string());
+            }
+            Ok(r) if r.status().as_u16() == 404 => return Ok(None),
+            Ok(r) if r.status().as_u16() == 429 || r.status().is_server_error() => last = format!("HTTP {}", r.status()),
+            Ok(r) => return Err(format!("HTTP {}", r.status())),
+            Err(e) => last = e.to_string(),
+        }
+        tokio::time::sleep(Duration::from_secs(BACKOFF_BASE_SECS << attempt)).await;
+    }
+    Err(format!("{url}: {last}"))
+}
+const METRICS_ARCHIVE: &str = "https://data.binance.vision/data/futures/um/daily/metrics/BTCUSDT";
+/// One archive day, or `Ok(None)` while the archive has not published it.
+async fn fetch_metrics_day(day: chrono::NaiveDate) -> Result<Option<MetricsDay>, String> {
+    let url = format!("{METRICS_ARCHIVE}/BTCUSDT-metrics-{day}.zip");
+    let Some(zip) = get_bytes(&url).await? else { return Ok(None) };
+    let csv = unzip_single_entry(&zip).map_err(|e| format!("{url}: {e}"))?;
+    let text = String::from_utf8_lossy(&csv);
+    let (oi, tlsr) = parse_metrics_csv(&text);
+    if oi.is_empty() || tlsr.is_empty() {
+        return Err(format!("{url}: no rows parsed"));
+    }
+    Ok(Some(MetricsDay { day: day.to_string(), oi, tlsr }))
+}
+/// The live tail of both series from `fapi`, from `since_s` on, paged at 500 rows
+/// and terminated by a short page or a page that adds nothing. `fapi` clamps a
+/// `startTime` older than its 30-day retention rather than erroring, so the loop
+/// starts at the boundary and walks forward. The same host rule as funding: no
+/// mirror carries these endpoints, and a 451 leaves the newest day without values,
+/// which `partial_columns` turns into zeroed columns for the model trained here.
+async fn fetch_derivs_live_since(since_s: i64) -> Result<(Vec<(i64, f64)>, Vec<(i64, f64)>), String> {
+    async fn series(path: &str, field: &str, since_s: i64) -> Result<Vec<(i64, f64)>, String> {
+        let mut out: Vec<(i64, f64)> = Vec::new();
+        let mut cursor_ms = since_s * 1000;
+        loop {
+            let url = format!("{}/futures/data/{path}?symbol=BTCUSDT&period=5m&startTime={cursor_ms}&limit=500", FUNDING_HOSTS[0]);
+            let page = crate::vipers::gboost_planb::parse_deriv_series(&get_json(&url).await?, field);
+            let before = out.len();
+            for (t, x) in &page {
+                if out.last().is_none_or(|(s, _)| *t > *s) {
+                    out.push((*t, *x));
+                    cursor_ms = t * 1000 + 1;
+                }
+            }
+            if page.len() < 500 || out.len() == before { return Ok(out); }
+        }
+    }
+    let oi = series("openInterestHist", "sumOpenInterest", since_s).await?;
+    let tlsr = series("takerlongshortRatio", "buySellRatio", since_s).await?;
+    Ok((oi, tlsr))
+}
+/// Every stored metrics day plus the live tail, merged into two series in the API's
+/// stamps; on an overlap the live value wins (the two agree within rounding).
+fn load_metrics(dir: &DataDir) -> (Vec<(i64, f64)>, Vec<(i64, f64)>) {
+    let (mut oi, mut tl): (BTreeMap<i64, f64>, BTreeMap<i64, f64>) = (BTreeMap::new(), BTreeMap::new());
+    if let Ok(entries) = std::fs::read_dir(dir.metrics()) {
+        for e in entries.flatten() {
+            if e.path() == dir.metrics_live() { continue; }
+            if let Ok(d) = read_json::<MetricsDay>(&e.path()) {
+                oi.extend(d.oi.iter().copied());
+                tl.extend(d.tlsr.iter().copied());
+            }
+        }
+    }
+    if let Ok((loi, ltl)) = read_json::<(Vec<(i64, f64)>, Vec<(i64, f64)>)>(&dir.metrics_live()) {
+        oi.extend(loi);
+        tl.extend(ltl);
+    }
+    (oi.into_iter().collect(), tl.into_iter().collect())
 }
 
 /// What a market fetch found.
@@ -1771,6 +1975,52 @@ async fn catch_up(asset: &str, dir: &DataDir, knobs: &TrainingKnobs, now: i64) -
         day = next;
     }
 
+    // Futures metrics by UTC day from the archive, then the live tail from fapi.
+    let _ = std::fs::create_dir_all(dir.metrics());
+    let mut mday = utc_day(from - KLINE_LEAD_DAYS * 86400);
+    let published_through = utc_day(now - 86400);
+    while mday <= published_through {
+        let path = dir.metrics_day(mday);
+        if read_json::<MetricsDay>(&path).is_err() {
+            match fetch_metrics_day(mday).await {
+                Ok(Some(d)) => {
+                    if let Err(e) = write_json_atomically(&path, &d) {
+                        warn!("GBoost plan-B pipeline [{asset}]: cannot write {}: {e}", path.display());
+                        update_status(asset, |s| s.note_error("write", format!("cannot write {}: {e}", path.display())));
+                    } else {
+                        update_status(asset, |s| s.clear_error("metrics"));
+                    }
+                }
+                // Not published yet: the live tail covers it; try again next pass.
+                Ok(None) => break,
+                Err(e) => {
+                    warn!("GBoost plan-B pipeline [{asset}]: futures metrics for {mday} unavailable ({e}); rows there carry no open interest or taker ratio until they are");
+                    update_status(asset, |s| s.note_error("metrics", format!("futures metrics for {mday} unavailable: {e}")));
+                    break;
+                }
+            }
+        }
+        let Some(next) = mday.succ_opt() else { break };
+        mday = next;
+    }
+    {
+        let (oi, _) = load_metrics(dir);
+        let since = oi.last().map(|x| x.0 - 3600).unwrap_or(now - 30 * 86400);
+        match fetch_derivs_live_since(since).await {
+            Ok(tail) => {
+                if let Err(e) = write_json_atomically(&dir.metrics_live(), &tail) {
+                    warn!("GBoost plan-B pipeline [{asset}]: cannot write {}: {e}", dir.metrics_live().display());
+                }
+                update_status(asset, |s| s.clear_error("metrics_live"));
+            }
+            Err(e) => {
+                // The newest day then has no values and `partial_columns` zeroes the
+                // four columns, so the model this instance trains matches what it can serve.
+                warn!("GBoost plan-B pipeline [{asset}]: live open interest and taker ratio unavailable ({e}); the newest day carries none and the columns stay zeroed");
+                update_status(asset, |s| s.note_error("metrics_live", format!("live futures metrics unavailable: {e}")));
+            }
+        }
+    }
     // Markets: oldest first. Progress is reported as it goes.
     let windows: Vec<i64> = (floor_hour(from)..=last_resolved).step_by(3600).collect();
     let mut missing = 0usize;
@@ -1996,7 +2246,7 @@ mod tests {
                 Bar { open_s: b[0].as_i64().unwrap(), open: b[1].as_f64().unwrap(), high: b[2].as_f64().unwrap(), low: b[3].as_f64().unwrap(), close: b[4].as_f64().unwrap() }
             }).collect();
             let funding: Vec<(i64, f64)> = f["funding"].as_array().unwrap().iter().map(|x| (x[0].as_i64().unwrap(), x[1].as_f64().unwrap())).collect();
-            let got = build_market_rows(w, &rec, &bars, &funding, &plan);
+            let got = build_market_rows(w, &rec, &bars, &funding, (&[], &[]), &plan);
             let expected = f["expected"].as_array().unwrap();
             assert_eq!(got.len(), expected.len(), "market {w}: row count");
             for (g, e) in got.iter().zip(expected) {
@@ -2035,11 +2285,11 @@ mod tests {
             let b = b.as_array().unwrap();
             Bar { open_s: b[0].as_i64().unwrap(), open: b[1].as_f64().unwrap(), high: b[2].as_f64().unwrap(), low: b[3].as_f64().unwrap(), close: b[4].as_f64().unwrap() }
         }).collect();
-        let with = build_market_rows(f["W"].as_i64().unwrap(), &rec, &bars, &[(0, 0.0001)], &plan);
+        let with = build_market_rows(f["W"].as_i64().unwrap(), &rec, &bars, &[(0, 0.0001)], (&[], &[]), &plan);
         let xs: Vec<[f64; N_FEATURES]> = with.iter().map(|r| r.features).collect();
         let dead: Vec<&str> = dead_columns(&xs).into_iter().map(|j| FEATURE_NAMES[j]).collect();
         assert_eq!(dead, vec!["oi_d5", "oi_d30", "tlsr", "tlsr15"]);
-        let without = build_market_rows(f["W"].as_i64().unwrap(), &rec, &bars, &[], &plan);
+        let without = build_market_rows(f["W"].as_i64().unwrap(), &rec, &bars, &[], (&[], &[]), &plan);
         let xs: Vec<[f64; N_FEATURES]> = without.iter().map(|r| r.features).collect();
         let dead: Vec<&str> = dead_columns(&xs).into_iter().map(|j| FEATURE_NAMES[j]).collect();
         assert_eq!(dead, vec!["funding", "oi_d5", "oi_d30", "tlsr", "tlsr15"]);
@@ -2220,20 +2470,20 @@ mod tests {
         let up_of = |rows: &[TrainingRow]| rows.iter().find(|r| r.side == 0).cloned().expect("a row for the Up side");
 
         // No print in the minute: the entry is the first sample AFTER it, plus half a spread.
-        let rows = build_market_rows(w, &rec, &bars, &[], &plan);
+        let rows = build_market_rows(w, &rec, &bars, &[], (&[], &[]), &plan);
         assert_eq!(rows.len(), 2, "one row per side");
         assert!((up_of(&rows).ask - (0.50 + HALF_SPREAD)).abs() < 1e-12, "ask {}", up_of(&rows).ask);
 
         // A print 5 s into the minute is what that trade paid, and it comes first.
         rec.tape.push(Print { ts: t + 5, side: "BUY".into(), o: 0, p: 0.62, s: 10.0 });
-        let rows = build_market_rows(w, &rec, &bars, &[], &plan);
+        let rows = build_market_rows(w, &rec, &bars, &[], (&[], &[]), &plan);
         assert!((up_of(&rows).ask - 0.62).abs() < 1e-12, "ask {}", up_of(&rows).ask);
 
         // A sale at 0.20 three seconds into the minute, before the Up side's entry
         // exists at t+9: it cannot stop a position that has not been bought.
         rec.tape = vec![Print { ts: w + 1, side: "BUY".into(), o: 1, p: 0.50, s: 1.0 },
                         Print { ts: t + 3, side: "SELL".into(), o: 0, p: 0.20, s: 100.0 }];
-        let row = up_of(&build_market_rows(w, &rec, &bars, &[], &plan));
+        let row = up_of(&build_market_rows(w, &rec, &bars, &[], (&[], &[]), &plan));
         assert!((row.ask - (0.50 + HALF_SPREAD)).abs() < 1e-12, "a sale is not an ask: {}", row.ask);
         assert_eq!(row.exit, ExitKind::Settle, "an exit cannot fire before the entry exists");
         assert!(row.y, "Up won this market");
@@ -2241,7 +2491,7 @@ mod tests {
         // The reference rule buys at the minute itself, so the same sale stops it: that
         // is what the harness fixture pins, and the stamp tells the two rules apart.
         let old = Plan { entry: EntryRule::LastBefore, ..plan };
-        let row = up_of(&build_market_rows(w, &rec, &bars, &[], &old));
+        let row = up_of(&build_market_rows(w, &rec, &bars, &[], (&[], &[]), &old));
         assert_eq!(row.exit, ExitKind::Sl, "under LastBefore the sale is inside the position");
         assert!(!row.y);
         assert_ne!(plan.label(), old.label(), "the stamp must tell the two rules apart");
@@ -2335,7 +2585,7 @@ mod tests {
         };
         let bars: Vec<Bar> = bars_from_day(&prev).chain(bars_from_day(&day)).collect();
         let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45 };
-        let rows = build_market_rows(w, &rec, &bars, &funding, &plan);
+        let rows = build_market_rows(w, &rec, &bars, &funding, (&[], &[]), &plan);
         println!("rows: {} ({} eligible); first: ask {:.3} y {} exit {:?}", rows.len(), rows.iter().filter(|r| r.elig).count(), rows[0].ask, rows[0].y, rows[0].exit);
         assert!(rows.len() >= 60);
         let xs: Vec<[f64; N_FEATURES]> = rows.iter().map(|r| r.features).collect();
@@ -2507,5 +2757,108 @@ mod tests {
         });
         let line = status_line("teststatus").unwrap();
         assert!(line.starts_with("data current | last cycle 2026-09-13 23:00 ET (rejected): candidate failed"), "{line}");
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+    use crate::vipers::gboost_planb::OI_ARCHIVE_STAMP_SHIFT_SECS;
+
+    /// The archive's real header and two rows as served on 2026-09-22. Open interest
+    /// is placed at `create_time + 300 s`, the taker ratio at `create_time` (check 3).
+    #[test]
+    fn archive_rows_land_on_the_api_stamps() {
+        let csv = "create_time,symbol,sum_open_interest,sum_open_interest_value,count_toptrader_long_short_ratio,sum_toptrader_long_short_ratio,count_long_short_ratio,sum_taker_long_short_vol_ratio\n\
+2026-09-20 00:45:00,BTCUSDT,107468.6330000000000000,8732405307.9261380000000000,1.09242907,2.08390900,0.94166944,0.34238500\n\
+2026-09-20 00:30:00,BTCUSDT,107482.0080000000000000,8737599861.8673930000000000,1.09140768,2.08320500,0.94066465,0.81852200\n";
+        let (oi, tl) = parse_metrics_csv(csv);
+        let t0030 = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).unwrap().and_hms_opt(0, 30, 0).unwrap().and_utc().timestamp();
+        assert_eq!(oi, vec![(t0030 + OI_ARCHIVE_STAMP_SHIFT_SECS, 107482.008), (t0030 + 900 + OI_ARCHIVE_STAMP_SHIFT_SECS, 107468.633)], "sorted, and shifted onto the API stamp");
+        assert_eq!(tl, vec![(t0030, 0.818522), (t0030 + 900, 0.342385)], "taker ratio at offset 0");
+        assert!(parse_metrics_csv("nothing,here\n1,2\n").0.is_empty());
+    }
+
+    /// A single-entry zip built in memory round-trips through the header parser and
+    /// inflater, for both stored and deflated entries.
+    #[test]
+    fn a_single_entry_zip_is_read_without_a_zip_crate() {
+        use std::io::Write as _;
+        let payload = b"create_time,sum_open_interest,sum_taker_long_short_vol_ratio\n2026-09-20 00:30:00,1,2\n".to_vec();
+        let build = |method: u16, body: &[u8], usize_: u32| {
+            let name = b"BTCUSDT-metrics-2026-09-20.csv";
+            let mut z = vec![0x50, 0x4b, 0x03, 0x04, 20, 0, 0, 0];
+            z.extend_from_slice(&method.to_le_bytes());
+            z.extend_from_slice(&[0u8; 8]); // time, date, crc
+            z.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            z.extend_from_slice(&usize_.to_le_bytes());
+            z.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            z.extend_from_slice(&0u16.to_le_bytes());
+            z.extend_from_slice(name);
+            z.extend_from_slice(body);
+            z
+        };
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&payload).unwrap();
+        let deflated = enc.finish().unwrap();
+        assert_eq!(unzip_single_entry(&build(8, &deflated, payload.len() as u32)).unwrap(), payload);
+        assert_eq!(unzip_single_entry(&build(0, &payload, payload.len() as u32)).unwrap(), payload);
+        assert!(unzip_single_entry(b"PK\x05\x06").is_err());
+        assert!(unzip_single_entry(&build(9, &payload, 1)).is_err(), "an unsupported method is an error, not garbage");
+    }
+
+    /// A column present only on the newest quarter of the fit rows is zeroed, as is
+    /// one present everywhere except the newest day of the holdout; a column with
+    /// full coverage, or one that is missing everywhere already (dead), is left to
+    /// `dead_columns`.
+    #[test]
+    fn a_column_that_does_not_span_the_fold_is_zeroed() {
+        let mut row = [1.0f64; N_FEATURES];
+        row[FUNDING_COLUMN_FOR_TEST] = f64::NAN;
+        let mut fit: Vec<[f64; N_FEATURES]> = vec![row; 100];
+        for r in fit.iter_mut().take(75) { r[23] = f64::NAN; } // oi_d5 on the newest 25% only
+        let cal = vec![row; 20];
+        let mut test = vec![row; 40];
+        let mut recent = vec![row; 5];
+        for r in recent.iter_mut() { r[24] = f64::NAN; } // oi_d30 missing on the newest day
+        for r in test.iter_mut().take(5) { r[24] = f64::NAN; }
+        let partial = partial_columns(&[&fit, &cal, &test, &recent], MIN_COLUMN_COVERAGE);
+        assert!(partial.contains(&23), "25% coverage in fit: {partial:?}");
+        assert!(partial.contains(&24), "0% coverage on the newest day: {partial:?}");
+        assert!(!partial.contains(&25) && !partial.contains(&0), "full coverage stays live: {partial:?}");
+        assert!(partial.contains(&FUNDING_COLUMN_FOR_TEST), "a dead column is also partial; the union is what is zeroed");
+        assert!(partial_columns(&[&[]], MIN_COLUMN_COVERAGE).is_empty(), "an empty set judges nothing");
+    }
+    const FUNDING_COLUMN_FOR_TEST: usize = 22;
+
+    /// The live tail from `fapi`, which answers 451 from US addresses: this passes on
+    /// the Ireland box and fails here by design. Ignored by default (network); run
+    /// with `cargo test live_derivs_tail -- --ignored --nocapture`. Checks the paging
+    /// terminates against a clamped `startTime` and that the taker series is the
+    /// `buySellRatio` of `takerlongshortRatio`, in 5-minute buckets.
+    #[tokio::test]
+    #[ignore = "fapi.binance.com; 451 from US addresses"]
+    async fn live_derivs_tail_pages_from_fapi() {
+        let now = chrono::Utc::now().timestamp();
+        // Older than retention: the API clamps rather than errors, and the loop must stop.
+        let (oi, tl) = fetch_derivs_live_since(now - 45 * 86400).await.expect("fapi reachable");
+        println!("oi rows={} ({:?} .. {:?}) tlsr rows={} ({:?} .. {:?})", oi.len(), oi.first(), oi.last(), tl.len(), tl.first(), tl.last());
+        assert!(oi.len() > 1000 && tl.len() > 1000, "30 days at 5m is ~8,640 rows");
+        assert!(oi.windows(2).all(|w| w[1].0 > w[0].0) && tl.windows(2).all(|w| w[1].0 > w[0].0));
+        assert!(tl.iter().all(|(_, v)| *v > 0.0 && *v < 20.0), "buySellRatio is a ratio near 1, not an account count");
+        let f = crate::vipers::gboost_planb::deriv_features_at(&oi, &tl, now - 600);
+        assert!(f.oi_d5.is_some() && f.oi_d30.is_some() && f.tlsr.is_some() && f.tlsr15.is_some(), "{f:?}");
+    }
+
+    /// Downloads one real archive day. Ignored by default (network); run with
+    /// `cargo test archive_day -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "downloads from data.binance.vision"]
+    async fn live_archive_day_parses_into_five_minute_series() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let d = fetch_metrics_day(day).await.expect("fetch").expect("published");
+        println!("oi rows={} tlsr rows={} first={:?} last={:?}", d.oi.len(), d.tlsr.len(), d.oi.first(), d.oi.last());
+        assert!(d.oi.len() > 250 && d.tlsr.len() > 250, "a day holds ~288 five-minute rows");
+        assert!(d.oi.windows(2).all(|w| w[1].0 > w[0].0));
     }
 }
