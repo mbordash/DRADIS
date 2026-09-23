@@ -861,12 +861,32 @@ pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(4.0);
 // stop, or settlement. The plan values below are the ones the model's labels were built with.
 pub const GBOOST_PLANB_MODEL_FILENAME: &str = "gboost_planb_v1.json";
 pub const GBOOST_PLANB_TRADE_SIZE_USDC: Decimal = dec!(4.0);
-pub const GBOOST_PLANB_MARGIN: Decimal = dec!(0.10);
+/// How far the calibrated win probability must clear break-even to enter.
+///
+/// Lowered from 0.10 on 2026-09-23, with the ask band widened below, after a
+/// sweep of both over three disjoint 14-day folds of the stored BTC hourly
+/// markets. At 0.10 with the old band the rule fired about once a fortnight,
+/// which put a 40-trade shadow record roughly 560 days away: the lane recorded
+/// and could never promote.
+///
+/// Chosen for entry RATE, not for measured return. The sweep found no stable
+/// combination — the spread between folds was larger than the spread between
+/// settings, and the pair that looked best on the newest fold was negative on
+/// both earlier ones. What held across every fold was the rate, 34 to 54 trades
+/// per fortnight here, which populates a record in ten days to a fortnight and
+/// lets the shadow lane's own out-of-sample evidence do the judging. That is
+/// what the lane is for; picking a setting on one fold's return would be
+/// fitting noise and calling it a plan.
+pub const GBOOST_PLANB_MARGIN: Decimal = dec!(0.05);
 pub const GBOOST_PLANB_TAKE_PROFIT_PCT: Decimal = dec!(0.20);
 pub const GBOOST_PLANB_STOP_LOSS_PCT: Decimal = dec!(0.11);
 pub const GBOOST_PLANB_TP_CEILING: Decimal = dec!(0.90);
-pub const GBOOST_PLANB_MIN_ASK: Decimal = dec!(0.43);
-pub const GBOOST_PLANB_MAX_ASK: Decimal = dec!(0.75);
+/// The ask band the plan will enter in; see `GBOOST_PLANB_MARGIN` for why these
+/// widened from $0.43-$0.75 on 2026-09-23. The old band was also the worst
+/// setting on the newest fold and the best on the oldest, which is the clearest
+/// single sign that the per-fold returns here are not estimating anything.
+pub const GBOOST_PLANB_MIN_ASK: Decimal = dec!(0.25);
+pub const GBOOST_PLANB_MAX_ASK: Decimal = dec!(0.90);
 pub const GBOOST_PLANB_FIRST_MINUTE: i64 = 5;
 pub const GBOOST_PLANB_LAST_MINUTE: i64 = 45;
 pub const GBOOST_RESTING_TP_ENABLED: bool = true;

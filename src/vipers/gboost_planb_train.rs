@@ -246,6 +246,9 @@ impl DataDir {
     pub fn new(asset: &str) -> Self {
         Self { root: PathBuf::from(format!("logs/gboost_planb/{}", asset.to_ascii_lowercase())) }
     }
+    /// A store at an explicit path, for reading one that was copied off an
+    /// instance rather than the one this process writes.
+    pub fn at(root: PathBuf) -> Self { Self { root } }
     pub fn markets(&self) -> PathBuf { self.root.join("markets") }
     pub fn market(&self, w: i64) -> PathBuf { self.markets().join(format!("{w}.json")) }
     pub fn klines(&self) -> PathBuf { self.root.join("klines") }
@@ -1080,6 +1083,17 @@ pub fn beats_incumbent(candidate: &FoldStats, incumbent: &FoldStats, min_trades:
     }
 }
 
+/// How many closed shadow trades the model currently in service has recorded.
+///
+/// Zero when nothing is in service, when the file will not load, or when the
+/// shard has no database — all of which mean "no experiment is in progress",
+/// which is what `serve_decision` does with the number.
+async fn shadow_trades_recorded(asset: &str, serving_path: &std::path::Path) -> usize {
+    let Ok(model) = crate::vipers::gboost_planb::load_model(serving_path) else { return 0 };
+    let Some(pool) = crate::helpers::db::pool_for(asset) else { return 0 };
+    crate::helpers::db::gboost_shadow_returns(&pool, asset, &model.version).await.len()
+}
+
 /// Whether the viper would actually trade this model under `plan`.
 ///
 /// Deliberately the same question `evaluate_entry` asks on every tick, with the
@@ -1105,6 +1119,10 @@ pub struct Incumbent {
     pub usable: bool,
     /// Its log-loss skill on THIS cycle's fold, so the two are comparable.
     pub skill: f64,
+    /// Closed shadow trades it has recorded so far, and the bar it needs. While
+    /// `0 < recorded < needed` it is mid-experiment.
+    pub shadow_trades: usize,
+    pub shadow_needed: usize,
 }
 
 /// Which model is in service after this cycle, and whether it may spend money.
@@ -1174,7 +1192,20 @@ pub fn serve_decision(
             if !inc.gate_passed || cand_beats_incumbent { Serve::Candidate } else { Serve::Incumbent }
         }
         (false, Some(inc)) => {
-            if inc.gate_passed { Serve::Incumbent }
+            if inc.gate_passed { return Serve::Incumbent; }
+            // A shadow model part-way through gathering its evidence is left
+            // alone. Replacing it starts its record at zero, and the comparison
+            // that would replace it is close to a coin flip: on a daily cycle
+            // the candidate and the incumbent are scored on folds overlapping
+            // 13 of 14 days, so neither reliably reflects a better model. Left
+            // as a bare `>=`, the serving slot turned over roughly every two
+            // days and no version ever accumulated enough trades to be
+            // promoted — a lane that records forever and promotes never.
+            //
+            // A candidate that clears the gate still displaces it immediately
+            // (the arm above), so this delays nothing that has earned its way.
+            let mid_experiment = inc.shadow_trades > 0 && inc.shadow_trades < inc.shadow_needed;
+            if mid_experiment { Serve::Incumbent }
             else if cand_skill >= inc.skill { Serve::CandidateInShadow }
             else { Serve::Incumbent }
         }
@@ -1235,6 +1266,12 @@ pub struct CycleInputs {
     pub budget: f64,
     pub auto_adopt: bool,
     pub threads: usize,
+    /// How many closed shadow trades the SERVING model has recorded, and the bar
+    /// it is working toward. A shadow model part-way through gathering its
+    /// evidence is not replaced by a coin-flip skill comparison; see
+    /// `serve_decision`.
+    pub incumbent_shadow_trades: usize,
+    pub shadow_min_trades: usize,
 }
 
 /// Load every stored market in the window and its bars, and build the rows.
@@ -1472,6 +1509,8 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
         // disagree about whether the serving model is usable.
         usable: incumbent.as_ref().is_some_and(|m| incumbent_usable(m, &inputs.plan)),
         skill: stats.skill,
+        shadow_trades: inputs.incumbent_shadow_trades,
+        shadow_needed: inputs.shadow_min_trades,
     });
     let inc_unusable = rep.incumbent.is_some() && inc_state.is_some_and(|i| !i.usable);
     let comparison = rep.incumbent.as_ref()
@@ -2106,6 +2145,9 @@ pub struct TrainingKnobs {
     pub min_trades: usize,
     pub min_win: f64,
     pub budget: f64,
+    /// The shadow record's target size, carried here so the adoption decision
+    /// can tell a model mid-experiment from one that has finished.
+    pub shadow_min_trades: usize,
 }
 
 impl TrainingKnobs {
@@ -2119,6 +2161,7 @@ impl TrainingKnobs {
             min_trades: dc.gboost_planb_gate_min_trades.max(1) as usize,
             min_win: dc.gboost_planb_gate_min_win_rate.to_f64().unwrap_or(0.53),
             budget: dc.gboost_planb_budget.to_f64().unwrap_or(2.0),
+            shadow_min_trades: dc.gboost_planb_shadow_min_trades.max(1) as usize,
         }
     }
 }
@@ -2402,6 +2445,11 @@ pub async fn run_pipeline(asset: String) {
                 budget: knobs.budget,
                 auto_adopt: knobs.auto_adopt,
                 threads: fit_threads(),
+                // Read here rather than in the blocking cycle: the record lives
+                // in SQLite and the cycle runs on a native thread with no
+                // runtime to await on.
+                incumbent_shadow_trades: shadow_trades_recorded(&asset, &serving_path).await,
+                shadow_min_trades: knobs.shadow_min_trades,
             };
             let (tx, rx) = tokio::sync::oneshot::channel();
             let spawned = std::thread::Builder::new()
@@ -2591,6 +2639,7 @@ mod tests {
         let inputs = CycleInputs {
             asset: "btc".into(), dir: dir.clone(), serving_path: serving.clone(), plan, now,
             window_days: 30, holdout_days: 1, min_trades: 5, min_win: 0.5, budget: 0.5, auto_adopt: true, threads: 1,
+            incumbent_shadow_trades: 0, shadow_min_trades: 40,
         };
         // Split as the cycle would, then train directly.
         let fold_start = floor_hour(now) - 86400;
@@ -2650,8 +2699,8 @@ mod tests {
     #[test]
     fn the_serve_table_always_leaves_a_model_in_service() {
         use super::{serve_decision, Incumbent, Serve};
-        let passed = |skill| Some(Incumbent { gate_passed: true, usable: true, skill });
-        let shadow = |skill| Some(Incumbent { gate_passed: false, usable: true, skill });
+        let passed = |skill| Some(Incumbent { gate_passed: true, usable: true, skill, shadow_trades: 40, shadow_needed: 40 });
+        let shadow = |skill| Some(Incumbent { gate_passed: false, usable: true, skill, shadow_trades: 40, shadow_needed: 40 });
 
         // A fresh instance serves whatever it trained, in the lane it earned.
         assert_eq!(serve_decision(true, 0.05, true, None), Serve::Candidate);
@@ -2693,7 +2742,7 @@ mod tests {
         // because the engine trades e2. Without this it outranked every honest
         // e2 candidate the pipeline could produce, forever — the permanently
         // idle viper, rebuilt out of a licensed model.
-        let refused = |skill| Some(Incumbent { gate_passed: true, usable: false, skill });
+        let refused = |skill| Some(Incumbent { gate_passed: true, usable: false, skill, shadow_trades: 0, shadow_needed: 40 });
         assert_eq!(serve_decision(false, -0.0034, false, refused(0.112)), Serve::CandidateInShadow,
                    "a failing candidate the engine CAN trade beats a passing one it cannot");
         assert_eq!(serve_decision(true, 0.01, false, refused(0.112)), Serve::Candidate,
@@ -2701,6 +2750,25 @@ mod tests {
         // The usable/unusable distinction is what decides it, not the gate.
         assert_eq!(serve_decision(false, -0.0034, false, passed(0.112)), Serve::Incumbent,
                    "the same numbers on a USABLE incumbent keep it, as before");
+
+        // A shadow model part-way through its record is not displaced by a
+        // coin-flip skill comparison. On a daily cycle the two models are scored
+        // on folds overlapping 13 of 14 days, so a bare `>=` turned the serving
+        // slot over about every two days and reset the record each time: a lane
+        // that records forever and promotes never.
+        let growing = |trades| Some(Incumbent {
+            gate_passed: false, usable: true, skill: -0.004, shadow_trades: trades, shadow_needed: 40,
+        });
+        assert_eq!(serve_decision(false, 0.05, true, growing(12)), Serve::Incumbent,
+                   "a better-scoring failed candidate must not restart a record in progress");
+        assert_eq!(serve_decision(false, 0.05, true, growing(0)), Serve::CandidateInShadow,
+                   "but a shadow model that has recorded nothing is not mid-experiment");
+        assert_eq!(serve_decision(false, 0.05, true, growing(40)), Serve::CandidateInShadow,
+                   "and one that finished its record without promoting may be replaced");
+        // A candidate that clears the gate still takes the slot immediately, so
+        // nothing that has earned its way is delayed by this.
+        assert_eq!(serve_decision(true, 0.05, false, growing(12)), Serve::Candidate,
+                   "a passing candidate is not held back by an experiment in progress");
     }
 
     /// The gate refuses a degenerate or losing candidate for a named reason and passes a
@@ -2838,6 +2906,7 @@ mod tests {
         let inputs = CycleInputs {
             asset: "btc".into(), dir: dir.clone(), serving_path: serving.clone(), plan, now: last_w + 3600 + 1800,
             window_days: 120, holdout_days: 14, min_trades: 30, min_win: 0.53, budget: 2.0, auto_adopt: true, threads: fit_threads(),
+            incumbent_shadow_trades: 0, shadow_min_trades: 40,
         };
         let t0 = Instant::now();
         let rep = run_cycle_blocking(&inputs);
@@ -2849,7 +2918,7 @@ mod tests {
             assert_eq!(m.trained_by.as_deref(), Some("dradis-engine"));
             assert_eq!(m.plan, Some([0.20, 0.11, 0.43, 0.75]));
             // A second cycle now has an incumbent to beat.
-            let rep2 = run_cycle_blocking(&CycleInputs { now: inputs.now + 3600, ..CycleInputs { asset: "btc".into(), dir: dir.clone(), serving_path: serving.clone(), plan, now: 0, window_days: 120, holdout_days: 14, min_trades: 30, min_win: 0.53, budget: 2.0, auto_adopt: true, threads: fit_threads() } });
+            let rep2 = run_cycle_blocking(&CycleInputs { now: inputs.now + 3600, ..CycleInputs { asset: "btc".into(), dir: dir.clone(), serving_path: serving.clone(), plan, now: 0, window_days: 120, holdout_days: 14, min_trades: 30, min_win: 0.53, budget: 2.0, auto_adopt: true, threads: fit_threads(), incumbent_shadow_trades: 0, shadow_min_trades: 40 } });
             println!("second cycle: {} ({})", rep2.decision, rep2.detail);
             assert!(rep2.incumbent.is_some());
             assert_eq!(rep2.incumbent_version.as_deref(), rep.model_version.as_deref());
@@ -3054,6 +3123,85 @@ mod tests {
         let line = status_line("teststatus").unwrap();
         assert!(line.starts_with("data current | last cycle 2026-09-13 23:00 ET (rejected): candidate failed"), "{line}");
     }
+
+    /// Measure how the entry margin and the ask band trade entry RATE against
+    /// return, on the stored data, so the pair can be chosen from evidence
+    /// rather than picked.
+    ///
+    /// The plan's 0.10 margin and $0.43-$0.75 band were frozen from the
+    /// pre-registration and have never been swept. At those settings the rule
+    /// fires about once a fortnight, which makes a 40-trade shadow record roughly
+    /// 560 days away — the lane records but cannot promote.
+    ///
+    /// Take-profit and stop are NOT swept: they are baked into each row's label
+    /// (`ret`, `exit`) at build time, so moving them would need a relabel, and
+    /// changing them changes what the model's probabilities mean. Margin and band
+    /// are applied at decision time over fixed labels, so this is an honest
+    /// re-read of the same rows.
+    ///
+    /// Run with:
+    ///   GBOOST_SWEEP_DIR=<store> GBOOST_SWEEP_MODEL=<model.json> \
+    ///     cargo test --release sweep_the_entry_margin -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs a stored GBoost data directory and a model file"]
+    fn sweep_the_entry_margin_and_ask_band() {
+        let dir = std::env::var("GBOOST_SWEEP_DIR").expect("GBOOST_SWEEP_DIR");
+        let model_path = std::env::var("GBOOST_SWEEP_MODEL").expect("GBOOST_SWEEP_MODEL");
+        let model = crate::vipers::gboost_planb::load_model(std::path::Path::new(&model_path))
+            .expect("model loads");
+        let window_days: i64 = std::env::var("GBOOST_SWEEP_WINDOW").ok()
+            .and_then(|s| s.parse().ok()).unwrap_or(120);
+        let holdout_days: i64 = std::env::var("GBOOST_SWEEP_HOLDOUT").ok()
+            .and_then(|s| s.parse().ok()).unwrap_or(14);
+
+        let plan = Plan {
+            entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90,
+            lo: 0.0, hi: 1.0, fee: 0.07, margin: 0.0, first_minute: 5, last_minute: 45,
+        };
+        let inputs = CycleInputs {
+            asset: "btc".into(), dir: DataDir::at(std::path::PathBuf::from(&dir)),
+            serving_path: std::path::PathBuf::from(&model_path), plan,
+            now: Utc::now().timestamp(), window_days, holdout_days,
+            min_trades: 30, min_win: 0.53, budget: 2.0, auto_adopt: false,
+            threads: 1, incumbent_shadow_trades: 0, shadow_min_trades: 40,
+        };
+        // Band wide open at build time so every row survives to be filtered here.
+        let (rows, _markets, _span) = load_rows(&inputs).expect("rows build");
+        // `GBOOST_SWEEP_BACK` slides the fold back by whole fold-widths, so a
+        // combination chosen on the newest fold can be re-read on an earlier,
+        // DISJOINT one. Without that check the sweep is choosing and scoring on
+        // the same rows, which is how you pick noise and call it a setting.
+        let back: i64 = std::env::var("GBOOST_SWEEP_BACK").ok()
+            .and_then(|s| s.parse().ok()).unwrap_or(0);
+        let fold_end = floor_hour(inputs.now) - back * holdout_days * 86400;
+        let fold_start = fold_end - holdout_days * 86400;
+        let test: Vec<&TrainingRow> = rows.iter()
+            .filter(|r| r.w >= fold_start && r.w < fold_end).collect();
+        assert!(!test.is_empty(), "no rows in the holdout fold");
+
+        let feats: Vec<[f64; N_FEATURES]> = test.iter().map(|r| r.features).collect();
+        let p: Vec<f64> = model.predict(&feats).into_iter().map(|x| x.1).collect();
+        let fold_days = holdout_days.max(1) as f64;
+
+        println!("\nfold rows {} over {holdout_days} d, model {}", test.len(), model.version);
+        println!("{:>6} {:>6} {:>6} | {:>7} {:>9} {:>7} {:>7} {:>9}",
+                 "margin", "lo", "hi", "trades", "per 14d", "mean%", "win", "lo bound%");
+        for &margin in &[0.10f64, 0.08, 0.06, 0.05, 0.04, 0.03, 0.02] {
+            for &(lo, hi) in &[(0.43f64, 0.75f64), (0.35, 0.80), (0.30, 0.85), (0.25, 0.90), (0.15, 0.95)] {
+                let keep: Vec<usize> = (0..test.len()).filter(|&i| lo <= test[i].ask && test[i].ask <= hi).collect();
+                if keep.is_empty() { continue; }
+                let sub: Vec<&TrainingRow> = keep.iter().map(|&i| test[i]).collect();
+                let subp: Vec<f64> = keep.iter().map(|&i| p[i]).collect();
+                let st = rule_stats(&sub, &subp, &Plan { lo, hi, margin, ..plan });
+                if st.trades == 0 { continue; }
+                println!("{:>6.2} {:>6.2} {:>6.2} | {:>7} {:>9.1} {:>7.2} {:>7.3} {:>9.2}",
+                         margin, lo, hi, st.trades, st.trades as f64 * 14.0 / fold_days,
+                         st.mean_ret * 100.0, st.win, st.ci_lo * 100.0);
+            }
+        }
+        println!();
+    }
+
 }
 
 #[cfg(test)]
