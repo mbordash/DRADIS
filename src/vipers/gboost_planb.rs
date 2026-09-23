@@ -185,6 +185,55 @@ pub struct Bar {
     pub close: f64,
 }
 
+/// What the shadow lane has recorded for the model currently in service.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ShadowStats {
+    pub trades: usize,
+    pub mean_ret: f64,
+    /// Lower bound of the 90% market-bootstrap interval on mean return.
+    pub lower_bound: f64,
+    pub win: f64,
+}
+
+/// Why this instance is not yet spending real money on GBoost, or `None` when
+/// it has earned the right to.
+///
+/// Both conditions must hold: the model cleared the holdout gate when it was
+/// trained, and the shadow lane's own out-of-sample record on THIS instance
+/// cleared the bar the pre-registration set for a live trial. The gate speaks
+/// for the model, the record speaks for the instance, and neither alone is
+/// evidence that this operator's box should be buying.
+///
+/// The bar is the pre-registration's, not a new one: at least
+/// `min_trades` entries, mean return above zero, the 90% bootstrap lower bound
+/// above zero, and a win rate at or above `min_win`. Returning the reason
+/// rather than a bool is deliberate — the card and the log have to be able to
+/// say which number is missing, or an operator cannot tell a viper that is
+/// working from one that is stuck.
+pub fn shadow_blocks_live(
+    gate_passed: bool,
+    rec: &ShadowStats,
+    min_trades: usize,
+    min_win: f64,
+) -> Option<String> {
+    if !gate_passed {
+        return Some("the model has not cleared the holdout gate".to_string());
+    }
+    if rec.trades < min_trades {
+        return Some(format!("shadow record {} of {} trades", rec.trades, min_trades));
+    }
+    if !(rec.mean_ret > 0.0) {
+        return Some(format!("shadow mean return {:+.2}% is not above zero", rec.mean_ret * 100.0));
+    }
+    if !(rec.lower_bound > 0.0) {
+        return Some(format!("shadow 90% lower bound {:+.2}% is not above zero", rec.lower_bound * 100.0));
+    }
+    if rec.win < min_win {
+        return Some(format!("shadow win rate {:.3} is below the {min_win:.2} bar", rec.win));
+    }
+    None
+}
+
 /// Everything one decision minute needs.
 pub struct DecisionInputs<'a> {
     /// Hourly window start (the strike is this minute's bar open).
@@ -586,6 +635,17 @@ pub struct PlanBModel {
     /// End of the calibration slice: the newest market the model has seen.
     pub calibrated_through: Option<String>,
     pub holdout_summary: Option<String>,
+    /// Did this model clear the holdout gate when it was trained?
+    ///
+    /// A model is now written to the serving path whether or not it passed, so
+    /// the viper always has something to score with and is never idle waiting
+    /// for one. `false` means it trades the shadow lane only: simulated entries
+    /// at the configured size, booked as simulated rows, until the instance's
+    /// own record earns real money. A model that predates the stamp is treated
+    /// as not passed, which is the safe reading — it was adopted under the old
+    /// rule where only a passing model was ever served, but the shadow lane
+    /// costs nothing and the promotion check will clear it on its own evidence.
+    pub gate_passed: bool,
 }
 
 /// Load and validate a model file: its layout, its input names, its calibration, its
@@ -638,7 +698,8 @@ pub fn load_model(path: &std::path::Path) -> std::result::Result<PlanBModel, Str
     let trained_by = meta("trained_by");
     let created_at = meta("created_at");
     let calibrated_through = meta("calibrated_through");
-    Ok(PlanBModel { booster, platt_a, platt_b, version, trees, zeroed, plan, entry_rule, trained_by, created_at, calibrated_through, holdout_summary })
+    let gate_passed = meta("gate_passed").as_deref() == Some("true");
+    Ok(PlanBModel { booster, platt_a, platt_b, version, trees, zeroed, plan, entry_rule, trained_by, created_at, calibrated_through, holdout_summary, gate_passed })
 }
 
 impl PlanBModel {
@@ -1684,7 +1745,7 @@ mod tests {
             let matrix = Matrix::new(&data, 4, 2);
             let mut b = PerpetualBooster::default().set_iteration_limit(Some(1)).set_num_threads(Some(1));
             b.fit(&matrix, &[0.0, 1.0, 0.0, 1.0], None, None).unwrap();
-            PlanBModel { booster: b, platt_a: 1.0, platt_b: 0.0, version: "t".into(), trees: 1, zeroed: vec![23, 24, 25, 26], plan, entry_rule, trained_by: None, created_at: None, calibrated_through: None, holdout_summary: None }
+            PlanBModel { booster: b, platt_a: 1.0, platt_b: 0.0, version: "t".into(), trees: 1, zeroed: vec![23, 24, 25, 26], plan, entry_rule, trained_by: None, created_at: None, calibrated_through: None, holdout_summary: None, gate_passed: true }
         };
         let m = |plan: Option<[f64; 4]>| m_with(plan, Some("e2".to_string()));
         assert!(m(Some(REFERENCE_PLAN)).plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2").is_none());
@@ -1927,5 +1988,50 @@ mod deriv_feature_tests {
         assert!((deriv_features_at(&oi, &[], t).oi_d5.unwrap() - (110.0f64 / 100.0).ln()).abs() < 1e-12);
         let oi = series(t, &[(5, 100.0), (0, 110.0), (-5, 999.0)]);
         assert!((deriv_features_at(&oi, &[], t).oi_d5.unwrap() - (110.0f64 / 100.0).ln()).abs() < 1e-12);
+    }
+}
+
+#[cfg(test)]
+mod shadow_promotion_tests {
+    use super::{shadow_blocks_live, ShadowStats};
+
+    fn passing() -> ShadowStats {
+        ShadowStats { trades: 44, mean_ret: 0.026, lower_bound: 0.004, win: 0.57 }
+    }
+
+    /// Both halves must hold: the gate speaks for the model, the record speaks
+    /// for this instance. Neither alone licenses spending an operator's money.
+    #[test]
+    fn a_passing_gate_and_a_passing_record_together_release_real_money() {
+        assert!(shadow_blocks_live(true, &passing(), 40, 0.53).is_none());
+        assert_eq!(shadow_blocks_live(false, &passing(), 40, 0.53).as_deref(),
+            Some("the model has not cleared the holdout gate"));
+    }
+
+    /// Each unmet condition names itself, because a card that cannot say which
+    /// number is missing leaves an operator unable to tell a viper that is
+    /// working from one that is stuck.
+    #[test]
+    fn every_unmet_condition_names_itself() {
+        let cases = [
+            (ShadowStats { trades: 12, ..passing() }, "shadow record 12 of 40 trades"),
+            (ShadowStats { mean_ret: -0.004, ..passing() }, "shadow mean return -0.40% is not above zero"),
+            (ShadowStats { lower_bound: -0.021, ..passing() }, "shadow 90% lower bound -2.10% is not above zero"),
+            (ShadowStats { win: 0.48, ..passing() }, "shadow win rate 0.480 is below the 0.53 bar"),
+        ];
+        for (rec, expected) in cases {
+            assert_eq!(shadow_blocks_live(true, &rec, 40, 0.53).as_deref(), Some(expected));
+        }
+    }
+
+    /// The bar is the pre-registration's, so a record that only just clears it
+    /// clears it, and a zero lower bound does not: "above zero" is strict
+    /// because an interval touching zero is the result that failed.
+    #[test]
+    fn the_bar_is_the_pre_registrations_and_zero_is_not_above_zero() {
+        let edge = ShadowStats { trades: 40, mean_ret: 0.0001, lower_bound: 0.0001, win: 0.53 };
+        assert!(shadow_blocks_live(true, &edge, 40, 0.53).is_none(), "exactly at the bar passes");
+        let zero_lb = ShadowStats { lower_bound: 0.0, ..edge };
+        assert!(shadow_blocks_live(true, &zero_lb, 40, 0.53).is_some(), "a zero lower bound is not above zero");
     }
 }
