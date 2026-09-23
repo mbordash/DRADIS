@@ -2257,6 +2257,27 @@ mod tests {
         let mut z = m(Some(REFERENCE_PLAN));
         z.zeroed.push(FUNDING_COLUMN);
         assert!(!z.needs_funding());
+
+        // The trainer decides whether to keep the serving model by asking this
+        // same question, and it has to pass the same arguments in the same
+        // order. When the two disagreed, production kept an e1-labeled model the
+        // viper refused on every tick, and GBoost sat idle behind it with no way
+        // out: a failing e2 candidate could not displace a model whose stamped
+        // holdout read as a pass.
+        use crate::vipers::gboost_planb_train::{incumbent_usable, EntryRule, Plan};
+        let plan = Plan {
+            entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90,
+            lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45,
+        };
+        assert!(incumbent_usable(&m(Some(REFERENCE_PLAN)), &plan),
+                "a model stamped for the configured plan is worth keeping");
+        assert!(!incumbent_usable(&m_with(Some(REFERENCE_PLAN), Some("e1".to_string())), &plan),
+                "the production case: right plan, wrong entry rule, refused on every tick");
+        for shifted in [Plan { tp: 0.25, ..plan }, Plan { sl: 0.15, ..plan },
+                        Plan { lo: 0.50, ..plan }, Plan { hi: 0.80, ..plan }] {
+            assert!(!incumbent_usable(&m(Some(REFERENCE_PLAN)), &shifted),
+                    "an operator moving a plan knob makes the stamped model unusable");
+        }
     }
 
     #[test]

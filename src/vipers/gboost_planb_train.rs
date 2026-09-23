@@ -1080,12 +1080,29 @@ pub fn beats_incumbent(candidate: &FoldStats, incumbent: &FoldStats, min_trades:
     }
 }
 
+/// Whether the viper would actually trade this model under `plan`.
+///
+/// Deliberately the same question `evaluate_entry` asks on every tick, with the
+/// same inputs, so the trainer and the viper cannot disagree about whether the
+/// serving model is usable. When they disagreed, the trainer kept a model the
+/// viper refused and GBoost sat idle behind it with no way out.
+pub fn incumbent_usable(model: &crate::vipers::gboost_planb::PlanBModel, plan: &Plan) -> bool {
+    model.plan_mismatch(plan.tp, plan.sl, plan.lo, plan.hi, plan.entry.stamp()).is_none()
+}
+
 /// What the serving model looked like when this cycle started.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Incumbent {
     /// Whether it cleared the holdout gate when it was trained, read back from
     /// its own `gate_passed` stamp.
     pub gate_passed: bool,
+    /// Whether the viper would trade it at all under the configured plan, i.e.
+    /// whether `plan_mismatch` accepts its entry rule and plan stamp.
+    ///
+    /// A licensed model the viper refuses is worse than an unlicensed one it
+    /// accepts: the refusal happens before any lane is chosen, so the viper
+    /// scores nothing, records nothing and can never improve its position.
+    pub usable: bool,
     /// Its log-loss skill on THIS cycle's fold, so the two are comparable.
     pub skill: f64,
 }
@@ -1136,8 +1153,21 @@ pub fn serve_decision(
     cand_beats_incumbent: bool,
     incumbent: Option<Incumbent>,
 ) -> Serve {
+    // An incumbent the viper will not trade is not an incumbent. It occupies the
+    // serving slot without ever producing a decision, so comparing it on gate or
+    // skill is comparing against nothing — and because it can neither be traded
+    // nor be improved upon by the comparison, keeping it is permanent idleness.
+    //
+    // This is not hypothetical. On production, 2026-09-23, the serving model was
+    // labeled with entry rule e1 while the engine traded e2, so `plan_mismatch`
+    // refused it on every tick. Its stamped holdout (195 trades, +6.35% a trade,
+    // 68.7% win) reads as a clear pass — those are the e1 prices [B47] showed the
+    // book never offered — so without this clause it outranked every honest e2
+    // candidate the pipeline could produce, forever.
+    let incumbent = incumbent.filter(|inc| inc.usable);
     match (gate_passed, incumbent) {
-        // A fresh instance: serve whatever was trained, in the lane it earned.
+        // A fresh instance, or one whose incumbent the viper refuses: serve
+        // whatever was trained, in the lane it earned.
         (true, None) => Serve::Candidate,
         (false, None) => Serve::CandidateInShadow,
         (true, Some(inc)) => {
@@ -1437,8 +1467,13 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
     // with no demonstrated skill is not, and is unchanged.
     let inc_state = rep.incumbent.as_ref().map(|stats| Incumbent {
         gate_passed: incumbent.as_ref().is_some_and(|m| m.gate_passed),
+        // The same question the viper asks every tick, asked here with the plan
+        // this cycle was trained for, so the trainer and the viper cannot
+        // disagree about whether the serving model is usable.
+        usable: incumbent.as_ref().is_some_and(|m| incumbent_usable(m, &inputs.plan)),
         skill: stats.skill,
     });
+    let inc_unusable = rep.incumbent.is_some() && inc_state.is_some_and(|i| !i.usable);
     let comparison = rep.incumbent.as_ref()
         .map(|inc_stats| beats_incumbent(&cand, inc_stats, inputs.min_trades));
     let beats = comparison.as_ref().map(|(ok, _)| *ok).unwrap_or(true);
@@ -1473,6 +1508,10 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
         }
         Serve::Candidate => {
             rep.comparison = match (&comparison, inc_state) {
+                _ if inc_unusable => Some(format!(
+                    "the serving model {inc_name} is not one this engine can trade under the configured plan, \
+                     so a candidate for the configured plan replaces it"
+                )),
                 (cmp, Some(inc)) if !inc.gate_passed => Some(format!(
                     "the serving model {inc_name} has not cleared the gate, so a passing candidate replaces it{}",
                     cmp.as_ref().map(|(_, why)| format!(" ({why}{overlap})")).unwrap_or_default(),
@@ -1482,10 +1521,18 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
             };
         }
         Serve::CandidateInShadow => {
-            rep.comparison = inc_state.map(|inc| format!(
-                "log-loss skill {:+.4} against the serving model's {:+.4}; neither has cleared the gate",
-                cand.skill, inc.skill,
-            ));
+            rep.comparison = if inc_unusable {
+                Some(format!(
+                    "the serving model {inc_name} is not one this engine can trade under the configured plan, \
+                     so it is replaced even though the candidate did not clear the gate: a model in the shadow \
+                     lane scores and builds a record, one the viper refuses does neither"
+                ))
+            } else {
+                inc_state.map(|inc| format!(
+                    "log-loss skill {:+.4} against the serving model's {:+.4}; neither has cleared the gate",
+                    cand.skill, inc.skill,
+                ))
+            };
         }
     }
 
@@ -1500,7 +1547,11 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
     // fails to load leaves the viper idle, so treating it as an incumbent and
     // declining to replace it would recreate the permanently idle viper behind an
     // unreadable file.
-    if !inputs.auto_adopt && incumbent.is_some() {
+    // `!inc_unusable` for the same reason as `incumbent.is_some()` itself: a
+    // model the viper refuses is not something in service, so declining to
+    // replace it is not deferring to the operator, it is leaving the viper idle
+    // behind a file it will never use.
+    if !inputs.auto_adopt && incumbent.is_some() && !inc_unusable {
         let detail = if shadow_only {
             format!(
                 "candidate {version} failed the holdout gate and would serve in the shadow lane; \
@@ -1534,8 +1585,12 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
     }
     // An operator who turned Auto Adopt off and still sees an adoption is owed the
     // reason in the same line, or their switch looks broken.
-    let bypassed = if inputs.auto_adopt { "" } else {
-        " (Auto Adopt is off, but nothing was in service, so there was no operator decision to defer to)"
+    let bypassed = match (inputs.auto_adopt, inc_unusable) {
+        (true, _) => "",
+        (false, true) => " (Auto Adopt is off, but nothing this engine could trade was in service, \
+                           so there was no operator decision to defer to)",
+        (false, false) => " (Auto Adopt is off, but nothing was in service, so there was no operator \
+                            decision to defer to)",
     };
     let summary = if shadow_only {
         format!(
@@ -2595,8 +2650,8 @@ mod tests {
     #[test]
     fn the_serve_table_always_leaves_a_model_in_service() {
         use super::{serve_decision, Incumbent, Serve};
-        let passed = |skill| Some(Incumbent { gate_passed: true, skill });
-        let shadow = |skill| Some(Incumbent { gate_passed: false, skill });
+        let passed = |skill| Some(Incumbent { gate_passed: true, usable: true, skill });
+        let shadow = |skill| Some(Incumbent { gate_passed: false, usable: true, skill });
 
         // A fresh instance serves whatever it trained, in the lane it earned.
         assert_eq!(serve_decision(true, 0.05, true, None), Serve::Candidate);
@@ -2630,6 +2685,22 @@ mod tests {
                            "there is no incumbent to keep");
             }
         }
+
+        // A model the viper will not trade is not an incumbent, however well it
+        // scored. Production on 2026-09-23 was exactly this: an e1-labeled model
+        // whose stamped holdout (195 trades, +6.35% a trade, 68.7% win, skill
+        // +0.112) reads as a clear pass, refused on every tick by plan_mismatch
+        // because the engine trades e2. Without this it outranked every honest
+        // e2 candidate the pipeline could produce, forever — the permanently
+        // idle viper, rebuilt out of a licensed model.
+        let refused = |skill| Some(Incumbent { gate_passed: true, usable: false, skill });
+        assert_eq!(serve_decision(false, -0.0034, false, refused(0.112)), Serve::CandidateInShadow,
+                   "a failing candidate the engine CAN trade beats a passing one it cannot");
+        assert_eq!(serve_decision(true, 0.01, false, refused(0.112)), Serve::Candidate,
+                   "and a passing candidate certainly does");
+        // The usable/unusable distinction is what decides it, not the gate.
+        assert_eq!(serve_decision(false, -0.0034, false, passed(0.112)), Serve::Incumbent,
+                   "the same numbers on a USABLE incumbent keep it, as before");
     }
 
     /// The gate refuses a degenerate or losing candidate for a named reason and passes a
