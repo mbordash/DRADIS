@@ -530,6 +530,17 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(g, e, "gboost_planb_take_profit_pct", "Plan Take Profit", "pct", true,
             "Take-profit target, entry-relative. The model's labels were built with 20%, so a different \
              target changes what its probabilities mean, which is why this is operator-only.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "gboost_planb_shadow_min_trades", "Shadow Record Size", "int", true,
+            "How many simulated trades this instance's shadow lane must record before GBoost is allowed to \
+             spend real money. GBoost always runs: until it is promoted it trades simulated, and it is promoted \
+             only when its model has cleared the training holdout gate AND this record shows a mean return above \
+             zero, a 90% bootstrap lower bound above zero, and the win rate below. The viper's card names \
+             whichever number is still missing. Lowering this promotes on thinner evidence."
+        ).range(5.0, 500.0).step(1.0));
+        v.push(F::new(g, e, "gboost_planb_shadow_min_win_rate", "Shadow Win Rate Bar", "pct", true,
+            "Win rate the shadow record must reach before GBoost trades real money. Break-even at plan-B \
+             prices is about 0.49, so the default asks for a real edge rather than a coin flip."
+        ).range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "gboost_planb_held_exposure_usdc", "Held Exposure Cap", "usd", true,
             "Most this viper may have tied up in positions whose market has already closed and which are \
              waiting to settle. Only the hold postures create these; at Exit Posture 0 nothing is ever held \
@@ -581,9 +592,13 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              A fit needs 2 GB of free memory beside the engine (a t3.medium has it, a t3.small does not); \
              without it the fit is refused and the GBoost card says why."));
         v.push(F::new(g, None, "gboost_planb_auto_adopt", "Auto Adopt", "bool", false,
-            "Put a candidate into service on its own once it passes the holdout gate and does at least as well \
-             as the serving model on the same held-out fold. Off, every candidate is written to \
-             logs/gboost_planb/btc/candidate.json with its report and the serving model is never replaced."));
+            "Put a candidate into service on its own. A candidate that passes the holdout gate and does at least \
+             as well as the serving model is adopted and licensed for real money; one that fails the gate is still \
+             served, but only in the shadow lane, where it trades simulated until this instance's own shadow record \
+             earns the promotion. Off, a candidate is written to logs/gboost_planb/btc/candidate.json with its \
+             report and the serving model is not replaced — except when nothing is in service at all, where a first \
+             model is put into service anyway, because honoring the switch there would leave the viper with nothing \
+             to score and no way to ever earn anything."));
         v.push(F::new(g, None, "gboost_planb_train_window_days", "Training Window", "int", false,
             "Days of hourly markets the pipeline keeps and trains on. The first backfill fetches about 24 markets \
              a day at one public API request a second (four to six requests a market), so 120 days takes four to \

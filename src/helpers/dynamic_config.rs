@@ -354,6 +354,8 @@ fn default_gboost_planb_holdout_days()       -> i64     { config::GBOOST_PLANB_H
 fn default_gboost_planb_retrain_hours()      -> i64     { config::GBOOST_PLANB_RETRAIN_HOURS             }
 fn default_gboost_planb_gate_min_trades()    -> i64     { config::GBOOST_PLANB_GATE_MIN_TRADES           }
 fn default_gboost_planb_gate_min_win_rate()  -> Decimal { config::GBOOST_PLANB_GATE_MIN_WIN_RATE         }
+fn default_gboost_planb_shadow_min_trades()  -> i64     { config::GBOOST_PLANB_SHADOW_MIN_TRADES         }
+fn default_gboost_planb_shadow_min_win_rate()-> Decimal { config::GBOOST_PLANB_SHADOW_MIN_WIN_RATE       }
 fn default_gboost_planb_budget()             -> Decimal { config::GBOOST_PLANB_BUDGET                    }
 
 /// Bridge for knobs whose profile constant is an `f64` (`FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC`):
@@ -819,6 +821,17 @@ pub struct DynamicConfig {
     #[serde(default = "default_gboost_planb_held_exposure_usdc")]
     pub gboost_planb_held_exposure_usdc: Decimal,
 
+    /// How many simulated trades the shadow lane must record before this
+    /// instance's evidence can release real money, and the win rate that record
+    /// must reach. GBoost trades simulated until the model has cleared the
+    /// holdout gate AND the record clears this bar, a mean return above zero and
+    /// a 90% bootstrap lower bound above zero. Raising either keeps the viper in
+    /// the shadow lane longer on the same evidence.
+    #[serde(default = "default_gboost_planb_shadow_min_trades")]
+    pub gboost_planb_shadow_min_trades: i64,
+    #[serde(default = "default_gboost_planb_shadow_min_win_rate")]
+    pub gboost_planb_shadow_min_win_rate: Decimal,
+
     // ── TrendCapture Viper ────────────────────────────────────────────────────
     #[serde(default = "default_trendcapture_min_trade_size")]
     pub trendcapture_min_trade_size_usdc: Decimal,
@@ -1199,6 +1212,8 @@ impl Default for DynamicConfig {
             momentum_scaled_sizing_enabled:       config::ENABLE_KELLY_SIZING,
             gboost_planb_exit_posture:            config::GBOOST_PLANB_EXIT_POSTURE,
             gboost_planb_held_exposure_usdc:      config::GBOOST_PLANB_HELD_EXPOSURE_USDC,
+            gboost_planb_shadow_min_trades:       config::GBOOST_PLANB_SHADOW_MIN_TRADES,
+            gboost_planb_shadow_min_win_rate:     config::GBOOST_PLANB_SHADOW_MIN_WIN_RATE,
             momentum_decay_exit_fraction:         config::MOMENTUM_DECAY_EXIT_FRACTION,
             momentum_decay_fee_margin_mult:       config::MOMENTUM_DECAY_FEE_MARGIN_MULT,
 
@@ -2010,6 +2025,7 @@ mod tests {
             "momentum_catastrophic_persist_secs", "momentum_scaled_sizing_enabled",
             "momentum_decay_exit_fraction", "momentum_decay_fee_margin_mult",
             "gboost_planb_exit_posture", "gboost_planb_held_exposure_usdc",
+            "gboost_planb_shadow_min_trades", "gboost_planb_shadow_min_win_rate",
         ] {
             assert!(obj.remove(added).is_some(), "{added} must be a serialized field");
         }
@@ -2021,6 +2037,8 @@ mod tests {
         assert_eq!(cfg.momentum_scaled_sizing_enabled, config::ENABLE_KELLY_SIZING);
         assert_eq!(cfg.gboost_planb_exit_posture, config::GBOOST_PLANB_EXIT_POSTURE);
         assert_eq!(cfg.gboost_planb_held_exposure_usdc, config::GBOOST_PLANB_HELD_EXPOSURE_USDC);
+        assert_eq!(cfg.gboost_planb_shadow_min_trades, config::GBOOST_PLANB_SHADOW_MIN_TRADES);
+        assert_eq!(cfg.gboost_planb_shadow_min_win_rate, config::GBOOST_PLANB_SHADOW_MIN_WIN_RATE);
         assert_eq!(cfg.momentum_decay_exit_fraction, config::MOMENTUM_DECAY_EXIT_FRACTION);
         assert_eq!(cfg.momentum_decay_fee_margin_mult, config::MOMENTUM_DECAY_FEE_MARGIN_MULT);
         assert_eq!(cfg.convergence_max_fee_to_target_ratio, config::CONVERGENCE_MAX_FEE_TO_TARGET_RATIO);

@@ -195,6 +195,126 @@ pub struct ShadowStats {
     pub win: f64,
 }
 
+/// Which exit the plan takes for an open shadow trade right now, if any.
+///
+/// Pure, and deliberately the labeler's rule (`gboost_planb_train`, the
+/// `ExitKind` loop) rather than a second opinion about how the plan behaves: the
+/// shadow record is only evidence about the plan if it simulates the same plan
+/// the holdout measured. Two differences from the labeler, both because live
+/// prices are better than reconstructed ones:
+///
+/// * the sale price is the real best bid, where the labeler had to approximate a
+///   sale from a mid by subtracting half a spread;
+/// * the stop sells at that bid rather than at the mid that triggered it.
+///
+/// The stop is checked before the take-profit, as the labeler checks it, so a
+/// tick that crosses both is scored the conservative way.
+///
+/// Three divergences remain, named here rather than discovered later:
+///
+/// * the lane samples the book every `SHADOW_SWEEP_SECS` where the labeler read
+///   every print and every history mid, so a brief touch of either level is
+///   missed — in both directions, so roughly symmetric;
+/// * a squadron rotates ten minutes before its market closes, after which the
+///   lane has no book for the old tokens and a position can only end at
+///   settlement, where the labeler scored stops and take-profits through to the
+///   close;
+/// * the record therefore measures the PLAN the holdout measured, which is the
+///   point, and not the live exit posture: at the default `ExitPosture::Gates`
+///   the live viper flattens at the bid before rotation instead of holding to
+///   settlement. A promotion licenses the plan on this instance's evidence; it
+///   is not evidence about the posture.
+pub fn shadow_exit(
+    entry: f64, tp_price: f64, stop_price: f64, bid: Option<f64>, resolved: Option<f64>,
+) -> Option<(f64, &'static str)> {
+    // A bid of zero is not a price, it is the absence of one: an empty bid side
+    // is published as $0.00 so that a dark feed reads as a market nobody is
+    // bidding on rather than as an error (`state.rs`, `snapshot_has_book`).
+    // Without this guard a websocket resync, or a thin losing side with no bids,
+    // books a shadow trade at $0.00 — a total loss the live viper would never
+    // take, because `exit_action` requires `bid > 0` before it will stop. One
+    // such row drags the bootstrap lower bound down for the rest of a 40-trade
+    // record, so it would corrupt the very evidence the promotion rests on.
+    if let Some(b) = bid.filter(|b| *b > 0.0) {
+        if b <= stop_price {
+            return Some((b, "stop"));
+        }
+        // A take-profit above a dollar can never fill, and one at or below the
+        // entry is not a profit; the labeler calls this `tp_possible`.
+        if tp_price < 1.0 && tp_price > entry && b >= tp_price {
+            return Some((tp_price, "take-profit"));
+        }
+    }
+    resolved.map(|r| (r, "settlement"))
+}
+
+/// What one closed shadow trade returned, per unit staked.
+///
+/// The plan's arithmetic: the entry fee was paid on the way in, an exit fee is
+/// paid only when the stop sells into the book, and a take-profit that rests is
+/// a maker sale that pays none. A settlement pays no exit fee either, because
+/// nothing is sold — the position redeems.
+pub fn shadow_ret(entry: f64, entry_fee: f64, exit_price: f64, reason: &str, fee_rate: f64) -> f64 {
+    let exit_fee = if reason == "stop" {
+        crate::vipers::gboost_planb_train::fee_per_share(fee_rate, exit_price)
+    } else {
+        0.0
+    };
+    if entry <= 0.0 { return 0.0; }
+    (exit_price - entry - entry_fee - exit_fee) / entry
+}
+
+/// Where the plan's take-profit and stop sit for an entry at `ask`.
+pub fn shadow_levels(ask: f64, tp: f64, sl: f64, tp_ceiling: f64) -> (f64, f64) {
+    (
+        crate::vipers::gboost_planb_train::ceil_tick(ask * (1.0 + tp)).min(tp_ceiling),
+        ask * (1.0 - sl),
+    )
+}
+
+/// The shadow lane's record for one model, from its closed simulated trades.
+///
+/// `returns` is `(hourly window, net return per unit staked)`, one entry per
+/// closed shadow trade. The interval is a MARKET bootstrap, resampling hourly
+/// markets rather than rows, because the pre-registration's bar is stated that
+/// way and for the reason it is stated that way: two entries on the same hourly
+/// market are one market's worth of evidence. Resampling rows would report a
+/// tighter interval than the evidence supports and promote the lane early,
+/// which is the one error this gate exists to prevent.
+///
+/// The estimator is deliberately the same one `rule_stats` uses for the holdout
+/// gate — same resample count, same deterministic generator, same percentile —
+/// so "lower bound above zero" means the identical thing in the gate and in the
+/// promotion, rather than two bars that merely share a name.
+pub fn shadow_stats(returns: &[(i64, f64)]) -> ShadowStats {
+    use crate::vipers::gboost_planb_train::{percentile, SplitMix, BOOTSTRAP_RESAMPLES};
+    if returns.is_empty() {
+        return ShadowStats::default();
+    }
+    let rets: Vec<f64> = returns.iter().map(|(_, r)| *r).collect();
+    let mut by_market: std::collections::BTreeMap<i64, Vec<f64>> = std::collections::BTreeMap::new();
+    for (w, r) in returns { by_market.entry(*w).or_default().push(*r); }
+    let markets: Vec<&Vec<f64>> = by_market.values().collect();
+    let mut rng = SplitMix(0);
+    let mut boots: Vec<f64> = Vec::with_capacity(BOOTSTRAP_RESAMPLES);
+    for _ in 0..BOOTSTRAP_RESAMPLES {
+        let (mut sum, mut n) = (0.0, 0usize);
+        for _ in 0..markets.len() {
+            let m = markets[rng.below(markets.len())];
+            sum += m.iter().sum::<f64>();
+            n += m.len();
+        }
+        boots.push(sum / n as f64);
+    }
+    boots.sort_by(|a, b| a.total_cmp(b));
+    ShadowStats {
+        trades: rets.len(),
+        mean_ret: rets.iter().sum::<f64>() / rets.len() as f64,
+        lower_bound: percentile(&boots, 5.0),
+        win: rets.iter().filter(|r| **r > 0.0).count() as f64 / rets.len() as f64,
+    }
+}
+
 /// Why this instance is not yet spending real money on GBoost, or `None` when
 /// it has earned the right to.
 ///
@@ -641,11 +761,54 @@ pub struct PlanBModel {
     /// the viper always has something to score with and is never idle waiting
     /// for one. `false` means it trades the shadow lane only: simulated entries
     /// at the configured size, booked as simulated rows, until the instance's
-    /// own record earns real money. A model that predates the stamp is treated
-    /// as not passed, which is the safe reading — it was adopted under the old
-    /// rule where only a passing model was ever served, but the shadow lane
-    /// costs nothing and the promotion check will clear it on its own evidence.
+    /// own record earns real money.
+    ///
+    /// A model written before the stamp existed has its verdict re-derived in
+    /// `load_model` from the holdout numbers it did record. Treating the missing
+    /// stamp as a failure would be permanent rather than safe: `shadow_blocks_live`
+    /// refuses on a failed gate before it ever looks at the record, so such a
+    /// model could never be promoted by its own evidence, however good. One that
+    /// recorded no holdout either stays in the shadow lane.
     pub gate_passed: bool,
+}
+
+/// The gate's verdict on a model that was written before the verdict was stamped,
+/// re-derived from the holdout numbers it did record.
+///
+/// Reading a missing stamp as "failed" would be permanent, not merely cautious:
+/// `shadow_blocks_live` refuses on a failed gate BEFORE it looks at the record,
+/// so an unstamped model could never be promoted by its own evidence however
+/// good, and the only escape would be the pipeline training a passing
+/// replacement — which on an instance whose candidates keep failing never comes.
+///
+/// Every input the gate weighs was already stamped by the trainer that wrote the
+/// file, so this reads the model's own holdout result rather than assuming
+/// anything about it. A file that recorded no holdout has produced no evidence
+/// and does not pass: `gate` refuses a NaN skill, a zero trade count and a NaN
+/// win rate on their own terms.
+///
+/// The bar is the compile-time one, because this runs in a loader with no
+/// DynamicConfig in reach. That only ever applies to pre-stamp files; anything
+/// this build trains carries the verdict the operator's own knobs produced.
+pub fn gate_from_stamp(
+    trees: usize, skill: Option<f64>, trades: Option<usize>, mean_ret: Option<f64>, win: Option<f64>,
+) -> bool {
+    use crate::vipers::gboost_planb_train::{gate, FoldStats, RuleStats};
+    let stats = FoldStats {
+        skill: skill.unwrap_or(f64::NAN),
+        rule: RuleStats {
+            trades: trades.unwrap_or(0),
+            mean_ret: mean_ret.unwrap_or(f64::NAN),
+            win: win.unwrap_or(f64::NAN),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    gate(
+        trees, &stats,
+        crate::config::GBOOST_PLANB_GATE_MIN_TRADES.max(0) as usize,
+        crate::config::GBOOST_PLANB_GATE_MIN_WIN_RATE.to_f64().unwrap_or(0.53),
+    ).passed
 }
 
 /// Load and validate a model file: its layout, its input names, its calibration, its
@@ -698,7 +861,38 @@ pub fn load_model(path: &std::path::Path) -> std::result::Result<PlanBModel, Str
     let trained_by = meta("trained_by");
     let created_at = meta("created_at");
     let calibrated_through = meta("calibrated_through");
-    let gate_passed = meta("gate_passed").as_deref() == Some("true");
+    // Whether this model is licensed for real money.
+    //
+    // Normally the trainer's own verdict, stamped into the file. A model written
+    // before this build carries no stamp, and reading that absence as "failed"
+    // would strand it in the shadow lane permanently: `shadow_blocks_live`
+    // refuses on a failed gate BEFORE it looks at the record, so no amount of
+    // good evidence on this instance could ever release it. The only escape
+    // would be the pipeline training a passing replacement, which on a box whose
+    // candidates keep failing never comes.
+    //
+    // So an unstamped file is judged on the evidence it DID record. Every input
+    // the gate weighs — trees, log-loss skill, holdout trades, mean return, win
+    // rate — was already stamped by the trainer that wrote it, and re-deriving
+    // the verdict from those numbers is reading the model's own holdout result,
+    // not assuming anything about it. A file with no holdout stamp either (an
+    // externally provided model) has recorded no evidence at all and stays in
+    // the shadow lane, which is the right answer for a model nobody can check.
+    //
+    // The bar used here is the compile-time one rather than the operator's
+    // current knob, because this runs in a loader that has no DynamicConfig. It
+    // applies only to pre-stamp files; anything this build trains carries the
+    // verdict the operator's own knobs produced.
+    let gate_passed = match meta("gate_passed").as_deref() {
+        Some(v) => v == "true",
+        None => gate_from_stamp(
+            trees,
+            num("holdout_skill"),
+            meta("holdout_trades").and_then(|s| s.parse::<usize>().ok()),
+            num("holdout_mean_ret"),
+            num("holdout_win"),
+        ),
+    };
     Ok(PlanBModel { booster, platt_a, platt_b, version, trees, zeroed, plan, entry_rule, trained_by, created_at, calibrated_through, holdout_summary, gate_passed })
 }
 
@@ -797,6 +991,21 @@ struct PlanBGlobals {
     attempted: StdMutex<HashSet<(String, usize)>>,
     below_minimum_noted: StdMutex<HashSet<String>>,
     detail_refreshed: StdMutex<Option<Instant>>,
+    /// Last time the shadow lane's open trades were swept for exits.
+    shadow_swept: StdMutex<Option<Instant>>,
+    /// Last resolution probe per condition, so a shadow position waiting on a
+    /// settlement does not ask the venue on every sweep.
+    shadow_probed: StdMutex<HashMap<String, Instant>>,
+    /// Resolutions the spawned probes have brought back, by token, waiting to be
+    /// applied by a later sweep.
+    shadow_resolved: StdMutex<HashMap<String, f64>>,
+    /// The promotion record for the serving model, and when it was read. Cached
+    /// because it changes only when a shadow trade closes, and the entry path
+    /// consults it every decision minute.
+    shadow_record: StdMutex<Option<(String, ShadowStats, Instant)>>,
+    /// Model versions whose lane state has been announced, so the promotion and
+    /// demotion lines are logged once each rather than every tick.
+    shadow_announced: StdMutex<HashSet<String>>,
 }
 
 fn lock<T>(m: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -822,7 +1031,24 @@ pub fn model_path(asset: &str) -> PathBuf {
 
 /// The card's detail line: which model is serving and where it came from, then what
 /// the training pipeline is doing.
-fn detail_line(model: Option<&PlanBModel>, asset: &str) -> String {
+/// How the card names the lane the viper is in, and what is still missing.
+///
+/// An operator looking at a GBoost card has exactly one question — is this
+/// spending my money, and if not, why not — so the line answers it with the
+/// numbers rather than a status word. A viper that is working towards a
+/// promotion and one that is stuck look identical without them.
+pub fn lane_line(gate_passed: bool, rec: &ShadowStats, min_trades: usize, min_win: f64) -> String {
+    let numbers = format!(
+        "record {} trades, {:+.2}% per trade, 90% lower bound {:+.2}%, win {:.3}",
+        rec.trades, rec.mean_ret * 100.0, rec.lower_bound * 100.0, rec.win,
+    );
+    match shadow_blocks_live(gate_passed, rec, min_trades, min_win) {
+        Some(why) => format!("SHADOW — trading simulated, not real money: {why} ({numbers})"),
+        None => format!("LIVE — the gate passed and this instance's own record earned it ({numbers})"),
+    }
+}
+
+fn detail_line(model: Option<&PlanBModel>, asset: &str, lane: Option<String>) -> String {
     let serving = match model {
         Some(m) => {
             let by = match m.trained_by.as_deref() {
@@ -835,6 +1061,10 @@ fn detail_line(model: Option<&PlanBModel>, asset: &str) -> String {
             format!("serving {} ({} trees, {by}{when}{holdout})", m.version, m.trees)
         }
         None => "no model in service".to_string(),
+    };
+    let serving = match lane {
+        Some(l) => format!("{l} | {serving}"),
+        None => serving,
     };
     match crate::vipers::gboost_planb_train::status_line(asset) {
         Some(p) => format!("{serving} | {p}"),
@@ -1171,6 +1401,180 @@ fn fmt_features(v: &[f64; N_FEATURES]) -> String {
 
 // ── Strategy ─────────────────────────────────────────────────────────────────
 
+/// The venue's taker fee rate as the plan's f64 arithmetic wants it.
+fn plan_fee_rate() -> f64 { crate::venues::taker_fee_rate().to_f64().unwrap_or(0.0) }
+
+/// How often the shadow lane sweeps its open trades for exits.
+///
+/// Not every 50ms tick: the sweep reads the database, and a research lane whose
+/// exits are scored to the second would still be scored against a book sampled
+/// once a tick. Five seconds is finer than the labeler's own event granularity
+/// and costs one small query.
+const SHADOW_SWEEP_SECS: u64 = 5;
+/// How often a shadow position past its market's close asks the venue whether it
+/// has resolved. One request per condition per minute, the same restraint the
+/// simulated event settlement uses.
+const SHADOW_PROBE_SECS: u64 = 60;
+/// How long the cached promotion record is trusted before it is re-read.
+const SHADOW_RECORD_TTL_SECS: u64 = 30;
+/// How long after its market closed a simulated position waits for a resolution
+/// before it is written off unscored.
+///
+/// A market the venue never settles — voided, or one Gamma simply never flips —
+/// would otherwise be probed once a minute forever and hold its market against
+/// re-entry for the life of the instance. Written off rather than guessed: a
+/// trade with no outcome is not a trade with a bad one, and the promotion
+/// evidence must not contain a number nobody observed.
+const SHADOW_GIVE_UP_SECS: i64 = 24 * 3600;
+
+/// The promotion record for `version` on `asset`, cached briefly.
+///
+/// Version-scoped: a retrain starts a fresh record, so a new model can never
+/// inherit the evidence an older one earned. That is the point of the scoping
+/// and not an incidental detail — without it the first retrain after promotion
+/// would hand its successor a real-money license it never tested.
+async fn shadow_record_for(asset: &str, version: &str) -> ShadowStats {
+    let g = globals(asset);
+    {
+        let cached = lock(&g.shadow_record);
+        if let Some((v, rec, at)) = cached.as_ref() {
+            if v == version && at.elapsed().as_secs() < SHADOW_RECORD_TTL_SECS {
+                return *rec;
+            }
+        }
+    }
+    let Some(pool) = crate::helpers::db::pool_for(asset) else { return ShadowStats::default() };
+    let rec = shadow_stats(&crate::helpers::db::gboost_shadow_returns(&pool, asset, version).await);
+    *lock(&g.shadow_record) = Some((version.to_string(), rec, Instant::now()));
+    rec
+}
+
+/// Drop the cached record, so the next read sees a trade that has just closed.
+fn invalidate_shadow_record(asset: &str) {
+    *lock(&globals(asset).shadow_record) = None;
+}
+
+/// Close out any simulated positions whose plan says they are done.
+///
+/// This is the shadow lane's exit engine. It exists inside the viper rather than
+/// as a `ghost_mode` order because the intl patrol computes ONE `ghosting` value
+/// per tick from the global switch and honors a per-order `ghost_mode` flag at
+/// exactly one site, the resting-exit arm (`patrol_impl.rs`). An Entry signal
+/// flagged simulated on a live instance would therefore place a real order —
+/// which is the whole reason the lane books its own trades and emits no signal.
+async fn sweep_shadow_exits(ctx: &StrategyContext, fee_rate: f64) {
+    let asset = &ctx.crypto_filter;
+    let g = globals(asset);
+    {
+        let mut swept = lock(&g.shadow_swept);
+        if swept.is_some_and(|t| t.elapsed().as_secs() < SHADOW_SWEEP_SECS) { return; }
+        *swept = Some(Instant::now());
+    }
+    let Some(pool) = crate::helpers::db::pool_for(asset) else { return };
+    // Every open row for the asset, not just the serving model's. The exit rule
+    // reads only the levels stored on the row, so a position a replaced model
+    // opened can still be finished properly — and left unswept it would sit with
+    // `closed_at` NULL forever, holding its market against re-entry and giving
+    // that model a record with a hole in it.
+    let open = crate::helpers::db::gboost_shadow_open_trades(&pool, asset).await;
+    if open.is_empty() { return; }
+    let now = Utc::now().timestamp();
+
+    for t in open {
+        let token = crate::venues::core::MarketId::new(&t.token_id);
+        // The best bid is what a sale would actually get. A market that has
+        // rotated out of the squadron has no book here, which is not an error:
+        // the position then waits for its settlement below.
+        let bid = crate::vipers::venue_for_token(ctx, &token).and_then(|(market, snap)| {
+            let b = if token == market.yes_token { snap.yes_bid } else { snap.no_bid };
+            if (Utc::now() - snap.timestamp).num_seconds() > MAX_SNAPSHOT_AGE_SECS { None } else { b.to_f64() }
+        });
+
+        // Past its market's close, ask the venue what it resolved to.
+        //
+        // Spawned rather than awaited here. `evaluate_exit` runs inside the
+        // orchestrator's 500ms per-strategy timeout, and a Gamma call is allowed
+        // five seconds; awaiting it inline would drop BOTH this viper's futures
+        // for that tick, and if the tick were a decision minute the minute is
+        // already marked decided, so it would be consumed with neither a live nor
+        // a simulated entry. The rest of this viper fetches the same way
+        // (`ensure_minute_data`, `ensure_price_history`) for exactly this reason.
+        let resolved = lock(&g.shadow_resolved).get(&t.token_id).copied();
+        if resolved.is_none() && now >= t.window_start + 3600 {
+            let due = {
+                let mut probed = lock(&g.shadow_probed);
+                let due = probed.get(&t.condition_id).is_none_or(|at| at.elapsed().as_secs() >= SHADOW_PROBE_SECS);
+                if due { probed.insert(t.condition_id.clone(), Instant::now()); }
+                probed.retain(|_, at| at.elapsed().as_secs() < 7200);
+                due
+            };
+            if due {
+                let (asset_c, cid, token) = (asset.clone(), t.condition_id.clone(), t.token_id.clone());
+                tokio::spawn(async move {
+                    let got = crate::raptors::sports_ledger::settled_prices_for_market(
+                        http(), &cid, std::slice::from_ref(&token),
+                    ).await;
+                    if let Some(px) = got.get(&token).copied() {
+                        let mut out = lock(&globals(&asset_c).shadow_resolved);
+                        out.insert(token, px);
+                        // Bounded: one entry per token that has ever resolved.
+                        if out.len() > 512 { out.clear(); }
+                    }
+                });
+            }
+            // Nothing to apply this pass; a later sweep picks the answer up.
+            if now >= t.window_start + 3600 + SHADOW_GIVE_UP_SECS {
+                if crate::helpers::db::gboost_shadow_abandon(&pool, t.id, "unresolved").await {
+                    warn!(
+                        "👻 GBoost shadow trade written off unscored [{}] {}: the venue never resolved it \
+                         {}h after close, so it counts as no trade rather than as a guess",
+                        t.market, t.side, (now - t.window_start - 3600) / 3600,
+                    );
+                }
+                continue;
+            }
+        }
+
+        let Some((exit_price, reason)) = shadow_exit(t.entry_price, t.tp_price, t.stop_price, bid, resolved) else {
+            continue;
+        };
+        let ret = shadow_ret(t.entry_price, t.entry_fee, exit_price, reason, fee_rate);
+        if !crate::helpers::db::gboost_shadow_close(&pool, t.id, exit_price, reason, ret).await {
+            // Another sweep took it, or the write failed. Either way this sweep
+            // must not also book a trade row for it.
+            continue;
+        }
+        invalidate_shadow_record(asset);
+
+        // The operator's trade list gets a ghost row, which is how a simulated
+        // trade has always been shown. The row the promotion is computed from is
+        // the shadow ledger's, not this one.
+        let pnl = ret * t.entry_price * t.shares;
+        // The fees the plan actually charged this trade, so the row's fee column
+        // agrees with its P&L instead of reading zero against a net number.
+        let exit_fee = if reason == "stop" {
+            crate::vipers::gboost_planb_train::fee_per_share(fee_rate, exit_price)
+        } else { 0.0 };
+        let fees = (t.entry_fee + exit_fee) * t.shares;
+        let mut scope = crate::state::TradeScope::new(asset, "", Some("crypto".to_string()), Some(asset.to_uppercase()));
+        scope.ghost = true;
+        crate::helpers::db::record_trade_db(
+            &pool, &scope, Decimal::from_f64_retain(fees).unwrap_or_default(),
+            STRATEGY_NAME, &t.market, &t.side,
+            Decimal::from_f64_retain(t.entry_price).unwrap_or_default(),
+            Decimal::from_f64_retain(exit_price).unwrap_or_default(),
+            Decimal::from_f64_retain(t.shares).unwrap_or_default(),
+            Decimal::from_f64_retain(pnl).unwrap_or_default(),
+            &format!("Shadow {reason} — simulated ({})", t.model_version),
+            None,
+        ).await;
+        info!(
+            "👻 GBoost shadow {} [{}] {} | entry ${:.3} → ${:.3}, {:+.2}% (model {})",
+            reason, t.market, t.side, t.entry_price, exit_price, ret * 100.0, t.model_version,
+        );
+    }
+}
+
 #[derive(Default)]
 pub struct GboostPlanBStrategy;
 
@@ -1216,15 +1620,27 @@ impl Strategy for GboostPlanBStrategy {
         let g = globals(&ctx.crypto_filter);
         // Checked on every tick, so a fresh start has the model loaded by its first decision minute.
         let model = ensure_model(g, &ctx.crypto_filter);
+        let f = |d: Decimal| d.to_f64().unwrap_or(0.0);
         {
-            // The card's detail line: the serving model and the pipeline's state.
-            let mut last = lock(&g.detail_refreshed);
-            if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(DETAIL_REFRESH_SECS)) {
-                *last = Some(Instant::now());
-                crate::helpers::viper_status::report_detail(&ctx.crypto_filter, STRATEGY_NAME, Some(detail_line(model.as_deref(), &ctx.crypto_filter)));
+            // The card's detail line: which lane, the serving model, and the
+            // pipeline's state.
+            let due = {
+                let mut last = lock(&g.detail_refreshed);
+                let due = last.is_none_or(|t| t.elapsed() >= Duration::from_secs(DETAIL_REFRESH_SECS));
+                if due { *last = Some(Instant::now()); }
+                due
+            };
+            if due {
+                let lane = match model.as_deref() {
+                    Some(m) => {
+                        let rec = shadow_record_for(&ctx.crypto_filter, &m.version).await;
+                        Some(lane_line(m.gate_passed, &rec, dc.gboost_planb_shadow_min_trades.max(0) as usize, f(dc.gboost_planb_shadow_min_win_rate)))
+                    }
+                    None => None,
+                };
+                crate::helpers::viper_status::report_detail(&ctx.crypto_filter, STRATEGY_NAME, Some(detail_line(model.as_deref(), &ctx.crypto_filter, lane)));
             }
         }
-        let f = |d: Decimal| d.to_f64().unwrap_or(0.0);
         if let Some(m) = &model {
             let plan = crate::vipers::gboost_planb_train::Plan::from_config(dc, f(crate::venues::taker_fee_rate()));
             if let Some(why) = m.plan_mismatch(f(dc.gboost_planb_take_profit_pct), f(dc.gboost_planb_stop_loss_pct), f(dc.gboost_planb_min_ask), f(dc.gboost_planb_max_ask), plan.entry.stamp()) {
@@ -1408,6 +1824,73 @@ impl Strategy for GboostPlanBStrategy {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── The shadow lane ──────────────────────────────────────────────────
+        //
+        // Real money needs two things, and this is the only place that decides
+        // it: the model cleared the holdout gate when it was trained, and this
+        // instance's own out-of-sample record cleared the pre-registration's bar.
+        // The gate speaks for the model, the record speaks for the box, and
+        // neither alone is evidence that this operator should be buying.
+        //
+        // Until both hold, the entry is taken simulated and NO signal is emitted.
+        // It must be done this way rather than by flagging the order simulated:
+        // the intl patrol derives one `ghosting` value per tick from the global
+        // switch and consults a per-order flag at exactly one site, so an Entry
+        // marked simulated on a live instance would place a real order.
+        let record = shadow_record_for(&ctx.crypto_filter, &model.version).await;
+        let min_trades = dc.gboost_planb_shadow_min_trades.max(0) as usize;
+        let min_win = f(dc.gboost_planb_shadow_min_win_rate);
+        if let Some(why) = shadow_blocks_live(model.gate_passed, &record, min_trades, min_win) {
+            let Some(pool) = crate::helpers::db::pool_for(&ctx.crypto_filter) else {
+                idle("the shadow lane has no database to record into");
+                return Ok(StrategySignal::NoSignal);
+            };
+            // The live path asks the position map whether this market is already
+            // held; the shadow lane is not in that map, so it has to ask its own
+            // ledger or it would open a fresh simulated position every minute.
+            if crate::helpers::db::gboost_shadow_holds(&pool, &ctx.crypto_filter, &cid).await {
+                idle("a simulated position is already open on this market");
+                return Ok(StrategySignal::NoSignal);
+            }
+            let (tp_price, stop_price) = shadow_levels(
+                ask[side], f(dc.gboost_planb_take_profit_pct), f(dc.gboost_planb_stop_loss_pct),
+                f(dc.gboost_planb_tp_ceiling),
+            );
+            let entry_fee = crate::vipers::gboost_planb_train::fee_per_share(
+                f(crate::venues::taker_fee_rate()), ask[side],
+            );
+            let opened = crate::helpers::db::gboost_shadow_open(
+                &pool, &ctx.crypto_filter, &model.version, &cid, token_id.as_str(),
+                &market.market_name, label[side], w, ask[side], f(shares),
+                tp_price, stop_price, entry_fee, preds[side].1, decisions[side].break_even,
+            ).await;
+            if opened {
+                // Marked attempted exactly as a confirmed live fill is, so the
+                // lane takes one entry per side per market and the record counts
+                // the same population the live rule would have traded.
+                lock(&g.attempted).insert((cid.clone(), side));
+                invalidate_shadow_record(&ctx.crypto_filter);
+                info!(
+                    "👻 GBoost shadow ENTRY [{}] {} at ${:.3} x {:.2} (p={:.4} need={:.4}, model {}) | \
+                     take-profit ${:.3}, stop ${:.3} | not spending real money: {}",
+                    market.market_name, label[side], ask[side], shares, preds[side].1,
+                    decisions[side].required, model.version, tp_price, stop_price, why,
+                );
+            }
+            idle(&format!("trading simulated — {why}"));
+            return Ok(StrategySignal::NoSignal);
+        }
+        // Promoted. Said once per model, because an instance crossing from
+        // simulated to real money is the single most consequential thing this
+        // viper does and it must be legible in the log afterwards.
+        if lock(&g.shadow_announced).insert(model.version.clone()) {
+            info!(
+                "💰 GBoost is now trading REAL MONEY on model {}: it cleared the holdout gate, and this \
+                 instance's shadow record is {} trades at {:+.2}% per trade, 90% lower bound {:+.2}%, win {:.3}",
+                model.version, record.trades, record.mean_ret * 100.0, record.lower_bound * 100.0, record.win,
+            );
+        }
+
         // A live side is marked attempted once its position is seen (above, or in the exit
         // pass), not here: an entry the patrol drops (a cooldown, a pending order) or the book
         // kills unfilled stays eligible at the next decision minute.
@@ -1464,6 +1947,18 @@ impl Strategy for GboostPlanBStrategy {
         let dc = &ctx.dynamic_config;
         let g = globals(&ctx.crypto_filter);
         let now_s = Utc::now().timestamp();
+        // The shadow lane manages its own positions: they are not in the position
+        // map, so nothing below this line would ever see them. Swept before the
+        // map is locked, because the sweep awaits a database read and, for a
+        // market that has closed, the venue — neither of which should be done
+        // while the patrol tick is waiting on the lock.
+        // Gated exactly as the entry path is. Without the venue and asset checks
+        // `ensure_model` would look for a model on every ETH and SOL squadron and
+        // on the other two venues, and warn every ten minutes that a file the
+        // BTC-only pipeline was never going to write is missing.
+        if dc.enable_gboost && venue_gate().is_none() && ctx.crypto_filter.eq_ignore_ascii_case("btc") {
+            sweep_shadow_exits(ctx, plan_fee_rate()).await;
+        }
         let positions = ctx.positions.lock().await;
         let mut resting: Vec<StrategySignal> = Vec::new();
 
@@ -1993,7 +2488,7 @@ mod deriv_feature_tests {
 
 #[cfg(test)]
 mod shadow_promotion_tests {
-    use super::{shadow_blocks_live, ShadowStats};
+    use super::{lane_line, shadow_blocks_live, shadow_exit, shadow_levels, shadow_ret, shadow_stats, ShadowStats};
 
     fn passing() -> ShadowStats {
         ShadowStats { trades: 44, mean_ret: 0.026, lower_bound: 0.004, win: 0.57 }
@@ -2034,4 +2529,231 @@ mod shadow_promotion_tests {
         let zero_lb = ShadowStats { lower_bound: 0.0, ..edge };
         assert!(shadow_blocks_live(true, &zero_lb, 40, 0.53).is_some(), "a zero lower bound is not above zero");
     }
+
+    /// The plan's exit rule, which the shadow record is only evidence about if
+    /// it is the same rule the holdout measured.
+    #[test]
+    fn the_shadow_exit_is_the_plans_own_rule() {
+        let (entry, tp, stop) = (0.60, 0.72, 0.51);
+
+        // Nothing while the bid sits between the levels and the market is open.
+        assert_eq!(shadow_exit(entry, tp, stop, Some(0.65), None), None);
+
+        // The stop sells into the book at the bid, not at the level.
+        assert_eq!(shadow_exit(entry, tp, stop, Some(0.49), None), Some((0.49, "stop")));
+        assert_eq!(shadow_exit(entry, tp, stop, Some(0.51), None), Some((0.51, "stop")),
+                   "at the level is a stop, as the labeler has it");
+
+        // A resting take-profit fills at its own price, not at the bid that
+        // reached it: that is what resting means.
+        assert_eq!(shadow_exit(entry, tp, stop, Some(0.80), None), Some((0.72, "take-profit")));
+
+        // A tick that satisfies both is scored the conservative way. It takes a
+        // degenerate plan to overlap the levels (the stop above the target), but
+        // the knobs are the operator's and the precedence must be defined.
+        assert_eq!(shadow_exit(entry, 0.61, 0.65, Some(0.63), None), Some((0.63, "stop")),
+                   "the stop is checked first, as the labeler checks it");
+
+        // A take-profit that cannot fill is not an exit.
+        assert_eq!(shadow_exit(entry, 1.00, stop, Some(0.99), None), None,
+                   "a dollar take-profit can never fill");
+        assert_eq!(shadow_exit(entry, 0.55, stop, Some(0.99), None), None,
+                   "a take-profit at or below the entry is not a profit");
+
+        // An empty bid side is published as $0.00, which is the absence of a
+        // price and not a price of zero. Booking it would record a total loss
+        // the live viper would never take — `exit_action` refuses to stop on a
+        // zero bid — and one such row would poison a 40-trade record.
+        assert_eq!(shadow_exit(entry, tp, stop, Some(0.0), None), None,
+                   "a websocket resync must not book a shadow trade as a total loss");
+        assert_eq!(shadow_exit(entry, tp, stop, Some(0.0), Some(1.0)), Some((1.0, "settlement")),
+                   "and it must not stop the real resolution from closing the trade");
+
+        // With no book — the market rotated away — only a resolution closes it.
+        assert_eq!(shadow_exit(entry, tp, stop, None, None), None);
+        assert_eq!(shadow_exit(entry, tp, stop, None, Some(1.0)), Some((1.0, "settlement")));
+        assert_eq!(shadow_exit(entry, tp, stop, None, Some(0.0)), Some((0.0, "settlement")));
+    }
+
+    /// Fees land where the plan puts them: on the way in always, on the way out
+    /// only when the stop sells into the book.
+    #[test]
+    fn only_a_stop_pays_an_exit_fee() {
+        let fee = 0.07;
+        let entry_fee = crate::vipers::gboost_planb_train::fee_per_share(fee, 0.60);
+        let tp = shadow_ret(0.60, entry_fee, 0.72, "take-profit", fee);
+        let settle = shadow_ret(0.60, entry_fee, 1.0, "settlement", fee);
+        let stop = shadow_ret(0.60, entry_fee, 0.51, "stop", fee);
+
+        assert!((tp - (0.72 - 0.60 - entry_fee) / 0.60).abs() < 1e-12, "a resting sale pays no exit fee");
+        assert!((settle - (1.0 - 0.60 - entry_fee) / 0.60).abs() < 1e-12, "a redemption sells nothing");
+        let stop_fee = crate::vipers::gboost_planb_train::fee_per_share(fee, 0.51);
+        assert!(stop_fee > 0.0);
+        assert!((stop - (0.51 - 0.60 - entry_fee - stop_fee) / 0.60).abs() < 1e-12);
+        assert!(stop < 0.0 && tp > 0.0);
+    }
+
+    /// The take-profit is ticked up and capped; the stop is entry-relative.
+    #[test]
+    fn the_levels_follow_the_plan_knobs() {
+        let (tp, sl) = shadow_levels(0.60, 0.20, 0.15, 0.95);
+        assert!((tp - 0.72).abs() < 1e-9);
+        assert!((sl - 0.51).abs() < 1e-9);
+        // The ceiling binds before a dollar.
+        let (tp, _) = shadow_levels(0.90, 0.20, 0.15, 0.95);
+        assert!((tp - 0.95).abs() < 1e-9, "the tp ceiling caps the target");
+    }
+
+    /// The record's interval resamples MARKETS, not rows: two entries on the
+    /// same hourly market are one market's worth of evidence, and resampling
+    /// rows would report a tighter bound than the evidence supports and promote
+    /// the lane early.
+    #[test]
+    fn the_record_bootstraps_by_market() {
+        assert_eq!(shadow_stats(&[]).trades, 0, "no record is not a passing record");
+
+        let flat: Vec<(i64, f64)> = (0..40).map(|i| (i as i64 * 3600, 0.05)).collect();
+        let r = shadow_stats(&flat);
+        assert_eq!(r.trades, 40);
+        assert!((r.mean_ret - 0.05).abs() < 1e-12);
+        assert!((r.win - 1.0).abs() < 1e-12);
+        assert!(r.lower_bound > 0.0, "40 identical winners have a lower bound above zero");
+
+        // The same 40 returns from ONE market are one market of evidence.
+        let same: Vec<(i64, f64)> = (0..40).map(|_| (0i64, 0.05)).collect();
+        let one = shadow_stats(&same);
+        assert_eq!(one.trades, 40);
+        assert!((one.mean_ret - 0.05).abs() < 1e-12);
+
+        let mixed: Vec<(i64, f64)> = (0..40)
+            .map(|i| (i as i64 * 3600, if i % 2 == 0 { 0.30 } else { -0.28 }))
+            .collect();
+        let m = shadow_stats(&mixed);
+        assert!((m.win - 0.5).abs() < 1e-12);
+        assert!(m.lower_bound < m.mean_ret, "a noisy record's lower bound sits below its mean");
+    }
+
+    /// The card answers the operator's only question, with the numbers.
+    #[test]
+    fn the_card_names_the_lane_and_what_is_missing() {
+        let thin = ShadowStats { trades: 12, mean_ret: 0.008, lower_bound: -0.021, win: 0.58 };
+        let line = lane_line(true, &thin, 40, 0.53);
+        assert!(line.starts_with("SHADOW"), "{line}");
+        assert!(line.contains("shadow record 12 of 40 trades"), "it must name the missing number: {line}");
+
+        let earned = ShadowStats { trades: 44, mean_ret: 0.026, lower_bound: 0.004, win: 0.57 };
+        let line = lane_line(true, &earned, 40, 0.53);
+        assert!(line.starts_with("LIVE"), "{line}");
+        assert!(line.contains("+2.60%"), "{line}");
+
+        // A model that never cleared the gate says so, however good the record.
+        let line = lane_line(false, &earned, 40, 0.53);
+        assert!(line.starts_with("SHADOW") && line.contains("holdout gate"), "{line}");
+    }
+
+
+    /// The shadow ledger end to end against a real database: open, refuse to
+    /// double-open, close, and have the closed trade appear in the record that
+    /// decides promotion.
+    ///
+    /// Written against a real pool rather than mocked because the last time a
+    /// DRADIS ledger path was covered only by pure-function tests, the schema
+    /// was wrong and the writer silently returned false.
+    #[tokio::test]
+    async fn the_shadow_ledger_opens_closes_and_feeds_the_record() {
+        use crate::helpers::db;
+        use sqlx::sqlite::SqlitePoolOptions;
+        let p = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        db::init_schema(&p).await.unwrap();
+        db::run_migrations(&p).await;
+
+        const V: &str = "engine-btc-20260923T1200Z";
+        assert!(!db::gboost_shadow_holds(&p, "btc", "cond-1").await);
+
+        let opened = db::gboost_shadow_open(
+            &p, "btc", V, "cond-1", "tok-yes", "Bitcoin Up or Down - September 23, 12PM ET",
+            "YES", 1_758_600_000, 0.60, 6.0, 0.72, 0.51, 0.0168, 0.71, 0.55,
+        ).await;
+        assert!(opened, "the shadow ledger must accept an entry, or the lane records nothing");
+        assert!(db::gboost_shadow_holds(&p, "btc", "cond-1").await,
+                "an open simulated position must be visible, or the lane re-enters every minute");
+
+        let open = db::gboost_shadow_open_trades(&p, "btc").await;
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].side, "YES");
+        assert!((open[0].tp_price - 0.72).abs() < 1e-9);
+        assert!((open[0].entry_fee - 0.0168).abs() < 1e-9);
+
+        assert_eq!(open[0].model_version, V, "the row carries the model that took it");
+        // The RECORD is version-scoped, so a retrain cannot inherit the evidence
+        // an older model earned — while the open position itself is still swept
+        // and still blocks a second entry on the same market.
+        assert!(db::gboost_shadow_returns(&p, "btc", "engine-btc-OTHER").await.is_empty());
+        assert!(db::gboost_shadow_holds(&p, "btc", "cond-1").await,
+                "a retrain mid-market must not let a new model stack a second position");
+
+        // Nothing counts toward the record until it closes.
+        assert!(db::gboost_shadow_returns(&p, "btc", V).await.is_empty());
+
+        let ret = shadow_ret(0.60, 0.0168, 0.72, "take-profit", 0.07);
+        assert!(db::gboost_shadow_close(&p, open[0].id, 0.72, "take-profit", ret).await);
+        assert!(!db::gboost_shadow_close(&p, open[0].id, 0.72, "take-profit", ret).await,
+                "a second sweep must not close the same trade twice");
+
+        assert!(!db::gboost_shadow_holds(&p, "btc", "cond-1").await);
+        assert!(db::gboost_shadow_open_trades(&p, "btc").await.is_empty());
+
+        let rows = db::gboost_shadow_returns(&p, "btc", V).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 1_758_600_000, "the hourly window is carried for the market bootstrap");
+        assert!((rows[0].1 - ret).abs() < 1e-12);
+
+        let rec = shadow_stats(&rows);
+        assert_eq!(rec.trades, 1);
+        assert!(rec.mean_ret > 0.0);
+        // One trade is nowhere near the bar, and the card must say which number.
+        let why = shadow_blocks_live(true, &rec, 40, 0.53).expect("one trade cannot release real money");
+        assert!(why.contains("1 of 40 trades"), "{why}");
+    }
+
+
+    /// A model written before the gate verdict was stamped is judged on the
+    /// holdout it did record, not stranded in the shadow lane forever.
+    ///
+    /// This matters because `shadow_blocks_live` refuses on a failed gate BEFORE
+    /// it looks at the record: a model read as failed can never be promoted by
+    /// its own evidence, so "absent means failed" would be permanent rather than
+    /// cautious, and every model in service anywhere when this shipped predates
+    /// the stamp.
+    #[test]
+    fn an_unstamped_model_is_judged_on_the_holdout_it_recorded() {
+        use super::gate_from_stamp;
+        let trees = crate::vipers::gboost_planb::STRUCTURAL_MIN_TREES;
+        let min_trades = crate::config::GBOOST_PLANB_GATE_MIN_TRADES as usize;
+
+        // A model that recorded a passing holdout passes.
+        assert!(gate_from_stamp(trees, Some(0.05), Some(min_trades), Some(0.03), Some(0.60)));
+
+        // Each gate condition still bites on the recorded numbers.
+        assert!(!gate_from_stamp(trees, Some(-0.003), Some(min_trades), Some(0.03), Some(0.60)),
+                "skill at or below the base rate fails");
+        assert!(!gate_from_stamp(trees, Some(0.05), Some(1), Some(0.03), Some(0.60)),
+                "one holdout trade is not a holdout");
+        assert!(!gate_from_stamp(trees, Some(0.05), Some(min_trades), Some(-0.39), Some(0.60)),
+                "a negative mean return fails");
+        assert!(!gate_from_stamp(trees, Some(0.05), Some(min_trades), Some(0.03), Some(0.10)),
+                "a win rate below the bar fails");
+        assert!(!gate_from_stamp(1, Some(0.05), Some(min_trades), Some(0.03), Some(0.60)),
+                "the structural tree minimum still applies");
+
+        // A file with no holdout stamp at all has recorded no evidence, so it
+        // stays simulated — the right answer for a model nobody can check.
+        assert!(!gate_from_stamp(trees, None, None, None, None),
+                "no recorded evidence must never read as a passing gate");
+
+        // The production shape at the time this shipped: skill -0.0034, one
+        // holdout trade, -39.32% mean return. It must not be licensed.
+        assert!(!gate_from_stamp(trees, Some(-0.0034), Some(1), Some(-0.3932), Some(0.0)));
+    }
+
 }

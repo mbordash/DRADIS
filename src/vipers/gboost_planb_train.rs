@@ -112,7 +112,7 @@ const MIN_TEST_ROWS: usize = 50;
 /// Fewest trees a candidate may have; the viper's loader refuses less too.
 const STRUCTURAL_MIN_TREES: usize = 5;
 /// Market bootstrap resamples for the return interval.
-const BOOTSTRAP_RESAMPLES: usize = 400;
+pub(crate) const BOOTSTRAP_RESAMPLES: usize = 400;
 
 /// Seconds a taker print counts as evidence of the entry price, before the
 /// decision minute under [`EntryRule::LastBefore`] and after it under
@@ -258,6 +258,21 @@ impl DataDir {
     pub fn metrics_live(&self) -> PathBuf { self.metrics().join("live.json") }
     pub fn candidate(&self) -> PathBuf { self.root.join("candidate.json") }
     pub fn archive(&self) -> PathBuf { self.root.join("archive").join("incumbent.json") }
+    /// Where a specific outgoing model is kept.
+    ///
+    /// One slot was enough while only gate-passing models were ever served, which
+    /// made replacement rare. Under shadow-first the serving slot turns over on
+    /// any cycle where a failed candidate merely scores no worse than the failed
+    /// model in service, so a single slot would let a string of shadow models
+    /// overwrite the last model that actually cleared the gate — the one model on
+    /// the box with a real-money license and the one worth being able to go back
+    /// to. Versioned, nothing is lost.
+    pub fn archive_version(&self, version: &str) -> PathBuf {
+        let safe: String = version.chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        self.root.join("archive").join(format!("{safe}.json"))
+    }
     pub fn reports(&self) -> PathBuf { self.root.join("reports") }
     pub fn status(&self) -> PathBuf { self.root.join("status.json") }
 }
@@ -509,11 +524,11 @@ pub struct TrainingRow {
     pub elig: bool,
 }
 
-fn fee_per_share(fee: f64, p: f64) -> f64 {
+pub(crate) fn fee_per_share(fee: f64, p: f64) -> f64 {
     if p > 0.0 && p < 1.0 { fee * p * (1.0 - p) } else { 0.0 }
 }
 
-fn ceil_tick(p: f64) -> f64 { (p / 0.01 - 1e-9).ceil() * 0.01 }
+pub(crate) fn ceil_tick(p: f64) -> f64 { (p / 0.01 - 1e-9).ceil() * 0.01 }
 
 /// The last value at or before `t` in a series sorted by time.
 fn last_at<T: Copy>(series: &[(i64, T)], t: i64) -> Option<(usize, T)> {
@@ -747,20 +762,20 @@ pub fn build_market_rows(
 
 /// splitmix64: a small deterministic generator for the bootstrap, so a report is
 /// reproducible and no dependency is added.
-struct SplitMix(u64);
+pub(crate) struct SplitMix(pub u64);
 impl SplitMix {
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
         z ^ (z >> 31)
     }
-    fn below(&mut self, n: usize) -> usize { (self.next() % n as u64) as usize }
+    pub(crate) fn below(&mut self, n: usize) -> usize { (self.next() % n as u64) as usize }
 }
 
 /// numpy's default (linear) percentile of a sorted sample.
-fn percentile(sorted: &[f64], q: f64) -> f64 {
+pub(crate) fn percentile(sorted: &[f64], q: f64) -> f64 {
     if sorted.is_empty() { return f64::NAN; }
     let pos = q / 100.0 * (sorted.len() - 1) as f64;
     let lo = pos.floor() as usize;
@@ -1065,6 +1080,77 @@ pub fn beats_incumbent(candidate: &FoldStats, incumbent: &FoldStats, min_trades:
     }
 }
 
+/// What the serving model looked like when this cycle started.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Incumbent {
+    /// Whether it cleared the holdout gate when it was trained, read back from
+    /// its own `gate_passed` stamp.
+    pub gate_passed: bool,
+    /// Its log-loss skill on THIS cycle's fold, so the two are comparable.
+    pub skill: f64,
+}
+
+/// Which model is in service after this cycle, and whether it may spend money.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Serve {
+    /// The candidate takes the serving path and is licensed for real money.
+    Candidate,
+    /// The candidate takes the serving path but trades simulated until this
+    /// instance's own shadow record earns the promotion.
+    CandidateInShadow,
+    /// Nothing changes; the serving model stays.
+    Incumbent,
+}
+
+/// The shadow-first rule table for ADOPTION in one place.
+///
+/// This decides which model serves, not the whole lifecycle: there is no
+/// demotion here. A model that cleared the gate keeps its real-money license
+/// for as long as it serves, even if later folds show its skill has decayed,
+/// because a failing candidate never displaces a passing incumbent. That was
+/// true before shadow-first too and is not introduced here, but it is the gap
+/// to close next. The shadow record guards the crossing into real money, but it
+/// does not guard the other direction: once a model is promoted the lane stops
+/// opening simulated trades, so its record freezes at the state that promoted it
+/// and no later evidence can send it back.
+///
+/// Two independent questions decide this, and conflating them is what produced
+/// the permanently idle viper: *which* model is the instance's best estimate,
+/// and *whether* that estimate has earned real money. A failed gate answers the
+/// second question only. Something is always served, because a viper with no
+/// model scores nothing and an operator cannot evaluate what never runs.
+///
+/// * A candidate that cleared the gate replaces a shadow model unconditionally:
+///   the shadow model is barred from trading, so keeping it on a better fold
+///   return would hold the instance simulated on purpose.
+/// * A candidate that failed never displaces one that passed, whatever the
+///   skill numbers say, because that would demote the instance.
+/// * Between two failed models, log-loss skill decides rather than return: the
+///   gate refused them for having too few holdout trades for a return to mean
+///   anything.
+/// * Between two passing models, the existing `beats_incumbent` comparison
+///   decides, unchanged.
+pub fn serve_decision(
+    gate_passed: bool,
+    cand_skill: f64,
+    cand_beats_incumbent: bool,
+    incumbent: Option<Incumbent>,
+) -> Serve {
+    match (gate_passed, incumbent) {
+        // A fresh instance: serve whatever was trained, in the lane it earned.
+        (true, None) => Serve::Candidate,
+        (false, None) => Serve::CandidateInShadow,
+        (true, Some(inc)) => {
+            if !inc.gate_passed || cand_beats_incumbent { Serve::Candidate } else { Serve::Incumbent }
+        }
+        (false, Some(inc)) => {
+            if inc.gate_passed { Serve::Incumbent }
+            else if cand_skill >= inc.skill { Serve::CandidateInShadow }
+            else { Serve::Incumbent }
+        }
+    }
+}
+
 /// The outcome of one training cycle, persisted as a report.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct CycleReport {
@@ -1323,6 +1409,10 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
         ("holdout_win", format!("{:?}", cand.rule.win)),
         ("holdout_skill", format!("{:?}", cand.skill)),
         ("created_at", rfc3339(Utc::now().timestamp())),
+        // The verdict travels with the model, because the file outlives this
+        // report: the viper's loader reads it back and `shadow_blocks_live`
+        // refuses to spend money on a model that did not clear the gate.
+        ("gate_passed", rep.gate.passed.to_string()),
     ];
     for (k, v) in &meta {
         booster.insert_metadata(k.to_string(), v.clone());
@@ -1336,46 +1426,134 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
         return finish(rep, "error", format!("cannot write the candidate file: {e}"));
     }
 
-    if !rep.gate.passed {
-        let why = rep.gate.reasons.join("; ");
-        return finish(rep, "rejected", format!("candidate {version} failed the holdout gate: {why}"));
-    }
-    if let Some(inc_stats) = &rep.incumbent {
-        let (ok, why) = beats_incumbent(&cand, inc_stats, inputs.min_trades);
-        let overlap = if rep.incumbent_overlaps_fold { " (the incumbent's training range overlaps the fold, which favors it)" } else { "" };
-        rep.comparison = Some(format!("{why}{overlap}"));
-        if !ok {
+    // Shadow-first: this instance always has a model in service. What the gate
+    // decides is not whether a model is served but whether it may spend money —
+    // the stamp above carries the verdict, and `shadow_blocks_live` in the viper
+    // keeps a failed model trading simulated until this box's own record earns
+    // the promotion. Before this, a failed candidate was written to
+    // `candidate.json` and never served, so an operator whose own data never
+    // produced a passing model had a viper that scored nothing, forever. That
+    // idle state is the thing being removed; refusing to spend money on a model
+    // with no demonstrated skill is not, and is unchanged.
+    let inc_state = rep.incumbent.as_ref().map(|stats| Incumbent {
+        gate_passed: incumbent.as_ref().is_some_and(|m| m.gate_passed),
+        skill: stats.skill,
+    });
+    let comparison = rep.incumbent.as_ref()
+        .map(|inc_stats| beats_incumbent(&cand, inc_stats, inputs.min_trades));
+    let beats = comparison.as_ref().map(|(ok, _)| *ok).unwrap_or(true);
+    let overlap = if rep.incumbent_overlaps_fold { " (the incumbent's training range overlaps the fold, which favors it)" } else { "" };
+    let inc_name = rep.incumbent_version.clone().unwrap_or_default();
+    let served = serve_decision(rep.gate.passed, cand.skill, beats, inc_state);
+    let shadow_only = served == Serve::CandidateInShadow;
+
+    match served {
+        Serve::Incumbent if !rep.gate.passed => {
+            let why = rep.gate.reasons.join("; ");
+            let detail = match inc_state {
+                Some(inc) if inc.gate_passed => format!(
+                    "candidate {version} failed the holdout gate: {why}; the serving model {inc_name} cleared it and is kept"
+                ),
+                Some(inc) => format!(
+                    "candidate {version} failed the holdout gate: {why}; the serving model {inc_name} has not cleared it \
+                     either but scores better on the same fold ({:+.4} against {:+.4}), so it is kept",
+                    inc.skill, cand.skill,
+                ),
+                None => format!("candidate {version} failed the holdout gate: {why}"),
+            };
+            return finish(rep, "rejected", detail);
+        }
+        Serve::Incumbent => {
+            let why = comparison.as_ref().map(|(_, w)| w.clone()).unwrap_or_default();
+            rep.comparison = Some(format!("{why}{overlap}"));
             let detail = format!(
-                "candidate {version} passed the gate but did not beat the serving model {}: {why}{overlap}",
-                rep.incumbent_version.clone().unwrap_or_default(),
+                "candidate {version} passed the gate but did not beat the serving model {inc_name}: {why}{overlap}",
             );
             return finish(rep, "incumbent_kept", detail);
         }
+        Serve::Candidate => {
+            rep.comparison = match (&comparison, inc_state) {
+                (cmp, Some(inc)) if !inc.gate_passed => Some(format!(
+                    "the serving model {inc_name} has not cleared the gate, so a passing candidate replaces it{}",
+                    cmp.as_ref().map(|(_, why)| format!(" ({why}{overlap})")).unwrap_or_default(),
+                )),
+                (Some((_, why)), _) => Some(format!("{why}{overlap}")),
+                (None, _) => None,
+            };
+        }
+        Serve::CandidateInShadow => {
+            rep.comparison = inc_state.map(|inc| format!(
+                "log-loss skill {:+.4} against the serving model's {:+.4}; neither has cleared the gate",
+                cand.skill, inc.skill,
+            ));
+        }
     }
-    if !inputs.auto_adopt {
-        let detail = format!(
-            "candidate {version} passed the gate{}; Auto Adopt is off, so it was written to {} and not put into service",
-            rep.comparison.as_deref().map(|c| format!(" and beat the serving model ({c})")).unwrap_or_default(),
-            inputs.dir.candidate().display(),
-        );
+
+    // Auto Adopt is the operator's switch over what goes into service, so it
+    // still holds — except when nothing is in service at all, where honoring it
+    // would recreate the permanently idle viper on every fresh instance. There
+    // is no decision to defer to the operator when there is nothing to replace,
+    // and a first model that lands in the shadow lane spends nothing.
+    // `incumbent.is_some()` rather than `serving_path.exists()`: the test has to
+    // be "is there a model the viper can use", and `incumbent` is the result of
+    // `load_model`, the same validator the viper applies. A file that exists but
+    // fails to load leaves the viper idle, so treating it as an incumbent and
+    // declining to replace it would recreate the permanently idle viper behind an
+    // unreadable file.
+    if !inputs.auto_adopt && incumbent.is_some() {
+        let detail = if shadow_only {
+            format!(
+                "candidate {version} failed the holdout gate and would serve in the shadow lane; \
+                 Auto Adopt is off, so it was written to {} and not put into service",
+                inputs.dir.candidate().display(),
+            )
+        } else {
+            format!(
+                "candidate {version} passed the gate{}; Auto Adopt is off, so it was written to {} and not put into service",
+                rep.comparison.as_deref().map(|c| format!(" and beat the serving model ({c})")).unwrap_or_default(),
+                inputs.dir.candidate().display(),
+            )
+        };
         return finish(rep, "auto_adopt_off", detail);
     }
     // Adopt: archive the incumbent, then rename the stamped file into the serving path.
     if inputs.serving_path.exists() {
-        if let Some(dir) = inputs.dir.archive().parent() { let _ = std::fs::create_dir_all(dir); }
-        if let Err(e) = std::fs::rename(&inputs.serving_path, inputs.dir.archive()) {
+        // Under its own version where one is readable, so a run of shadow
+        // replacements cannot overwrite the last model that cleared the gate.
+        let dest = match incumbent.as_ref() {
+            Some(inc) => inputs.dir.archive_version(&inc.version),
+            None => inputs.dir.archive(),
+        };
+        if let Some(dir) = dest.parent() { let _ = std::fs::create_dir_all(dir); }
+        if let Err(e) = std::fs::rename(&inputs.serving_path, &dest) {
             return finish(rep, "error", format!("cannot archive the serving model: {e}"));
         }
     }
     if let Err(e) = write_atomically(&inputs.serving_path, &bytes) {
         return finish(rep, "error", format!("cannot write the serving model: {e}"));
     }
-    let summary = format!(
-        "adopted {version}: {} trees, holdout {} trades at {:+.2}% per trade, win {:.3}, skill {:+.4}{}",
-        rep.trees, cand.rule.trades, cand.rule.mean_ret * 100.0, cand.rule.win, cand.skill,
-        rep.comparison.as_deref().map(|c| format!("; {c}")).unwrap_or_default(),
-    );
-    finish(rep, "adopted", summary)
+    // An operator who turned Auto Adopt off and still sees an adoption is owed the
+    // reason in the same line, or their switch looks broken.
+    let bypassed = if inputs.auto_adopt { "" } else {
+        " (Auto Adopt is off, but nothing was in service, so there was no operator decision to defer to)"
+    };
+    let summary = if shadow_only {
+        format!(
+            "serving {version} in the shadow lane: {} trees, holdout {} trades at {:+.2}% per trade, win {:.3}, \
+             skill {:+.4}; it did not clear the gate ({}), so it trades simulated until this instance's own \
+             record earns real money{}{bypassed}",
+            rep.trees, cand.rule.trades, cand.rule.mean_ret * 100.0, cand.rule.win, cand.skill,
+            rep.gate.reasons.join("; "),
+            rep.comparison.as_deref().map(|c| format!("; {c}")).unwrap_or_default(),
+        )
+    } else {
+        format!(
+            "adopted {version}: {} trees, holdout {} trades at {:+.2}% per trade, win {:.3}, skill {:+.4}{}{bypassed}",
+            rep.trees, cand.rule.trades, cand.rule.mean_ret * 100.0, cand.rule.win, cand.skill,
+            rep.comparison.as_deref().map(|c| format!("; {c}")).unwrap_or_default(),
+        )
+    };
+    finish(rep, if shadow_only { "shadow_adopted" } else { "adopted" }, summary)
 }
 
 // ── Fetching ─────────────────────────────────────────────────────────────────
@@ -1846,7 +2024,7 @@ pub fn status_line(asset: &str) -> Option<String> {
         other => other.to_string(),
     };
     let last = st.last_cycle.as_ref().map(|c| match c.decision.as_str() {
-        "adopted" => format!("last cycle {}: {}", fmt_et(&c.finished_at), c.detail),
+        "adopted" | "shadow_adopted" => format!("last cycle {}: {}", fmt_et(&c.finished_at), c.detail),
         _ => format!("last cycle {} ({}): {}", fmt_et(&c.finished_at), c.decision.replace('_', " "), c.detail),
     });
     let err = st.last_error.as_ref().map(|e| format!("last error: {e}"));
@@ -2182,7 +2360,7 @@ pub async fn run_pipeline(asset: String) {
                 Err(e) => CycleReport { decision: "error".into(), detail: format!("cannot start the training thread: {e}"), finished_at: rfc3339(Utc::now().timestamp()), ..Default::default() },
             };
             match report.decision.as_str() {
-                "adopted" => info!("GBoost plan-B pipeline [{asset}]: {}", report.detail),
+                "adopted" | "shadow_adopted" => info!("GBoost plan-B pipeline [{asset}]: {}", report.detail),
                 "error" => warn!("GBoost plan-B pipeline [{asset}]: cycle failed: {}", report.detail),
                 _ => info!("GBoost plan-B pipeline [{asset}]: {} ({})", report.detail, report.decision),
             }
@@ -2407,6 +2585,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// The shadow-first rule table. Something is always served, and only the
+    /// gate decides whether the served model may spend money.
+    ///
+    /// Before shadow-first, a failed candidate went to `candidate.json` and was
+    /// never served, so an operator whose own data never produced a passing
+    /// model had a GBoost viper that scored nothing at all — the permanently
+    /// idle state this table exists to remove.
+    #[test]
+    fn the_serve_table_always_leaves_a_model_in_service() {
+        use super::{serve_decision, Incumbent, Serve};
+        let passed = |skill| Some(Incumbent { gate_passed: true, skill });
+        let shadow = |skill| Some(Incumbent { gate_passed: false, skill });
+
+        // A fresh instance serves whatever it trained, in the lane it earned.
+        assert_eq!(serve_decision(true, 0.05, true, None), Serve::Candidate);
+        assert_eq!(serve_decision(false, -0.003, true, None), Serve::CandidateInShadow,
+                   "a fresh instance whose first model fails must still have something to score");
+
+        // A passing candidate replaces a shadow model unconditionally: the
+        // shadow model cannot trade, so a better fold return is no reason to
+        // hold the instance simulated.
+        assert_eq!(serve_decision(true, 0.01, false, shadow(0.9)), Serve::Candidate);
+
+        // Between two passing models the existing comparison decides, unchanged.
+        assert_eq!(serve_decision(true, 0.05, true, passed(0.01)), Serve::Candidate);
+        assert_eq!(serve_decision(true, 0.05, false, passed(0.01)), Serve::Incumbent);
+
+        // A failed candidate never displaces a passing one, however it scores.
+        assert_eq!(serve_decision(false, 0.99, true, passed(-0.01)), Serve::Incumbent,
+                   "replacing a licensed model with an unlicensed one would demote the instance");
+
+        // Between two failed models, skill decides — not return, which the gate
+        // already refused for having too few holdout trades to mean anything.
+        assert_eq!(serve_decision(false, -0.001, true, shadow(-0.004)), Serve::CandidateInShadow);
+        assert_eq!(serve_decision(false, -0.009, true, shadow(-0.004)), Serve::Incumbent);
+        // A tie goes to the newer model, which has seen more recent data.
+        assert_eq!(serve_decision(false, -0.004, true, shadow(-0.004)), Serve::CandidateInShadow);
+
+        // Whatever the inputs, the instance is never left with nothing.
+        for gate in [true, false] {
+            for beats in [true, false] {
+                assert_ne!(serve_decision(gate, 0.0, beats, None), Serve::Incumbent,
+                           "there is no incumbent to keep");
+            }
+        }
+    }
+
     /// The gate refuses a degenerate or losing candidate for a named reason and passes a
     /// sound one; a candidate beats an incumbent on return when the incumbent trades, on
     /// skill when it does not.
@@ -2548,7 +2773,7 @@ mod tests {
         println!("markets copied: {n}; cycle in {:.1}s\n{}", t0.elapsed().as_secs_f64(), serde_json::to_string_pretty(&rep).unwrap());
         assert_ne!(rep.decision, "error", "{}", rep.detail);
         assert!(dir.candidate().exists());
-        if rep.decision == "adopted" {
+        if rep.decision == "adopted" || rep.decision == "shadow_adopted" {
             let m = load_model(&serving).unwrap();
             assert_eq!(m.trained_by.as_deref(), Some("dradis-engine"));
             assert_eq!(m.plan, Some([0.20, 0.11, 0.43, 0.75]));

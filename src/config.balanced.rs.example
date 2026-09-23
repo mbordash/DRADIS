@@ -907,13 +907,18 @@ pub const GBOOST_PLANB_HELD_EXPOSURE_USDC: Decimal = dec!(8.0);
 // ── GBoost plan-B in-engine training (2026-09-13) ─────────────────────────────
 // Every instance trains its own plan-B model from public data (Polymarket Gamma, data-api
 // and CLOB history; Binance bars and funding), validates it on a held-out fold behind a
-// gate, and adopts it only when it passes and does no worse than the serving model on the
-// same fold. These are instance-wide (the "GBoost Training" group in Setup); the plan the
+// gate, and licenses it for real money only when it passes and does no worse than the
+// serving model on the same fold. A candidate that fails the gate is still served, in
+// the shadow lane, so the viper is never idle and never spends money it has not earned. These are instance-wide (the "GBoost Training" group in Setup); the plan the
 // labels are built for comes from the BTC squadron's GBoost knobs above.
 /// Run the pipeline at all. Off, the viper serves whatever model file is in place.
 pub const GBOOST_PLANB_TRAINING_ENABLED: bool = true;
-/// Put a validated candidate into service automatically. Off, candidates are written
-/// beside the data for inspection and never replace the serving model.
+/// Put a candidate into service automatically. A candidate that clears the holdout
+/// gate is licensed for real money; one that fails it is still served, in the shadow
+/// lane, where it trades simulated until this instance's own record earns promotion.
+/// Off, candidates are written beside the data for inspection and do not replace the
+/// serving model — except when nothing is in service, where a first model is adopted
+/// anyway rather than leaving the viper with nothing to score.
 pub const GBOOST_PLANB_AUTO_ADOPT: bool = true;
 /// Days of hourly markets kept and trained on. Polymarket's history reaches back to
 /// March 2026; the first production model used 102 days.
@@ -926,6 +931,18 @@ pub const GBOOST_PLANB_RETRAIN_HOURS: i64 = 24;
 pub const GBOOST_PLANB_GATE_MIN_TRADES: i64 = 30;
 /// Holdout win rate a candidate must reach (break-even at plan-B prices is about 0.49).
 pub const GBOOST_PLANB_GATE_MIN_WIN_RATE: Decimal = dec!(0.53);
+/// How many simulated trades the shadow lane must record before its evidence can
+/// release real money.
+///
+/// The shadow lane runs the model on live prices without spending anything, and
+/// GBoost is promoted to real money only when the model cleared the holdout gate
+/// AND this instance's own shadow record clears the pre-registration's bar. This
+/// is the record's minimum size; it is the pre-registration's own figure for a
+/// live trial. Seeds the `gboost_planb_shadow_min_trades` Control Tower setting.
+pub const GBOOST_PLANB_SHADOW_MIN_TRADES: i64 = 40;
+/// Win rate the shadow record must reach before real money is released, alongside
+/// a mean return and a 90% bootstrap lower bound both above zero.
+pub const GBOOST_PLANB_SHADOW_MIN_WIN_RATE: Decimal = dec!(0.53);
 /// perpetual's training budget; 2.0 was selected by the pre-registered sweep.
 pub const GBOOST_PLANB_BUDGET: Decimal = dec!(2.0);
 

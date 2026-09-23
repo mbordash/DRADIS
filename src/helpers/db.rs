@@ -310,7 +310,7 @@ pub fn available_assets() -> Vec<String> {
 
 // ─── Schema ─────────────────────────────────────────────────────────────────
 
-async fn init_schema(pool: &SqlitePool) -> Result<()> {
+pub(crate) async fn init_schema(pool: &SqlitePool) -> Result<()> {
     // trades: completed round-trips logged by record_trade()
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS trades (
@@ -953,9 +953,186 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+// ── GBoost shadow lane ───────────────────────────────────────────────────────
+//
+// The shadow lane's own ledger, separate from `trades` on purpose. Every number
+// in it comes from the plan's f64 arithmetic and none of it ever reaches a
+// venue, so it is stored as REAL rather than the money ledger's TEXT decimals;
+// treating simulated research output as money invites it being read as money.
+// `trades` still gets a ghost row for each closed shadow trade, which is what
+// the operator sees in the trade list — this table is what the promotion
+// decision is computed from, and it is scoped to the model version so a retrain
+// cannot inherit the previous model's record.
+
+/// One simulated GBoost entry that has not exited yet.
+#[derive(Debug, Clone)]
+pub struct ShadowTrade {
+    pub id: i64,
+    /// The model that took this entry. The sweep closes every open row whatever
+    /// the serving model is now, but the record stays scoped to one version.
+    pub model_version: String,
+    pub condition_id: String,
+    pub token_id: String,
+    pub market: String,
+    pub side: String,
+    /// Hourly window open, which is also the market's settlement boundary.
+    pub window_start: i64,
+    pub entry_price: f64,
+    pub shares: f64,
+    /// Where the plan's take-profit rests, and where its stop triggers.
+    pub tp_price: f64,
+    pub stop_price: f64,
+    /// Entry fee per share, charged at entry the way the plan charges it.
+    pub entry_fee: f64,
+}
+
+/// Open a simulated position. Returns false if the write failed, in which case
+/// the caller must not treat the entry as taken.
+#[allow(clippy::too_many_arguments)]
+pub async fn gboost_shadow_open(
+    pool: &SqlitePool, asset: &str, model_version: &str, condition_id: &str, token_id: &str,
+    market: &str, side: &str, window_start: i64, entry_price: f64, shares: f64,
+    tp_price: f64, stop_price: f64, entry_fee: f64, p: f64, break_even: f64,
+) -> bool {
+    match sqlx::query(
+        "INSERT INTO gboost_shadow_trades
+            (asset, model_version, condition_id, token_id, market, side, window_start, opened_at,
+             entry_price, shares, tp_price, stop_price, entry_fee, p, break_even)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(asset).bind(model_version).bind(condition_id).bind(token_id).bind(market).bind(side)
+        .bind(window_start).bind(Utc::now().to_rfc3339())
+        .bind(entry_price).bind(shares).bind(tp_price).bind(stop_price).bind(entry_fee)
+        .bind(p).bind(break_even)
+        .execute(pool).await
+    {
+        Ok(_) => true,
+        Err(e) => { error!("❌ DB gboost shadow open failed: {}", e); false }
+    }
+}
+
+/// Every simulated position still open for this model on this asset.
+///
+/// Scoped to the serving model version, so a retrain both starts a fresh record
+/// AND abandons the previous model's open positions rather than closing them
+/// under a model that did not take them.
+pub async fn gboost_shadow_open_trades(pool: &SqlitePool, asset: &str) -> Vec<ShadowTrade> {
+    let rows: Vec<(i64, String, String, String, String, String, i64, f64, f64, f64, f64, f64)> = sqlx::query_as(
+        "SELECT id, model_version, condition_id, token_id, market, side, window_start, entry_price, shares,
+                tp_price, stop_price, entry_fee
+           FROM gboost_shadow_trades
+          WHERE asset = ? AND closed_at IS NULL
+          ORDER BY id")
+        .bind(asset)
+        .fetch_all(pool).await
+        .unwrap_or_else(|e| { error!("❌ DB gboost shadow read failed: {}", e); Vec::new() });
+    rows.into_iter().map(|r| ShadowTrade {
+        id: r.0, model_version: r.1, condition_id: r.2, token_id: r.3, market: r.4, side: r.5,
+        window_start: r.6, entry_price: r.7, shares: r.8, tp_price: r.9, stop_price: r.10, entry_fee: r.11,
+    }).collect()
+}
+
+/// Close a simulated position that never resolved, recording NO return.
+///
+/// A market the venue never settles is not a trade with a bad outcome, it is a
+/// trade with no outcome, and inventing a number for it would put fiction into
+/// the evidence that releases real money. The row is closed so the lane stops
+/// probing it and the market is free again; `gboost_shadow_returns` skips it,
+/// because it requires a return to be present.
+pub async fn gboost_shadow_abandon(pool: &SqlitePool, id: i64, reason: &str) -> bool {
+    match sqlx::query(
+        "UPDATE gboost_shadow_trades
+            SET closed_at = ?, exit_reason = ?
+          WHERE id = ? AND closed_at IS NULL")
+        .bind(Utc::now().to_rfc3339()).bind(reason).bind(id)
+        .execute(pool).await
+    {
+        Ok(r) => r.rows_affected() > 0,
+        Err(e) => { error!("❌ DB gboost shadow abandon failed: {}", e); false }
+    }
+}
+
+/// Whether a simulated position is already open on this market, on either side.
+///
+/// The live path asks the position map the same question; the shadow lane is not
+/// in the map, so it has to ask here or it would re-enter every minute. NOT
+/// scoped to the model version: an open position on this market is an open
+/// position whoever took it, and a retrain mid-market must not let the new model
+/// stack a second simulated position on top of the old one's.
+pub async fn gboost_shadow_holds(pool: &SqlitePool, asset: &str, condition_id: &str) -> bool {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM gboost_shadow_trades
+          WHERE asset = ? AND condition_id = ? AND closed_at IS NULL")
+        .bind(asset).bind(condition_id)
+        .fetch_one(pool).await.unwrap_or(0);
+    n > 0
+}
+
+/// Close a simulated position at `exit_price`, recording the plan's net return
+/// per unit staked.
+pub async fn gboost_shadow_close(pool: &SqlitePool, id: i64, exit_price: f64, reason: &str, ret: f64) -> bool {
+    match sqlx::query(
+        "UPDATE gboost_shadow_trades
+            SET closed_at = ?, exit_price = ?, exit_reason = ?, ret = ?
+          WHERE id = ? AND closed_at IS NULL")
+        .bind(Utc::now().to_rfc3339()).bind(exit_price).bind(reason).bind(ret).bind(id)
+        .execute(pool).await
+    {
+        Ok(r) => r.rows_affected() > 0,
+        Err(e) => { error!("❌ DB gboost shadow close failed: {}", e); false }
+    }
+}
+
+/// The closed shadow record for one model, as `(hourly window, return)` pairs.
+///
+/// The window is carried because the promotion bar's confidence interval is a
+/// MARKET bootstrap: two entries on the same hourly market are one market's
+/// worth of evidence, not two, and resampling rows instead of markets would
+/// understate the interval exactly where the record is thinnest.
+pub async fn gboost_shadow_returns(pool: &SqlitePool, asset: &str, model_version: &str) -> Vec<(i64, f64)> {
+    sqlx::query_as(
+        "SELECT window_start, ret FROM gboost_shadow_trades
+          WHERE asset = ? AND model_version = ? AND closed_at IS NOT NULL AND ret IS NOT NULL
+          ORDER BY id")
+        .bind(asset).bind(model_version)
+        .fetch_all(pool).await
+        .unwrap_or_else(|e| { error!("❌ DB gboost shadow returns read failed: {}", e); Vec::new() })
+}
+
 /// Add new columns to existing tables that pre-date the session tracking feature.
 /// Uses sqlx error suppression rather than IF NOT EXISTS (SQLite does not support that syntax).
-async fn run_migrations(pool: &SqlitePool) {
+pub(crate) async fn run_migrations(pool: &SqlitePool) {
+    // The GBoost shadow lane's ledger. Created here rather than in `init_schema`
+    // so an instance upgrading from an earlier build gets it at the next start
+    // without a fresh database.
+    let _ = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS gboost_shadow_trades (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset         TEXT    NOT NULL,
+            model_version TEXT    NOT NULL,
+            condition_id  TEXT    NOT NULL,
+            token_id      TEXT    NOT NULL,
+            market        TEXT    NOT NULL,
+            side          TEXT    NOT NULL,
+            window_start  INTEGER NOT NULL,
+            opened_at     TEXT    NOT NULL,
+            entry_price   REAL    NOT NULL,
+            shares        REAL    NOT NULL,
+            tp_price      REAL    NOT NULL,
+            stop_price    REAL    NOT NULL,
+            entry_fee     REAL    NOT NULL,
+            p             REAL    NOT NULL,
+            break_even    REAL    NOT NULL,
+            closed_at     TEXT,
+            exit_price    REAL,
+            exit_reason   TEXT,
+            ret           REAL
+        )"
+    ).execute(pool).await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_gboost_shadow_model
+             ON gboost_shadow_trades(asset, model_version, closed_at)"
+    ).execute(pool).await;
+
     // Add session_id to trades
     let _ = sqlx::query("ALTER TABLE trades ADD COLUMN session_id TEXT")
         .execute(pool).await;
@@ -1186,6 +1363,23 @@ pub async fn record_trade_db(
     }
 }
 
+/// What a settlement write actually did.
+///
+/// `record_settlement_trade_idempotent` collapses two very different outcomes
+/// into `false`: the fingerprint already existed (the settlement is booked, the
+/// position is finished) and the insert failed (nothing is booked, the trade is
+/// lost). A caller that retires a position on the strength of the answer needs
+/// to tell those apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettlementWrite {
+    /// A new row was written.
+    Inserted,
+    /// An earlier pass already wrote this exact settlement; nothing to do.
+    Duplicate,
+    /// The write failed. Nothing was recorded.
+    Failed,
+}
+
 /// Idempotently record a *settlement* trade — INSERTs only if no row with the same
 /// settlement fingerprint already exists.
 ///
@@ -1200,7 +1394,7 @@ pub async fn record_trade_db(
 ///
 /// The fingerprint (strategy, market, side, reason, shares, pnl) is stable across
 /// restarts for the same settlement, so the `WHERE NOT EXISTS` makes recording
-/// idempotent.  Returns true if a NEW row was inserted.
+/// idempotent.  Returns which of the three [`SettlementWrite`] outcomes occurred.
 ///
 /// Files the row under `scope` (venue, market class, underlying) exactly as
 /// `record_trade_db` does. This writer predates those columns and never wrote
@@ -1212,7 +1406,7 @@ pub async fn record_trade_db(
 /// fingerprint, so a settlement recorded before this change is still
 /// recognized and not re-booked.
 #[allow(clippy::too_many_arguments)]
-pub async fn record_settlement_trade_idempotent(
+pub async fn record_settlement_trade_checked(
     pool: &SqlitePool,
     scope: &TradeScope,
     strategy: &str,
@@ -1225,7 +1419,7 @@ pub async fn record_settlement_trade_idempotent(
     fees: Decimal,
     reason: &str,
     timestamp: Option<DateTime<Utc>>,
-) -> bool {
+) -> SettlementWrite {
     let ts = timestamp.unwrap_or_else(Utc::now).to_rfc3339();
     let sid = current_session_id();
     let venue = resolved_venue(scope).or_else(|| {
@@ -1266,9 +1460,36 @@ pub async fn record_settlement_trade_idempotent(
     .bind(pnl.to_string())
     .execute(pool)
     .await {
-        Ok(r)  => r.rows_affected() > 0,
-        Err(e) => { error!("❌ DB settlement idempotent write failed: {}", e); false }
+        Ok(r) if r.rows_affected() > 0 => SettlementWrite::Inserted,
+        Ok(_)  => SettlementWrite::Duplicate,
+        Err(e) => { error!("❌ DB settlement idempotent write failed: {}", e); SettlementWrite::Failed }
     }
+}
+
+/// The bool-returning form the live settlement paths were written against:
+/// true when a NEW row was inserted. A caller that must distinguish "already
+/// booked" from "the write failed" — the simulated-settlement path does, because
+/// it drops the position and closes its row on the strength of this answer —
+/// should call [`record_settlement_trade_checked`] instead.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_settlement_trade_idempotent(
+    pool: &SqlitePool,
+    scope: &TradeScope,
+    strategy: &str,
+    market: &str,
+    side: &str,
+    entry_price: Decimal,
+    exit_price: Decimal,
+    shares: Decimal,
+    pnl: Decimal,
+    fees: Decimal,
+    reason: &str,
+    timestamp: Option<DateTime<Utc>>,
+) -> bool {
+    record_settlement_trade_checked(
+        pool, scope, strategy, market, side, entry_price, exit_price, shares, pnl, fees,
+        reason, timestamp,
+    ).await == SettlementWrite::Inserted
 }
 
 /// The filing dimensions a settlement or reconciliation booking for `market`
@@ -3807,7 +4028,15 @@ pub struct TradeStatsRow {
     pub last_ts: Option<String>,
 }
 
-pub async fn get_trade_stats(pool: &SqlitePool) -> TradeStatsRow {
+/// Lifetime trade statistics for one shard, for the given posture.
+///
+/// Scoped by `ghost` for the same reason `session_realized_pnl` is: a simulated
+/// trade is not realized P&L and must never be added to a live instance's
+/// totals. This was unscoped while nothing simulated could occur during a live
+/// session; the GBoost shadow lane books simulated rows on a live instance by
+/// design, so the dashboard's lifetime count, win/loss and realized P&L would
+/// otherwise silently absorb them.
+pub async fn get_trade_stats_for(pool: &SqlitePool, ghost: bool) -> TradeStatsRow {
     let empty = TradeStatsRow {
         count: 0, wins: 0, losses: 0, realized_pnl: 0.0, fees: 0.0,
         first_ts: None, last_ts: None,
@@ -3819,8 +4048,9 @@ pub async fn get_trade_stats(pool: &SqlitePool) -> TradeStatsRow {
                 COALESCE(SUM(CAST(pnl AS REAL)), 0.0),
                 COALESCE(SUM(CAST(COALESCE(fees, '0') AS REAL)), 0.0),
                 MIN(ts), MAX(ts)
-         FROM trades"
+         FROM trades WHERE COALESCE(ghost, 0) = ?"
     )
+    .bind(ghost as i32)
     .fetch_one(pool)
     .await {
         Ok(r) => TradeStatsRow {
@@ -3866,6 +4096,18 @@ pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
         })).collect(),
         Err(e) => { error!("❌ DB get_recent_trades failed: {}", e); vec![] }
     }
+}
+
+/// Lifetime statistics for the posture the instance is actually running in.
+///
+/// Deliberately the instance's current posture rather than a hard `false`: the
+/// shipped AMI default is ghost mode, where every row is simulated, and scoping
+/// these cards to real trades there would report a dashboard of zeroes to an
+/// operator whose bot is working. A live instance gets its real trades only,
+/// which is what excludes the GBoost shadow lane's simulated rows from the
+/// totals.
+pub async fn get_trade_stats(pool: &SqlitePool) -> TradeStatsRow {
+    get_trade_stats_for(pool, crate::helpers::dynamic_config::ghosting_now()).await
 }
 
 /// Every completed trade, oldest first — backs the tradelog CSV export
@@ -5561,7 +5803,7 @@ mod reconcile_tests {
                 Decimal::ONE, "TP", Some(base + chrono::Duration::hours(1) + chrono::Duration::minutes(i))).await;
         }
 
-        let stats = get_trade_stats(&pool).await;
+        let stats = get_trade_stats_for(&pool, false).await;
         assert_eq!(stats.count, 15);
         assert_eq!(stats.wins, 12);
         assert_eq!(stats.losses, 3);
@@ -5586,7 +5828,7 @@ mod reconcile_tests {
             record_trade_db(&pool, &scope, Decimal::ZERO, "S", market, "YES",
                 Decimal::new(50, 2), Decimal::new(50, 2), Decimal::ONE, pnl, "r", None).await;
         }
-        let stats = get_trade_stats(&pool).await;
+        let stats = get_trade_stats_for(&pool, false).await;
         assert_eq!((stats.count, stats.wins, stats.losses), (3, 1, 1));
     }
 
@@ -6384,6 +6626,7 @@ mod squadron_column_migration_tests {
 mod pnl_history_window_tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
+    use rust_decimal_macros::dec;
 
     /// The chart must see a full day, whatever the snapshot cadence.
     ///
