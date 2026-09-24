@@ -628,6 +628,19 @@ pub const MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY: i64 = 1500;
 /// Conservative: 90s — longer warmup for fully stable orderbook depth and OBI readings.
 /// Root cause fix for 2026-05-27 20:11 loss (−$0.73): entry fired 6s after switch.
 pub const MOMENTUM_MARKET_WARMUP_SECS: i64 = 90;
+/// Seconds after an hourly window OPENS before Momentum may enter it.
+///
+/// Distinct from the warmup above, which counts from the squadron rotating onto
+/// the market — on an hourly contract that happens about ten minutes before the
+/// PREVIOUS window closes, so it has long expired by the time the new window
+/// opens and the first seconds of every window were unguarded. On 2026-09-24
+/// Momentum bought six seconds into a window and lost $1.42 of a $4.88 position.
+///
+/// 90 s is the figure the pre-registered momentum replay tested ("at least 90 s
+/// since the market window opened"); the engine never implemented it, so that
+/// study was measuring a rule production did not run. Seeds the
+/// `momentum_window_open_warmup_secs` Control Tower setting.
+pub const MOMENTUM_WINDOW_OPEN_WARMUP_SECS: i64 = 90;
 
 
 // ============================================================================

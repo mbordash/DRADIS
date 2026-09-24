@@ -303,6 +303,54 @@ pub struct SpikeGates {
 /// strike + buffer, ask ≤ max entry) or the crossing branch (oracle beyond
 /// strike, ask ≤ crossing cap); the price blocker is named only when neither
 /// branch's price condition holds.
+pub const WINDOW_PRE_OPEN: &str = "window not open yet — no strike exists until the open";
+pub const WINDOW_NO_STRIKE: &str = "strike unresolved";
+pub const WINDOW_WARMUP: &str = "window-open warmup";
+
+/// Why a windowed market cannot be entered yet, or `None` when it can.
+///
+/// Two gates that only apply to markets with a window, and both exist because
+/// of real money.
+///
+/// **A strike must exist.** An "Up or Down" market's strike IS its window's
+/// opening print, so there is none until the window opens, and the squadron
+/// holds the next hour's market from roughly :50 of the previous one. Without a
+/// strike the entry rule cannot ask the only question that makes a directional
+/// bet meaningful here — is the oracle on the winning side of the line — and
+/// Momentum's no-strike branch traded anyway. Three of the first four
+/// real-money Momentum trades entered with no strike; all three lost. FairValue
+/// was given this same guard after three real-money losses on 2026-09-02/03;
+/// Momentum never was.
+///
+/// **The window must have warmed up.** The separate market warmup counts from
+/// the squadron rotating ONTO the market, which on an hourly contract happens
+/// about ten minutes before the PREVIOUS window closes — so it has long expired
+/// by the time the new window opens, leaving the first seconds unguarded. On
+/// 2026-09-24 Momentum bought NO six seconds into the 11AM window, on a single
+/// confirming tick at the bottom of a $157 five-second flush, and gave back 23%
+/// in under a minute. 90 s is the figure the pre-registered replay tested; the
+/// engine never had it, so that study measured a rule production did not run.
+///
+/// A market with no close time has no window and no strike to wait for, so
+/// neither gate applies to it.
+pub fn window_entry_block(
+    close_time: Option<chrono::DateTime<chrono::Utc>>,
+    strike: Option<Decimal>,
+    now: chrono::DateTime<chrono::Utc>,
+    warmup_secs: i64,
+) -> Option<&'static str> {
+    let close_time = close_time?;
+    let open = crate::helpers::time::hourly_window_reference_time(close_time, now);
+    if strike.is_none() {
+        return Some(if open.is_none() { WINDOW_PRE_OPEN } else { WINDOW_NO_STRIKE });
+    }
+    // A strike exists, so the window has opened; hold off until it has settled.
+    match open {
+        Some(o) if (now - o).num_seconds() < warmup_secs => Some(WINDOW_WARMUP),
+        _ => None,
+    }
+}
+
 pub fn spike_blockers(g: &SpikeGates) -> Vec<&'static str> {
     let mut out = Vec::new();
     match g.strike {
@@ -516,6 +564,26 @@ impl Strategy for MomentumStrategyImpl {
                 secs_since_market_start, config::MOMENTUM_MARKET_WARMUP_SECS);
             report_gate(asset, "market warmup", "market warmup", config::MOMENTUM_GATE_LOG_INTERVAL_SECS, || format!(
                 "market warmup | {}s since switch (min {}s)", secs_since_market_start, config::MOMENTUM_MARKET_WARMUP_SECS));
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Windowed-market entry gates: strike present, and window warmed up ──
+        if let Some(why) = window_entry_block(
+            ctx.market.market_close_time, ctx.market.strike_price,
+            chrono::Utc::now(), dc.momentum_window_open_warmup_secs,
+        ) {
+            let detail = match why {
+                WINDOW_WARMUP => {
+                    let since = ctx.market.market_close_time
+                        .and_then(|ct| crate::helpers::time::hourly_window_reference_time(ct, chrono::Utc::now()))
+                        .map(|o| (chrono::Utc::now() - o).num_seconds())
+                        .unwrap_or(0);
+                    format!("{why} | {since}s since the window opened (min {}s)",
+                            dc.momentum_window_open_warmup_secs)
+                }
+                _ => format!("{why} | market {}", ctx.market.market_name),
+            };
+            report_gate(asset, why, why, config::MOMENTUM_GATE_LOG_INTERVAL_SECS, || detail.clone());
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -2138,4 +2206,51 @@ mod tests {
         let mid = momentum_trade_size(true, threshold * dec!(1.5), threshold, min, max);
         assert!(mid > min && mid < max, "a move between the threshold and the cap sizes between min and max, got {mid}");
     }
+
+    /// The two windowed-market gates, pinned to the trade that motivated them.
+    ///
+    /// 2026-09-24: Momentum bought NO six seconds into the 11AM ET window, 74
+    /// seconds before the strike resolved, and lost $1.42 of a $4.88 position.
+    /// Three of the first four real-money Momentum trades entered with no
+    /// strike; all three lost.
+    #[test]
+    fn a_windowed_market_needs_a_strike_and_a_warmed_up_window() {
+        use super::{window_entry_block, WINDOW_NO_STRIKE, WINDOW_PRE_OPEN, WINDOW_WARMUP};
+        use chrono::{Duration, TimeZone, Utc};
+
+        let close = Utc.with_ymd_and_hms(2026, 9, 24, 16, 0, 0).unwrap(); // 11AM ET window closes
+        let open = close - Duration::hours(1);
+        let strike = Some(rust_decimal_macros::dec!(83673.77));
+
+        // The actual trade: 6 s into the window, strike not yet resolved.
+        assert_eq!(window_entry_block(Some(close), None, open + Duration::seconds(6), 90),
+                   Some(WINDOW_NO_STRIKE), "the trade that lost $1.42 must be refused");
+
+        // Held before the window opens at all. The squadron rotates onto the
+        // next hour's market about ten minutes before the previous one closes,
+        // so this state lasts most of an hour.
+        assert_eq!(window_entry_block(Some(close), None, open - Duration::minutes(50), 90),
+                   Some(WINDOW_PRE_OPEN));
+
+        // Strike resolved, but the window is still inside its warmup.
+        assert_eq!(window_entry_block(Some(close), strike, open + Duration::seconds(74), 90),
+                   Some(WINDOW_WARMUP), "a resolved strike alone is not enough this early");
+        assert_eq!(window_entry_block(Some(close), strike, open + Duration::seconds(89), 90),
+                   Some(WINDOW_WARMUP));
+
+        // Warmed up and referenced: enterable.
+        assert_eq!(window_entry_block(Some(close), strike, open + Duration::seconds(90), 90), None);
+        assert_eq!(window_entry_block(Some(close), strike, open + Duration::minutes(30), 90), None);
+
+        // A market with no window has no strike to wait for, so neither gate
+        // applies and the no-strike branch stays legitimate there.
+        assert_eq!(window_entry_block(None, None, Utc::now(), 90), None);
+
+        // A warmup of 0 restores the old behavior once a strike exists.
+        assert_eq!(window_entry_block(Some(close), strike, open + Duration::seconds(1), 0), None);
+        // ...but never re-opens the no-strike hole.
+        assert_eq!(window_entry_block(Some(close), None, open + Duration::seconds(1), 0),
+                   Some(WINDOW_NO_STRIKE));
+    }
+
 }

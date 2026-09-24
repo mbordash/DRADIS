@@ -304,6 +304,14 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Hard emergency stop-loss overriding the min-hold window.").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "momentum_min_secs_to_expiry_for_entry", "Min Secs to Expiry", "secs", true,
             "Don't enter with fewer than this many seconds left.").min(0.0).step(1.0).unit("s"));
+        v.push(F::new(g, e, "momentum_window_open_warmup_secs", "Window Open Warmup", "secs", true,
+            "How long after an hourly market's window OPENS before Momentum may enter it. Separate from the \
+             market warmup, which counts from the squadron rotating onto the market — on an hourly contract that \
+             happens about ten minutes before the PREVIOUS window closes, so it has expired by the time the new \
+             window opens and the first seconds were unguarded. Those first seconds are where a spike is most \
+             likely to be the open's own noise rather than a move: on 2026-09-24 Momentum bought six seconds \
+             into a window and gave back 23% in under a minute. 0 restores the old behavior."
+        ).min(0.0).step(1.0).unit("s"));
         v.push(F::new(g, e, "momentum_deriv_gate_enabled", "Deriv Gate", "bool", true,
             "Derivatives-Raptor confirmation gate: block entries the perp book contradicts (counter CVD flow or hard OI unwind). Inert when OI/CVD report no data."));
         v.push(F::new(g, e, "momentum_deriv_cvd_confirm_margin", "Deriv CVD Margin", "decimal", true,

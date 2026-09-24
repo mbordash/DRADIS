@@ -615,6 +615,18 @@ pub const MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY: i64 = 900;
 /// Aggressive: 30s — shorter warmup to capture more of the initial market move.
 /// Root cause fix for 2026-05-27 20:11 loss (−$0.73): entry fired 6s after switch.
 pub const MOMENTUM_MARKET_WARMUP_SECS: i64 = 30;
+/// Seconds after an hourly window OPENS before Momentum may enter it.
+///
+/// Distinct from the warmup above, which counts from the squadron rotating onto
+/// the market — on an hourly contract that happens about ten minutes before the
+/// PREVIOUS window closes, so it has long expired by the time the new window
+/// opens and the first seconds of every window were unguarded. On 2026-09-24
+/// Momentum bought six seconds into a window and lost $1.42 of a $4.88 position.
+///
+/// Held to this profile's shorter warmup rather than the 90 s the pre-registered
+/// replay tested: an aggressive operator is choosing to trade earlier into a
+/// window, and this profile already makes that trade on the rotation warmup.
+pub const MOMENTUM_WINDOW_OPEN_WARMUP_SECS: i64 = 30;
 
 
 // ============================================================================

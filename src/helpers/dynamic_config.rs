@@ -307,6 +307,7 @@ fn default_momentum_obi_exhaustion_block()  -> Decimal { config::MOMENTUM_OBI_EX
 fn default_momentum_take_profit_ceiling()   -> Decimal { config::MOMENTUM_TAKE_PROFIT_CEILING          }
 fn default_momentum_catastrophic_sl_pct()   -> Decimal { config::MOMENTUM_CATASTROPHIC_SL_PCT          }
 fn default_momentum_min_secs_to_expiry_for_entry() -> i64 { config::MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY }
+fn default_momentum_window_open_warmup_secs()     -> i64 { config::MOMENTUM_WINDOW_OPEN_WARMUP_SECS      }
 fn default_momentum_obi_exhaust_max_adverse_pct() -> Decimal { config::MOMENTUM_OBI_EXHAUST_MAX_ADVERSE_PCT }
 fn default_momentum_obi_exhaust_min_hold_secs()   -> i64     { config::MOMENTUM_OBI_EXHAUST_MIN_HOLD_SECS   }
 fn default_momentum_obi_exhaust_persist_secs()    -> i64     { config::MOMENTUM_OBI_EXHAUST_PERSIST_SECS    }
@@ -533,6 +534,13 @@ pub struct DynamicConfig {
     pub momentum_catastrophic_sl_pct:  Decimal,
     #[serde(default = "default_momentum_min_secs_to_expiry_for_entry")]
     pub momentum_min_secs_to_expiry_for_entry: i64,
+
+    /// Seconds after an hourly window opens before Momentum may enter it. The
+    /// separate market warmup counts from the squadron rotating onto the market,
+    /// which on an hourly contract is about ten minutes before the PREVIOUS
+    /// window closes, leaving the first seconds of each new window unguarded.
+    #[serde(default = "default_momentum_window_open_warmup_secs")]
+    pub momentum_window_open_warmup_secs: i64,
     /// Deepest drawdown at which the in-position OBI-exhaustion exit may still fire.
     /// Beyond it the (catastrophic) stop-loss owns the position instead.
     #[serde(default = "default_momentum_obi_exhaust_max_adverse_pct")]
@@ -1199,6 +1207,7 @@ impl Default for DynamicConfig {
             momentum_take_profit_ceiling:  config::MOMENTUM_TAKE_PROFIT_CEILING,
             momentum_catastrophic_sl_pct:  config::MOMENTUM_CATASTROPHIC_SL_PCT,
             momentum_min_secs_to_expiry_for_entry: config::MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY,
+            momentum_window_open_warmup_secs: config::MOMENTUM_WINDOW_OPEN_WARMUP_SECS,
             momentum_obi_exhaust_max_adverse_pct: config::MOMENTUM_OBI_EXHAUST_MAX_ADVERSE_PCT,
             momentum_obi_exhaust_min_hold_secs:   config::MOMENTUM_OBI_EXHAUST_MIN_HOLD_SECS,
             momentum_obi_exhaust_persist_secs:    config::MOMENTUM_OBI_EXHAUST_PERSIST_SECS,
@@ -2026,6 +2035,7 @@ mod tests {
             "momentum_decay_exit_fraction", "momentum_decay_fee_margin_mult",
             "gboost_planb_exit_posture", "gboost_planb_held_exposure_usdc",
             "gboost_planb_shadow_min_trades", "gboost_planb_shadow_min_win_rate",
+            "momentum_window_open_warmup_secs",
         ] {
             assert!(obj.remove(added).is_some(), "{added} must be a serialized field");
         }
@@ -2038,6 +2048,7 @@ mod tests {
         assert_eq!(cfg.gboost_planb_exit_posture, config::GBOOST_PLANB_EXIT_POSTURE);
         assert_eq!(cfg.gboost_planb_held_exposure_usdc, config::GBOOST_PLANB_HELD_EXPOSURE_USDC);
         assert_eq!(cfg.gboost_planb_shadow_min_trades, config::GBOOST_PLANB_SHADOW_MIN_TRADES);
+        assert_eq!(cfg.momentum_window_open_warmup_secs, config::MOMENTUM_WINDOW_OPEN_WARMUP_SECS);
         assert_eq!(cfg.gboost_planb_shadow_min_win_rate, config::GBOOST_PLANB_SHADOW_MIN_WIN_RATE);
         assert_eq!(cfg.momentum_decay_exit_fraction, config::MOMENTUM_DECAY_EXIT_FRACTION);
         assert_eq!(cfg.momentum_decay_fee_margin_mult, config::MOMENTUM_DECAY_FEE_MARGIN_MULT);
