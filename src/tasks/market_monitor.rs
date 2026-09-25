@@ -124,6 +124,79 @@ async fn resolve_maker_strike(
     }
 }
 
+/// How often a strike that is owed is chased, independently of the discovery
+/// scan's own cadence.
+///
+/// The strike used to be fetched only inside the 90 s scan, which meant a market
+/// could sit through most of a minute and a half of its own window with no
+/// reference price. That window is not idle time: Momentum refuses to enter
+/// without a strike (`window_entry_block`) and FairValue idles, so every second
+/// of it is trading time the operator paid for and did not get. Worse, the phase
+/// was an accident of when the process last started, so the blackout was
+/// somewhere in [0, 90) seconds with no way to predict it.
+const STRIKE_POLL_SECS: u64 = 3;
+
+/// Fetch and broadcast the held market's strike if it is owed one.
+///
+/// Re-broadcasts the SAME market with its strike filled in: the patrol treats an
+/// unchanged condition id as a no-op rather than a rotation, and reads the strike
+/// live from this channel every tick.
+async fn resolve_owed_strike(
+    http: &reqwest::Client,
+    crypto_filter: &str,
+    market_tx: &watch::Sender<MarketState>,
+) {
+    let (cur_strike, cur_close, cur_name) = {
+        let ms = market_tx.borrow();
+        (ms.4, ms.3, ms.2.clone())
+    };
+    if !strike_refresh_due(cur_strike, cur_close, Utc::now()) {
+        return;
+    }
+    match fetch_strike_price_from_close_time(http, crypto_filter, cur_close).await {
+        Some(strike) => {
+            info!("✅ Hourly strike resolved at window open: ${} for \"{}\"", strike, cur_name);
+            let (y, n, nm, ct, _, ds, mk, cid) = market_tx.borrow().clone();
+            let _ = market_tx.send((y, n, nm, ct, Some(strike), ds, mk, cid));
+        }
+        None => tracing::warn!(
+            "⚠️ Hourly strike still unresolved for \"{}\" after its window opened — retrying shortly",
+            cur_name,
+        ),
+    }
+}
+
+/// Wait for the next discovery scan, chasing an owed strike every few seconds in
+/// the meantime.
+///
+/// The discovery scan keeps its own 90 s cadence — it is a multi-request Gamma
+/// sweep and must not be run every three seconds. Only the single strike lookup
+/// is fast-pathed, and only while one is actually owed, so a market that already
+/// has its strike costs nothing extra.
+async fn wait_for_scan_chasing_strike(
+    interval: &mut tokio::time::Interval,
+    http: &reqwest::Client,
+    crypto_filter: &str,
+    market_tx: &watch::Sender<MarketState>,
+) {
+    loop {
+        let owed = {
+            let ms = market_tx.borrow();
+            strike_refresh_due(ms.4, ms.3, Utc::now())
+        };
+        if !owed {
+            interval.tick().await;
+            return;
+        }
+        tokio::select! {
+            _ = interval.tick() => return,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(STRIKE_POLL_SECS)) => {
+                resolve_owed_strike(http, crypto_filter, market_tx).await;
+            }
+        }
+    }
+}
+
 pub async fn run_market_monitor(
     http: Arc<reqwest::Client>,
     crypto_filter: String,
@@ -141,7 +214,7 @@ pub async fn run_market_monitor(
     let mut consecutive_timeouts: u32 = 0;
     let mut skip_ticks: u32 = 0;
     loop {
-        interval.tick().await;
+        wait_for_scan_chasing_strike(&mut interval, &http, &crypto_filter, &market_tx).await;
         if skip_ticks > 0 {
             skip_ticks -= 1;
             continue;
@@ -228,30 +301,10 @@ pub async fn run_market_monitor(
 
         if candidate.yes_token == cur_yes {
             // ── Strike arriving after rotation ───────────────────────────────
-            // Re-broadcast the SAME market with its strike filled in. The patrol
-            // loop treats an unchanged condition id as a no-op rather than a
-            // rotation (no order cancel, no redeploy) and reads the strike live
-            // from this channel on every tick — see `live_hourly_strike`.
-            let (cur_strike, cur_close) = {
-                let ms = market_tx.borrow();
-                (ms.4, ms.3)
-            };
-            if strike_refresh_due(cur_strike, cur_close, Utc::now()) {
-                match fetch_strike_price_from_close_time(&http, &crypto_filter, cur_close).await {
-                    Some(strike) => {
-                        info!(
-                            "✅ Hourly strike resolved at window open: ${} for \"{}\"",
-                            strike, cur_name,
-                        );
-                        let (y, n, nm, ct, _, ds, mk, cid) = market_tx.borrow().clone();
-                        let _ = market_tx.send((y, n, nm, ct, Some(strike), ds, mk, cid));
-                    }
-                    None => tracing::warn!(
-                        "⚠️ Hourly strike still unresolved for \"{}\" after its window opened — retrying next scan",
-                        cur_name,
-                    ),
-                }
-            }
+            // A strike arriving after rotation is normally picked up by the fast
+            // poll in `wait_for_scan_chasing_strike`; this is the belt-and-braces
+            // path for the case where the scan itself was what unblocked it.
+            resolve_owed_strike(&http, &crypto_filter, &market_tx).await;
             // Hourly market unchanged — still check if maker market changed
             let cur_maker_yes = market_tx.borrow().6.as_ref().map(|m| m.yes_token.clone());
             let new_maker_yes = maker_candidate.as_ref().map(|m| m.yes_token.clone());
@@ -358,6 +411,18 @@ mod strike_refresh_tests {
         assert!(strike_refresh_due(None, close, utc("2026-09-03T10:48:00Z")), "mid-hour: still owed");
         assert!(!strike_refresh_due(None, close, utc("2026-09-03T11:00:01Z")), "closed: nothing to price");
         assert!(!strike_refresh_due(Some(dec!(77600)), close, utc("2026-09-03T10:30:00Z")), "already known");
+
+        // The fast poll's guard is this same predicate, so what matters is that
+        // it goes false the moment the strike lands: `wait_for_scan_chasing_strike`
+        // then stops waking every few seconds and drops back to the scan cadence.
+        // Before v1.2.4 the strike was fetched only inside the 90 s scan, so a
+        // market could sit most of a minute and a half of its own window with no
+        // reference price — time in which Momentum refuses to enter and FairValue
+        // idles — and the phase was an accident of when the process last started.
+        assert!(strike_refresh_due(None, close, utc("2026-09-03T10:00:03Z")),
+                "three seconds into the window the strike is already owed");
+        assert!(!strike_refresh_due(Some(dec!(77600)), close, utc("2026-09-03T10:00:03Z")),
+                "and the moment it lands the poll must stand down");
     }
 
     /// The ZERO sentinel (no market held) and a market with no close time can
