@@ -902,7 +902,14 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
         // its next startup. The viper still idles unless `enable_sports_fairvalue`
         // is on and the ledger is producing lines. Politics is deliberately not
         // here: it has no signal source yet (see the roadmap's politics spike).
+        // Bookline rests a post-only bid under the bookmaker consensus and holds
+        // to fee-free settlement, which is the only shape that can trade these
+        // books: a taker needs the consensus to beat mid by ~1.75 points to cover
+        // the fee and pre-game it sits within ~0.6. Ships disabled and
+        // simulated-only; `bookline_enabled` gates execution and the viper refuses
+        // to run outside Simulation Mode regardless.
         ("sports",   "arbitrage"), ("sports",   "maker"), ("sports", "fairvalue"),
+        ("sports",   "bookline"),
         ("politics", "arbitrage"), ("politics", "maker"),
         ("unknown",  "arbitrage"), ("unknown",  "maker"),
     ] {
@@ -2341,6 +2348,9 @@ pub const VIPER_KINDS: &[(&str, &str, i32)] = &[
     ("trendcapture", "TrendReversal", 0),
     ("convergence",  "Convergence",   0),
     ("fairvalue",    "FairValue",     0),
+    // Sports-only, and not venue-agnostic: it prices from the bookmaker
+    // consensus board, which exists for Polymarket International moneylines.
+    ("bookline",     "Bookline",      0),
 ];
 
 /// Fetch pending deployment requests from the queue.

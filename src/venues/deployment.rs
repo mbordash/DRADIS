@@ -151,6 +151,7 @@ pub(crate) fn apply_viper_budgets(
             // compile-time default — while the deploy UI reports success.
             // `viper_kinds_all_have_a_budget_slot` pins the two lists together.
             "fairvalue"    => &mut cfg.fairvalue_max_exposure_usdc,
+            "bookline"     => &mut cfg.bookline_max_exposure_usdc,
             other => {
                 warn!("Unknown viper kind '{}' in deploy budgets — skipped", other);
                 continue;
@@ -366,7 +367,7 @@ mod budget_coverage_tests {
     /// beside the match above so the two are edited together.
     const BUDGETED_KINDS: &[&str] = &[
         "arbitrage", "time_decay", "momentum", "maker", "basis",
-        "gboost", "trendcapture", "convergence", "fairvalue",
+        "gboost", "trendcapture", "convergence", "fairvalue", "bookline",
     ];
 
     /// A viper seeded into `viper_kind` with no arm in the budget match has its

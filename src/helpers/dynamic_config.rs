@@ -250,6 +250,21 @@ fn default_sports_line_max_age_secs()       -> i64     { config::SPORTS_LINE_MAX
 fn default_sports_line_min_books()          -> i64     { config::SPORTS_LINE_MIN_BOOKS                 }
 fn default_sports_maker_max_dispersion()    -> Decimal { config::SPORTS_MAKER_MAX_DISPERSION           }
 fn default_sports_fairvalue_min_consensus() -> Decimal { config::SPORTS_FAIRVALUE_MIN_CONSENSUS        }
+fn default_bookline_enabled() -> bool { config::BOOKLINE_ENABLED }
+fn default_bookline_base_edge() -> Decimal { config::BOOKLINE_BASE_EDGE }
+fn default_bookline_min_edge() -> Decimal { config::BOOKLINE_MIN_EDGE }
+fn default_bookline_edge_taper_secs() -> i64 { config::BOOKLINE_EDGE_TAPER_SECS }
+fn default_bookline_drift_mult() -> Decimal { config::BOOKLINE_DRIFT_MULT }
+fn default_bookline_min_consensus() -> Decimal { config::BOOKLINE_MIN_CONSENSUS }
+fn default_bookline_min_books() -> i64 { config::BOOKLINE_MIN_BOOKS }
+fn default_bookline_max_dispersion() -> Decimal { config::BOOKLINE_MAX_DISPERSION }
+fn default_bookline_max_feed_age_secs() -> i64 { config::BOOKLINE_MAX_FEED_AGE_SECS }
+fn default_bookline_pull_on_adverse_drift() -> Decimal { config::BOOKLINE_PULL_ON_ADVERSE_DRIFT }
+fn default_bookline_pull_before_start_secs() -> i64 { config::BOOKLINE_PULL_BEFORE_START_SECS }
+fn default_bookline_trade_size_usdc() -> Decimal { config::BOOKLINE_TRADE_SIZE_USDC }
+fn default_bookline_max_exposure_usdc() -> Decimal { config::BOOKLINE_MAX_EXPOSURE_USDC }
+fn default_bookline_max_open_markets() -> usize { config::BOOKLINE_MAX_OPEN_MARKETS }
+fn default_bookline_resting_tp_edge() -> Decimal { config::BOOKLINE_RESTING_TP_EDGE }
 fn default_sports_fairvalue_max_dispersion()-> Decimal { config::SPORTS_FAIRVALUE_MAX_DISPERSION       }
 fn default_sports_fairvalue_settle_hold()   -> bool    { config::SPORTS_FAIRVALUE_SETTLE_HOLD          }
 fn default_sports_fairvalue_catastrophic() -> bool    { config::SPORTS_FAIRVALUE_CATASTROPHIC_ARMED   }
@@ -1113,6 +1128,40 @@ pub struct DynamicConfig {
     /// control. Below 0.55 leaves that scope entirely.
     #[serde(default = "default_sports_fairvalue_min_consensus")]
     pub sports_fairvalue_min_consensus:   Decimal,
+
+    // ── Bookline Viper (sports, maker-first, ghost-only) ──────────────────────
+    // A resting post-only bid under the bookmaker consensus, held to fee-free
+    // settlement. Ships off: Phase 2 is gated on the ghost record.
+    #[serde(default = "default_bookline_enabled")]
+    pub bookline_enabled: bool,
+    #[serde(default = "default_bookline_base_edge")]
+    pub bookline_base_edge: Decimal,
+    #[serde(default = "default_bookline_min_edge")]
+    pub bookline_min_edge: Decimal,
+    #[serde(default = "default_bookline_edge_taper_secs")]
+    pub bookline_edge_taper_secs: i64,
+    #[serde(default = "default_bookline_drift_mult")]
+    pub bookline_drift_mult: Decimal,
+    #[serde(default = "default_bookline_min_consensus")]
+    pub bookline_min_consensus: Decimal,
+    #[serde(default = "default_bookline_min_books")]
+    pub bookline_min_books: i64,
+    #[serde(default = "default_bookline_max_dispersion")]
+    pub bookline_max_dispersion: Decimal,
+    #[serde(default = "default_bookline_max_feed_age_secs")]
+    pub bookline_max_feed_age_secs: i64,
+    #[serde(default = "default_bookline_pull_on_adverse_drift")]
+    pub bookline_pull_on_adverse_drift: Decimal,
+    #[serde(default = "default_bookline_pull_before_start_secs")]
+    pub bookline_pull_before_start_secs: i64,
+    #[serde(default = "default_bookline_trade_size_usdc")]
+    pub bookline_trade_size_usdc: Decimal,
+    #[serde(default = "default_bookline_max_exposure_usdc")]
+    pub bookline_max_exposure_usdc: Decimal,
+    #[serde(default = "default_bookline_max_open_markets")]
+    pub bookline_max_open_markets: usize,
+    #[serde(default = "default_bookline_resting_tp_edge")]
+    pub bookline_resting_tp_edge: Decimal,
     /// Widest book disagreement a sports FairValue entry will accept.
     #[serde(default = "default_sports_fairvalue_max_dispersion")]
     pub sports_fairvalue_max_dispersion:  Decimal,
@@ -1382,6 +1431,21 @@ impl Default for DynamicConfig {
             sports_line_min_books:            config::SPORTS_LINE_MIN_BOOKS,
             sports_maker_max_dispersion:      config::SPORTS_MAKER_MAX_DISPERSION,
             sports_fairvalue_min_consensus:   config::SPORTS_FAIRVALUE_MIN_CONSENSUS,
+            bookline_enabled: config::BOOKLINE_ENABLED,
+            bookline_base_edge: config::BOOKLINE_BASE_EDGE,
+            bookline_min_edge: config::BOOKLINE_MIN_EDGE,
+            bookline_edge_taper_secs: config::BOOKLINE_EDGE_TAPER_SECS,
+            bookline_drift_mult: config::BOOKLINE_DRIFT_MULT,
+            bookline_min_consensus: config::BOOKLINE_MIN_CONSENSUS,
+            bookline_min_books: config::BOOKLINE_MIN_BOOKS,
+            bookline_max_dispersion: config::BOOKLINE_MAX_DISPERSION,
+            bookline_max_feed_age_secs: config::BOOKLINE_MAX_FEED_AGE_SECS,
+            bookline_pull_on_adverse_drift: config::BOOKLINE_PULL_ON_ADVERSE_DRIFT,
+            bookline_pull_before_start_secs: config::BOOKLINE_PULL_BEFORE_START_SECS,
+            bookline_trade_size_usdc: config::BOOKLINE_TRADE_SIZE_USDC,
+            bookline_max_exposure_usdc: config::BOOKLINE_MAX_EXPOSURE_USDC,
+            bookline_max_open_markets: config::BOOKLINE_MAX_OPEN_MARKETS,
+            bookline_resting_tp_edge: config::BOOKLINE_RESTING_TP_EDGE,
             sports_fairvalue_max_dispersion:  config::SPORTS_FAIRVALUE_MAX_DISPERSION,
             sports_fairvalue_settle_hold:     config::SPORTS_FAIRVALUE_SETTLE_HOLD,
             sports_fairvalue_catastrophic_armed: config::SPORTS_FAIRVALUE_CATASTROPHIC_ARMED,
@@ -2036,6 +2100,21 @@ mod tests {
             "gboost_planb_exit_posture", "gboost_planb_held_exposure_usdc",
             "gboost_planb_shadow_min_trades", "gboost_planb_shadow_min_win_rate",
             "momentum_window_open_warmup_secs",
+            "bookline_enabled",
+            "bookline_base_edge",
+            "bookline_min_edge",
+            "bookline_edge_taper_secs",
+            "bookline_drift_mult",
+            "bookline_min_consensus",
+            "bookline_min_books",
+            "bookline_max_dispersion",
+            "bookline_max_feed_age_secs",
+            "bookline_pull_on_adverse_drift",
+            "bookline_pull_before_start_secs",
+            "bookline_trade_size_usdc",
+            "bookline_max_exposure_usdc",
+            "bookline_max_open_markets",
+            "bookline_resting_tp_edge",
         ] {
             assert!(obj.remove(added).is_some(), "{added} must be a serialized field");
         }
@@ -2049,6 +2128,9 @@ mod tests {
         assert_eq!(cfg.gboost_planb_held_exposure_usdc, config::GBOOST_PLANB_HELD_EXPOSURE_USDC);
         assert_eq!(cfg.gboost_planb_shadow_min_trades, config::GBOOST_PLANB_SHADOW_MIN_TRADES);
         assert_eq!(cfg.momentum_window_open_warmup_secs, config::MOMENTUM_WINDOW_OPEN_WARMUP_SECS);
+        assert_eq!(cfg.bookline_enabled, config::BOOKLINE_ENABLED);
+        assert_eq!(cfg.bookline_min_consensus, config::BOOKLINE_MIN_CONSENSUS);
+        assert_eq!(cfg.bookline_max_open_markets, config::BOOKLINE_MAX_OPEN_MARKETS);
         assert_eq!(cfg.gboost_planb_shadow_min_win_rate, config::GBOOST_PLANB_SHADOW_MIN_WIN_RATE);
         assert_eq!(cfg.momentum_decay_exit_fraction, config::MOMENTUM_DECAY_EXIT_FRACTION);
         assert_eq!(cfg.momentum_decay_fee_margin_mult, config::MOMENTUM_DECAY_FEE_MARGIN_MULT);

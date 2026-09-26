@@ -71,7 +71,7 @@ pub fn scope_for_group(group: &str) -> Option<ConfigScope> {
         "Global" | "Deployment" | "Raptor Polling" | "GBoost Training" => ConfigScope::Global,
         // Per-squadron: rendered on a squadron page, read from its own row.
         "Order Book" | "Exit Accounting" => ConfigScope::Squadron,
-        "Arbitrage" | "Basis" | "Convergence" | "FairValue" | "GBoost"
+        "Arbitrage" | "Basis" | "Bookline Viper" | "Convergence" | "FairValue" | "GBoost"
         | "Maker" | "Momentum" | "Time Decay" | "TrendReversal" => ConfigScope::Squadron,
         _ => return None,
     })
@@ -1031,6 +1031,62 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Maker will not quote a game whose books disagree by more than this (highest minus lowest book probability). A wide line is a soft line: the books themselves do not know the price, so a passive quote is likelier to be picked off than filled."));
         v.push(F::new("Global", None, "sports_fairvalue_min_consensus", "Sports Favorite Floor", "price", true,
             "Smallest bookmaker consensus a sports FairValue entry will buy. The pre-registered hypothesis is favorite-side only (0.55 and above); the longshot side is its declared negative control, and the de-vig method inflates consensus exactly there, so cheap outcomes show an 'edge' that is an artifact. Setting this below 0.55 trades outside the hypothesis the evidence is being gathered for."));
+        // ── Bookline (sports, maker-first, ghost-only) ────────────────────────
+        let bl = "Bookline Viper";
+        v.push(F::new(bl, None, "bookline_enabled", "Enabled", "bool", true,
+            "Run Bookline. It rests a post-only bid under the bookmaker consensus on one side of a sports \
+             moneyline and holds to fee-free settlement, which is the only way these books can be traded: a \
+             taker at mid needs the true probability to beat mid by about 1.75 points just to cover the fee, \
+             and pre-game the consensus sits within about 0.6 points of mid. A maker resting at the bid needs \
+             -0.69 points, because it collects the half-spread and the venue's rebate. Ships off, and simulated \
+             only: real money is gated on the simulated record."));
+        v.push(F::new(bl, None, "bookline_base_edge", "Base Edge", "price", true,
+            "How far under the consensus the bid must sit when the game is far away, in probability points. \
+             Relaxes toward the Min Edge as kick-off approaches, because there is less time for the line to \
+             move against a resting bid before it fills."));
+        v.push(F::new(bl, None, "bookline_min_edge", "Min Edge", "price", true,
+            "Floor on the required edge however close kick-off is. Below this the trade is not worth the \
+             adverse-selection risk of leaving a bid on the book."));
+        v.push(F::new(bl, None, "bookline_edge_taper_secs", "Edge Taper", "secs", true,
+            "Seconds to kick-off at which the full Base Edge is demanded; inside this window the requirement \
+             tapers toward Min Edge.").min(60.0).step(60.0).unit("s"));
+        v.push(F::new(bl, None, "bookline_drift_mult", "Drift Penalty", "decimal", true,
+            "Extra edge demanded per point-per-hour of consensus movement. A line that is travelling keeps \
+             travelling, and a bid resting under a moving line is picked off from the direction of travel. \
+             0 ignores line velocity."));
+        v.push(F::new(bl, None, "bookline_min_consensus", "Favorite Floor", "price", true,
+            "Smallest consensus Bookline will buy. Proportional de-vig inflates consensus on longshots — \
+             measured at about +1.55 points under $0.10 against -1.69 points above $0.90 — so a rule that \
+             buys wherever consensus beats the bid fires almost only on cheap outcomes and its record measures \
+             the de-vig rather than the bookmakers' information. Lowering this below the FairValue floor trades \
+             outside the pre-registered hypothesis."));
+        v.push(F::new(bl, None, "bookline_min_books", "Min Books", "int", true,
+            "Fewest bookmakers behind a consensus worth quoting against. A one-to-three book consensus is one \
+             bookmaker's opinion.").min(1.0).step(1.0));
+        v.push(F::new(bl, None, "bookline_max_dispersion", "Max Dispersion", "price", true,
+            "Widest book disagreement Bookline will quote into. Wide dispersion is news in flight, and a \
+             resting bid is the wrong side of news."));
+        v.push(F::new(bl, None, "bookline_max_feed_age_secs", "Max Feed Age", "secs", true,
+            "Oldest consensus Bookline will quote against. Also a pull reason: a bid already resting comes off \
+             when the feed behind it goes stale.").min(30.0).step(30.0).unit("s"));
+        v.push(F::new(bl, None, "bookline_pull_on_adverse_drift", "Pull On Adverse Drift", "price", true,
+            "How far the consensus may move AGAINST a resting bid before it is pulled, in probability points. \
+             A cancel is free, so this is deliberately trigger-happy: the asymmetry between an unfilled pull \
+             and an adversely-selected fill is the whole reason this viper can work."));
+        v.push(F::new(bl, None, "bookline_pull_before_start_secs", "Pull Before Kick-off", "secs", true,
+            "Stop quoting and pull any resting bid this many seconds before kick-off. The bookmaker feed goes \
+             stale the moment a game starts, and in-play is a different instrument.").min(0.0).step(60.0).unit("s"));
+        v.push(F::new(bl, None, "bookline_trade_size_usdc", "Trade Size", "usd", true,
+            "Notional per market.").min(0.0).step(1.0).unit("USDC"));
+        v.push(F::new(bl, None, "bookline_max_exposure_usdc", "Max Exposure", "usd", true,
+            "Ceiling on total Bookline notional across every sports market.").min(0.0).step(1.0).unit("USDC"));
+        v.push(F::new(bl, None, "bookline_max_open_markets", "Max Open Markets", "int", true,
+            "Most markets Bookline may hold at once. This is the cap that matters: sports positions correlate \
+             only by sport and each resolves as a coin flip at whatever probability was paid, so a dozen small \
+             bets is a different risk from one large one.").min(1.0).step(1.0));
+        v.push(F::new(bl, None, "bookline_resting_tp_edge", "Take Profit Edge", "price", true,
+            "Edge above consensus for the resting take-profit ask. Settlement is the plan and it is fee-free; \
+             this is the bonus when the market will pay the consensus plus an edge before the game starts."));
         v.push(F::new("Global", None, "sports_fairvalue_max_dispersion", "Sports FairValue Max Dispersion", "price", true,
             "Widest book disagreement (highest minus lowest book probability) a sports FairValue entry will accept. A wide line is a soft line: if the books do not agree what the game is worth, neither does the consensus derived from them."));
         v.push(F::new("Global", None, "sports_fairvalue_settle_hold", "Sports Hold To Settlement", "bool", true,

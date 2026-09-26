@@ -861,7 +861,7 @@ mod sports_seeder_tests {
             league: "nfl".into(), sport_key: "americanfootball_nfl".into(),
             odds_event_id: "e1".into(), commence, outcome_label: "Giants".into(),
             consensus: 0.6, num_books: 8, dispersion: Some(0.01),
-            max_book_age_secs: Some(30), odds_at: Utc::now(), drift: None,
+            max_book_age_secs: Some(30), odds_at: Utc::now(), drift: None, drift_secs: None,
         }
     }
 

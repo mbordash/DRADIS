@@ -24,6 +24,7 @@ use crate::vipers::gboost_planb::GboostPlanBStrategy;
 use crate::vipers::trendreversal_impl::TrendReversalStrategyImpl;
 use crate::vipers::convergence_impl::ConvergenceStrategyImpl;
 use crate::vipers::fairvalue_impl::FairValueStrategyImpl;
+use crate::vipers::bookline_impl::BooklineStrategy;
 use crate::config;
 use rust_decimal_macros::dec;
 use tracing::info;
@@ -121,6 +122,7 @@ impl StrategyRegistry {
             Box::new(TrendReversalStrategyImpl::new())      as Box<dyn Strategy>,
             Box::new(ConvergenceStrategyImpl::new())       as Box<dyn Strategy>,
             Box::new(FairValueStrategyImpl::new())         as Box<dyn Strategy>,
+            Box::new(BooklineStrategy::new())              as Box<dyn Strategy>,
         ]
     }
 
@@ -174,6 +176,7 @@ impl StrategyRegistry {
             "TrendReversalStrategy",
             "ConvergenceStrategy",
             "FairValueStrategy",
+            "BooklineStrategy",
         ]
         .into_iter().map(|s| s.to_string()).collect()
     }
@@ -202,6 +205,7 @@ pub fn strategy_name_to_kind(name: &str) -> &'static str {
         "GboostStrategy"        => "gboost",
         "ConvergenceStrategy"   => "convergence",
         "FairValueStrategy"     => "fairvalue",
+        "BooklineStrategy"      => "bookline",
         "TrendReversalStrategy" => "trendcapture",
         "TrendCaptureStrategy"  => "trendcapture", // legacy alias (pre-rename positions)
         _ => "",

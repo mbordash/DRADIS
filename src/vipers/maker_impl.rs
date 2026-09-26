@@ -81,6 +81,8 @@ fn side_reject_reason(
     ask: Decimal,
     complementary_bid: Decimal,
     velocity_block: bool,
+    // This MARKET's taker coefficient, not the venue-wide one.
+    fee_rate: Decimal,
     dc: &crate::helpers::dynamic_config::DynamicConfig,
 ) -> Option<(&'static str, String)> {
     // Checked before the spread, because without an ask there is no spread to
@@ -113,7 +115,23 @@ fn side_reject_reason(
         // price puts it in the same units as the spread. Binds on every venue —
         // Polymarket US charges 0.06 and was wrongly carried as free until
         // 2026-09-09, which let this branch quote into spreads under the fee.
-        let fee_floor = crate::venues::round_trip_fee_pct(bid_price) * bid_price;
+        // ONE taker leg at THIS MARKET's rate, not two at the venue-wide one.
+        //
+        // Two things were wrong here and both pushed the floor up. A resting
+        // post-only quote is never charged a taker fee by the CLOB — only a FAK
+        // that force-exits it is — so the round-trip figure overstates a maker's
+        // cost by exactly 2x, which `entry_only_fee_pct` already documents.
+        // And `round_trip_fee_pct` reads the venue-wide coefficient (0.07, the
+        // crypto rate) while Polymarket International charges 0.05 on sports and
+        // 0.04 on politics, so an event market was judged at the wrong venue's
+        // price.
+        //
+        // Together those made the floor 3.5c at mid on a sports book instead of
+        // 1.25c, and every sports moneyline quotes about 1c. The corrected floor
+        // still refuses a 1c book at mid — that is real arithmetic, not a knob —
+        // but it no longer refuses the lopsided books, where the quadratic is
+        // small: 0.8c at $0.80 and 0.45c at $0.90.
+        let fee_floor = crate::venues::taker_leg_fee_pct_at(bid_price, fee_rate) * bid_price;
         if spread < fee_floor {
             return Some((
                 "spread_below_fee",
@@ -1040,7 +1058,8 @@ impl Strategy for MakerStrategyImpl {
                 None => side_reject_reason(
                     snapshot.yes_has_ask(), yes_book_ok, taker_flow_blocks_yes, yes_toxic_cooldown,
                     yes_spread, yes_bid_price,
-                    snapshot.yes_ask, no_bid, velocity_bias_strong_negative, dc,
+                    snapshot.yes_ask, no_bid, velocity_bias_strong_negative,
+                    crate::venues::fee_rate_from_ceiling_bps(market.yes_fee_bps), dc,
                 ).unwrap_or(("unknown", "unknown".to_string())),
             };
             let (no_key, no_detail) = match no_streak {
@@ -1048,7 +1067,8 @@ impl Strategy for MakerStrategyImpl {
                 None => side_reject_reason(
                     snapshot.no_has_ask(), no_book_ok, taker_flow_blocks_no, no_toxic_cooldown,
                     no_spread, no_bid_price,
-                    snapshot.no_ask, yes_bid, velocity_bias_strong_positive, dc,
+                    snapshot.no_ask, yes_bid, velocity_bias_strong_positive,
+                    crate::venues::fee_rate_from_ceiling_bps(market.no_fee_bps), dc,
                 ).unwrap_or(("unknown", "unknown".to_string())),
             };
             // Displayed as one line, counted per leg: the advisor's refusal
@@ -2022,8 +2042,46 @@ mod spread_gate_wording_tests {
     use rust_decimal_macros::dec;
 
     /// The fee floor in price units, as the gate computes it.
+    /// The floor the gate actually applies: ONE taker leg at the MARKET's rate.
+    /// Mirrors `side_reject_reason`; taking the crypto coefficient as the
+    /// default so the existing crypto cases keep their meaning.
+    fn fee_floor_at(price: Decimal, rate: Decimal) -> Decimal {
+        crate::venues::taker_leg_fee_pct_at(price, rate) * price
+    }
     fn fee_floor(price: Decimal) -> Decimal {
-        crate::venues::round_trip_fee_pct(price) * price
+        fee_floor_at(price, crate::venues::taker_fee_rate())
+    }
+
+    /// The sports-fee correction, in the numbers that motivated it.
+    ///
+    /// Two errors compounded: the floor charged a maker TWO taker legs when a
+    /// resting post-only quote is charged none (only a force-exiting FAK is),
+    /// and it read the venue-wide 0.07 crypto coefficient on markets the venue
+    /// charges 0.05 (sports) and 0.04 (politics). A sports moneyline quotes
+    /// about 1c, so the inflated floor refused every sports book at every price.
+    #[test]
+    fn the_fee_floor_uses_one_leg_at_the_markets_own_rate() {
+        let sports = crate::venues::fee_rate_from_ceiling_bps(125);
+        assert_eq!(sports, dec!(0.05), "125bps is the $0.50 ceiling of a 0.05 coefficient");
+        assert_eq!(crate::venues::fee_rate_from_ceiling_bps(100), dec!(0.04), "politics");
+        assert_eq!(crate::venues::fee_rate_from_ceiling_bps(0), Decimal::ZERO, "a published zero is free");
+
+        // At mid the corrected floor is 1.25c against the old 3.5c. A 1c book is
+        // still refused, and that is arithmetic rather than a knob.
+        let mid = fee_floor_at(dec!(0.50), sports);
+        assert_eq!(mid, dec!(0.0125));
+        assert!(dec!(0.01) < mid, "a 1c spread at mid genuinely cannot pay a taker exit");
+
+        // Away from mid the quadratic collapses and a 1c book becomes quotable —
+        // which is what this correction unlocks on sports.
+        assert!(dec!(0.01) > fee_floor_at(dec!(0.80), sports), "0.8c at $0.80");
+        assert!(dec!(0.01) > fee_floor_at(dec!(0.90), sports), "0.45c at $0.90");
+
+        // The old floor refused all three, at more than double the true cost.
+        for p in [dec!(0.50), dec!(0.80), dec!(0.90)] {
+            assert!(fee_floor(p) > fee_floor_at(p, sports),
+                    "the venue-wide two-leg floor overstates the cost at {p}");
+        }
     }
 
     /// Below the fee, no `maker_min_spread` rescues the quote.
@@ -2057,16 +2115,23 @@ mod spread_gate_wording_tests {
     /// Every venue DRADIS ships charges a quadratic taker fee, so the floor is
     /// real everywhere. Polymarket US was the exception in name only: it was
     /// carried as free until 2026-09-09 while charging 0.06, and this test
-    /// asserted the zero. At mid the round trip there is 2 × 0.06 × 0.25 = 3¢
-    /// of spread — under the shipped 8-tick `maker_min_spread`, so the knob
-    /// binds first on a normal book, and this branch names the books that
-    /// cannot pay at any setting.
+    /// asserted the zero.
+    ///
+    /// The figure is ONE taker leg, not two. A resting post-only quote is never
+    /// charged by the CLOB; only a FAK that force-exits it is, which is what the
+    /// floor has to be able to pay for. Charging two legs overstated a maker's
+    /// cost by exactly 2x — the thing `entry_only_fee_pct` was written to say —
+    /// and it is why this figure halved on 2026-09-26. On Polymarket US a maker
+    /// is better off still, earning a rebate on the resting leg, so one taker
+    /// leg remains the conservative read.
     #[test]
     fn every_venue_has_a_real_fee_floor() {
         let floor = fee_floor(dec!(0.50));
         assert!(floor > Decimal::ZERO, "every shipped venue charges a taker fee; floor was {floor}");
         #[cfg(feature = "us_retail")]
-        assert_eq!(floor, dec!(0.03), "Polymarket US: 2 × 0.06 × 0.50 × 0.50");
+        assert_eq!(floor, dec!(0.015), "Polymarket US: 0.06 × 0.50 × 0.50, one leg");
+        #[cfg(feature = "intl_clob")]
+        assert_eq!(floor, dec!(0.0175), "Polymarket International crypto: 0.07 × 0.50 × 0.50, one leg");
     }
 }
 
@@ -2476,7 +2541,7 @@ mod sports_dispersion_tests {
             odds_event_id: "e1".into(), commence: now + Duration::seconds(1800),
             outcome_label: "Rams".into(), consensus: 0.7, num_books: books,
             dispersion, max_book_age_secs: Some(30),
-            odds_at: now - Duration::seconds(age_secs), drift: None,
+            odds_at: now - Duration::seconds(age_secs), drift: None, drift_secs: None,
         }
     }
 

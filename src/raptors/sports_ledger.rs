@@ -351,6 +351,14 @@ pub struct SportsLine {
     /// Change in `consensus` since this token's previous line, when there was one:
     /// the line movement that [E32] wanted, per outcome rather than per feed.
     pub drift: Option<f64>,
+    /// Seconds the `drift` above spans, so a consumer can turn it into a velocity.
+    ///
+    /// A bare difference between two readings is not a rate: the same 4-point
+    /// move means something very different over two minutes than over an hour,
+    /// and the interval between readings is set by the poll cadence rather than
+    /// by the market. Without this, any knob scaled on `drift` silently means
+    /// something different on every instance and whenever the cadence changes.
+    pub drift_secs: Option<i64>,
 }
 
 impl SportsLine {
@@ -429,9 +437,9 @@ pub fn fold_rows(prev: &SportsBoard, rows: &[db::SportsLedgerRow], now: DateTime
             next.remove(&r.token_id);
             continue;
         };
-        let drift = prev.get(&r.token_id)
-            .filter(|p| p.odds_at < odds_at)
-            .map(|p| consensus - p.consensus);
+        let prev_line = prev.get(&r.token_id).filter(|p| p.odds_at < odds_at);
+        let drift = prev_line.map(|p| consensus - p.consensus);
+        let drift_secs = prev_line.map(|p| (odds_at - p.odds_at).num_seconds().max(0));
         next.insert(r.token_id.clone(), SportsLine {
             league: r.league.clone(),
             sport_key: r.sport_key.clone(),
@@ -444,6 +452,7 @@ pub fn fold_rows(prev: &SportsBoard, rows: &[db::SportsLedgerRow], now: DateTime
             max_book_age_secs: r.max_book_age_secs,
             odds_at,
             drift,
+            drift_secs,
         });
     }
     next

@@ -1528,6 +1528,18 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
                 Some(inc) if inc.gate_passed => format!(
                     "candidate {version} failed the holdout gate: {why}; the serving model {inc_name} cleared it and is kept"
                 ),
+                // Two different reasons a failed candidate does not displace a
+                // failed incumbent, and they must not be reported as one. On
+                // 2026-09-25 production printed "scores better ... (+0.0172
+                // against +0.0216)" while the CANDIDATE held the higher skill:
+                // it was kept by the mid-experiment rule, and the message said
+                // the comparison had gone the other way.
+                Some(inc) if inc.shadow_trades > 0 && inc.shadow_trades < inc.shadow_needed => format!(
+                    "candidate {version} failed the holdout gate: {why}; the serving model {inc_name} is \
+                     {}/{} through its shadow record, so it is kept rather than restarting the count \
+                     (its skill {:+.4} against the candidate's {:+.4})",
+                    inc.shadow_trades, inc.shadow_needed, inc.skill, cand.skill,
+                ),
                 Some(inc) => format!(
                     "candidate {version} failed the holdout gate: {why}; the serving model {inc_name} has not cleared it \
                      either but scores better on the same fold ({:+.4} against {:+.4}), so it is kept",

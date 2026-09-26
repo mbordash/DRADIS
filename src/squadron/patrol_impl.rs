@@ -4068,6 +4068,12 @@ pub(crate) mod resting_exit {
                 "MomentumStrategy" => self.momentum,
                 "ConvergenceStrategy" => self.convergence,
                 "GboostStrategy" => self.gboost,
+                // Bookline's resting take-profit is intrinsic to the design, not
+                // an option: settlement is the plan and the ask is the bonus
+                // path, so there is no knob to fall through to. Without this arm
+                // it inherited the Maker's switch and an operator turning the
+                // Maker's resting exits off would silently disable Bookline's.
+                "BooklineStrategy" => true,
                 _ => self.maker,
             }
         }
@@ -4081,6 +4087,7 @@ pub(crate) mod resting_exit {
             "FairValueStrategy" => "FairValue resting TP".to_string(),
             "MomentumStrategy" => "Momentum resting TP".to_string(),
             "ConvergenceStrategy" => "Convergence resting TP".to_string(),
+            "BooklineStrategy" => "Bookline resting TP".to_string(),
             "GboostStrategy" => "GBoost resting TP".to_string(),
             other => format!("{other} resting exit"),
         }

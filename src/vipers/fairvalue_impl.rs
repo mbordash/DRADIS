@@ -4055,7 +4055,7 @@ mod sports_consensus_tests {
             outcome_label: "Rams".into(),
             consensus, num_books: books, dispersion,
             max_book_age_secs: Some(30),
-            odds_at: now - Duration::seconds(age_secs), drift: None,
+            odds_at: now - Duration::seconds(age_secs), drift: None, drift_secs: None,
         }
     }
 

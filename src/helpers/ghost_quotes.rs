@@ -196,6 +196,30 @@ pub fn resting_count() -> usize {
     lock().len()
 }
 
+/// One strategy's resting quotes: the number of distinct markets they sit on, and
+/// the notional they commit.
+///
+/// A viper that caps its own exposure cannot see a simulated quote from the
+/// position map, because a resting quote is not a position until it fills. Without
+/// this a cap counted only fills, so a strategy could rest a bid on every deployed
+/// market simultaneously and its stated ceiling would only start binding after the
+/// first one crossed — which in a simulated record is exactly the wrong time to
+/// find out.
+///
+/// Markets are counted by `market_name` rather than by token, matching how the
+/// callers count positions, so the two halves of a cap agree.
+pub fn resting_commitment(strategy: &str) -> (std::collections::HashSet<String>, Decimal) {
+    let map = lock();
+    let mut markets = std::collections::HashSet::new();
+    let mut notional = Decimal::ZERO;
+    for (key, q) in map.iter() {
+        if key.strategy != strategy { continue; }
+        markets.insert(q.params.market_name.clone());
+        notional += q.params.price * q.params.shares;
+    }
+    (markets, notional)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

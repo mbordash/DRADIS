@@ -153,6 +153,31 @@ pub fn published_or_venue_fee_bps(published: Option<Decimal>, venue_wide_rate: D
     }
 }
 
+/// The market's own taker coefficient, recovered from the ceiling its
+/// `MarketConfig` carries.
+///
+/// The inverse of [`taker_fee_ceiling_bps`], which stores a rate as the fee it
+/// would charge at $0.50 (`rate / 4`). Needed because a market's published rate
+/// is not the venue-wide one: Polymarket International charges 0.05 on sports
+/// and 0.04 on politics against the 0.07 crypto coefficient, and a gate reading
+/// the global knob on an event market is asking the wrong venue's price.
+pub fn fee_rate_from_ceiling_bps(fee_bps: u32) -> Decimal {
+    if fee_bps == 0 { return Decimal::ZERO; }
+    Decimal::from(fee_bps) / dec!(10000) * dec!(4)
+}
+
+/// The taker fee on ONE leg at an explicit coefficient, as a fraction of the
+/// entry notional.
+///
+/// The sibling of [`exit_only_fee_pct`] for callers holding a market's own rate
+/// rather than the venue-wide one. Same quadratic, same evaluation at the entry
+/// price; only the coefficient differs.
+pub fn taker_leg_fee_pct_at(entry_price: Decimal, rate: Decimal) -> Decimal {
+    if entry_price <= Decimal::ZERO || entry_price >= Decimal::ONE { return Decimal::ZERO; }
+    if rate <= Decimal::ZERO { return Decimal::ZERO; }
+    rate * (Decimal::ONE - entry_price)
+}
+
 /// The venue's quadratic taker-fee coefficient.
 #[cfg(feature = "intl_clob")]
 pub fn taker_fee_rate() -> Decimal { crate::venues::intl::live_taker_fee_rate() }

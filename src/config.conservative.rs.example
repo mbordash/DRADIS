@@ -797,6 +797,89 @@ pub const SPORTS_MAKER_MAX_DISPERSION: Decimal = dec!(0.05);
 /// rather than a signal. Never set below 0.55 without amending the
 /// pre-registration, which restarts its sample.
 pub const SPORTS_FAIRVALUE_MIN_CONSENSUS: Decimal = dec!(0.60);
+
+// ── Bookline Viper (sports moneylines, maker-first; ghost-only) ───────────────
+// The 2026-09-09 sports spike measured why a taker cannot work here: Polymarket's
+// pre-game moneylines track the de-vigged multi-book consensus to within the
+// spread (mean absolute gap 0.6 points across ten MLB games priced by nine
+// books), while a taker at mid 0.50 needs +1.75 points just to cover the fee.
+// A maker resting at the bid and holding to fee-free settlement needs -0.69
+// points, because it collects the half-spread and the venue's 15% rebate. That
+// 2.4-point swing is the whole thesis, and every knob below protects it.
+//
+// Ships OFF and ghost-only. Phase 1 of the spike's sequencing is a simulated
+// record, and DRADIS's ghost fill model is pessimistic for a maker (a resting bid
+// fills only when the ask trades down through it), so its P&L is a floor.
+/// Run the viper at all. Off by default: Phase 2 (real money) is gated on the
+/// ghost record, which is gated in turn on the line cadence being in minutes.
+pub const BOOKLINE_ENABLED: bool = false;
+/// Tick grid Bookline quotes on.
+///
+/// Polymarket International's sports moneylines quote a thousandth, not a cent:
+/// the spike measured 0.001 tick sizes and 1c spreads on MLB books carrying
+/// $250k-$560k. `helpers::price` hard-codes the cent grid the crypto markets use,
+/// and flooring a sports bid to it would place the quote up to nine ticks under
+/// the queue it meant to join, which on this design is the difference between a
+/// resting bid and a decoration.
+///
+/// A venue constant rather than an operator knob, because it is a fact about the
+/// book and not a preference. It should become per-market if any sports venue is
+/// found quoting a different grid.
+///
+/// NOTE for Phase 2: this value does not reach the venue today. The intl order
+/// builder floors or rounds every price to CENTS and builds amounts in integer
+/// cents, so a thousandth price is silently coerced before the CLOB sees it — and
+/// the CLOB rejects genuinely off-grid prices with "Price breaks minimum tick size
+/// rule". Polymarket publishes a per-market `minimum_tick_size` that DRADIS does
+/// not read anywhere. Going live needs that field on `MarketConfig` and
+/// `helpers::price` taking a tick, not this constant.
+pub const BOOKLINE_TICK_SIZE: Decimal = dec!(0.001);
+/// Edge demanded far from kick-off, in probability points, tapering toward
+/// `BOOKLINE_MIN_EDGE` as the game approaches.
+pub const BOOKLINE_BASE_EDGE: Decimal = dec!(0.03);
+/// Floor on the required edge, however close kick-off is.
+pub const BOOKLINE_MIN_EDGE: Decimal = dec!(0.005);
+/// Seconds to kick-off at which the full base edge is demanded; inside this the
+/// requirement relaxes, because there is less time for the line to move against
+/// a resting bid before it fills.
+pub const BOOKLINE_EDGE_TAPER_SECS: i64 = 3600;
+/// Extra edge per point-per-hour of consensus velocity. A line that is travelling
+/// keeps travelling, and a bid resting under a moving line is picked off from the
+/// direction of travel.
+pub const BOOKLINE_DRIFT_MULT: Decimal = dec!(0.25);
+/// Smallest consensus Bookline will buy, the same favorite-side floor and for the
+/// same reason as `SPORTS_FAIRVALUE_MIN_CONSENSUS`: proportional de-vig inflates
+/// consensus on longshots (measured mean +1.55 points under $0.10 against -1.69
+/// above $0.90), so a rule that buys wherever consensus beats the bid would fire
+/// almost only on longshots and its record would measure the de-vig.
+pub const BOOKLINE_MIN_CONSENSUS: Decimal = dec!(0.60);
+/// Fewest books behind a consensus worth quoting against. A one-to-three book
+/// "consensus" is one bookmaker's opinion.
+pub const BOOKLINE_MIN_BOOKS: i64 = 5;
+/// Widest book disagreement that still counts as a price. Wide dispersion is news
+/// in flight, and a resting bid is the wrong side of news.
+pub const BOOKLINE_MAX_DISPERSION: Decimal = dec!(0.06);
+/// Oldest consensus Bookline will quote against, in seconds.
+pub const BOOKLINE_MAX_FEED_AGE_SECS: i64 = 600;
+/// Adverse consensus movement, in points, that pulls a resting bid.
+pub const BOOKLINE_PULL_ON_ADVERSE_DRIFT: Decimal = dec!(0.01);
+/// Seconds before kick-off at which Bookline stops quoting and pulls. The free
+/// feed goes stale the moment a game starts, and in-play is a different
+/// instrument the spike puts out of scope.
+pub const BOOKLINE_PULL_BEFORE_START_SECS: i64 = 900;
+/// Notional per market. The spike's Phase 2 figure is $10; ghost uses the same so
+/// the record is comparable.
+pub const BOOKLINE_TRADE_SIZE_USDC: Decimal = dec!(5.0);
+/// Ceiling on total Bookline notional.
+pub const BOOKLINE_MAX_EXPOSURE_USDC: Decimal = dec!(10.0);
+/// Most markets Bookline may hold at once. The cap that matters is the COUNT:
+/// sports positions correlate only by sport and each resolves as a coin flip at
+/// whatever probability was paid, so a dozen small bets is a different risk from
+/// one large one.
+pub const BOOKLINE_MAX_OPEN_MARKETS: usize = 2;
+/// Edge above consensus for the resting take-profit ask. Settlement is the plan;
+/// this is the bonus when the market will pay the consensus plus an edge early.
+pub const BOOKLINE_RESTING_TP_EDGE: Decimal = dec!(0.03);
 /// Widest book disagreement FairValue will enter on. A wide line is a soft
 /// line: the books do not know the price, so neither does the consensus.
 pub const SPORTS_FAIRVALUE_MAX_DISPERSION: Decimal = dec!(0.04);

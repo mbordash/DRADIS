@@ -226,7 +226,22 @@
         "sports_fairvalue_max_dispersion": "0.04",
         "sports_fairvalue_settle_hold": true,
         "sports_fairvalue_catastrophic_armed": true,
-        "tennis_tour": ""
+        "tennis_tour": "",
+        "bookline_enabled": false,
+        "bookline_base_edge": "0.03",
+        "bookline_min_edge": "0.005",
+        "bookline_edge_taper_secs": 3600,
+        "bookline_drift_mult": "0.25",
+        "bookline_min_consensus": "0.60",
+        "bookline_min_books": 5,
+        "bookline_max_dispersion": "0.06",
+        "bookline_max_feed_age_secs": 600,
+        "bookline_pull_on_adverse_drift": "0.01",
+        "bookline_pull_before_start_secs": 900,
+        "bookline_trade_size_usdc": "5.0",
+        "bookline_max_exposure_usdc": "10.0",
+        "bookline_max_open_markets": 2,
+        "bookline_resting_tp_edge": "0.03"
       }
     },
     "balanced": {
@@ -454,7 +469,22 @@
         "sports_fairvalue_max_dispersion": "0.06",
         "sports_fairvalue_settle_hold": true,
         "sports_fairvalue_catastrophic_armed": true,
-        "tennis_tour": ""
+        "tennis_tour": "",
+        "bookline_enabled": false,
+        "bookline_base_edge": "0.02",
+        "bookline_min_edge": "0.005",
+        "bookline_edge_taper_secs": 3600,
+        "bookline_drift_mult": "0.25",
+        "bookline_min_consensus": "0.55",
+        "bookline_min_books": 3,
+        "bookline_max_dispersion": "0.06",
+        "bookline_max_feed_age_secs": 600,
+        "bookline_pull_on_adverse_drift": "0.01",
+        "bookline_pull_before_start_secs": 900,
+        "bookline_trade_size_usdc": "10.0",
+        "bookline_max_exposure_usdc": "30.0",
+        "bookline_max_open_markets": 3,
+        "bookline_resting_tp_edge": "0.03"
       }
     },
     "aggressive": {
@@ -682,7 +712,22 @@
         "sports_fairvalue_max_dispersion": "0.10",
         "sports_fairvalue_settle_hold": true,
         "sports_fairvalue_catastrophic_armed": true,
-        "tennis_tour": ""
+        "tennis_tour": "",
+        "bookline_enabled": false,
+        "bookline_base_edge": "0.02",
+        "bookline_min_edge": "0.005",
+        "bookline_edge_taper_secs": 3600,
+        "bookline_drift_mult": "0.25",
+        "bookline_min_consensus": "0.55",
+        "bookline_min_books": 3,
+        "bookline_max_dispersion": "0.06",
+        "bookline_max_feed_age_secs": 600,
+        "bookline_pull_on_adverse_drift": "0.01",
+        "bookline_pull_before_start_secs": 900,
+        "bookline_trade_size_usdc": "10.0",
+        "bookline_max_exposure_usdc": "60.0",
+        "bookline_max_open_markets": 6,
+        "bookline_resting_tp_edge": "0.03"
       }
     }
   }
