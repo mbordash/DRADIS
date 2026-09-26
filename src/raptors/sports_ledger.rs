@@ -111,14 +111,55 @@ const RESULTS_REFRESH_SECS: i64 = 30 * 60;
 /// event can be the same game. Sampled 2026-09-11: identical for Ligue 1, one
 /// minute apart for MLB.
 const MATCH_TOLERANCE_SECS: i64 = 15 * 60;
-/// A snapshot target stays due for this long, so a slow tick or a restart
-/// does not skip it.
-const SNAPSHOT_WINDOW_SECS: i64 = 20 * 60;
-/// A snapshot taken this long before a target already covers it. Pre-game lines
-/// barely move (not a full point in 71 game-hours on the 2026-09-09 probe), so
-/// a second paid call minutes after the first buys nothing. Must stay well
-/// under the gap between configured offsets.
-const SNAPSHOT_COALESCE_SECS: i64 = 30 * 60;
+/// Longest a snapshot target stays due, so a slow tick or a restart does not skip
+/// it. Narrowed to the configured spacing by `snapshot_timing` — this is only the
+/// ceiling for a single-offset schedule.
+const SNAPSHOT_WINDOW_MAX_SECS: i64 = 20 * 60;
+/// Ceiling on how long before a target an existing snapshot still covers it. Also
+/// narrowed by `snapshot_timing`.
+///
+/// Pre-game lines barely move (not a full point in 71 game-hours on the 2026-09-09
+/// probe), so on a sparse schedule a second paid call minutes after the first buys
+/// nothing. That stops being true once the schedule is deliberately dense near
+/// kick-off, which is why neither figure is fixed any more.
+const SNAPSHOT_COALESCE_MAX_SECS: i64 = 30 * 60;
+/// Floor on the window, so a target always survives a few 60s ticks.
+const SNAPSHOT_WINDOW_MIN_SECS: i64 = 3 * 60;
+
+/// How long a target stays due, and how long a prior snapshot covers it, DERIVED
+/// from the configured offsets.
+///
+/// These were fixed at 20 and 30 minutes, which silently capped the whole feed's
+/// cadence: with any offsets closer together than 30 minutes, the coalesce window
+/// swallowed every one after the first, so adding near-kick-off offsets bought
+/// nothing and the operator's knob was inert. The shipped `-120,-10` schedule polls
+/// a median of 45 minutes apart, which is slower than every consumer's staleness
+/// bar — Bookline refuses a line older than 10 minutes, so it was gated off for
+/// roughly four ticks in five, and any bid it did rest was pulled before a book
+/// could cross it.
+///
+/// Derived as half the tightest gap between offsets, so the operator's schedule is
+/// the cadence rather than a suggestion, and two adjacent targets can never
+/// coalesce into one. A single-offset schedule keeps the old generous ceilings,
+/// because with nothing to collide with there is no reason to narrow them.
+pub fn snapshot_timing(offsets_mins: &[i64]) -> (i64, i64) {
+    let mut sorted: Vec<i64> = offsets_mins.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let tightest = sorted.windows(2).map(|w| (w[1] - w[0]) * 60).min();
+    match tightest {
+        Some(gap) => {
+            let half = gap / 2;
+            // The floor is the WINDOW's alone: a target has to outlive a couple of
+            // 60-second ticks or it could expire unseen between two of them. The
+            // coalesce window has no such need and must stay under the real gap, so
+            // flooring it too would let adjacent targets merge on a tight schedule.
+            let window = half.clamp(SNAPSHOT_WINDOW_MIN_SECS, SNAPSHOT_WINDOW_MAX_SECS);
+            (window, half.min(SNAPSHOT_COALESCE_MAX_SECS).max(1))
+        }
+        None => (SNAPSHOT_WINDOW_MAX_SECS, SNAPSHOT_COALESCE_MAX_SECS),
+    }
+}
 /// Games are tracked from this long before their start...
 const LOOKAHEAD_SECS: i64 = 36 * 3600;
 /// ...until this long after it, so in-play snapshots still cover them.
@@ -662,9 +703,9 @@ pub fn match_games(pm: &[PmGame], odds: &[OddsEvent], sport_key: &str) -> Vec<Ma
 // ── Scheduling and budget ────────────────────────────────────────────────────
 
 /// Sport keys with a snapshot due now: some matched game has reached one of the
-/// offsets from its start within the last `SNAPSHOT_WINDOW_SECS`, and that
-/// sport has not been snapshotted since `SNAPSHOT_COALESCE_SECS` before the
-/// target. One call covers every game of a sport, so a due sport is returned
+/// offsets from its start within the derived snapshot window, and that sport has
+/// not been snapshotted within the derived coalesce window before the target
+/// (see `snapshot_timing`). One call covers every game of a sport, so a due sport is returned
 /// once, and games starting close together share a snapshot.
 pub fn due_sport_keys(
     games: &[MatchedGame],
@@ -672,13 +713,14 @@ pub fn due_sport_keys(
     last_snapshot: &HashMap<String, DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> Vec<String> {
+    let (window_secs, coalesce_secs) = snapshot_timing(offsets_mins);
     let mut due: Vec<String> = Vec::new();
     for g in games {
         for off in offsets_mins {
             let target = g.commence + ChronoDuration::minutes(*off);
-            let open = target <= now && now < target + ChronoDuration::seconds(SNAPSHOT_WINDOW_SECS);
+            let open = target <= now && now < target + ChronoDuration::seconds(window_secs);
             let taken = last_snapshot.get(&g.sport_key)
-                .is_some_and(|t| *t >= target - ChronoDuration::seconds(SNAPSHOT_COALESCE_SECS));
+                .is_some_and(|t| *t >= target - ChronoDuration::seconds(coalesce_secs));
             if open && !taken && !due.contains(&g.sport_key) {
                 due.push(g.sport_key.clone());
             }
@@ -1736,6 +1778,44 @@ mod tests {
     }
 
     #[test]
+    /// The snapshot cadence must follow the operator's offsets, not cap them.
+    ///
+    /// Fixed at 20 and 30 minutes, the coalesce window swallowed every offset
+    /// closer than half an hour to another — so the shipped `-120,-10` schedule
+    /// polled a median of 45 minutes apart and adding near-kick-off offsets bought
+    /// nothing. Every consumer's staleness bar is tighter than that: Bookline
+    /// refuses a line older than 10 minutes.
+    #[test]
+    fn the_snapshot_cadence_is_derived_from_the_configured_offsets() {
+        use super::snapshot_timing;
+
+        // The shipped dense schedule: 5-minute spacing near kick-off means the
+        // coalesce window must be under 5 minutes or adjacent targets merge.
+        let dense = [-120, -60, -30, -25, -20, -15, -10, -5];
+        let (window, coalesce) = snapshot_timing(&dense);
+        assert!(coalesce < 5 * 60, "coalesce {coalesce}s would swallow a 5-minute gap");
+        assert!(window >= SNAPSHOT_WINDOW_MIN_SECS, "a target must survive a few 60s ticks");
+        assert_eq!((window, coalesce), (SNAPSHOT_WINDOW_MIN_SECS, 150),
+                   "coalesce is half the 5-minute gap; the window is floored so a target outlives a tick");
+
+        // A sparse schedule keeps the generous ceilings: nothing to collide with.
+        let (w, c) = snapshot_timing(&[-120, -10]);
+        assert_eq!((w, c), (SNAPSHOT_WINDOW_MAX_SECS, SNAPSHOT_COALESCE_MAX_SECS));
+
+        // One offset, or none, has no gap at all.
+        assert_eq!(snapshot_timing(&[-10]), (SNAPSHOT_WINDOW_MAX_SECS, SNAPSHOT_COALESCE_MAX_SECS));
+        assert_eq!(snapshot_timing(&[]), (SNAPSHOT_WINDOW_MAX_SECS, SNAPSHOT_COALESCE_MAX_SECS));
+
+        // An absurdly tight schedule is floored, not allowed to go to zero, or a
+        // target could expire between two 60-second ticks and never be taken.
+        let (w, c) = snapshot_timing(&[-3, -2, -1]);
+        assert_eq!(w, SNAPSHOT_WINDOW_MIN_SECS);
+        assert!(c < 60, "coalesce must stay under a one-minute gap, got {c}s");
+
+        // Order and duplicates in the knob must not change the answer.
+        assert_eq!(snapshot_timing(&[-5, -120, -10, -5]), snapshot_timing(&[-120, -10, -5]));
+    }
+
     fn best_levels_read_the_touch_regardless_of_ordering() {
         let book = serde_json::json!({
             "bids": [{"price": "0.47", "size": "100"}, {"price": "0.48", "size": "25"}, {"price": "0.49", "size": "0"}],

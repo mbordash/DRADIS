@@ -747,8 +747,25 @@ pub const SPORTS_LEDGER_ENABLED: bool = false;
 /// Polymarket league code (Gamma /sports) = The Odds API sport key.
 pub const SPORTS_LEDGER_LEAGUES: &str = "mlb=baseball_mlb,nfl=americanfootball_nfl,cfb=americanfootball_ncaaf,epl=soccer_epl,lal=soccer_spain_la_liga,bun=soccer_germany_bundesliga,fl1=soccer_france_ligue_one,sea=soccer_italy_serie_a,mls=soccer_usa_mls,ucl=soccer_uefa_champs_league,ufc=mma_mixed_martial_arts,wnba=basketball_wnba,nba=basketball_nba,nhl=icehockey_nhl";
 /// Snapshot times, in minutes relative to each game's start (negative = before).
-/// One Odds API call covers every game of a sport.
-pub const SPORTS_LEDGER_SNAPSHOT_OFFSETS_MINS: &str = "-120,-10";
+/// One Odds API call covers every game of a sport, so the cost is per sport per
+/// target rather than per game.
+///
+/// Dense near kick-off and sparse far out, because that is where the line moves and
+/// where a consumer needs it fresh. The old `-120,-10` schedule polled a median of
+/// 45 minutes apart, which was slower than every consumer's own staleness bar:
+/// Bookline refuses a line older than 10 minutes, so it sat gated for roughly four
+/// ticks in five and any bid it rested was pulled before a book could cross it. It
+/// also made the lead/lag statistic the sports spike gates on unmeasurable, since a
+/// lead resolving inside 45 minutes is invisible at 45-minute sampling.
+///
+/// Five-minute spacing inside the last half hour. The snapshot window and coalesce
+/// window are DERIVED from the tightest gap here (`snapshot_timing`), so changing
+/// this knob genuinely changes the cadence — with the old fixed 30-minute coalesce,
+/// any offset closer than half an hour to another was silently swallowed.
+///
+/// Budget: about four times the old schedule, which at the observed ~60 credits a
+/// day is roughly 240 a day against a 100,000-a-month plan.
+pub const SPORTS_LEDGER_SNAPSHOT_OFFSETS_MINS: &str = "-120,-60,-30,-25,-20,-15,-10,-5";
 /// Odds API credits the ledger never spends into.
 pub const SPORTS_LEDGER_CREDIT_RESERVE: i64 = 25;
 // ── Sports consumers: the board as a trading signal ─────────────────────────
