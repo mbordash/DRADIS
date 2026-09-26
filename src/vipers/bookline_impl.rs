@@ -70,6 +70,7 @@
 //!   mechanism this design relies on, and they are effectively absent until the
 //!   near-kick-off cadence is in minutes.
 
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
 /// The largest `|consensus - mid|` that can be an edge rather than a mistake.
@@ -565,56 +566,62 @@ mod tests {
 // ── The viper ────────────────────────────────────────────────────────────────
 
 use crate::orchestrator::strategy::{Strategy, StrategyContext};
-use crate::state::{OrderParams, PositionKey, StrategySignal, StrategyStatus};
+use crate::state::{StrategySignal, StrategyStatus};
 use crate::venues::core::MarketId;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
-use std::collections::HashMap;
-use std::sync::{Mutex as StdMutex, OnceLock};
 use tracing::info;
 
 pub const STRATEGY_NAME: &str = "BooklineStrategy";
 /// How often a refusal repeats in the log.
 const GATE_LOG_INTERVAL_SECS: u64 = 300;
 
-/// The consensus each resting bid is being judged against, by token.
+/// Why there is no in-memory placement registry.
 ///
-/// `adverse_drift` is measured from where the line was when we committed, not
-/// from the previous poll: a bid placed at 0.62 and still resting while the
-/// consensus has walked to 0.58 is in danger whether it walked in one step or
-/// four. FairValue keeps an entry-fair registry for the same reason.
+/// An earlier cut kept the consensus each bid was committed against in a static
+/// map. Two things were wrong with that. The orchestrator runs entry and exit
+/// concurrently against one context and the quote is only registered after both
+/// have run, so a baseline written by entry was wiped by exit on the same tick and
+/// the adverse-drift pull never fired at all. And a static map is empty after a
+/// restart, which would silently disarm the same rule for the rest of a resting
+/// quote's life.
 ///
-/// Written on the first tick the quote is OBSERVED resting, not on the tick it is
-/// emitted. The orchestrator runs `evaluate_entry` and `evaluate_exit`
-/// concurrently against one context, and the patrol only registers the quote in
-/// its consumer AFTER both have run — so a baseline written by entry was wiped by
-/// exit on the very same tick, when exit saw neither a position nor a resting
-/// quote and cleaned up what it took for a stale entry. The drift pull was
-/// therefore dead: `adverse` read zero for the life of every quote and only the
-/// line-refusal pulls ever fired.
-///
-/// Recording a tick later costs at most one board poll of drift and is
-/// restart-correct for free: this registry is in-memory and the startup sweep
-/// drops every simulated quote and position, so an empty registry is exactly the
-/// right state after a restart.
-fn placed_at() -> &'static StdMutex<HashMap<String, Decimal>> {
-    static M: OnceLock<StdMutex<HashMap<String, Decimal>>> = OnceLock::new();
-    M.get_or_init(|| StdMutex::new(HashMap::new()))
-}
+/// The baseline now lives in the ledger row as `consensus_at_quote`, written once
+/// when the quote is recorded. Durable, restart-correct, and there is no second
+/// place for it to disagree with.
 
-fn lock<T>(m: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() { Ok(g) => g, Err(p) => p.into_inner() }
-}
-
-fn record_placed(token: &str, consensus: Decimal) {
-    lock(placed_at()).insert(token.to_string(), consensus);
-}
-fn clear_placed(token: &str) {
-    lock(placed_at()).remove(token);
-}
-fn consensus_at_placement(token: &str) -> Option<Decimal> {
-    lock(placed_at()).get(token).copied()
+/// Book a closed simulated trade into the operator's trade list as a ghost row.
+///
+/// The lane's own ledger is what the Phase 1 statistics are computed from; this is
+/// so the operator can SEE the trades. `ghost = 1` keeps them out of realized P&L
+/// and out of the lifetime stat cards on a live instance, which is the whole reason
+/// those were scoped by posture.
+///
+/// Fees are recorded as zero because none were paid: a resting bid pays no taker
+/// fee, and neither settlement nor a lifted post-only ask pays one on the way out.
+/// A settle-snipe is the exception and its fee is already netted into `ret`, so the
+/// row's P&L is consistent with the ledger either way.
+async fn record_ghost_trade(
+    pool: &sqlx::SqlitePool,
+    ctx: &StrategyContext,
+    row: &crate::helpers::db::BooklineShadow,
+    exit_price: f64,
+    reason: &str,
+    ret: f64,
+) {
+    let entry = Decimal::try_from(row.quote_price).unwrap_or(Decimal::ZERO);
+    let shares = Decimal::try_from(row.shares).unwrap_or(Decimal::ZERO);
+    let pnl = Decimal::try_from(ret).unwrap_or(Decimal::ZERO) * entry * shares;
+    let mut scope = crate::state::TradeScope::new(
+        &ctx.crypto_filter, "", Some("sports".to_string()), None,
+    );
+    scope.ghost = true;
+    crate::helpers::db::record_trade_db(
+        pool, &scope, Decimal::ZERO, STRATEGY_NAME, &row.market, &row.side,
+        entry, Decimal::try_from(exit_price).unwrap_or(Decimal::ZERO), shares, pnl,
+        &format!("Bookline {reason} — simulated"), None,
+    ).await;
 }
 
 #[derive(Default)]
@@ -632,11 +639,6 @@ fn legs(ctx: &StrategyContext) -> [(usize, MarketId, Decimal, Decimal); 2] {
     ]
 }
 
-/// This market's own taker coefficient, for the one leg an exit might cross on.
-fn market_fee_rate(ctx: &StrategyContext, side: usize) -> Decimal {
-    let bps = if side == 0 { ctx.market.yes_fee_bps } else { ctx.market.no_fee_bps };
-    crate::venues::fee_rate_from_ceiling_bps(bps)
-}
 
 #[async_trait]
 impl Strategy for BooklineStrategy {
@@ -653,18 +655,23 @@ impl Strategy for BooklineStrategy {
             idle("disabled in config");
             return Ok(StrategySignal::NoSignal);
         }
-        // Ghost-only, and enforced here rather than trusted to a knob.
+        // No instance-wide simulation gate.
         //
-        // Phase 2 of the spike's sequencing — real money — is gated on the
-        // simulated record, and the simulated record is gated in turn on the line
-        // cadence being in minutes rather than the ~45 it currently is. Until
-        // both are settled this viper must be incapable of spending money, not
-        // merely configured not to. An operator who turns `bookline_enabled` on
-        // in a live session gets a simulated lane and a log line saying so.
-        if !(crate::config::GHOST_MODE || dc.ghost_mode) {
-            idle("Bookline is simulated-only in this build — turn on Simulation Mode to run it");
-            return Ok(StrategySignal::NoSignal);
-        }
+        // This viper keeps its OWN books (`db::bookline_shadow_*`) and returns
+        // `NoSignal` on every path, so it cannot reach a venue whatever mode the
+        // instance is in. That is what lets it earn its record on the production
+        // box, against the same books and the same latency the live vipers face —
+        // which is the only place a record about these markets means anything.
+        //
+        // Gating on `ghost_mode` instead, as the first cut did, made the viper
+        // permanently inert on the one instance whose evidence counts, and pushed
+        // the experiment onto a quiet demo box where the result would not transfer.
+        //
+        // It must also not use the engine's ghost-quote registry: the patrol runs
+        // the simulated fill sweep inside `if ghosting`, so on a live box a
+        // registered quote would never cross, and the `MakerQuote` consumer reads
+        // real-versus-simulated from the same tick-wide switch — an order flagged
+        // simulated on a live instance becomes a real order.
         if ctx.market_class.as_deref() != Some("sports") {
             idle("Bookline trades sports moneylines only");
             return Ok(StrategySignal::NoSignal);
@@ -676,40 +683,31 @@ impl Strategy for BooklineStrategy {
         };
         let now = Utc::now();
 
-        // One side, one market. The position key is per token, so nothing in the
-        // keying stops a YES bid and a NO bid coexisting — and two resting bids on
-        // opposite sides of the same game is the two-sided market making this
-        // viper exists NOT to do. Any position or resting quote on either leg ends
-        // the tick.
-        for (_, token, _, _) in legs(ctx) {
-            let key = PositionKey::new(&ctx.squadron_id, STRATEGY_NAME, token.clone());
-            let held = ctx.positions.lock().await.contains_key(&key);
-            if held || crate::helpers::ghost_quotes::is_resting(&key) {
-                idle("already committed on this market");
-                return Ok(StrategySignal::NoSignal);
-            }
+        let Some(pool) = crate::helpers::db::pool_for(&ctx.crypto_filter) else {
+            idle("no database for the simulated ledger");
+            return Ok(StrategySignal::NoSignal);
+        };
+
+        // One side, one market, asked of the lane's own books.
+        //
+        // A resting bid on one outcome and another on the opposite outcome is
+        // two-sided market making, which this viper exists not to do — and nothing
+        // in the keying prevents it, because a key is per token.
+        if crate::helpers::db::bookline_shadow_holds(&pool, &ctx.crypto_filter, &ctx.market.condition_id).await {
+            idle("already committed on this market");
+            return Ok(StrategySignal::NoSignal);
         }
 
-        // Room, counted in MARKETS as well as notional.
+        // Commitments, not fills. A resting bid is a commitment: counting only
+        // filled rows would let Bookline rest a bid on every deployed sports market
+        // at once and discover its own ceiling after the first one crossed.
         let size = dc.bookline_trade_size_usdc;
-        // Positions AND resting quotes. A resting bid is a commitment: it is not a
-        // position until it fills, so counting only the map would let Bookline rest
-        // a bid on every deployed sports market at once and discover its own
-        // ceiling only after the first one crossed.
-        let (open_markets, exposure) = {
-            let map = ctx.positions.lock().await;
-            let mine: Vec<_> = map.iter()
-                .filter(|(k, _)| k.strategy == STRATEGY_NAME)
-                .collect();
-            let mut markets: std::collections::HashSet<String> =
-                mine.iter().map(|(_, p)| p.market_name.clone()).collect();
-            let mut notional: Decimal = mine.iter().map(|(_, p)| p.shares * p.avg_entry).sum();
-            let (quoted_markets, quoted_notional) =
-                crate::helpers::ghost_quotes::resting_commitment(STRATEGY_NAME);
-            markets.extend(quoted_markets);
-            notional += quoted_notional;
-            (markets.len(), notional)
-        };
+        let live = crate::helpers::db::bookline_shadow_open(&pool, &ctx.crypto_filter).await;
+        let open_markets = live.iter().map(|r| r.condition_id.clone())
+            .collect::<std::collections::HashSet<_>>().len();
+        let exposure: Decimal = live.iter()
+            .filter_map(|r| Decimal::try_from(r.quote_price * r.shares).ok())
+            .sum();
         if let Err(why) = has_room(open_markets, exposure, size,
                                    dc.bookline_max_open_markets, dc.bookline_max_exposure_usdc) {
             idle(why);
@@ -719,7 +717,7 @@ impl Strategy for BooklineStrategy {
         // Score both sides and take the better one. Only one can pass the favorite
         // floor on a two-outcome game, so this is not really a choice in practice —
         // but a draw market has three outcomes and the floor does not guarantee it.
-        let mut best: Option<(usize, MarketId, Decimal, Decimal, Decimal)> = None;
+        let mut best: Option<(usize, MarketId, Decimal, Decimal, Decimal, Decimal)> = None;
         let mut last_refusal = String::new();
         for (side, token, bid, ask) in legs(ctx) {
             let Some(line) = board.side(side) else {
@@ -751,14 +749,14 @@ impl Strategy for BooklineStrategy {
                 Ok(px) => {
                     let room = consensus - px;
                     if best.as_ref().is_none_or(|b| room > b.4) {
-                        best = Some((side, token.clone(), px, consensus, room));
+                        best = Some((side, token.clone(), px, consensus, room, edge));
                     }
                 }
                 Err(why) => last_refusal = why.to_string(),
             }
         }
 
-        let Some((side, token, price, consensus, room)) = best else {
+        let Some((side, token, price, _consensus, room, edge)) = best else {
             idle(if last_refusal.is_empty() { "no side worth quoting" } else { &last_refusal });
             return Ok(StrategySignal::NoSignal);
         };
@@ -779,160 +777,153 @@ impl Strategy for BooklineStrategy {
             room, line.secs_to_start(Utc::now()) / 60,
         );
 
-        let params = OrderParams {
-            token_id: token,
-            price,
-            shares,
-            fee_bps: if side == 0 { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 },
-            is_neg_risk: ctx.market.is_neg_risk,
-            market_name: ctx.market.market_name.clone(),
-            condition_id: ctx.market.condition_id.clone(),
-            order_type: crate::venues::core::TimeInForce::Gtc,
-            post_only: true,
-            ghost_mode: true,
-        };
-        Ok(if side == 0 {
-            StrategySignal::MakerQuote { yes: Some(params), no: None }
-        } else {
-            StrategySignal::MakerQuote { yes: None, no: Some(params) }
-        })
+        crate::helpers::db::bookline_shadow_quote(
+            &pool, &ctx.crypto_filter, &ctx.market.condition_id, token.as_str(),
+            &ctx.market.market_name, if side == 0 { "YES" } else { "NO" },
+            Some(line.league.as_str()), Some(&line.commence.to_rfc3339()),
+            price.to_f64().unwrap_or(0.0), shares.to_f64().unwrap_or(0.0),
+            line.consensus, edge.to_f64().unwrap_or(0.0), line.num_books, line.dispersion,
+        ).await;
+
+        // No signal, ever. The lane's whole safety property is that nothing it
+        // decides reaches a venue consumer, which is what lets it run on a live box.
+        Ok(StrategySignal::NoSignal)
     }
 
+    /// Sweep the lane's own books: fill resting quotes the book has crossed, pull
+    /// the ones that should not be there, and close the filled ones.
+    ///
+    /// Emits nothing. Not gated on `bookline_enabled` either: turning the knob off
+    /// must PULL what is resting, not abandon it, because this sweep is the only
+    /// thing that will ever fill or close these rows. Disabled means "stop
+    /// quoting", never "stop looking after what is already out there".
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config;
-        // Deliberately NOT gated on `bookline_enabled`. Turning the knob off while
-        // a bid rests must PULL it, not abandon it: the fill simulation keeps
-        // crossing a registered quote whether the viper is enabled or not, so
-        // gating here would strand quotes that then fill against a stale line with
-        // nothing left to manage them. Maker and FairValue leave their exits
-        // ungated for the same reason. Disabled means "stop quoting", never "stop
-        // looking after what is already out there".
         if ctx.market_class.as_deref() != Some("sports") {
             return Ok(StrategySignal::NoSignal);
         }
+        let Some(pool) = crate::helpers::db::pool_for(&ctx.crypto_filter) else {
+            return Ok(StrategySignal::NoSignal);
+        };
+        let live = crate::helpers::db::bookline_shadow_open(&pool, &ctx.crypto_filter).await;
+        if live.is_empty() {
+            return Ok(StrategySignal::NoSignal);
+        }
         let now = Utc::now();
-        let board = ctx.sports.as_ref();
+        let board = crate::raptors::sports_ledger::board();
 
-        for (side, token, bid, _ask) in legs(ctx) {
-            let key = PositionKey::new(&ctx.squadron_id, STRATEGY_NAME, token.clone());
-            let position = ctx.positions.lock().await.get(&key).cloned();
-            // A simulated resting quote is NOT in the position map, so without this
-            // the pull rules could never fire in ghost — and the pull rules are the
-            // only thing protecting a resting bid from adverse selection. The Maker
-            // reads the same registry for the same reason.
-            let ghost_resting = position.is_none()
-                && crate::helpers::ghost_quotes::is_resting(&key);
+        for row in live {
+            let token = MarketId::new(&row.token_id);
+            // The book for this token, when this squadron still has one. A market
+            // it has rotated away from has none, which is not an error: the row
+            // then waits for the venue's resolution below.
+            let book = crate::vipers::venue_for_token(ctx, &token).and_then(|(market, snap)| {
+                let is_yes = token == market.yes_token;
+                let (bid, ask) = if is_yes { (snap.yes_bid, snap.yes_ask) } else { (snap.no_bid, snap.no_ask) };
+                let fee_bps = if is_yes { market.yes_fee_bps } else { market.no_fee_bps };
+                // A zero bid is the absence of a price, not a price of zero — the
+                // feed publishes a missing level that way.
+                (ask > Decimal::ZERO).then_some((bid, ask, fee_bps))
+            });
 
-            if position.is_none() && !ghost_resting {
-                clear_placed(token.as_str());
-                continue;
+            // The line as it stands now, straight from the board rather than from
+            // `ctx.sports`: this row may be on a market the squadron no longer holds.
+            let line = board.get(&row.token_id).cloned();
+            let quote_px = Decimal::try_from(row.quote_price).unwrap_or(Decimal::ZERO);
+            let consensus_now = line.as_ref().and_then(|l| Decimal::try_from(l.consensus).ok());
+
+            // ── Settlement: the plan for every position, and fee-free ──────────
+            if row.filled_at.is_some() {
+                if let Some(resolved) = crate::helpers::db::sports_resolved_price(&pool, &row.token_id).await {
+                    let px = Decimal::try_from(resolved).unwrap_or(Decimal::ZERO);
+                    // No exit fee: the contract redeems, nothing is sold. The entry
+                    // paid none either, which is the whole point of resting.
+                    let ret = ((px - quote_px) / quote_px).to_f64().unwrap_or(0.0);
+                    if crate::helpers::db::bookline_shadow_close(&pool, row.id, resolved, "settlement", ret).await {
+                        record_ghost_trade(&pool, ctx, &row, resolved, "settlement", ret).await;
+                        info!("📖 Bookline settled [{}] {} @ ${:.2} — {:+.2}% (simulated)",
+                              row.market, row.side, resolved, ret * 100.0);
+                    }
+                    continue;
+                }
             }
 
-            // The line as it stands now, and whether it is still fit to hold against.
-            let line_state = match board.and_then(|b| b.side(side)) {
-                Some(line) => {
-                    let consensus = Decimal::try_from(line.consensus).unwrap_or(Decimal::ZERO);
-                    let dispersion = line.dispersion.and_then(|d| Decimal::try_from(d).ok());
-                    let verdict = line_usable(
-                        consensus, None, line.num_books, dispersion, line.age_secs(now),
-                        line.secs_to_start(now), dc.bookline_min_consensus, dc.bookline_min_books,
-                        dc.bookline_max_dispersion, dc.bookline_max_feed_age_secs,
-                        dc.bookline_pull_before_start_secs,
-                    );
-                    Some((consensus, verdict))
-                }
-                None => None,
-            };
+            let Some((bid, ask, fee_bps)) = book else { continue };
 
-            let unfilled = ghost_resting
-                || position.as_ref().is_some_and(|p| p.fill_effective_at(dc.ghost_mode).is_none());
-
-            if unfilled {
-                // An unfilled pull is free, so the rules are deliberately eager.
-                let verdict = line_state.map(|(_, v)| v).unwrap_or(Err(LineRefusal::NoLine));
-                // First tick this quote is seen resting: this is where the drift
-                // baseline is set. See `placed_at` for why it cannot be set at
-                // quote time.
-                if let Some((now_c, _)) = line_state {
-                    if consensus_at_placement(token.as_str()).is_none() {
-                        record_placed(token.as_str(), now_c);
-                    }
-                }
-                let adverse = match (line_state, consensus_at_placement(token.as_str())) {
-                    (Some((now_c, _)), Some(then_c)) => then_c - now_c,
-                    _ => Decimal::ZERO,
+            if row.filled_at.is_none() {
+                // ── Resting: pull, or let the book cross us ────────────────────
+                let verdict = match line.as_ref() {
+                    Some(l) => line_usable(
+                        Decimal::try_from(l.consensus).unwrap_or(Decimal::ZERO), None, l.num_books,
+                        l.dispersion.and_then(|d| Decimal::try_from(d).ok()),
+                        l.age_secs(now), l.secs_to_start(now), dc.bookline_min_consensus,
+                        dc.bookline_min_books, dc.bookline_max_dispersion,
+                        dc.bookline_max_feed_age_secs, dc.bookline_pull_before_start_secs,
+                    ),
+                    None => Err(LineRefusal::NoLine),
                 };
-                // Disabled is itself a pull reason. Stopping quoting while leaving
-                // a bid on the book is the one state that has all of this design's
-                // risk and none of its upside.
+                // Measured from the consensus the bid was COMMITTED against, which
+                // is durable in the row rather than in memory — so a restart cannot
+                // silently disarm this rule for the rest of a quote's life.
+                let adverse = match consensus_now {
+                    Some(c) => Decimal::try_from(row.consensus_at_quote).unwrap_or(c) - c,
+                    None => Decimal::ZERO,
+                };
                 let why = if !dc.bookline_enabled {
-                    Some("Bookline disabled — pulling the resting bid")
+                    Some("Bookline disabled")
                 } else {
                     pull_reason(verdict, adverse, dc.bookline_pull_on_adverse_drift)
                 };
                 if let Some(why) = why {
-                    info!("📖 Bookline pull [{}] {}: {}", ctx.market.market_name,
-                          if side == 0 { "YES" } else { "NO" }, why);
-                    clear_placed(token.as_str());
-                    return Ok(StrategySignal::MakerCancel { tokens: vec![token] });
+                    if crate::helpers::db::bookline_shadow_pull(&pool, row.id, why).await {
+                        info!("📖 Bookline pull [{}] {}: {} (simulated)", row.market, row.side, why);
+                    }
+                    continue;
+                }
+                // The pessimistic fill rule, the same one the engine's own ghost
+                // model uses: a resting BUY at Q is filled when somebody is willing
+                // to sell at Q, i.e. when the best ASK falls to Q or below. Anything
+                // sooner is the simulator handing itself a trade. A real queue
+                // position would fill more often than this, so the record is a floor.
+                if ask <= quote_px && crate::helpers::db::bookline_shadow_fill(&pool, row.id).await {
+                    info!("📖 Bookline filled [{}] {} @ ${:.3} (ask ${:.3}) — simulated",
+                          row.market, row.side, row.quote_price, ask);
                 }
                 continue;
             }
 
-            // Filled. The plan is settlement, which is fee-free, so there is no
-            // stop: a binary that resolves in hours does not behave like a
-            // position that can be stopped out, and a 20-point adverse move on a
-            // contract that still settles at a dollar is noise. The only reason to
-            // sell is that the market is offering more than the model thinks it is
-            // worth, net of the fee it would cost to take it.
-            //
-            // When the line is gone — the board drops a game six hours after
-            // kick-off — that is hold-to-settlement, never "nothing to manage".
-            let Some(position) = position else { continue };
-            let Some((consensus, _)) = line_state else { continue };
-            let fee = crate::venues::taker_leg_fee_pct_at(bid, market_fee_rate(ctx, side));
+            // ── Filled and unresolved: the two early exits ─────────────────────
+            let Some(consensus) = consensus_now else { continue };
+            let fee = crate::venues::taker_leg_fee_pct_at(
+                bid, crate::venues::fee_rate_from_ceiling_bps(fee_bps));
 
             if settle_snipe_sell(bid, consensus, fee) {
-                info!(
-                    "📖 Bookline settle-snipe [{}] {}: bid ${:.3} net of fee beats consensus {:.3}",
-                    ctx.market.market_name, if side == 0 { "YES" } else { "NO" }, bid, consensus,
-                );
-                return Ok(StrategySignal::Exit {
-                    params: OrderParams {
-                        token_id: token,
-                        price: bid,
-                        shares: position.shares,
-                        fee_bps: if side == 0 { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 },
-                        is_neg_risk: ctx.market.is_neg_risk,
-                        market_name: ctx.market.market_name.clone(),
-                        condition_id: ctx.market.condition_id.clone(),
-                        order_type: crate::venues::core::TimeInForce::Fak,
-                        post_only: false,
-                        ghost_mode: true,
-                    },
-                    reason: format!("BooklineSettleSnipe: bid=${bid:.3} beats consensus {consensus:.3} net of fee"),
-                    exit_pair: false,
-                });
+                let net = bid - bid * fee;
+                let ret = ((net - quote_px) / quote_px).to_f64().unwrap_or(0.0);
+                if crate::helpers::db::bookline_shadow_close(
+                    &pool, row.id, bid.to_f64().unwrap_or(0.0), "settle-snipe", ret).await
+                {
+                    record_ghost_trade(&pool, ctx, &row, bid.to_f64().unwrap_or(0.0), "settle-snipe", ret).await;
+                    info!("📖 Bookline settle-snipe [{}] {}: bid ${:.3} net beats consensus {:.3} — {:+.2}% (simulated)",
+                          row.market, row.side, bid, consensus, ret * 100.0);
+                }
+                continue;
             }
 
-            // The bonus path: let the market lift us at consensus plus an edge.
+            // The bonus path. A resting ask is lifted when the BID rises to it,
+            // the mirror of the fill rule above, and pays no fee.
             if let Some(px) = resting_tp_price(consensus, dc.bookline_resting_tp_edge,
-                                               position.avg_entry, bid, crate::config::BOOKLINE_TICK_SIZE) {
-                return Ok(StrategySignal::MakerRestingExit {
-                    params: OrderParams {
-                        token_id: token,
-                        price: px,
-                        shares: position.shares,
-                        fee_bps: if side == 0 { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 },
-                        is_neg_risk: ctx.market.is_neg_risk,
-                        market_name: ctx.market.market_name.clone(),
-                        condition_id: ctx.market.condition_id.clone(),
-                        order_type: crate::venues::core::TimeInForce::Gtc,
-                        post_only: true,
-                        ghost_mode: true,
-                    },
-                    reason: format!("BooklineRestingTP: ask=${px:.3} consensus={consensus:.3}"),
-                });
+                                               quote_px, bid, crate::config::BOOKLINE_TICK_SIZE) {
+                if bid >= px {
+                    let ret = ((px - quote_px) / quote_px).to_f64().unwrap_or(0.0);
+                    if crate::helpers::db::bookline_shadow_close(
+                        &pool, row.id, px.to_f64().unwrap_or(0.0), "take-profit", ret).await
+                    {
+                        record_ghost_trade(&pool, ctx, &row, px.to_f64().unwrap_or(0.0), "take-profit", ret).await;
+                        info!("📖 Bookline take-profit [{}] {} @ ${:.3} — {:+.2}% (simulated)",
+                              row.market, row.side, px, ret * 100.0);
+                    }
+                }
             }
         }
         Ok(StrategySignal::NoSignal)

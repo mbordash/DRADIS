@@ -960,6 +960,170 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+// ── Bookline shadow lane ─────────────────────────────────────────────────────
+//
+// Bookline's own books, for the same reason GBoost has its own: a viper that must
+// not spend money yet still has to earn its record against the real market, and
+// the record has to be gathered on the box where the result means something.
+//
+// It cannot use the engine's ghost-quote machinery to do that. The patrol runs the
+// simulated fill sweep inside `if ghosting`, so on a live instance a registered
+// quote would rest forever and never cross, and the `MakerQuote` consumer decides
+// real-versus-simulated from the same tick-wide switch — so an order flagged
+// simulated on a live box becomes a real order. The lane therefore keeps its own
+// state and the viper emits no venue-bound signal at all.
+//
+// Three states, and the difference between them is the whole point of a maker:
+// a row that never filled is not a losing trade, it is a bid that was withdrawn,
+// and counting it as either would misstate the strategy.
+//
+//   resting  filled_at IS NULL AND closed_at IS NULL
+//   open     filled_at IS NOT NULL AND closed_at IS NULL
+//   pulled   closed_at IS NOT NULL AND filled_at IS NULL   (ret IS NULL: no trade)
+//   closed   closed_at IS NOT NULL AND filled_at IS NOT NULL AND ret IS NOT NULL
+
+/// One simulated Bookline quote, resting or filled.
+#[derive(Debug, Clone)]
+pub struct BooklineShadow {
+    pub id: i64,
+    pub condition_id: String,
+    pub token_id: String,
+    pub market: String,
+    pub side: String,
+    /// Kick-off, the clock this viper works to. A sports market's close time is a
+    /// week after the game on MLB and kick-off itself on football, so the close is
+    /// useless as a horizon.
+    pub commence: Option<String>,
+    pub quote_price: f64,
+    pub shares: f64,
+    /// The consensus the bid was judged against, for adverse-drift pulls. Durable
+    /// here rather than in memory, so a restart does not silently disarm the pull
+    /// rule for the rest of a resting quote's life.
+    pub consensus_at_quote: f64,
+    pub filled_at: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn bookline_shadow_quote(
+    pool: &SqlitePool, asset: &str, condition_id: &str, token_id: &str, market: &str, side: &str,
+    league: Option<&str>, commence: Option<&str>, quote_price: f64, shares: f64,
+    consensus: f64, required_edge: f64, num_books: i64, dispersion: Option<f64>,
+) -> bool {
+    match sqlx::query(
+        "INSERT INTO bookline_shadow
+            (asset, condition_id, token_id, market, side, league, commence, quoted_at,
+             quote_price, shares, consensus_at_quote, required_edge, num_books, dispersion)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(asset).bind(condition_id).bind(token_id).bind(market).bind(side)
+        .bind(league).bind(commence).bind(Utc::now().to_rfc3339())
+        .bind(quote_price).bind(shares).bind(consensus).bind(required_edge)
+        .bind(num_books).bind(dispersion)
+        .execute(pool).await
+    {
+        Ok(_) => true,
+        Err(e) => { error!("❌ DB bookline shadow quote failed: {}", e); false }
+    }
+}
+
+/// Every simulated quote still live: resting or filled, not yet closed.
+pub async fn bookline_shadow_open(pool: &SqlitePool, asset: &str) -> Vec<BooklineShadow> {
+    let rows: Vec<(i64, String, String, String, String, Option<String>, f64, f64, f64, Option<String>)> =
+        sqlx::query_as(
+            "SELECT id, condition_id, token_id, market, side, commence, quote_price, shares,
+                    consensus_at_quote, filled_at
+               FROM bookline_shadow
+              WHERE asset = ? AND closed_at IS NULL
+              ORDER BY id")
+            .bind(asset)
+            .fetch_all(pool).await
+            .unwrap_or_else(|e| { error!("❌ DB bookline shadow read failed: {}", e); Vec::new() });
+    rows.into_iter().map(|r| BooklineShadow {
+        id: r.0, condition_id: r.1, token_id: r.2, market: r.3, side: r.4, commence: r.5,
+        quote_price: r.6, shares: r.7, consensus_at_quote: r.8, filled_at: r.9,
+    }).collect()
+}
+
+/// Whether anything of Bookline's is already live on this market, either side.
+///
+/// Not scoped to a token: a resting bid on one outcome and another on the
+/// opposite outcome is two-sided market making, which this viper exists not to do.
+pub async fn bookline_shadow_holds(pool: &SqlitePool, asset: &str, condition_id: &str) -> bool {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM bookline_shadow
+          WHERE asset = ? AND condition_id = ? AND closed_at IS NULL")
+        .bind(asset).bind(condition_id)
+        .fetch_one(pool).await.unwrap_or(0);
+    n > 0
+}
+
+/// Mark a resting quote filled.
+pub async fn bookline_shadow_fill(pool: &SqlitePool, id: i64) -> bool {
+    match sqlx::query(
+        "UPDATE bookline_shadow SET filled_at = ? WHERE id = ? AND filled_at IS NULL AND closed_at IS NULL")
+        .bind(Utc::now().to_rfc3339()).bind(id)
+        .execute(pool).await
+    {
+        Ok(r) => r.rows_affected() > 0,
+        Err(e) => { error!("❌ DB bookline shadow fill failed: {}", e); false }
+    }
+}
+
+/// Withdraw a resting quote. Records NO return: a bid that was pulled before it
+/// filled is not a losing trade, and counting it as one would make the strategy
+/// look worse than it is exactly where it behaved correctly.
+pub async fn bookline_shadow_pull(pool: &SqlitePool, id: i64, reason: &str) -> bool {
+    match sqlx::query(
+        "UPDATE bookline_shadow SET closed_at = ?, exit_reason = ?
+          WHERE id = ? AND filled_at IS NULL AND closed_at IS NULL")
+        .bind(Utc::now().to_rfc3339()).bind(format!("pulled: {reason}")).bind(id)
+        .execute(pool).await
+    {
+        Ok(r) => r.rows_affected() > 0,
+        Err(e) => { error!("❌ DB bookline shadow pull failed: {}", e); false }
+    }
+}
+
+/// Close a FILLED simulated position at `exit_price`, recording its net return.
+pub async fn bookline_shadow_close(
+    pool: &SqlitePool, id: i64, exit_price: f64, reason: &str, ret: f64,
+) -> bool {
+    match sqlx::query(
+        "UPDATE bookline_shadow SET closed_at = ?, exit_price = ?, exit_reason = ?, ret = ?
+          WHERE id = ? AND filled_at IS NOT NULL AND closed_at IS NULL")
+        .bind(Utc::now().to_rfc3339()).bind(exit_price).bind(reason).bind(ret).bind(id)
+        .execute(pool).await
+    {
+        Ok(r) => r.rows_affected() > 0,
+        Err(e) => { error!("❌ DB bookline shadow close failed: {}", e); false }
+    }
+}
+
+/// The closed record: `(condition_id, return)` per settled simulated trade.
+///
+/// The condition id travels so the caller can bootstrap by GAME rather than by
+/// row — two outcomes of one match are one game's worth of evidence — the same
+/// reason the GBoost record carries its hourly window.
+pub async fn bookline_shadow_returns(pool: &SqlitePool, asset: &str) -> Vec<(String, f64)> {
+    sqlx::query_as(
+        "SELECT condition_id, ret FROM bookline_shadow
+          WHERE asset = ? AND closed_at IS NOT NULL AND ret IS NOT NULL
+          ORDER BY id")
+        .bind(asset)
+        .fetch_all(pool).await
+        .unwrap_or_else(|e| { error!("❌ DB bookline shadow returns read failed: {}", e); Vec::new() })
+}
+
+/// The venue's own resolution for a token, as the sports ledger recorded it.
+///
+/// Settlement is the plan for every Bookline position, so this is the primary exit
+/// and not a fallback. The ledger already captures results on close for every
+/// matched game.
+pub async fn sports_resolved_price(pool: &SqlitePool, token_id: &str) -> Option<f64> {
+    sqlx::query_scalar("SELECT resolved_price FROM sports_line_results WHERE token_id = ?")
+        .bind(token_id)
+        .fetch_optional(pool).await.ok().flatten()
+}
+
 // ── GBoost shadow lane ───────────────────────────────────────────────────────
 //
 // The shadow lane's own ledger, separate from `trades` on purpose. Every number
@@ -1138,6 +1302,37 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) {
     let _ = sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_gboost_shadow_model
              ON gboost_shadow_trades(asset, model_version, closed_at)"
+    ).execute(pool).await;
+
+    // Bookline's simulated ledger. See the "Bookline shadow lane" section for why
+    // it keeps its own books rather than using the engine's ghost-quote registry.
+    let _ = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS bookline_shadow (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset              TEXT    NOT NULL,
+            condition_id       TEXT    NOT NULL,
+            token_id           TEXT    NOT NULL,
+            market             TEXT    NOT NULL,
+            side               TEXT    NOT NULL,
+            league             TEXT,
+            commence           TEXT,
+            quoted_at          TEXT    NOT NULL,
+            quote_price        REAL    NOT NULL,
+            shares             REAL    NOT NULL,
+            consensus_at_quote REAL    NOT NULL,
+            required_edge      REAL    NOT NULL,
+            num_books          INTEGER,
+            dispersion         REAL,
+            filled_at          TEXT,
+            closed_at          TEXT,
+            exit_price         REAL,
+            exit_reason        TEXT,
+            ret                REAL
+        )"
+    ).execute(pool).await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_bookline_shadow_live
+             ON bookline_shadow(asset, closed_at)"
     ).execute(pool).await;
 
     // Add session_id to trades

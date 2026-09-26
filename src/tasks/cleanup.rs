@@ -2032,7 +2032,7 @@ mod settlement_evidence_tests {
 /// row may claim. A resolution is a result; a tie is its own category; a mark
 /// booked past the deferral bound is neither and must not read as either.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum PriceSource { Resolved, Tie, MarkFallback }
+pub(crate) enum PriceSource { Resolved, Tie, MarkFallback }
 
 /// Book simulated positions on an event market as settlements once the venue
 /// has stopped accepting orders, then drop them from the map.
