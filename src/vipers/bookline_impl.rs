@@ -752,7 +752,13 @@ impl Strategy for BooklineStrategy {
                 continue;
             };
             let consensus = Decimal::try_from(line.consensus).unwrap_or(Decimal::ZERO);
-            let mid = (bid > Decimal::ZERO && ask > Decimal::ZERO)
+            // An ABSENT ask is published as $1.00, not as zero — the feed fills a
+            // missing level with the value least attractive to us. So `ask > 0` is
+            // not a test for a seller, and a 0.60 bid with no ask yielded a mid of
+            // 0.80: nonsense, and enough to trip the implausible-gap guard against a
+            // perfectly good consensus. `has_ask` is the real test.
+            let has_ask = if side == 0 { ctx.snapshot.yes_has_ask() } else { ctx.snapshot.no_has_ask() };
+            let mid = (bid > Decimal::ZERO && has_ask)
                 .then(|| (bid + ask) / Decimal::from(2));
             let dispersion = line.dispersion.and_then(|d| Decimal::try_from(d).ok());
             let secs_to_start = line.secs_to_start(now);
@@ -848,9 +854,12 @@ impl Strategy for BooklineStrategy {
                 let is_yes = token == market.yes_token;
                 let (bid, ask) = if is_yes { (snap.yes_bid, snap.yes_ask) } else { (snap.no_bid, snap.no_ask) };
                 let fee_bps = if is_yes { market.yes_fee_bps } else { market.no_fee_bps };
-                // A zero bid is the absence of a price, not a price of zero — the
-                // feed publishes a missing level that way.
-                (ask > Decimal::ZERO).then_some((bid, ask, fee_bps))
+                // Absent levels are published as the values least attractive to
+                // us: a missing bid at $0.00 and a missing ask at $1.00. Neither is
+                // a price, so both have to be excluded — testing `ask > 0` would
+                // accept a book with no seller at all.
+                let has_ask = if is_yes { snap.yes_has_ask() } else { snap.no_has_ask() };
+                has_ask.then_some((bid, ask, fee_bps))
             });
 
             // The line as it stands now, straight from the board rather than from
@@ -1005,6 +1014,30 @@ mod venue_fee_tests {
             assert!(fee > Decimal::ZERO, "Kalshi charges makers on its game series");
             assert_eq!(fee, rate * dec!(0.40) * dec!(0.60));
         }
+    }
+
+    /// An absent ask is $1.00, so a mid computed without checking for a seller is
+    /// not a mid.
+    ///
+    /// This shipped as `ask > 0`, which is never false: the feed fills a missing
+    /// level with the value least attractive to us, so a leg with no seller reports
+    /// an ask of exactly $1.00. A 0.60 bid with no ask therefore produced a "mid" of
+    /// 0.80, and on production that was enough to trip the implausible-gap guard
+    /// against a consensus that was fine — the guard fired, but for the wrong
+    /// reason, which is the worst way for a guard to behave.
+    #[test]
+    fn a_book_with_no_seller_has_no_mid() {
+        let mid = |bid: Decimal, ask: Decimal| {
+            let has_ask = ask < Decimal::ONE;
+            (bid > Decimal::ZERO && has_ask).then(|| (bid + ask) / Decimal::from(2))
+        };
+        assert_eq!(mid(dec!(0.60), dec!(0.62)), Some(dec!(0.61)), "a real two-sided book");
+        assert_eq!(mid(dec!(0.60), dec!(1)), None, "no seller: $1.00 is the absence of an ask");
+        assert_eq!(mid(dec!(0), dec!(0.62)), None, "no bidder: $0.00 is the absence of a bid");
+        assert_eq!(mid(dec!(0), dec!(1)), None, "an empty book");
+        // The old test would have accepted this and called it 0.80.
+        let old_guard_would_accept = dec!(1) > Decimal::ZERO;
+        assert!(old_guard_would_accept, "which is exactly why `ask > 0` was never a test");
     }
 
     /// The grid a post-only order must land on differs per venue: a thousandth on
