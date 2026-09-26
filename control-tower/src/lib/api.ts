@@ -507,6 +507,14 @@ export const VIPER_DEFS: ViperDef[] = [
     strategyName: 'FairValueStrategy',
     description: 'Analytic binary pricing Φ(ln(S/K)/σ√T) — buys sides trading at a discount to model fair value; snipes settlements',
   },
+  {
+    name: 'Bookline',
+    enableKey: 'bookline_enabled',
+    accentColor: 'violet',
+    statusKey: 'bookline',
+    strategyName: 'BooklineStrategy',
+    description: 'Sports moneylines, maker-first: rests a bid under the bookmaker consensus and holds to fee-free settlement. Simulated lane — it keeps its own books and places no venue order',
+  },
 ];
 
 /**

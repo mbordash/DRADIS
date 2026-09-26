@@ -237,6 +237,25 @@ export interface DynamicConfig {
   sports_fairvalue_max_dispersion?: string;
   sports_fairvalue_settle_hold?: boolean;
   sports_fairvalue_catastrophic_armed?: boolean;
+
+  // ── Bookline Viper (sports, maker-first, simulated lane) ────────────────────
+  // Decimals arrive as strings, matching every other Decimal knob here: the API
+  // serializes rust_decimal as a string so no value is lost to a float on the way.
+  bookline_enabled?: boolean;
+  bookline_base_edge?: string;
+  bookline_min_edge?: string;
+  bookline_edge_taper_secs?: number;
+  bookline_drift_mult?: string;
+  bookline_min_consensus?: string;
+  bookline_min_books?: number;
+  bookline_max_dispersion?: string;
+  bookline_max_feed_age_secs?: number;
+  bookline_pull_on_adverse_drift?: string;
+  bookline_pull_before_start_secs?: number;
+  bookline_trade_size_usdc?: string;
+  bookline_max_exposure_usdc?: string;
+  bookline_max_open_markets?: number;
+  bookline_resting_tp_edge?: string;
   sports_ledger_leagues:            string;
   sports_ledger_snapshot_offsets_mins: string;
   sports_ledger_credit_reserve:     number;
