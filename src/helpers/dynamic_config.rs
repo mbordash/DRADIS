@@ -1600,6 +1600,7 @@ impl DynamicConfig {
             "convergence"  => self.enable_convergence,
             "fairvalue"    => self.enable_fairvalue,
             "trendcapture" => self.enable_trendcapture,
+            "bookline"     => self.bookline_enabled,
             _ => true,
         }
     }
@@ -1754,6 +1755,7 @@ impl DynamicConfig {
             "convergence"  => self.enable_convergence,
             "fairvalue"    => self.enable_fairvalue,
             "trendcapture" => self.enable_trendcapture,
+            "bookline"     => self.bookline_enabled,
             _ => return None,
         })
     }

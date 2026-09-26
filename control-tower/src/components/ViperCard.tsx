@@ -34,6 +34,12 @@ const ACCENT: Record<string, { ring: string; badge: string; dot: string }> = {
   purple:  { ring: 'ring-purple-500/30',  badge: 'bg-purple-500/10 text-purple-300',  dot: 'bg-purple-500'  },
   cyan:    { ring: 'ring-cyan-500/30',    badge: 'bg-cyan-500/10 text-cyan-300',      dot: 'bg-cyan-500'    },
   violet:  { ring: 'ring-violet-500/30',  badge: 'bg-violet-500/10 text-violet-300',  dot: 'bg-violet-500'  },
+  // Arbitrage, Basis and FairValue have named these since they shipped, but
+  // the map had no entry for them, so all three silently rendered as indigo —
+  // identical to Time Decay's card and to each other's.
+  teal:    { ring: 'ring-teal-500/30',    badge: 'bg-teal-500/10 text-teal-300',      dot: 'bg-teal-500'    },
+  rose:    { ring: 'ring-rose-500/30',    badge: 'bg-rose-500/10 text-rose-300',      dot: 'bg-rose-500'    },
+  amber:   { ring: 'ring-amber-500/30',   badge: 'bg-amber-500/10 text-amber-300',    dot: 'bg-amber-500'   },
 };
 
 // ── Runtime status helpers ────────────────────────────────────────────────────

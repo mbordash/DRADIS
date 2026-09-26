@@ -736,6 +736,11 @@ impl Squadron {
                     .as_ref()
                     .map(|m| m.market_name.clone())
                     .unwrap_or_else(|| if single_market { hourly_market_name.clone() } else { String::new() }),
+                // A viper that prices from a raptor board rather than from the
+                // squadron's own market still patrols this squadron's market, so
+                // name it. "Unknown" read as a fault when it was a property of
+                // the design.
+                "Sports" => hourly_market_name.clone(),
                 _ => String::from("Unknown"),
             };
             let status_key = sn

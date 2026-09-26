@@ -23,8 +23,19 @@
 //! by **−0.69 points**: it can be slightly wrong and still break even, because it
 //! collects the half-spread and the venue's 15% maker rebate. That 2.4-point
 //! swing is the entire thesis of this viper, and every rule below exists to
-//! protect it. The viper never pays the fee and never pays the spread; if it ever
-//! does either, the edge is gone and the trade was not worth taking.
+//! protect it. The viper never pays the TAKER fee and never pays the spread; if it
+//! ever does either, the edge is gone and the trade was not worth taking.
+//!
+//! The resting leg is not free everywhere, though, and the difference is large
+//! enough to change where this viper is worth running. Polymarket International
+//! charges makers nothing and pays into a rebate pool; Polymarket US pays the maker
+//! a rebate at trade, which is better still; Kalshi charges makers on every game
+//! series it ships (`quadratic_with_maker_fees`, MLB at half rate), taking roughly
+//! half the half-spread. Break-even at mid runs about -0.81 points on Polymarket
+//! US, -0.69 on Polymarket International, and only -0.56 on a 2c Kalshi book —
+//! close to a coin flip on a 1c one. `venues::sports_maker_fee_rate` carries this,
+//! and the simulated return is signed by it, because a record that assumed a free
+//! maker leg would be inflated on Kalshi exactly where the margin is thinnest.
 //!
 //! ## What this viper is NOT allowed to become
 //!
@@ -573,6 +584,20 @@ use async_trait::async_trait;
 use chrono::Utc;
 use tracing::info;
 
+/// What the RESTING leg cost, per share, at the price it rested at.
+///
+/// Zero on Polymarket International and negative on Polymarket US, where the maker
+/// rebate is paid at trade — but positive on Kalshi, which charges makers on every
+/// game series it ships. The quadratic is the same shape as the taker schedule.
+fn maker_fee(price: Decimal) -> Decimal {
+    if price <= Decimal::ZERO || price >= Decimal::ONE { return Decimal::ZERO; }
+    // NOT `taker_leg_fee_pct_at`: that helper floors a non-positive rate at zero,
+    // which is right for a taker (no venue pays one to cross) and wrong here —
+    // Polymarket US pays the maker a rebate at trade, and flooring it would throw
+    // away the very thing that makes that venue the friendliest for this design.
+    crate::venues::sports_maker_fee_rate() * (Decimal::ONE - price) * price
+}
+
 pub const STRATEGY_NAME: &str = "BooklineStrategy";
 /// How often a refusal repeats in the log.
 const GATE_LOG_INTERVAL_SECS: u64 = 300;
@@ -598,10 +623,12 @@ const GATE_LOG_INTERVAL_SECS: u64 = 300;
 /// and out of the lifetime stat cards on a live instance, which is the whole reason
 /// those were scoped by posture.
 ///
-/// Fees are recorded as zero because none were paid: a resting bid pays no taker
-/// fee, and neither settlement nor a lifted post-only ask pays one on the way out.
-/// A settle-snipe is the exception and its fee is already netted into `ret`, so the
-/// row's P&L is consistent with the ledger either way.
+/// The fee column carries what the resting leg actually cost. That is zero on
+/// Polymarket International, a credit on Polymarket US, and a real charge on
+/// Kalshi — an earlier version recorded a flat zero and claimed "none were paid",
+/// which was true only on the venue it was written against. Exit-side fees are
+/// already netted into `ret` (a settle-snipe crosses and pays one; settlement and a
+/// lifted ask do not), so the row's P&L agrees with the ledger either way.
 async fn record_ghost_trade(
     pool: &sqlx::SqlitePool,
     ctx: &StrategyContext,
@@ -618,7 +645,7 @@ async fn record_ghost_trade(
     );
     scope.ghost = true;
     crate::helpers::db::record_trade_db(
-        pool, &scope, Decimal::ZERO, STRATEGY_NAME, &row.market, &row.side,
+        pool, &scope, maker_fee(entry) * shares, STRATEGY_NAME, &row.market, &row.side,
         entry, Decimal::try_from(exit_price).unwrap_or(Decimal::ZERO), shares, pnl,
         &format!("Bookline {reason} — simulated"), None,
     ).await;
@@ -745,7 +772,7 @@ impl Strategy for BooklineStrategy {
                 secs_to_start, drift, dc.bookline_base_edge, dc.bookline_min_edge,
                 dc.bookline_edge_taper_secs, dc.bookline_drift_mult,
             );
-            match quote_price(consensus, bid, edge, crate::config::BOOKLINE_TICK_SIZE) {
+            match quote_price(consensus, bid, edge, crate::venues::sports_tick_size()) {
                 Ok(px) => {
                     let room = consensus - px;
                     if best.as_ref().is_none_or(|b| room > b.4) {
@@ -836,9 +863,13 @@ impl Strategy for BooklineStrategy {
             if row.filled_at.is_some() {
                 if let Some(resolved) = crate::helpers::db::sports_resolved_price(&pool, &row.token_id).await {
                     let px = Decimal::try_from(resolved).unwrap_or(Decimal::ZERO);
-                    // No exit fee: the contract redeems, nothing is sold. The entry
-                    // paid none either, which is the whole point of resting.
-                    let ret = ((px - quote_px) / quote_px).to_f64().unwrap_or(0.0);
+                    // Settlement pays no exit fee: the contract redeems, nothing is
+                    // sold. The ENTRY fee is not always zero, though — Kalshi
+                    // charges makers on every game series it ships, so treating the
+                    // resting leg as free would inflate a Kalshi record by roughly
+                    // half its half-spread. `sports_maker_fee_rate` is negative on
+                    // Polymarket US, where the rebate is paid at trade.
+                    let ret = ((px - quote_px - maker_fee(quote_px)) / quote_px).to_f64().unwrap_or(0.0);
                     if crate::helpers::db::bookline_shadow_close(&pool, row.id, resolved, "settlement", ret).await {
                         record_ghost_trade(&pool, ctx, &row, resolved, "settlement", ret).await;
                         info!("📖 Bookline settled [{}] {} @ ${:.2} — {:+.2}% (simulated)",
@@ -899,7 +930,7 @@ impl Strategy for BooklineStrategy {
 
             if settle_snipe_sell(bid, consensus, fee) {
                 let net = bid - bid * fee;
-                let ret = ((net - quote_px) / quote_px).to_f64().unwrap_or(0.0);
+                let ret = ((net - quote_px - maker_fee(quote_px)) / quote_px).to_f64().unwrap_or(0.0);
                 if crate::helpers::db::bookline_shadow_close(
                     &pool, row.id, bid.to_f64().unwrap_or(0.0), "settle-snipe", ret).await
                 {
@@ -913,9 +944,11 @@ impl Strategy for BooklineStrategy {
             // The bonus path. A resting ask is lifted when the BID rises to it,
             // the mirror of the fill rule above, and pays no fee.
             if let Some(px) = resting_tp_price(consensus, dc.bookline_resting_tp_edge,
-                                               quote_px, bid, crate::config::BOOKLINE_TICK_SIZE) {
+                                               quote_px, bid, crate::venues::sports_tick_size()) {
                 if bid >= px {
-                    let ret = ((px - quote_px) / quote_px).to_f64().unwrap_or(0.0);
+                    // A lifted post-only ask pays no taker fee; the entry leg's
+                    // maker fee still applies where the venue charges one.
+                    let ret = ((px - quote_px - maker_fee(quote_px)) / quote_px).to_f64().unwrap_or(0.0);
                     if crate::helpers::db::bookline_shadow_close(
                         &pool, row.id, px.to_f64().unwrap_or(0.0), "take-profit", ret).await
                     {
@@ -932,5 +965,54 @@ impl Strategy for BooklineStrategy {
     fn status(&self) -> StrategyStatus { StrategyStatus::Active }
     fn name(&self) -> String { STRATEGY_NAME.to_string() }
     fn venue(&self) -> &'static str { "Sports" }
+    fn risk_model(&self) -> &'static str {
+        "Maker-first: resting bid under the bookmaker consensus, hold to fee-free settlement (simulated)"
+    }
     fn max_exposure(&self) -> Decimal { crate::config::BOOKLINE_MAX_EXPOSURE_USDC }
+}
+
+#[cfg(test)]
+mod venue_fee_tests {
+    use super::maker_fee;
+    use rust_decimal_macros::dec;
+    use rust_decimal::Decimal;
+
+    /// The resting leg is not free on every venue, and the sign matters.
+    ///
+    /// Bookline's thesis is a fee asymmetry, so the one number it must never get
+    /// wrong is what the maker leg costs. Polymarket International charges makers
+    /// nothing; Polymarket US pays a rebate AT TRADE, which an earlier version
+    /// silently floored to zero by borrowing the taker helper; Kalshi charges
+    /// makers on every game series it ships, which an earlier version claimed was
+    /// free. All three are wrong in different directions and all three would bias
+    /// the simulated record.
+    #[test]
+    fn the_maker_leg_is_priced_with_the_venues_own_sign() {
+        let fee = maker_fee(dec!(0.60));
+        let rate = crate::venues::sports_maker_fee_rate();
+
+        // Whatever the venue, the quadratic shape holds and the extremes are free.
+        assert_eq!(maker_fee(dec!(0)), Decimal::ZERO);
+        assert_eq!(maker_fee(dec!(1)), Decimal::ZERO, "a resolved contract has no fee");
+
+        if rate == Decimal::ZERO {
+            assert_eq!(fee, Decimal::ZERO, "Polymarket International charges makers nothing");
+        } else if rate < Decimal::ZERO {
+            assert!(fee < Decimal::ZERO,
+                    "a rebate must stay a CREDIT, not be floored to zero as a taker fee would be");
+            assert_eq!(fee, rate * dec!(0.40) * dec!(0.60));
+        } else {
+            assert!(fee > Decimal::ZERO, "Kalshi charges makers on its game series");
+            assert_eq!(fee, rate * dec!(0.40) * dec!(0.60));
+        }
+    }
+
+    /// The grid a post-only order must land on differs per venue: a thousandth on
+    /// Polymarket International's sports books, a whole cent on Kalshi. An ask off
+    /// the grid is rejected outright, so this cannot be a shared constant.
+    #[test]
+    fn the_sports_tick_is_a_venue_fact() {
+        let tick = crate::venues::sports_tick_size();
+        assert!(tick > Decimal::ZERO && tick <= dec!(0.01), "got {tick}");
+    }
 }

@@ -217,6 +217,60 @@ pub fn min_order_shares() -> Decimal { dec!(1) }
 #[cfg(feature = "us_retail")]
 pub fn min_order_shares() -> Decimal { dec!(1) }
 
+/// The price grid the venue's sports game markets quote on.
+///
+/// Distinct from `helpers::price`'s hard-coded cent grid, which is the crypto
+/// markets' tick. It matters for a post-only order: a price off the grid is
+/// rejected ("Price breaks minimum tick size rule"), and rounding to the wrong
+/// grid either crosses the book or gives away ticks.
+///
+/// Polymarket International's sports moneylines quote a thousandth (measured on
+/// MLB books carrying $250k-$560k, 2026-09-09). Kalshi quotes whole cents —
+/// `price_ranges` on a live `KXMLBGAME` market reports `step 0.0100`, which is
+/// why a thousandth-grid ask would be refused there.
+#[cfg(feature = "intl_clob")]
+pub fn sports_tick_size() -> Decimal { dec!(0.001) }
+
+/// Kalshi's grid is a whole cent.
+#[cfg(feature = "kalshi")]
+pub fn sports_tick_size() -> Decimal { dec!(0.01) }
+
+/// Polymarket US quotes on the gateway's own price scale; a cent until a market
+/// record is captured that says otherwise.
+#[cfg(feature = "us_retail")]
+pub fn sports_tick_size() -> Decimal { dec!(0.01) }
+
+/// What a RESTING maker order costs on this venue's sports game markets, as a
+/// coefficient on the same quadratic the taker schedule uses. Negative is a rebate.
+///
+/// Bookline's entire thesis is that a resting maker pays nothing and settlement is
+/// free, which flips its break-even from a taker's +1.75 points to -0.69. That is
+/// true on Polymarket International and better than true on Polymarket US, and it
+/// is FALSE on Kalshi: every game series in the shipped list reports
+/// `fee_type: "quadratic_with_maker_fees"` (checked live 2026-09-26 against
+/// `KXNFLGAME`, `KXNBAGAME`, `KXMLBGAME`, `KXNHLGAME`, `KXEPLGAME`, `KXATPMATCH`),
+/// so a maker is charged a quarter of the taker coefficient. Kalshi still has a
+/// thesis because its cent grid forces 2c spreads, but a thin one, and on a 1c
+/// Kalshi book it is close to a coin flip.
+///
+/// Any simulated record that treats the maker leg as free would therefore be
+/// inflated on Kalshi, which is why this is a venue fact and not a constant.
+#[cfg(feature = "intl_clob")]
+pub fn sports_maker_fee_rate() -> Decimal { Decimal::ZERO }
+
+/// Kalshi charges makers a quarter of the taker coefficient on its game series.
+/// `fee_multiplier` scales it per series (MLB ships 0.5); this is the unscaled
+/// figure, and the Kalshi adapter applies the multiplier when it has the series
+/// record in hand.
+#[cfg(feature = "kalshi")]
+pub fn sports_maker_fee_rate() -> Decimal { dec!(0.0175) }
+
+/// Polymarket US pays the maker a rebate AT TRADE rather than charging one
+/// (docs.polymarket.us/fees: 0.06 taker, -0.0125 maker), which makes it the
+/// friendliest venue for a resting-bid strategy.
+#[cfg(feature = "us_retail")]
+pub fn sports_maker_fee_rate() -> Decimal { dec!(-0.0125) }
+
 /// Cancel every resting order the VENUE reports, before trading begins.
 ///
 /// A crashed or restarted session leaves its GTC orders working. Polymarket

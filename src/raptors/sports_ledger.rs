@@ -190,6 +190,95 @@ fn parse_time(s: &str) -> Option<DateTime<Utc>> {
         .or_else(|| DateTime::parse_from_str(&format!("{s}00"), "%Y-%m-%d %H:%M:%S%z").ok().map(|t| t.with_timezone(&Utc)))
 }
 
+/// Polymarket International's catalog: Gamma for the games and the resolutions,
+/// the CLOB for the touch.
+///
+/// This is the implementation the ledger has always had, behind the seam rather
+/// than inlined. It stays in this module rather than moving to `src/venues/intl/`
+/// only because the Gamma paging, the league-series lookup and the matcher are
+/// deeply interleaved here; the other venues' adapters have no such history and
+/// belong under `src/venues/`.
+pub struct IntlSportsCatalog;
+
+#[async_trait::async_trait]
+impl SportsCatalog for IntlSportsCatalog {
+    async fn games(
+        &self,
+        http: &reqwest::Client,
+        api_key: &str,
+        leagues: &[(String, String)],
+        now: DateTime<Utc>,
+    ) -> (Vec<MatchedGame>, Option<i64>) {
+        refresh_catalog(http, api_key, leagues, now).await
+    }
+
+    async fn best_levels(
+        &self,
+        http: &reqwest::Client,
+        leg_id: &str,
+    ) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
+        match get_json(http, CLOB_BOOK, None, &[("token_id", leg_id)]).await {
+            Ok((book, _, _)) => best_levels(&book),
+            Err(_) => (None, None, None, None),
+        }
+    }
+
+    async fn settled_prices(
+        &self,
+        http: &reqwest::Client,
+        market_key: &str,
+        legs: &[String],
+    ) -> HashMap<String, f64> {
+        settled_prices_for_market(http, market_key, legs).await
+    }
+}
+
+/// The three things the ledger needs from a venue, and the only things about it
+/// that are venue-specific.
+///
+/// Everything else in this module — the Odds API polling, the de-vig, the game
+/// matching, the credit budget, the board fold, the telemetry — is already
+/// venue-neutral and stays that way. What differs per venue is which markets exist
+/// (Polymarket International reads Gamma, Kalshi reads its game series, Polymarket
+/// US reads its signed catalog), where the touch comes from, and who answers the
+/// question of how a game resolved.
+///
+/// One board, keyed by the venue's own leg identifier, and one implementation live
+/// per process: the engine builds a separate binary per venue feature, so a running
+/// ledger only ever holds one venue's identifiers. That is why there is no venue
+/// field on `SportsLine` and no partitioning of the board — the ambiguity a
+/// multi-venue board would create cannot arise.
+///
+/// Implementations belong under `src/venues/`, which is where the architecture puts
+/// everything that knows a venue's shape.
+#[async_trait::async_trait]
+pub trait SportsCatalog: Send + Sync {
+    /// The venue's game markets for these leagues, matched to bookmaker events.
+    /// The second element is the Odds API credits remaining, when the call reports it.
+    async fn games(
+        &self,
+        http: &reqwest::Client,
+        api_key: &str,
+        leagues: &[(String, String)],
+        now: DateTime<Utc>,
+    ) -> (Vec<MatchedGame>, Option<i64>);
+
+    /// Best bid, bid size, ask, ask size for one leg, as the venue reports them.
+    async fn best_levels(
+        &self,
+        http: &reqwest::Client,
+        leg_id: &str,
+    ) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>);
+
+    /// How the venue says these legs resolved, for legs it has settled.
+    async fn settled_prices(
+        &self,
+        http: &reqwest::Client,
+        market_key: &str,
+        legs: &[String],
+    ) -> HashMap<String, f64>;
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PmOutcome {
     /// Team name, or "Draw".
