@@ -189,6 +189,12 @@ pub const MOMENTUM_CONFIRMATION_TICKS: u32 = 3;
 
 pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.10);
 pub const MOMENTUM_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
+/// The most `momentum_stop_loss_pct` may be set to on this build, whichever
+/// profile is compiled in. A ceiling is what the build vouches for, not a risk
+/// posture, so it is identical in all three profile templates and sits above
+/// the aggressive default: the default moves with the profile, the ceiling does
+/// not. See `dynamic_config::BUILD_CAPPED_KEYS`.
+pub const MOMENTUM_STOP_LOSS_CEILING: Decimal = dec!(0.15);
 
 /// Requires a very strong reversal before exiting — avoids shaking out on noise.
 pub const MOMENTUM_REVERSAL_RATIO: Decimal = dec!(1.00);
@@ -1472,6 +1478,10 @@ pub const TIME_DECAY_STOP_LOSS_PERCENT: Decimal = dec!(0.03);
 /// its own, so it gets a wider bar or it would churn taker exits. The leg is
 /// otherwise held to settlement (zero exit fee) while the partner bid rests.
 pub const TIME_DECAY_LONE_LEG_STOP_LOSS_PERCENT: Decimal = dec!(0.08);
+/// Ceiling for `time_decay_stop_loss_pct` on this build, identical across the
+/// profile templates and above the aggressive default; see
+/// `MOMENTUM_STOP_LOSS_CEILING` for why a ceiling is not the profile's default.
+pub const TIME_DECAY_STOP_LOSS_CEILING: Decimal = dec!(0.10);
 pub const TIME_DECAY_MIN_HOLD_SECS: i64 = 120;
 pub const TIME_DECAY_STOP_LOSS_COOLDOWN_SECS: u64 = 600;
 
@@ -1486,6 +1496,12 @@ pub const TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER: Decimal = dec!(0.35);
 /// Extreme-probability YES prices (< MIN or > MAX) mean the book has decided
 /// an outcome — theta thesis breaks down and share counts balloon dangerously.
 pub const TIME_DECAY_MAX_ENTRY_PRICE: Decimal = dec!(0.46);
+/// Ceiling for `time_decay_max_entry_price` on this build. A TimeDecay leg
+/// bought above $0.50 is no longer the cheap side of a sub-$1.00 pair, so the
+/// premise ends there; the 2026-08-29 approval of 0.50 that the old cap
+/// silently clamped to 0.46 is reachable. Identical across the profile
+/// templates; see `MOMENTUM_STOP_LOSS_CEILING`.
+pub const TIME_DECAY_MAX_ENTRY_PRICE_CEILING: Decimal = dec!(0.50);
 pub const TIME_DECAY_MIN_ENTRY_PRICE: Decimal = dec!(0.38);
 
 /// OBI gate: block entry when the order book is heavily one-sided.

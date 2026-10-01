@@ -160,6 +160,22 @@ function ParamRow({ field, config, onPatch, disabled }: ParamRowProps) {
     const stored = fromDisplay(type, draft);
     const prev   = fromDisplay(type, toDisplay(type, rawValue as string));
     if (stored === prev) return;
+    // Hold the schema's declared range here, the same way the advanced modal
+    // and the advisor's proposal validator do. This row used to send whatever
+    // was typed, so for a basic field the range was decorative: a lone-leg stop
+    // of 90% would have gone straight through. Refuse rather than clamp, so the
+    // operator sees the bound instead of a silently different value.
+    const n = parseFloat(stored);
+    if (!isNaN(n)) {
+      const below = field.min != null && n < field.min;
+      const above = field.max != null && n > field.max;
+      if (below || above) {
+        const lo = field.min != null ? toDisplay(type, field.min) : null;
+        const hi = field.max != null ? toDisplay(type, field.max) : null;
+        setSaveErr(`out of range (${[lo != null ? `min ${lo}` : null, hi != null ? `max ${hi}` : null].filter(Boolean).join(', ')})`);
+        return;
+      }
+    }
     setSaving(true);
     setSaveErr(null);
     try {

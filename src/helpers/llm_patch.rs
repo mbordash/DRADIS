@@ -597,13 +597,22 @@ mod tests {
     /// `time_decay_max_entry_price: 0.46 -> 0.5` on the Marketplace instance.
     /// The schema range is 0.0 to 1.0 so it validated, the write succeeded, the
     /// audit ledger said `applied`, and the build cap of 0.46 silently put it
-    /// back on the next read. It must be rejected before any of that.
+    /// back on the next read. The cap was the compiled profile's default then;
+    /// it is now a ceiling shared by every profile template (0.50 for this key,
+    /// where TimeDecay's cheap-leg premise ends), so 0.50 itself is reachable and
+    /// the first value above the ceiling is what must be rejected, before any
+    /// write, with the ceiling named.
     #[test]
     fn rejects_a_value_above_its_build_cap() {
-        let b = propose("time_decay_max_entry_price", serde_json::json!(0.5));
+        use crate::helpers::dynamic_config::build_cap_for;
+        use rust_decimal::prelude::ToPrimitive;
+        let cap = build_cap_for("time_decay_max_entry_price").expect("capped");
+        let at = propose("time_decay_max_entry_price", serde_json::json!(cap.to_f64().expect("finite")));
+        assert_eq!(at.accepted.len(), 1, "the ceiling itself is reachable: {:?}", at.rejected);
+        let b = propose("time_decay_max_entry_price", serde_json::json!(cap.to_f64().expect("finite") + 0.01));
         assert!(b.accepted.is_empty(), "must not accept an unreachable value");
         let why = &b.rejected.first().expect("one rejection").why;
-        assert!(why.contains("0.46"), "the message must name the cap: {why}");
+        assert!(why.contains(&cap.to_string()), "the message must name the ceiling {cap}: {why}");
         assert!(why.contains("cannot take effect"), "and say why: {why}");
     }
 

@@ -281,7 +281,13 @@ impl Strategy for TimeDecayStrategyImpl {
         // from letting skewed entries (yes_bid=0.59, 0.63) through.
         // 2026-05-08 session: DB had max_entry_price=0.65; compile-time is 0.50.
         // TimeDecay only makes sense in the symmetric zone where BOTH legs are near 0.50.
-        let max_entry = dc.time_decay_max_entry_price.min(config::TIME_DECAY_MAX_ENTRY_PRICE);
+        // Bounded by the build CEILING, not the compiled profile's default: the
+        // default is a risk posture that moves with the baked template, the
+        // ceiling is the most any build vouches for. With the default here, a
+        // conservative AMI silently held every runtime profile to its own value
+        // (the 2026-10-01 finding), and the 2026-08-29 approval of 0.50 could
+        // never take effect. Same constant `apply_build_caps` enforces.
+        let max_entry = dc.time_decay_max_entry_price.min(config::TIME_DECAY_MAX_ENTRY_PRICE_CEILING);
         if yes_bid > max_entry || yes_bid < dc.time_decay_min_entry_price {
             idle("market skewed (YES leg outside symmetric band)");
             return Ok(StrategySignal::NoSignal);

@@ -256,7 +256,7 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(g, e, "time_decay_stop_loss_pct", "Stop Loss", "pct", false,
             "Entry-relative stop loss (0.05 = 5%).").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "time_decay_lone_leg_stop_pct", "Lone Leg Stop", "pct", false,
-            "Stop for a leg whose partner bid has not filled: exit when the leg's bid is this far below its own entry (0.10 = 10%). Until then the leg is held toward settlement while the partner bid keeps resting.").range(0.0, 1.0).step(0.01));
+            "When a leg whose partner bid has not filled is sold: exit when its bid is this far below its own entry (0.10 = 10%); otherwise it is held toward settlement while the partner bid keeps resting. This does not cap the loss: a lone leg can lose its full notional at any setting, so this chooses when a partial loss is realized (each stop pays a taker fee), not how large it can get. Floor 0.05 is about one taker fee at a 0.45 entry; below it the stop fires on noise.").range(0.05, 0.25).step(0.01));
         v.push(F::new(g, e, "time_decay_max_entry_price", "Max Entry", "price", false,
             "Highest price the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
         // Advanced

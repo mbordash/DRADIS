@@ -523,7 +523,15 @@ pub struct DynamicConfig {
     pub time_decay_min_hold_secs:              i64,
     /// Stop for a TimeDecay leg whose partner bid has not filled, as a fraction
     /// of that leg's own entry. Wider than the pair stop on purpose: a lone leg
-    /// of an hourly binary moves several cents on its own. Build-capped.
+    /// of an hourly binary moves several cents on its own.
+    ///
+    /// Deliberately NOT build-capped. "Stricter wins" assumes tighter is safer,
+    /// and for this knob it is not: the leg's maximum loss is its notional
+    /// whatever the value, so the stop only decides WHEN a partial loss is
+    /// realized, and a tighter one realizes more of them as taker fees on
+    /// noise. The bound is the schema range (0.05 to 0.25), which the Control
+    /// Tower inputs and the advisor's proposal validator hold; a raw API PATCH
+    /// is not range-checked, as with every knob.
     #[serde(default = "default_time_decay_lone_leg_stop_pct")]
     pub time_decay_lone_leg_stop_pct:          Decimal,
 
@@ -1652,10 +1660,21 @@ pub fn reconcile_global_semantics(
 /// [`build_cap_for`]. Adding a fourth cap means adding it to `BUILD_CAPPED_KEYS`
 /// and to both functions; `build_caps_cover_every_declared_key` fails if you
 /// miss one.
+///
+/// A cap is a CEILING, not the compiled profile's default. They used to be the
+/// same constant, and that made the compiled profile a hard limit on the
+/// runtime one: the AMI bakes the conservative template, so on 2026-10-01 a
+/// production box running the balanced profile had 241 of 244 keys in force
+/// and these three sitting at the conservative values, pulled back silently on
+/// every load. The ceilings (`*_CEILING` in config.rs) are identical in all
+/// three profile templates and sit above the aggressive default, so a profile
+/// means what it says on every build; `every_profile_value_survives_the_build_caps`
+/// holds that line. A write above a ceiling is refused with the ceiling named
+/// (`ceiling_violations`), and a stored value above it, which can now only
+/// come from a later build lowering a ceiling, is clamped on load and logged.
 pub const BUILD_CAPPED_KEYS: &[&str] = &[
     "time_decay_max_entry_price",
     "time_decay_stop_loss_pct",
-    "time_decay_lone_leg_stop_pct",
     "momentum_stop_loss_pct",
 ];
 
@@ -1665,10 +1684,9 @@ pub const BUILD_CAPPED_KEYS: &[&str] = &[
 /// read path lowers it back on the next load.
 pub fn build_cap_for(field: &str) -> Option<Decimal> {
     match field {
-        "time_decay_max_entry_price" => Some(config::TIME_DECAY_MAX_ENTRY_PRICE),
-        "time_decay_stop_loss_pct"   => Some(config::TIME_DECAY_STOP_LOSS_PERCENT),
-        "time_decay_lone_leg_stop_pct" => Some(config::TIME_DECAY_LONE_LEG_STOP_LOSS_PERCENT),
-        "momentum_stop_loss_pct"     => Some(config::MOMENTUM_STOP_LOSS_PERCENT),
+        "time_decay_max_entry_price" => Some(config::TIME_DECAY_MAX_ENTRY_PRICE_CEILING),
+        "time_decay_stop_loss_pct"   => Some(config::TIME_DECAY_STOP_LOSS_CEILING),
+        "momentum_stop_loss_pct"     => Some(config::MOMENTUM_STOP_LOSS_CEILING),
         _ => None,
     }
 }
@@ -1737,15 +1755,77 @@ impl DynamicConfig {
     }
 }
 
-pub fn apply_build_caps(cfg: &mut DynamicConfig) {
-    cfg.time_decay_max_entry_price =
-        cfg.time_decay_max_entry_price.min(config::TIME_DECAY_MAX_ENTRY_PRICE);
-    cfg.time_decay_stop_loss_pct =
-        cfg.time_decay_stop_loss_pct.min(config::TIME_DECAY_STOP_LOSS_PERCENT);
-    cfg.time_decay_lone_leg_stop_pct =
-        cfg.time_decay_lone_leg_stop_pct.min(config::TIME_DECAY_LONE_LEG_STOP_LOSS_PERCENT);
-    cfg.momentum_stop_loss_pct =
-        cfg.momentum_stop_loss_pct.min(config::MOMENTUM_STOP_LOSS_PERCENT);
+///
+/// Returns every field it lowered, so the caller can say so: a silent clamp is
+/// what hid the 2026-10-01 profile mismatch.
+pub fn apply_build_caps(cfg: &mut DynamicConfig) -> Vec<CeilingClamp> {
+    let mut clamped = Vec::new();
+    let mut cap = |key: &'static str, value: &mut Decimal, ceiling: Decimal| {
+        if *value > ceiling {
+            clamped.push(CeilingClamp { key, configured: *value, ceiling });
+            *value = ceiling;
+        }
+    };
+    cap("time_decay_max_entry_price", &mut cfg.time_decay_max_entry_price, config::TIME_DECAY_MAX_ENTRY_PRICE_CEILING);
+    cap("time_decay_stop_loss_pct",   &mut cfg.time_decay_stop_loss_pct,   config::TIME_DECAY_STOP_LOSS_CEILING);
+    cap("momentum_stop_loss_pct",     &mut cfg.momentum_stop_loss_pct,     config::MOMENTUM_STOP_LOSS_CEILING);
+    clamped
+}
+
+/// A capped field found above its build ceiling: on load (clamped) or in a
+/// patch (refused).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CeilingClamp {
+    pub key: &'static str,
+    pub configured: Decimal,
+    pub ceiling: Decimal,
+}
+
+impl std::fmt::Display for CeilingClamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} = {} (ceiling {})", self.key, self.configured, self.ceiling)
+    }
+}
+
+/// Log a load-time clamp once per `(scope, key)` for the life of the process.
+/// `load_for_squadron` runs on a 30s cadence on two venues, so an unthrottled
+/// warning would bury the one line that matters.
+fn warn_ceiling_clamps(scope: &str, clamps: &[CeilingClamp]) {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    for c in clamps {
+        let first = seen.lock().map(|mut s| s.insert(format!("{scope}:{}", c.key))).unwrap_or(true);
+        if first {
+            warn!("⚙️  {scope}: stored {} is above this build's ceiling; running at {} until the stored value is lowered in the Control Tower",
+                  c, c.ceiling);
+        }
+    }
+}
+
+/// Capped keys in a PATCH body whose value is above the build ceiling. Pure, so
+/// the refusal can be tested without a database.
+pub fn ceiling_violations(patch: &serde_json::Value) -> Vec<CeilingClamp> {
+    let Some(obj) = patch.as_object() else { return Vec::new() };
+    BUILD_CAPPED_KEYS.iter().filter_map(|key| {
+        let configured: Decimal = match obj.get(*key)? {
+            serde_json::Value::String(s) => s.parse().ok()?,
+            serde_json::Value::Number(n) => n.to_string().parse().ok()?,
+            _ => return None,
+        };
+        let ceiling = build_cap_for(key)?;
+        (configured > ceiling).then_some(CeilingClamp { key, configured, ceiling })
+    }).collect()
+}
+
+/// Refuse a patch that sets a capped key above its ceiling, naming the key and
+/// the ceiling so the operator sees the bound instead of a quietly lower value.
+fn refuse_ceiling_violations(patch: &serde_json::Value) -> Result<()> {
+    let over = ceiling_violations(patch);
+    if over.is_empty() {
+        return Ok(());
+    }
+    let list = over.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ");
+    anyhow::bail!("refused: above this build's ceiling: {list}. The ceiling is the most this build vouches for; choose a value at or below it.")
 }
 
 impl DynamicConfig {
@@ -1772,7 +1852,7 @@ impl DynamicConfig {
                         //
                         // Shared with the LLM proposal validator so the two cannot
                         // disagree about what is reachable — see `apply_build_caps`.
-                        apply_build_caps(&mut cfg);
+                        warn_ceiling_clamps("global config", &apply_build_caps(&mut cfg));
 
                         info!("⚙️  DynamicConfig loaded from SQLite (safety floors applied)");
 
@@ -1849,6 +1929,7 @@ impl DynamicConfig {
     pub async fn apply_patch_as(current: &Arc<Self>, patch_json: &str, actor: &str) -> Result<Arc<Self>> {
         let mut value = serde_json::to_value(current.as_ref())?;
         let patch: serde_json::Value = serde_json::from_str(patch_json)?;
+        refuse_ceiling_violations(&patch)?;
 
         // Merge: patch fields overwrite current fields; unknown keys are ignored.
         if let (Some(obj), Some(patch_obj)) = (value.as_object_mut(), patch.as_object()) {
@@ -1902,7 +1983,7 @@ impl DynamicConfig {
                 match serde_json::from_str::<DynamicConfig>(&json) {
                     Ok(mut cfg) => {
                         // Same build caps as the global config — see `apply_build_caps`.
-                        apply_build_caps(&mut cfg);
+                        warn_ceiling_clamps(&format!("squadron {squadron_id}"), &apply_build_caps(&mut cfg));
 
                         // Instance-level fields follow the global row, always.
                         // A squadron row that disagrees is never honored — see
@@ -2051,6 +2132,7 @@ impl DynamicConfig {
         let current = Self::load_for_squadron(squadron_id).await;
         let mut value = serde_json::to_value(current.as_ref())?;
         let patch: serde_json::Value = serde_json::from_str(patch_json)?;
+        refuse_ceiling_violations(&patch)?;
 
         if let (Some(obj), Some(patch_obj)) = (value.as_object_mut(), patch.as_object()) {
             for (k, v) in patch_obj {
@@ -2342,6 +2424,85 @@ mod build_cap_tests {
                 .unwrap_or_else(|| panic!("{key} is not a Decimal-shaped field"));
             assert_eq!(got, cap, "apply_build_caps does not enforce the cap on {key}");
         }
+    }
+
+    /// The lone-leg stop is not capped, on purpose: a lone leg's worst case is
+    /// its notional at any setting, so a tighter stop only realizes more
+    /// partial losses as taker fees. The AMI bakes the conservative constant
+    /// (0.08), and on 2026-10-01 the cap clamped production's balanced 0.10 to
+    /// it silently. Raising it through the UI must stick; the other three caps
+    /// stay exactly as they were.
+    #[test]
+    fn the_lone_leg_stop_is_not_build_capped() {
+        assert!(!BUILD_CAPPED_KEYS.contains(&"time_decay_lone_leg_stop_pct"));
+        assert_eq!(build_cap_for("time_decay_lone_leg_stop_pct"), None);
+        let mut cfg = DynamicConfig::default();
+        cfg.time_decay_lone_leg_stop_pct = config::TIME_DECAY_LONE_LEG_STOP_LOSS_PERCENT + Decimal::new(5, 2);
+        let raised = cfg.time_decay_lone_leg_stop_pct;
+        apply_build_caps(&mut cfg);
+        assert_eq!(cfg.time_decay_lone_leg_stop_pct, raised, "a raised lone-leg stop must survive the caps");
+        assert_eq!(BUILD_CAPPED_KEYS, &["time_decay_max_entry_price", "time_decay_stop_loss_pct", "momentum_stop_loss_pct"]);
+    }
+
+    /// The 2026-10-01 production finding. Balanced was applied, 241 of 244 keys
+    /// took, and the three capped ones sat at the conservative constants because
+    /// the AMI bakes the conservative template and the cap was that template's
+    /// default. A ceiling is identical across the templates and above the
+    /// aggressive default, so every profile's own values must pass the caps
+    /// untouched on every build, and must not be refused by PATCH either.
+    #[test]
+    fn every_profile_value_survives_the_build_caps() {
+        let profiles: serde_json::Value =
+            serde_json::from_str(include_str!("../profiles.json")).expect("profiles.json parses");
+        let profiles = profiles["profiles"].as_object().expect("profiles object");
+        assert_eq!(profiles.len(), 3);
+        for (name, profile) in profiles {
+            let values = &profile["values"];
+            let mut base = serde_json::to_value(DynamicConfig::default()).expect("serializes");
+            for (k, v) in values.as_object().expect("values object") { base[k] = v.clone(); }
+            let mut cfg: DynamicConfig =
+                serde_json::from_value(base).unwrap_or_else(|e| panic!("profile '{name}': {e}"));
+            let clamps = apply_build_caps(&mut cfg);
+            assert!(clamps.is_empty(), "profile '{name}' is lowered by the build caps: {clamps:?}");
+            let refused = ceiling_violations(values);
+            assert!(refused.is_empty(), "profile '{name}' would be refused by PATCH: {refused:?}");
+        }
+        // The two live stops this test exists for, by name and value.
+        let balanced = &profiles["balanced"]["values"];
+        assert_eq!(balanced["momentum_stop_loss_pct"].as_str(), Some("0.11"));
+        assert_eq!(balanced["time_decay_stop_loss_pct"].as_str(), Some("0.05"));
+    }
+
+    /// A write above the ceiling is refused with the key and ceiling named; one
+    /// at the ceiling passes; uncapped keys are the schema range's business.
+    #[test]
+    fn a_patch_above_the_ceiling_is_refused_and_one_at_it_passes() {
+        let cap = build_cap_for("momentum_stop_loss_pct").expect("capped");
+        let over = serde_json::json!({
+            "momentum_stop_loss_pct": (cap + Decimal::new(1, 2)).to_string(),
+            "enable_momentum": true,
+        });
+        let v = ceiling_violations(&over);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].key, "momentum_stop_loss_pct");
+        assert_eq!(v[0].ceiling, cap);
+        assert!(refuse_ceiling_violations(&over).unwrap_err().to_string().contains("momentum_stop_loss_pct"));
+        assert!(ceiling_violations(&serde_json::json!({"momentum_stop_loss_pct": cap.to_string()})).is_empty());
+        assert!(refuse_ceiling_violations(&serde_json::json!({"momentum_stop_loss_pct": cap})).is_ok(), "a JSON number is read too");
+        assert!(ceiling_violations(&serde_json::json!({"time_decay_lone_leg_stop_pct": "0.9"})).is_empty());
+    }
+
+    /// A stored value above the ceiling (a later build lowered it) is clamped
+    /// on load and reported, never silently.
+    #[test]
+    fn a_load_above_the_ceiling_is_clamped_and_reported() {
+        let cap = config::MOMENTUM_STOP_LOSS_CEILING;
+        let mut cfg = DynamicConfig::default();
+        cfg.momentum_stop_loss_pct = cap + Decimal::ONE;
+        let clamps = apply_build_caps(&mut cfg);
+        assert_eq!(clamps, vec![CeilingClamp { key: "momentum_stop_loss_pct", configured: cap + Decimal::ONE, ceiling: cap }]);
+        assert_eq!(cfg.momentum_stop_loss_pct, cap);
+        assert!(apply_build_caps(&mut cfg).is_empty(), "at the ceiling nothing is reported");
     }
 
     /// A cap must never RAISE a value. "Stricter wins" is one-way.
