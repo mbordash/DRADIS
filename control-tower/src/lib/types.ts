@@ -77,6 +77,7 @@ export interface DynamicConfig {
   time_decay_max_slow_drift_pct:         string;
   time_decay_iv_stop_tighten_multiplier: string;
   time_decay_min_hold_secs:              number;
+  time_decay_lone_leg_stop_pct:          string;
 
   // Momentum Viper
   momentum_min_trade_size_usdc: string;

@@ -370,6 +370,7 @@ fn default_time_decay_max_fast_velocity_pct()      -> Decimal { config::TIME_DEC
 fn default_time_decay_max_slow_drift_pct()         -> Decimal { config::TIME_DECAY_MAX_SLOW_DRIFT_PCT         }
 fn default_time_decay_iv_stop_tighten_multiplier() -> Decimal { config::TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER }
 fn default_time_decay_min_hold_secs()              -> i64     { config::TIME_DECAY_MIN_HOLD_SECS              }
+fn default_time_decay_lone_leg_stop_pct()          -> Decimal { config::TIME_DECAY_LONE_LEG_STOP_LOSS_PERCENT }
 
 fn default_gboost_planb_trade_size_usdc()   -> Decimal { config::GBOOST_PLANB_TRADE_SIZE_USDC           }
 fn default_gboost_planb_margin()            -> Decimal { config::GBOOST_PLANB_MARGIN                    }
@@ -520,6 +521,11 @@ pub struct DynamicConfig {
     pub time_decay_iv_stop_tighten_multiplier: Decimal,
     #[serde(default = "default_time_decay_min_hold_secs")]
     pub time_decay_min_hold_secs:              i64,
+    /// Stop for a TimeDecay leg whose partner bid has not filled, as a fraction
+    /// of that leg's own entry. Wider than the pair stop on purpose: a lone leg
+    /// of an hourly binary moves several cents on its own. Build-capped.
+    #[serde(default = "default_time_decay_lone_leg_stop_pct")]
+    pub time_decay_lone_leg_stop_pct:          Decimal,
 
     // ── Momentum Viper ────────────────────────────────────────────────────────
     pub momentum_min_trade_size_usdc:  Decimal,
@@ -1319,6 +1325,7 @@ impl Default for DynamicConfig {
             time_decay_max_slow_drift_pct:         config::TIME_DECAY_MAX_SLOW_DRIFT_PCT,
             time_decay_iv_stop_tighten_multiplier: config::TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER,
             time_decay_min_hold_secs:              config::TIME_DECAY_MIN_HOLD_SECS,
+            time_decay_lone_leg_stop_pct:          config::TIME_DECAY_LONE_LEG_STOP_LOSS_PERCENT,
 
             momentum_min_trade_size_usdc:  config::MOMENTUM_MIN_TRADE_SIZE_USDC,
             momentum_max_trade_size_usdc:  config::MOMENTUM_MAX_TRADE_SIZE_USDC,
@@ -1648,6 +1655,7 @@ pub fn reconcile_global_semantics(
 pub const BUILD_CAPPED_KEYS: &[&str] = &[
     "time_decay_max_entry_price",
     "time_decay_stop_loss_pct",
+    "time_decay_lone_leg_stop_pct",
     "momentum_stop_loss_pct",
 ];
 
@@ -1659,6 +1667,7 @@ pub fn build_cap_for(field: &str) -> Option<Decimal> {
     match field {
         "time_decay_max_entry_price" => Some(config::TIME_DECAY_MAX_ENTRY_PRICE),
         "time_decay_stop_loss_pct"   => Some(config::TIME_DECAY_STOP_LOSS_PERCENT),
+        "time_decay_lone_leg_stop_pct" => Some(config::TIME_DECAY_LONE_LEG_STOP_LOSS_PERCENT),
         "momentum_stop_loss_pct"     => Some(config::MOMENTUM_STOP_LOSS_PERCENT),
         _ => None,
     }
@@ -1733,6 +1742,8 @@ pub fn apply_build_caps(cfg: &mut DynamicConfig) {
         cfg.time_decay_max_entry_price.min(config::TIME_DECAY_MAX_ENTRY_PRICE);
     cfg.time_decay_stop_loss_pct =
         cfg.time_decay_stop_loss_pct.min(config::TIME_DECAY_STOP_LOSS_PERCENT);
+    cfg.time_decay_lone_leg_stop_pct =
+        cfg.time_decay_lone_leg_stop_pct.min(config::TIME_DECAY_LONE_LEG_STOP_LOSS_PERCENT);
     cfg.momentum_stop_loss_pct =
         cfg.momentum_stop_loss_pct.min(config::MOMENTUM_STOP_LOSS_PERCENT);
 }

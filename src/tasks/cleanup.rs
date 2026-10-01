@@ -18,7 +18,8 @@
 ///
 /// Runs every 300 seconds (5 minutes) to:
 /// 1. Remove positions for markets that have expired or are expiring within 60s.
-/// 2. Detect and exit orphaned paired positions (ArbitrageStrategy / TimeDecayStrategy)
+/// 2. Detect and exit orphaned paired positions (Repair-policy pairs: ArbitrageStrategy;
+///    TimeDecay holds and manages its own lone leg, see `state::lone_leg_policy`)
 ///    where the first leg filled but the second leg never did.
 /// 3. Prune expired TimeDecay position metadata.
 /// 4. Sync open_positions DB table against live on-chain holdings (purge stale rows).
@@ -491,6 +492,14 @@ pub async fn reconcile_orphaned_positions(
     for (key, position) in pos_map.iter() {
         let (strategy_name, token_id) = (&key.strategy, &key.market);
         if strategy_name != "ArbitrageStrategy" && strategy_name != "TimeDecayStrategy" {
+            continue;
+        }
+        // Only a Repair-policy pair is this backstop's to repair. TimeDecay
+        // (HoldAndManage) keeps its lone leg on purpose: the partner bid rests
+        // for its window and the viper's exit holds the leg toward settlement.
+        // Selling it here 60s after placement would reinstate the 2026-10-01
+        // taker flatten by the back door.
+        if crate::state::lone_leg_policy(strategy_name) == crate::state::LoneLegPolicy::HoldAndManage {
             continue;
         }
         if (now - position.opened_at).num_seconds() < 60 { continue; }

@@ -255,6 +255,8 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Hard cap on total time-decay capital at risk.").min(0.0).step(0.5).unit("USDC"));
         v.push(F::new(g, e, "time_decay_stop_loss_pct", "Stop Loss", "pct", false,
             "Entry-relative stop loss (0.05 = 5%).").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "time_decay_lone_leg_stop_pct", "Lone Leg Stop", "pct", false,
+            "Stop for a leg whose partner bid has not filled: exit when the leg's bid is this far below its own entry (0.10 = 10%). Until then the leg is held toward settlement while the partner bid keeps resting.").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "time_decay_max_entry_price", "Max Entry", "price", false,
             "Highest price the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
         // Advanced

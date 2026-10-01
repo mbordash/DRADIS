@@ -45,7 +45,7 @@ use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk_v2::clob::types::AssetType;
 
 use crate::config;
-use crate::state::{Position, StrategySignal, MarketConfig, MarketSnapshot};
+use crate::state::{Position, StrategySignal, MarketConfig, MarketSnapshot, LoneLegPolicy, lone_leg_policy};
 use crate::venues::core::MarketId;
 use crate::venues::intl::{market_id_from_u256, u256_from_market_id};
 use crate::orchestrator::{StrategyRegistry, StrategyContext};
@@ -1802,6 +1802,34 @@ impl Squadron {
                                     }
                                 }
 
+                                // ── Lone-leg exit: pull the partner's resting bid first ──────
+                                // A HoldAndManage pair (TimeDecay) exits a lone leg with
+                                // exit_pair=false while its partner bid may still rest. Left on
+                                // the book, that bid could fill after we are out and create a
+                                // fresh lone leg nobody chose. Pull it before the sell. The
+                                // partner's pending position is forgotten only if a bid was
+                                // actually found resting: a partner that filled in the race
+                                // vanishes from the book instead, and its sync task must still
+                                // be able to confirm it.
+                                if !exit_pair && !ghosting && lone_leg_policy(&sn) == LoneLegPolicy::HoldAndManage {
+                                    let partner = { let map = positions.lock().await; map.get(&pos_key).and_then(|p| p.paired_leg_token_id.clone()) };
+                                    if let Some(partner) = partner {
+                                        let partner_key = PositionKey::new(sq_key.clone(), sn.clone(), partner.clone());
+                                        let partner_pending = { let map = positions.lock().await; map.get(&partner_key).map(|p| p.fill_confirmed_at.is_none()).unwrap_or(false) };
+                                        if partner_pending {
+                                            let pulled = cancel_resting_orders_for_token(&trading_client, &partner, RestingSide::Bids).await;
+                                            if pulled.any_found() {
+                                                info!("🧹 EXIT [{}]: pulled the partner leg's resting bid on {} ahead of the lone-leg exit", sn, partner);
+                                                positions.lock().await.remove(&partner_key);
+                                                token_ownership.lock().await.remove(&partner);
+                                                if let Some(pool) = db::pool_for(&asset_lc) { db::close_pending_open_position(&pool, partner.as_str()).await; }
+                                            } else {
+                                                info!("EXIT [{}]: partner leg {} had no resting bid to pull — leaving its pending position for its sync task to resolve", sn, partner);
+                                            }
+                                        }
+                                    }
+                                }
+
                                 let shares = { let map = positions.lock().await; match map.get(&pos_key) { Some(p) => p.shares, None => continue } };
                                 if shares < config::MIN_ORDER_SHARES || params.price <= dec!(0) {
                                     let mut map = positions.lock().await; if let Some(p) = map.remove(&pos_key) { let aep = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); *total_pnl.lock().await += (aep - p.avg_entry) * p.shares; } continue;
@@ -2511,6 +2539,21 @@ impl Squadron {
                                             }
                                             Ok((leg_a_id, leg_b_id)) => {
                                                 let primary_wait_secs = if target_yes_token == hourly_yes_token { crate::helpers::balance::MAX_WAIT_SECS_HOURLY } else { crate::helpers::balance::MAX_WAIT_SECS_WINDOW };
+                                                // What a one-sided fill means for this pair. Under
+                                                // `HoldAndManage` (TimeDecay) each leg's sync task must
+                                                // let its bid rest to the expiry buffer instead of
+                                                // cancelling it at the 180s/600s fill window, and must
+                                                // treat an unfilled post-only bid as an expired quote
+                                                // rather than a phantom (no cooldown). Arbitrage keeps
+                                                // its windows and its phantom accounting unchanged.
+                                                let lone_leg = lone_leg_policy(&sn);
+                                                let (primary_wait_secs, sync_post_only_a) = match lone_leg {
+                                                    LoneLegPolicy::HoldAndManage => (
+                                                        crate::helpers::balance::hold_leg_rest_secs(target_market_close_time, Utc::now(), config::MARKET_EXPIRY_SAFETY_BUFFER_SECS, primary_wait_secs),
+                                                        params.post_only,
+                                                    ),
+                                                    LoneLegPolicy::Repair => (primary_wait_secs, false),
+                                                };
                                                 let cl_s = Arc::clone(&trading_client); let ps_s = Arc::clone(&positions); let pc_s = Arc::clone(&phantom_cooldowns); let to_s = Arc::clone(&token_ownership); let sn_s = sn.clone(); let tn_s = params.token_id.clone();
                                                 let db_sn_a = sn.clone(); let db_tid_a = params.token_id.to_string(); let db_mn_a = params.market_name.clone();
                                                 let db_side_a = side_of(&params.token_id); let db_ep_a = actual_entry_price; let db_sh_a = params.shares; let asset_a = asset_lc.clone(); let scope_a = scope.clone();
@@ -2520,7 +2563,7 @@ impl Squadron {
                                                 }
                                                 let sq_bal = squadron_id.clone();
                                                 tokio::spawn(async move {
-                                                    if let Ok(true) = sync_position_balance(&sq_bal, &cl_s, &ps_s, &sn_s, &tn_s, Some(&pc_s), primary_baseline, primary_wait_secs, &to_s, false).await {
+                                                    if let Ok(true) = sync_position_balance(&sq_bal, &cl_s, &ps_s, &sn_s, &tn_s, Some(&pc_s), primary_baseline, primary_wait_secs, &to_s, sync_post_only_a).await {
                                                         // Update to confirmed (Mission In-Flight) + record entry
                                                         if let Some(pool) = db::pool_for(&asset_a) {
                                                             db::confirm_position_status(&pool, &db_sn_a, &db_tid_a).await;
@@ -2535,6 +2578,13 @@ impl Squadron {
                                         token_ownership.lock().await.insert(pp_token_m.clone(), sn.clone());
 
                                                 let pair_wait_secs = if pp.token_id == hourly_yes_token || pp.token_id == hourly_no_token { crate::helpers::balance::MAX_WAIT_SECS_HOURLY } else { crate::helpers::balance::MAX_WAIT_SECS_WINDOW };
+                                                let (pair_wait_secs, sync_post_only_b) = match lone_leg {
+                                                    LoneLegPolicy::HoldAndManage => (
+                                                        crate::helpers::balance::hold_leg_rest_secs(target_market_close_time, Utc::now(), config::MARKET_EXPIRY_SAFETY_BUFFER_SECS, pair_wait_secs),
+                                                        pp.post_only,
+                                                    ),
+                                                    LoneLegPolicy::Repair => (pair_wait_secs, false),
+                                                };
                                                 let sn_p = sn.clone(); let tn_p = pp.token_id.clone(); let ps_p = Arc::clone(&positions); let cl_p = Arc::clone(&trading_client); let pc_p = Arc::clone(&phantom_cooldowns); let to_p = Arc::clone(&token_ownership);
                                                 let db_sn_b = sn.clone(); let db_tid_b = pp.token_id.to_string(); let db_mn_b = pp.market_name.clone();
                                                 let db_side_b = side_of(&pp.token_id); let db_ep_b = actual_pair_entry_price; let db_sh_b = pp.shares; let asset_b = asset_lc.clone(); let scope_b = scope.clone();
@@ -2544,7 +2594,7 @@ impl Squadron {
                                                 }
                                                 let sq_bal = squadron_id.clone();
                                                 tokio::spawn(async move {
-                                                    if let Ok(true) = sync_position_balance(&sq_bal, &cl_p, &ps_p, &sn_p, &tn_p, Some(&pc_p), pair_baseline, pair_wait_secs, &to_p, false).await {
+                                                    if let Ok(true) = sync_position_balance(&sq_bal, &cl_p, &ps_p, &sn_p, &tn_p, Some(&pc_p), pair_baseline, pair_wait_secs, &to_p, sync_post_only_b).await {
                                                         // Update to confirmed (Mission In-Flight) + record entry
                                                         if let Some(pool) = db::pool_for(&asset_b) {
                                                             db::confirm_position_status(&pool, &db_sn_b, &db_tid_b).await;
@@ -2558,17 +2608,15 @@ impl Squadron {
                                                     let arb_tok_a = params.token_id.clone(); let arb_tok_b = pp.token_id.clone(); let arb_base_a = primary_baseline; let arb_base_b = pair_baseline;
                                                     let arb_side_a = side_of(&params.token_id).to_string();
                                                     let arb_side_b = side_of(&pp.token_id).to_string();
-                                                    let arb_wait = if sn.contains("TimeDecay") {
-                                                        // TimeDecay resting maker bids need the full theta window
-                                                        // (up to TIME_DECAY_MAX_SECS_TO_EXPIRY = 1800s) to fill.
-                                                        // Using MAX_WAIT_SECS_HOURLY (180s) caused the arbiter to
-                                                        // declare orphan after 3 minutes while the GTC bid was still
-                                                        // resting. Match the wait to the theta window so both legs
-                                                        // get a fair chance before any orphan flatten fires.
-                                                        crate::config::TIME_DECAY_MAX_SECS_TO_EXPIRY
-                                                    } else {
-                                                        primary_wait_secs.max(pair_wait_secs)
-                                                    };
+                                                    // The monitor's hard deadline for the neither-filled
+                                                    // case only. It has never governed the one-sided case:
+                                                    // that is decided by `lone_leg` (Repair: the 5s maker
+                                                    // grace; HoldAndManage: hand the held leg to the viper
+                                                    // and leave the partner bid resting). The old TimeDecay
+                                                    // special case here passed the theta window believing it
+                                                    // protected both legs; it did not, and the real resting
+                                                    // window now lives in the sync waits above.
+                                                    let arb_wait = primary_wait_secs.max(pair_wait_secs);
                                                     let arb_asset = asset_lc.clone();
                                                     let arb_tp = Arc::clone(&total_pnl);
                                                     let arb_scope = scope.clone();
@@ -2577,7 +2625,7 @@ impl Squadron {
                                                         crate::helpers::balance::arb_pair_fill_monitor(
                                                             &sq_bal,
                                                             arb_cl, arb_nm, arb_sg, safe_address, eoa_address, vc, vc_p,
-                                                            arb_ps, arb_pc, arb_to, arb_sn, &arb_tok_a, &arb_tok_b,
+                                                            arb_ps, arb_pc, arb_to, arb_sn, lone_leg, &arb_tok_a, &arb_tok_b,
                                                             arb_base_a, arb_base_b, arb_side_a, arb_side_b, arb_wait, arb_http, arb_asset,
                                                             arb_scope,
                                                             arb_tp,
@@ -2589,7 +2637,9 @@ impl Squadron {
                                                 // Register the new arb pair in the venue's active-token set and
                                                 // track both GTC orders with the shared OrderLifecycle so the
                                                 // 30 s reconcile loop can confirm fills, cancel stale legs, and
-                                                // flatten naked legs independent of arb_pair_fill_monitor.
+                                                // flatten naked legs independent of arb_pair_fill_monitor
+                                                // (Repair-policy strategies only; a HoldAndManage lone leg
+                                                // is the viper's to manage and the lifecycle leaves it).
                                                 patrol_venue.register_tokens(
                                                     &[params.token_id.clone(), pp.token_id.clone()]
                                                 ).await;

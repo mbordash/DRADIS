@@ -666,6 +666,61 @@ impl Position {
     }
 }
 
+/// What the engine does with one leg of a paired entry when the other leg has
+/// not filled.
+///
+/// Two vipers place YES+NO pairs and they mean different things by it.
+/// Arbitrage sends two legs that must fill together: a lone leg is a failed
+/// atomic entry, so it is repaired (re-hedged or flattened) within seconds.
+/// TimeDecay posts two resting maker bids and expects them to fill at different
+/// times as the book oscillates: a lone leg is the normal first half of the
+/// trade. On 2026-10-01 the Arbitrage rule was applied to a TimeDecay pair: the
+/// YES bid filled 17s after placement, the arbiter declared the NO bid an orphan
+/// 8s later and sold the YES leg as a taker, booking a loss that was 63% fee on
+/// a one-cent move. Every path that decides what a lone leg means consults this
+/// policy instead of assuming the Arbitrage answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoneLegPolicy {
+    /// The legs are meant to fill together. A lone leg is repaired at once by
+    /// the pair monitor, the order lifecycle, and the cleanup backstop.
+    Repair,
+    /// The legs are resting bids expected to fill apart. The partner bid keeps
+    /// resting for its window and the viper's own `evaluate_exit` manages the
+    /// held leg (its stop, and holding to settlement).
+    HoldAndManage,
+}
+
+/// The lone-leg policy for a strategy, by its registry name.
+pub fn lone_leg_policy(strategy_name: &str) -> LoneLegPolicy {
+    if strategy_name == "TimeDecayStrategy" {
+        LoneLegPolicy::HoldAndManage
+    } else {
+        LoneLegPolicy::Repair
+    }
+}
+
+#[cfg(test)]
+mod lone_leg_policy_tests {
+    use super::{lone_leg_policy, LoneLegPolicy};
+
+    /// The 2026-10-01 defect: TimeDecay's resting pair was repaired like an
+    /// Arbitrage pair. TimeDecay holds; everything else keeps the repair.
+    #[test]
+    fn time_decay_holds_a_lone_leg_and_arbitrage_repairs_it() {
+        assert_eq!(lone_leg_policy("TimeDecayStrategy"), LoneLegPolicy::HoldAndManage);
+        assert_eq!(lone_leg_policy("ArbitrageStrategy"), LoneLegPolicy::Repair);
+    }
+
+    /// Single-leg vipers never reach a lone-leg decision, but if one did, the
+    /// safe default is the one that closes exposure.
+    #[test]
+    fn unknown_strategies_default_to_repair() {
+        for s in ["MakerStrategy", "FairValueStrategy", "GboostStrategy", ""] {
+            assert_eq!(lone_leg_policy(s), LoneLegPolicy::Repair, "{s}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod exposure_counting_tests {
     use super::*;

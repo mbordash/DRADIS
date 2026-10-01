@@ -1431,6 +1431,13 @@ pub const TIME_DECAY_TARGET_PROFIT_PERCENT: Decimal = dec!(0.012);
 pub const TIME_DECAY_MAX_TOTAL_EXPOSURE_USDC: Decimal = dec!(50);
 pub const TIME_DECAY_MAX_POSITIONS: usize = 5;
 pub const TIME_DECAY_STOP_LOSS_PERCENT: Decimal = dec!(0.05);
+/// Stop for a TimeDecay leg whose partner bid has not filled, as a fraction of
+/// the leg's own entry price. The pair stop above measures the COMBINED bid
+/// against the combined entry, where the two legs offset and a few cents is a
+/// real divergence; a single leg of an hourly binary moves several cents on
+/// its own, so it gets a wider bar or it would churn taker exits. The leg is
+/// otherwise held to settlement (zero exit fee) while the partner bid rests.
+pub const TIME_DECAY_LONE_LEG_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
 pub const TIME_DECAY_MIN_HOLD_SECS: i64 = 120;
 pub const TIME_DECAY_STOP_LOSS_COOLDOWN_SECS: u64 = 600;
 

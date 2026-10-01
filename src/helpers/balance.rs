@@ -61,6 +61,29 @@ pub const PHANTOM_COOLDOWN_SECS: u64 = 600;
 pub const MAX_WAIT_SECS_HOURLY: i64 = 180;
 pub const MAX_WAIT_SECS_WINDOW: i64 = 600;
 
+/// How long a `HoldAndManage` pair leg's resting bid may wait for its fill:
+/// until the market's expiry safety buffer, and never less than `floor_secs`.
+///
+/// TimeDecay's two bids are meant to fill at different times, so the partner
+/// of a filled leg keeps resting for the rest of the market rather than for
+/// the 180s/600s fill window an Arbitrage leg gets. When this window closes
+/// `sync_position_balance` cancels the bid and drops its pending position
+/// quietly (post-only path), which is also what stops it filling into a
+/// market about to settle. On 2026-10-01 the pair was placed 1356s before
+/// close; with the 180s buffer the NO bid would have had 1176s to fill
+/// instead of the 8s it got.
+pub fn hold_leg_rest_secs(
+    close_time: Option<chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+    expiry_buffer_secs: i64,
+    floor_secs: i64,
+) -> i64 {
+    match close_time {
+        Some(close) => ((close - now).num_seconds() - expiry_buffer_secs).max(floor_secs),
+        None => floor_secs,
+    }
+}
+
 
 
 pub fn parse_balance_from_error(err_msg: &str) -> Option<Decimal> {
@@ -806,6 +829,44 @@ pub async fn reconcile_orphaned_positions(
     }
 }
 
+/// What the pair monitor does on a poll where exactly one leg is confirmed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AsymmetricAction {
+    /// Keep polling: the missing leg still has its maker grace.
+    Wait,
+    /// Cancel the missing leg and re-hedge or flatten the filled one.
+    Repair,
+    /// Stop watching: the viper owns the held leg and the partner bid keeps
+    /// resting for its own window.
+    HandOff,
+}
+
+/// The decision behind the monitor's asymmetric branch, pure so the 2026-10-01
+/// timeline can be replayed in a test.
+///
+/// `asymmetric_for` is how long exactly one leg has been confirmed; `grace` is
+/// the Repair policy's maker grace; `past_deadline` is the monitor's hard
+/// deadline. A `HoldAndManage` strategy never repairs: its legs are resting
+/// bids expected to fill apart, so the first fill is the trade's normal first
+/// half, not an orphan.
+pub fn asymmetric_fill_action(
+    policy: crate::state::LoneLegPolicy,
+    asymmetric_for: Duration,
+    grace: Duration,
+    past_deadline: bool,
+) -> AsymmetricAction {
+    match policy {
+        crate::state::LoneLegPolicy::HoldAndManage => AsymmetricAction::HandOff,
+        crate::state::LoneLegPolicy::Repair => {
+            if asymmetric_for >= grace || past_deadline {
+                AsymmetricAction::Repair
+            } else {
+                AsymmetricAction::Wait
+            }
+        }
+    }
+}
+
 /// Orphan-leg cleanup monitor spawned alongside every atomic two-leg arb entry.
 ///
 /// Enforces the invariant:
@@ -825,6 +886,13 @@ pub async fn reconcile_orphaned_positions(
 /// instead of the full fill window (the dominant orphan-loss window). The original
 /// `max_wait_secs + ARBITER_GRACE_SECS` is retained only as a hard deadline for the
 /// neither-filled case, where the individual `sync_position_balance` tasks own cleanup.
+///
+/// ── Per-strategy meaning of a one-sided fill ─────────────────────────────────
+/// The repair above is the Arbitrage rule. A `HoldAndManage` strategy (TimeDecay)
+/// posts two resting bids that are expected to fill apart, so on the first
+/// asymmetric poll this monitor logs and returns: the partner bid keeps resting
+/// for the window `sync_position_balance` was given, and the viper's own
+/// `evaluate_exit` manages the held leg. See `crate::state::lone_leg_policy`.
 pub async fn arb_pair_fill_monitor(
     // Squadron that owns the positions being reconciled. Part of every
     // PositionKey built below, so two squadrons trading the same token each
@@ -841,6 +909,10 @@ pub async fn arb_pair_fill_monitor(
     phantom_cooldowns: PhantomCooldowns,
     token_ownership: Arc<Mutex<HashMap<MarketId, String>>>,
     strategy_name: String,
+    // What a one-sided fill means for this strategy. `Repair` runs the
+    // re-hedge/flatten below after the short grace; `HoldAndManage` hands the
+    // held leg to the viper and leaves the partner bid resting.
+    lone_leg: crate::state::LoneLegPolicy,
     leg_a_token: &MarketId,
     leg_b_token: &MarketId,
     leg_a_baseline: Decimal,
@@ -942,14 +1014,30 @@ pub async fn arb_pair_fill_monitor(
                 }
             }
             _ => {
-                // Asymmetric — exactly one leg filled. Give the missing leg a short
-                // grace to fill as a free maker; repair the moment it elapses (or at
-                // the hard deadline, whichever comes first).
+                // Asymmetric — exactly one leg filled. Under `Repair`, give the
+                // missing leg a short grace to fill as a free maker and repair the
+                // moment it elapses (or at the hard deadline, whichever comes
+                // first). Under `HoldAndManage` this is the trade's normal first
+                // half: the viper's exit owns the held leg and the partner bid
+                // rests until its own sync window closes. Note `max_wait_secs`
+                // never governed this branch — only the neither-filled deadline —
+                // which is how a 1800s wait passed for TimeDecay still produced an
+                // 8s orphan flatten on 2026-10-01.
                 let since = *first_asymmetric_at.get_or_insert_with(Instant::now);
-                if since.elapsed() >= Duration::from_secs(FIRST_LEG_CONFIRM_GRACE_SECS)
-                    || Instant::now() >= deadline
-                {
-                    break (a_conf, a_sh, b_sh);
+                match asymmetric_fill_action(
+                    lone_leg,
+                    since.elapsed(),
+                    Duration::from_secs(FIRST_LEG_CONFIRM_GRACE_SECS),
+                    Instant::now() >= deadline,
+                ) {
+                    AsymmetricAction::Repair => break (a_conf, a_sh, b_sh),
+                    AsymmetricAction::Wait => {}
+                    AsymmetricAction::HandOff => {
+                        let (held, resting) = if a_conf { (leg_a_token, leg_b_token) } else { (leg_b_token, leg_a_token) };
+                        info!(" PAIR MONITOR [{}]: one leg filled ({}) and the partner bid ({}) is still resting — hold-and-manage strategy, the viper owns the held leg; no repair",
+                              strategy_name, held, resting);
+                        return;
+                    }
                 }
             }
         }
@@ -1602,5 +1690,69 @@ mod rehedge_fill_tests {
         let fill = rehedge_fill(dec!(0), dec!(0), dec!(26), dec!(0.64), RATE);
         assert!(!fill.reported);
         assert_eq!((fill.shares, fill.price), (dec!(26), dec!(0.64)));
+    }
+}
+
+#[cfg(test)]
+mod lone_leg_timeline_tests {
+    use super::{asymmetric_fill_action, hold_leg_rest_secs, AsymmetricAction};
+    use crate::state::LoneLegPolicy;
+    use chrono::{DateTime, Utc};
+    use tokio::time::Duration;
+
+    const GRACE: Duration = Duration::from_secs(5);
+
+    fn t(s: &str) -> DateTime<Utc> {
+        s.parse::<DateTime<Utc>>().expect("rfc3339")
+    }
+
+    /// Production, 2026-10-01 (ET): the TimeDecay pair was placed at 06:37:24, the
+    /// YES bid confirmed at 06:37:41, and at 06:37:49 — eight seconds of
+    /// asymmetry — the monitor declared the NO bid an orphan and sold the YES leg
+    /// as a taker. The same eight seconds must now hand off, and keep handing off
+    /// at the 180s sync window the Arbitrage legs get and past the 1800s
+    /// "theta window" wait the call site believed it was granting.
+    #[test]
+    fn the_production_timeline_hands_off_instead_of_repairing() {
+        let eight_secs = Duration::from_secs(8);
+        assert_eq!(asymmetric_fill_action(LoneLegPolicy::Repair, eight_secs, GRACE, false),
+                   AsymmetricAction::Repair, "what production did");
+        assert_eq!(asymmetric_fill_action(LoneLegPolicy::HoldAndManage, eight_secs, GRACE, false),
+                   AsymmetricAction::HandOff, "what it must do");
+        for secs in [180u64, 1800, 1815] {
+            assert_eq!(asymmetric_fill_action(LoneLegPolicy::HoldAndManage, Duration::from_secs(secs), GRACE, secs >= 1815),
+                       AsymmetricAction::HandOff, "{secs}s");
+        }
+    }
+
+    /// Arbitrage's protection is untouched: inside the grace it waits, at the
+    /// grace it repairs, and the hard deadline repairs regardless.
+    #[test]
+    fn arbitrage_keeps_its_grace_and_repair() {
+        assert_eq!(asymmetric_fill_action(LoneLegPolicy::Repair, Duration::from_secs(2), GRACE, false), AsymmetricAction::Wait);
+        assert_eq!(asymmetric_fill_action(LoneLegPolicy::Repair, GRACE, GRACE, false), AsymmetricAction::Repair);
+        assert_eq!(asymmetric_fill_action(LoneLegPolicy::Repair, Duration::from_secs(1), GRACE, true), AsymmetricAction::Repair);
+    }
+
+    /// The NO bid's sync task was given 180s on 2026-10-01. With the pair placed
+    /// at 10:37:24Z for an 11:00:00Z close and the 180s expiry buffer, the bid
+    /// now rests 1176s: well past the 5s grace and past the 180s window.
+    #[test]
+    fn the_partner_bid_rests_to_the_expiry_buffer() {
+        let placed = t("2026-10-01T10:37:24Z");
+        let close = Some(t("2026-10-01T11:00:00Z"));
+        let rest = hold_leg_rest_secs(close, placed, 180, super::MAX_WAIT_SECS_HOURLY);
+        assert_eq!(rest, 1176);
+        assert!(rest > 180 && rest > 5);
+    }
+
+    /// Close to expiry, or with no close time known, the window falls back to the
+    /// ordinary fill window rather than to zero or a negative number.
+    #[test]
+    fn the_rest_window_never_drops_below_the_floor() {
+        let now = t("2026-10-01T10:58:00Z");
+        assert_eq!(hold_leg_rest_secs(Some(t("2026-10-01T11:00:00Z")), now, 180, 180), 180);
+        assert_eq!(hold_leg_rest_secs(Some(t("2026-10-01T10:50:00Z")), now, 180, 180), 180, "already past close");
+        assert_eq!(hold_leg_rest_secs(None, now, 180, 600), 600);
     }
 }

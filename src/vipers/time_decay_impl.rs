@@ -43,6 +43,20 @@
 ///   4. Expiry forced exit: sell before MARKET_EXPIRY_SAFETY_BUFFER_SECS to
 ///      avoid settlement edge cases.
 ///
+/// ── One-sided fills (the normal first half) ──────────────────────────────────
+///   Two resting bids fill at different times, so a lone leg is expected, not an
+///   orphan. The engine's lone-leg policy for this viper is `HoldAndManage`
+///   (`state::lone_leg_policy`): the partner bid keeps resting until the expiry
+///   buffer (its sync task cancels it then), and the held leg is managed here:
+///   5. Lone-leg stop: sell the leg (FAK) when its bid falls
+///      TIME_DECAY_LONE_LEG_STOP_LOSS_PERCENT below its own entry, after the
+///      min hold. The partner bid is pulled by the exit path first.
+///   6. Otherwise the leg is held to settlement (zero exit fee, EV about zero at
+///      a near-fair fill). Worst case is the leg's notional, bounded first by
+///      the stop and then by TIME_DECAY_POSITION_SIZE_USDC per leg.
+///   On 2026-10-01 the Arbitrage rule sold such a leg 8s after it filled, as a
+///   taker, for a loss that was 63% fee on a one-cent move.
+///
 /// ── Oracle Volatility Gate ───────────────────────────────────────────────────
 ///   Blocks entry when oracle signals active repricing or sustained trend:
 ///   - |velocity_5s| > TIME_DECAY_MAX_FAST_VELOCITY_* (active move in progress)
@@ -65,6 +79,68 @@ use crate::config;
 use crate::venues::core::TimeInForce;
 
 const STRATEGY_NAME: &str = "TimeDecayStrategy";
+
+/// Which legs of a TimeDecay pair are in hand, from each leg's presence and
+/// fill confirmation. `None` means no position on that side at all; `Some(c)`
+/// means a position exists and `c` says whether its fill is confirmed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairState {
+    /// Nothing on either side.
+    Empty,
+    /// Both legs present with the same confirmation state: a hedged pair, or a
+    /// pair whose fills have not yet been synced (first seconds, ghost mode).
+    Pair,
+    /// Only the YES leg is held. `partner_resting` is true while the NO bid's
+    /// pending position is still tracked (its GTC is on the book).
+    LoneYes { partner_resting: bool },
+    /// Only the NO leg is held; see `LoneYes`.
+    LoneNo { partner_resting: bool },
+}
+
+pub fn pair_state(yes: Option<bool>, no: Option<bool>) -> PairState {
+    match (yes, no) {
+        (None, None) => PairState::Empty,
+        (Some(true), Some(false)) => PairState::LoneYes { partner_resting: true },
+        (Some(false), Some(true)) => PairState::LoneNo { partner_resting: true },
+        (Some(_), Some(_)) => PairState::Pair,
+        (Some(_), None) => PairState::LoneYes { partner_resting: false },
+        (None, Some(_)) => PairState::LoneNo { partner_resting: false },
+    }
+}
+
+/// What to do with a lone leg this tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoneLegDecision {
+    /// Keep the leg: toward settlement, with the partner bid resting.
+    Hold,
+    /// The leg's bid has fallen through its stop: sell it (FAK).
+    Stop,
+}
+
+/// The lone-leg stop, pure. `stop_pct` is a fraction of the leg's own entry
+/// (`time_decay_lone_leg_stop_pct`), tightened by `tighten_mult` while oracle
+/// velocity is elevated, exactly as the pair stop is. Suppressed inside the min
+/// hold. A non-positive bid is an empty book, not a crash: there is nothing to
+/// sell into, and an exit priced at zero would be booked as a wipeout.
+pub fn lone_leg_decision(
+    entry: Decimal,
+    bid: Decimal,
+    stop_pct: Decimal,
+    iv_elevated: bool,
+    tighten_mult: Decimal,
+    held_secs: i64,
+    min_hold_secs: i64,
+) -> LoneLegDecision {
+    if bid <= Decimal::ZERO || held_secs < min_hold_secs {
+        return LoneLegDecision::Hold;
+    }
+    let pct = if iv_elevated { stop_pct * tighten_mult } else { stop_pct };
+    if bid < entry * (dec!(1) - pct) {
+        LoneLegDecision::Stop
+    } else {
+        LoneLegDecision::Hold
+    }
+}
 
 /// Throttle for the gate-rejection log line: `asset → (last reason, logged at)`.
 ///
@@ -295,7 +371,60 @@ impl Strategy for TimeDecayStrategyImpl {
         let yes_key = PositionKey::new(&ctx.squadron_id, "TimeDecayStrategy", market.yes_token.clone());
         let no_key  = PositionKey::new(&ctx.squadron_id, "TimeDecayStrategy", market.no_token.clone());
 
-        if let (Some(yp), Some(np)) = (pos_map.get(&yes_key), pos_map.get(&no_key)) {
+        // One-sided fills are the normal first half of this trade (two resting
+        // bids fill apart), so sort the legs before any pair arithmetic runs: the
+        // pair branch below used to run on a pending partner as if it were held,
+        // and a lone leg had no exit at all.
+        let ghost = dc.ghost_mode;
+        let (yes_pos, no_pos) = (pos_map.get(&yes_key), pos_map.get(&no_key));
+        let state = pair_state(
+            yes_pos.map(|p| p.fill_effective_at(ghost).is_some()),
+            no_pos.map(|p| p.fill_effective_at(ghost).is_some()),
+        );
+        match state {
+            PairState::Empty => return Ok(StrategySignal::NoSignal),
+            PairState::Pair => {}
+            PairState::LoneYes { partner_resting } | PairState::LoneNo { partner_resting } => {
+                let lone_yes = matches!(state, PairState::LoneYes { .. });
+                let (leg, token, bid, fee_bps, side) = if lone_yes {
+                    (yes_pos.expect("lone YES leg is present"), market.yes_token.clone(), snap.yes_bid, market.yes_fee_bps as u16, "YES")
+                } else {
+                    (no_pos.expect("lone NO leg is present"), market.no_token.clone(), snap.no_bid, market.no_fee_bps as u16, "NO")
+                };
+                let (max_fast_vel, _) = TimeDecayStrategy::iv_thresholds(snap.oracle_price, dc.time_decay_max_fast_velocity_pct, dc.time_decay_max_slow_drift_pct);
+                let iv_elevated = snap.velocity.abs() > max_fast_vel;
+                let held_secs = (Utc::now() - leg.fill_effective_at(ghost).unwrap_or(leg.opened_at)).num_seconds();
+                let decision = lone_leg_decision(
+                    leg.avg_entry, bid, dc.time_decay_lone_leg_stop_pct, iv_elevated,
+                    dc.time_decay_iv_stop_tighten_multiplier, held_secs, dc.time_decay_min_hold_secs,
+                );
+                let partner = if partner_resting { "partner bid resting" } else { "partner bid gone" };
+                return Ok(match decision {
+                    LoneLegDecision::Stop => StrategySignal::Exit {
+                        params: OrderParams {
+                            token_id: token, price: bid, shares: leg.shares, fee_bps,
+                            is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(),
+                            condition_id: market.condition_id.clone(), order_type: TimeInForce::Fak,
+                            post_only: false, ghost_mode: dc.ghost_mode,
+                        },
+                        reason: format!(
+                            "Time Decay lone-leg SL{}: {} bid=${:.4} entry=${:.4} ({})",
+                            if iv_elevated { " (IV-tightened)" } else { "" }, side, bid, leg.avg_entry, partner,
+                        ),
+                        exit_pair: false,
+                    },
+                    LoneLegDecision::Hold => {
+                        tracing::debug!(
+                            "⏳ TimeDecay lone {} leg held: bid=${:.4} entry=${:.4} held={}s ({}) — toward settlement",
+                            side, bid, leg.avg_entry, held_secs, partner,
+                        );
+                        StrategySignal::NoSignal
+                    }
+                });
+            }
+        }
+
+        if let (Some(yp), Some(np)) = (yes_pos, no_pos) {
             let yes_bid = snap.yes_bid;
             let no_bid  = snap.no_bid;
 
@@ -450,5 +579,67 @@ mod gate_log_throttle_tests {
     fn assets_throttle_independently() {
         assert!(time_decay_gate_log_permitted("tdtest_btc", "exposure cap reached"));
         assert!(time_decay_gate_log_permitted("tdtest_eth", "exposure cap reached"));
+    }
+}
+
+#[cfg(test)]
+mod lone_leg_tests {
+    use super::{lone_leg_decision, pair_state, LoneLegDecision, PairState};
+    use rust_decimal_macros::dec;
+
+    /// Production, 2026-10-01 06:37 ET: YES filled and confirmed at 17s, the NO bid
+    /// still pending on the book. That is a lone YES with its partner resting —
+    /// the viper's to manage, not a pair and not nothing.
+    #[test]
+    fn a_confirmed_leg_beside_a_pending_partner_is_a_lone_leg() {
+        assert_eq!(pair_state(Some(true), Some(false)), PairState::LoneYes { partner_resting: true });
+        assert_eq!(pair_state(Some(false), Some(true)), PairState::LoneNo { partner_resting: true });
+    }
+
+    /// After the partner bid is cancelled (sync window closed, or pulled by the
+    /// stop path) the leg stands alone with no bid to pair against.
+    #[test]
+    fn a_leg_with_no_partner_position_is_a_lone_leg_with_the_bid_gone() {
+        assert_eq!(pair_state(Some(true), None), PairState::LoneYes { partner_resting: false });
+        assert_eq!(pair_state(None, Some(true)), PairState::LoneNo { partner_resting: false });
+        assert_eq!(pair_state(Some(false), None), PairState::LoneYes { partner_resting: false }, "a chain-adopted leg is still ours");
+    }
+
+    /// Both confirmed is the hedge; both unconfirmed is the first seconds after
+    /// placement (or ghost mode) and keeps the pair arithmetic it always had.
+    #[test]
+    fn matching_confirmation_is_a_pair_and_nothing_is_empty() {
+        assert_eq!(pair_state(Some(true), Some(true)), PairState::Pair);
+        assert_eq!(pair_state(Some(false), Some(false)), PairState::Pair);
+        assert_eq!(pair_state(None, None), PairState::Empty);
+    }
+
+    /// The production leg: entry 0.45, bid 0.44 when it was sold. A one-cent move
+    /// is inside a 10% stop, so the leg is held — the fee-dominated flatten does
+    /// not happen. At 0.40 (−11%) the stop fires.
+    #[test]
+    fn the_production_leg_is_held_and_a_real_drop_is_stopped() {
+        let hold = lone_leg_decision(dec!(0.45), dec!(0.44), dec!(0.10), false, dec!(0.5), 300, 120);
+        assert_eq!(hold, LoneLegDecision::Hold);
+        let stop = lone_leg_decision(dec!(0.45), dec!(0.40), dec!(0.10), false, dec!(0.5), 300, 120);
+        assert_eq!(stop, LoneLegDecision::Stop);
+        // Exactly at the threshold is not through it.
+        assert_eq!(lone_leg_decision(dec!(0.45), dec!(0.405), dec!(0.10), false, dec!(0.5), 300, 120), LoneLegDecision::Hold);
+    }
+
+    /// Elevated oracle velocity halves the stop, as it does for the pair.
+    #[test]
+    fn elevated_velocity_tightens_the_stop() {
+        assert_eq!(lone_leg_decision(dec!(0.45), dec!(0.42), dec!(0.10), false, dec!(0.5), 300, 120), LoneLegDecision::Hold);
+        assert_eq!(lone_leg_decision(dec!(0.45), dec!(0.42), dec!(0.10), true, dec!(0.5), 300, 120), LoneLegDecision::Stop);
+    }
+
+    /// Inside the min hold nothing fires, and an empty book (bid 0) is never a
+    /// stop: there is nothing to sell into and a zero-priced exit would book a
+    /// wipeout that did not happen.
+    #[test]
+    fn min_hold_and_an_empty_book_both_hold() {
+        assert_eq!(lone_leg_decision(dec!(0.45), dec!(0.30), dec!(0.10), false, dec!(0.5), 60, 120), LoneLegDecision::Hold);
+        assert_eq!(lone_leg_decision(dec!(0.45), dec!(0), dec!(0.10), false, dec!(0.5), 300, 120), LoneLegDecision::Hold);
     }
 }

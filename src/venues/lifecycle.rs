@@ -108,8 +108,12 @@ impl LifecycleConfig {
     /// GTC maker bids can rest for much longer than US custodial orders: the
     /// fill window for window/daily markets is up to 600 s. Use 30 min as the
     /// stale-cancel threshold so slowly-filling books are not disrupted.
-    /// The existing `arb_pair_fill_monitor` handles the fast-path (30 s grace),
-    /// so this backstop only fires on genuinely abandoned resting orders.
+    /// The existing `arb_pair_fill_monitor` handles the fast path (a 5 s grace
+    /// for Repair-policy pairs), so this backstop only fires on genuinely
+    /// abandoned resting orders. A HoldAndManage (TimeDecay) partner bid rests
+    /// to the expiry buffer by design; the hourly theta window keeps that under
+    /// this threshold, and if an operator widens the window past it the stale
+    /// cancel only ends the bid early — the held leg stays the viper's.
     pub fn intl() -> Self {
         Self {
             stale_order_secs: 1800, // 30 min backstop for slow resting bids
@@ -253,6 +257,12 @@ impl OrderLifecycle {
                     if k.squadron != self.squadron_id { return None; }
                     let (s, t) = (&k.strategy, &k.market);
                     let partner = p.paired_leg_token_id.as_ref()?;
+                    // A HoldAndManage pair (TimeDecay) owns its lone leg: the viper's
+                    // exit manages it and the partner bid rests for its own window. The
+                    // re-hedge/flatten below is the Arbitrage repair and must not reach
+                    // it — a flatten here at the 0.01 limit would be the 2026-10-01
+                    // taker loss again, by another route.
+                    if crate::state::lone_leg_policy(s) == crate::state::LoneLegPolicy::HoldAndManage { return None; }
                     let i_held          = held.get(t.as_str()).copied().unwrap_or_default() > Decimal::ZERO;
                     let partner_held    = held.get(partner.as_str()).copied().unwrap_or_default() > Decimal::ZERO;
                     let partner_resting = resting_tokens.contains(partner.as_str());
