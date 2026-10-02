@@ -129,6 +129,19 @@ pub struct SquadronSummary {
     /// Viper kinds meaningful for this squadron's market class.
     #[serde(default)]
     pub vipers:            Vec<String>,
+
+    /// When the ENGINE retired this squadron (market closed, Helm complete,
+    /// game over). An operator stand-down does not set it: the operator
+    /// removed the squadron and it leaves the registry at once. A retired
+    /// squadron lingers for `squadron_retire_linger_secs` so the operator can
+    /// read why it ended, then `reap_retired` drops it.
+    /// Skipped when absent rather than sent as `null`, so the Control Tower's
+    /// optional fields are genuinely optional on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stood_down_at:     Option<DateTime<Utc>>,
+    /// Why the engine retired it, in the words of the retirement log line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stood_down_reason: Option<String>,
 }
 
 impl SquadronSummary {
@@ -146,6 +159,8 @@ impl SquadronSummary {
             underlying:        s.asset.slug(),
             raptors:           Vec::new(),
             vipers:            Vec::new(),
+            stood_down_at:     None,
+            stood_down_reason: None,
         }
     }
 }
@@ -366,6 +381,8 @@ impl Cag {
             underlying:        market_type.to_lowercase(),
             raptors:           raptors.to_vec(),
             vipers:            vipers.to_vec(),
+            stood_down_at:     None,
+            stood_down_reason: None,
         };
 
         self.inner.registry.insert(squadron_id.to_string(), CagEntry {
@@ -454,6 +471,15 @@ impl Cag {
     pub fn update_state(&self, id: &SquadronId, state: SquadronState) {
         if let Some(mut entry) = self.inner.registry.get_mut(id) {
             entry.summary.state = state.to_string();
+            // A squadron that comes back to life sheds its retirement. Keeping
+            // the stamps would show a live squadron a "retired — removed
+            // shortly" banner, and would leave it reapable the moment a venue
+            // loop marked it STOOD_DOWN again, defeating the rule that a
+            // state-only stand-down is never reaped.
+            if state != SquadronState::StoodDown {
+                entry.summary.stood_down_at     = None;
+                entry.summary.stood_down_reason = None;
+            }
         }
     }
 
@@ -494,10 +520,89 @@ impl Cag {
         info!(squadron = %id, "🗑️   CAG: squadron removed from registry");
     }
 
+    /// The ENGINE ended this squadron — market closed, Helm intents complete,
+    /// game over. It is marked stood down with the reason and the time, and
+    /// stays listed for `squadron_retire_linger_secs` so the operator can see
+    /// what happened; `reap_retired` drops it afterwards.
+    ///
+    /// Distinct from an operator stand-down on purpose: the operator removed
+    /// that squadron, so the API removes it at once (`remove`). Routine
+    /// rotation never comes through here either — RTB is a state, not an
+    /// ending, and the rotation loop keeps its squadron id.
+    /// The first reason wins, and so does the first clock. Two paths can retire
+    /// the same squadron: the intl patrol retires itself with a precise reason
+    /// (`market "<name>" <why>`, `patrol_impl.rs`), and the deployment tail then
+    /// retires whatever its row produced with a generic one
+    /// (`venues/deployment.rs`) because the Kalshi and US loops only mark state.
+    /// Overwriting meant the operator always read the less informative reason
+    /// and the linger clock restarted, so the squadron lingered twice as long as
+    /// configured. A second retirement is therefore the no-op its caller's
+    /// comment already claims it is.
+    pub fn retire(&self, id: &SquadronId, reason: &str) {
+        if let Some(mut entry) = self.inner.registry.get_mut(id) {
+            if entry.summary.stood_down_at.is_some() {
+                return;
+            }
+            entry.summary.state = SquadronState::StoodDown.to_string();
+            entry.summary.stood_down_at = Some(Utc::now());
+            entry.summary.stood_down_reason = Some(reason.to_string());
+            info!(squadron = %id, "🏁  CAG: squadron retired — {reason}");
+        }
+    }
+
+    /// Drop every retired squadron whose linger has elapsed. Only entries
+    /// `retire` marked are candidates: a STOOD_DOWN entry with no
+    /// `stood_down_at` (a venue path that marked state directly) is left
+    /// alone, as is anything RTB or patrolling. Returns the ids dropped.
+    pub fn reap_retired(&self, now: DateTime<Utc>, linger_secs: u64) -> Vec<SquadronId> {
+        let candidates: Vec<SquadronId> = self.inner.registry
+            .iter()
+            .filter(|e| e.summary.state == SquadronState::StoodDown.to_string())
+            .filter(|e| e.summary.stood_down_at
+                .is_some_and(|at| (now - at).num_seconds() >= linger_secs as i64))
+            .map(|e| e.key().clone())
+            .collect();
+        // The scan and the removal are separate steps, so re-check the condition
+        // under the write lock. The venue rotation loops reuse squadron ids, and
+        // `register*` inserts over whatever is there: a squadron re-registered
+        // between the two steps is a live replacement, and removing it by id
+        // would delete the running squadron rather than the retired one.
+        let mut due = Vec::new();
+        for id in candidates {
+            let reaped = self.inner.registry
+                .remove_if(&id, |_, e| {
+                    e.summary.state == SquadronState::StoodDown.to_string()
+                        && e.summary.stood_down_at
+                            .is_some_and(|at| (now - at).num_seconds() >= linger_secs as i64)
+                })
+                .is_some();
+            if reaped {
+                info!(squadron = %id, "🗑️   CAG: retired squadron reaped after {linger_secs}s");
+                due.push(id);
+            }
+        }
+        due
+    }
+
     // ── Queries ──────────────────────────────────────────────────────────────
 
     /// Return summaries of all registered squadrons, sorted by deployment time.
     pub fn list_squadrons(&self) -> Vec<SquadronSummary> {
+        self.list_squadrons_at(
+            Utc::now(),
+            crate::helpers::dynamic_config::squadron_retire_linger_secs(),
+        )
+    }
+
+    /// `list_squadrons` with the clock and the linger passed in, so a test can
+    /// prove that listing is what does the reaping without waiting ten minutes
+    /// or reaching into the global config channel.
+    pub fn list_squadrons_at(&self, now: DateTime<Utc>, linger_secs: u64) -> Vec<SquadronSummary> {
+        // Lazy reaping: a retired squadron whose linger has passed leaves the
+        // registry the next time anyone lists it. Every reader of the list —
+        // the API, the auto-deploy seeder — therefore sees the same, bounded
+        // set, and nothing grows until restart.
+        self.reap_retired(now, linger_secs);
         let mut list: Vec<_> = self.inner.registry
             .iter()
             .map(|e| e.summary.clone())
@@ -512,8 +617,18 @@ impl Cag {
     }
 
     /// Number of currently registered (not yet removed) squadrons.
+    /// How many squadrons are still working.
+    ///
+    /// Retired entries are excluded. `api/migration.rs` waits on this reaching
+    /// zero before snapshotting, bounded at 15s, so counting the retired
+    /// squadrons that now linger for `squadron_retire_linger_secs` would burn
+    /// that whole deadline for every migration started within ten minutes of
+    /// any market close — a wait for squadrons that have already finished.
     pub fn squadron_count(&self) -> usize {
-        self.inner.registry.len()
+        self.inner.registry
+            .iter()
+            .filter(|e| e.summary.state != SquadronState::StoodDown.to_string())
+            .count()
     }
 
 }
@@ -674,5 +789,241 @@ mod adama_registration_tests {
             !independent.is_cancelled(),
             "an independent token is unreachable — this is why the derived token above matters",
         );
+    }
+}
+
+#[cfg(test)]
+mod retire_and_reap_tests {
+    use super::*;
+
+    fn register(cag: &Cag, id: &str) {
+        cag.register_adama_squadron(
+            id, "0xmarket", "crypto", "Bitcoin Up or Down?",
+            &["price".to_string()], &["gboost".to_string()],
+            CancellationToken::new(),
+        );
+    }
+
+    fn ids(cag: &Cag) -> Vec<SquadronId> {
+        let mut v: Vec<_> = cag.inner.registry.iter().map(|e| e.key().clone()).collect();
+        v.sort();
+        v
+    }
+
+    /// An engine retirement is readable for a while, then gone.
+    ///
+    /// Nothing used to drop a stood-down squadron at all: the registry grew
+    /// until the process restarted, and a Helm squadron that retired the moment
+    /// its intents went terminal sat in the panel's collapsed drawer
+    /// indefinitely. A day of hourly crypto rotation leaves dozens. But dropping
+    /// it the instant it retires is no better — the operator never sees why it
+    /// ended. Hence the linger, and hence both halves asserted here: still
+    /// listed one second before the window closes, gone one second after.
+    #[test]
+    fn a_retired_squadron_lingers_for_its_window_then_is_reaped() {
+        let cag = Cag::new();
+        register(&cag, "helm-open-accept1");
+        cag.retire(&"helm-open-accept1".to_string(), "Helm intents complete");
+
+        let retired_at = cag.inner.registry
+            .get("helm-open-accept1").expect("still registered")
+            .summary.stood_down_at.expect("retire records the time");
+
+        let kept = cag.reap_retired(retired_at + chrono::Duration::seconds(599), 600);
+        assert!(kept.is_empty(), "nothing is reaped before the linger elapses");
+        assert_eq!(ids(&cag), vec!["helm-open-accept1".to_string()],
+                   "the operator can still read why it ended");
+
+        // Exactly at the window. The comparison is `>=`, and asserting only
+        // 599/601 would let a change to `>` pass unnoticed.
+        let at_the_boundary = cag.reap_retired(retired_at + chrono::Duration::seconds(600), 600);
+        assert_eq!(at_the_boundary, vec!["helm-open-accept1".to_string()],
+                   "the linger is inclusive: 600s after a 600s window is elapsed");
+        assert!(ids(&cag).is_empty(), "the registry does not grow until restart");
+    }
+
+    /// A second retirement keeps the first reason and the first clock.
+    ///
+    /// Two paths retire the same squadron. The intl patrol retires itself with
+    /// `market "<name>" <why>`; the deployment tail then retires whatever its
+    /// row produced with "deployment finished: its market closed", because the
+    /// Kalshi and US loops only mark state. Its comment says the second call is
+    /// a no-op — it was not, so the operator always read the generic reason and
+    /// the linger clock restarted, lingering twice as long as configured.
+    #[test]
+    fn retiring_twice_keeps_the_first_reason_and_the_first_clock() {
+        let cag = Cag::new();
+        register(&cag, "btc-open");
+
+        cag.retire(&"btc-open".to_string(), "market \"Bitcoin Up or Down?\" closed on the venue");
+        let first_at = cag.inner.registry.get("btc-open").unwrap().summary.stood_down_at.unwrap();
+
+        cag.retire(&"btc-open".to_string(), "deployment finished: its market closed");
+        let entry = cag.inner.registry.get("btc-open").unwrap();
+        assert_eq!(entry.summary.stood_down_reason.as_deref(),
+                   Some("market \"Bitcoin Up or Down?\" closed on the venue"),
+                   "the precise reason must survive the generic one");
+        assert_eq!(entry.summary.stood_down_at, Some(first_at),
+                   "the clock must not restart, or the linger doubles");
+    }
+
+    /// A squadron marked STOOD_DOWN by a venue path is left alone forever.
+    ///
+    /// `update_state` sets the state and nothing else, and the venue rotation
+    /// loops use it. Reaping on state alone would therefore delete squadrons
+    /// whose retirement the engine never recorded a reason for — and, worse,
+    /// would race the rotation loops that still own those ids. Only an entry
+    /// `retire` stamped is a candidate, which is what the `stood_down_at`
+    /// filter in `reap_retired` is for.
+    #[test]
+    fn a_state_only_stand_down_is_never_reaped() {
+        let cag = Cag::new();
+        register(&cag, "btc-open");
+        cag.update_state(&"btc-open".to_string(), SquadronState::StoodDown);
+
+        let dropped = cag.reap_retired(Utc::now() + chrono::Duration::days(30), 600);
+        assert!(dropped.is_empty(), "no timestamp, no reaping — however old the clock says it is");
+        assert_eq!(ids(&cag), vec!["btc-open".to_string()]);
+    }
+
+    /// Reaping never touches a squadron that is still working, and the state
+    /// filter is what guarantees it.
+    ///
+    /// RTB is the dangerous one. It is an operating phase, not an ending — the
+    /// squadron has stopped opening and is managing open positions to close, and
+    /// it is entered 60s before every market close. Reaping one would drop a
+    /// squadron that still holds money.
+    ///
+    /// The stamp is written straight into the registry here because no public
+    /// path produces a stamped RTB entry any more — `update_state` clears the
+    /// stamps on revival, which is the point of
+    /// `a_revived_squadron_sheds_its_retirement`. Reaching in is deliberate: it
+    /// is the only way to prove the `state == STOOD_DOWN` filter carries its own
+    /// weight rather than being shadowed by the timestamp filter.
+    #[test]
+    fn reaping_leaves_every_working_squadron_where_it_is() {
+        let cag = Cag::new();
+        register(&cag, "btc-open");
+        register(&cag, "sports-open");
+        {
+            let mut entry = cag.inner.registry.get_mut("btc-open").unwrap();
+            entry.summary.state = SquadronState::Rtb.to_string();
+            entry.summary.stood_down_at = Some(Utc::now() - chrono::Duration::days(30));
+        }
+
+        let dropped = cag.reap_retired(Utc::now(), 600);
+        assert!(dropped.is_empty(),
+                "RTB is winding down positions, not ended — however stale the stamp");
+        assert_eq!(ids(&cag), vec!["btc-open".to_string(), "sports-open".to_string()]);
+    }
+
+    /// A squadron that comes back to life sheds its retirement.
+    ///
+    /// Keeping the stamps would show a live squadron the UI's "retired —
+    /// removed shortly" banner, which is keyed on the reason alone. Worse, the
+    /// stale timestamp would make it instantly reapable the moment a venue loop
+    /// marked it STOOD_DOWN again, defeating the rule that a state-only
+    /// stand-down is never reaped.
+    #[test]
+    fn a_revived_squadron_sheds_its_retirement() {
+        let cag = Cag::new();
+        register(&cag, "btc-open");
+        cag.retire(&"btc-open".to_string(), "market closed");
+        cag.update_state(&"btc-open".to_string(), SquadronState::Patrolling);
+
+        {
+            let entry = cag.inner.registry.get("btc-open").unwrap();
+            assert!(entry.summary.stood_down_at.is_none(), "a live squadron is not retired");
+            assert!(entry.summary.stood_down_reason.is_none(), "and shows no retirement banner");
+        }
+
+        // And is therefore safe from reaping once it next stands down.
+        cag.update_state(&"btc-open".to_string(), SquadronState::StoodDown);
+        let dropped = cag.reap_retired(Utc::now() + chrono::Duration::days(30), 600);
+        assert!(dropped.is_empty(), "a state-only stand-down is never reaped, revival or not");
+    }
+
+    /// An operator stand-down removes the squadron; a retirement does not.
+    ///
+    /// The two paths are deliberately different, and conflating them is what
+    /// produced the complaint that started this: the operator stood a squadron
+    /// down and it stayed in the panel. `remove` is for "I removed it, it should
+    /// go"; `retire` is for the engine ending something the operator did not ask
+    /// to end, which is worth a reason and a moment to read it.
+    ///
+    /// This covers the registry primitives only. That `POST
+    /// /api/squadrons/{id}/stand-down` calls `remove` rather than `retire` is
+    /// not asserted here — deleting that call in `api/server.rs` would not fail
+    /// this test, and proving it needs the handler's `AppState`.
+    #[test]
+    fn an_operator_removal_is_immediate_and_a_retirement_is_not() {
+        let cag = Cag::new();
+        register(&cag, "helm-open-operator");
+        register(&cag, "helm-open-engine");
+
+        cag.remove(&"helm-open-operator".to_string());
+        cag.retire(&"helm-open-engine".to_string(), "market closed");
+
+        assert_eq!(ids(&cag), vec!["helm-open-engine".to_string()],
+                   "the operator's squadron leaves at once; the engine's lingers with its reason");
+        let entry = cag.inner.registry.get("helm-open-engine").expect("still listed");
+        assert_eq!(entry.summary.state, "STOOD_DOWN");
+        assert_eq!(entry.summary.stood_down_reason.as_deref(), Some("market closed"),
+                   "the engine's retirement carries the reason the operator will read");
+        assert!(entry.summary.stood_down_at.is_some(), "and the clock the linger runs on");
+    }
+
+    /// A working squadron count must not wait on finished ones.
+    ///
+    /// `api/migration.rs` waits up to 15s for `squadron_count()` to reach zero
+    /// before snapshotting. Retired squadrons now linger for ten minutes, so
+    /// counting them would burn that whole deadline on squadrons that have
+    /// already stopped trading — for any migration started within ten minutes
+    /// of a market close.
+    #[test]
+    fn retired_squadrons_do_not_count_as_working() {
+        let cag = Cag::new();
+        register(&cag, "btc-open");
+        register(&cag, "sports-open");
+        assert_eq!(cag.squadron_count(), 2);
+
+        cag.retire(&"btc-open".to_string(), "market closed");
+        assert_eq!(cag.squadron_count(), 1, "a retired squadron is not still working");
+
+        cag.update_state(&"sports-open".to_string(), SquadronState::Rtb);
+        assert_eq!(cag.squadron_count(), 1,
+                   "but RTB is: it still holds positions, and the backup must wait for it");
+    }
+
+    /// Listing is what does the reaping, so every reader sees the same bounded
+    /// set and nothing needs a timer task.
+    ///
+    /// Both halves are asserted through `list_squadrons_at`, because a test that
+    /// only proves the "keeps" half would pass just as well if `list_squadrons`
+    /// never reaped at all — and one that leaned on the real
+    /// `squadron_retire_linger_secs()` would be passing by accident of the
+    /// default being 600 in every profile.
+    #[test]
+    fn listing_is_what_reaps_and_a_just_retired_squadron_survives_it() {
+        let cag = Cag::new();
+        register(&cag, "helm-open-fresh");
+        register(&cag, "helm-open-stale");
+        cag.retire(&"helm-open-fresh".to_string(), "Helm intents complete");
+        cag.retire(&"helm-open-stale".to_string(), "market closed");
+
+        let fresh_at = cag.inner.registry
+            .get("helm-open-fresh").unwrap().summary.stood_down_at.unwrap();
+
+        // Listing immediately: both are young, both survive with their reasons.
+        let listed = cag.list_squadrons_at(fresh_at, 600);
+        assert_eq!(listed.len(), 2, "a retirement must survive the listing that follows it");
+        let fresh = listed.iter().find(|s| s.id == "helm-open-fresh").expect("listed");
+        assert_eq!(fresh.state, "STOOD_DOWN");
+        assert_eq!(fresh.stood_down_reason.as_deref(), Some("Helm intents complete"));
+
+        // Listing after the window: the list itself is what removes them.
+        let listed = cag.list_squadrons_at(fresh_at + chrono::Duration::seconds(601), 600);
+        assert!(listed.is_empty(), "listing reaps — nothing else is going to");
+        assert!(ids(&cag).is_empty(), "and the registry is bounded, not just the list");
     }
 }

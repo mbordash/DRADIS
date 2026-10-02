@@ -27,6 +27,7 @@ import OpenPositionsCard from '@/components/OpenPositionsCard';
 import SquadronsPanel  from '@/components/SquadronsPanel';
 import SquadronDetailView from '@/components/SquadronDetailView';
 import TradelogPage    from '@/components/TradelogPage';
+import HelmPage        from '@/components/HelmPage';
 import SetupPage       from '@/components/SetupPage';
 import AiActionsPage   from '@/components/AiActionsPage';
 import ConsolePage     from '@/components/ConsolePage';
@@ -441,7 +442,7 @@ function PortfolioValueBanner({
 
 // ── Top-level nav ─────────────────────────────────────────────────────────────
 
-type AppView = 'main' | 'telemetry' | 'tradelog' | 'ai' | 'console' | 'setup';
+type AppView = 'main' | 'telemetry' | 'tradelog' | 'helm' | 'ai' | 'console' | 'setup';
 
 /**
  * The app's location, encoded in the URL hash.
@@ -474,6 +475,11 @@ const VIEW_DEFS: { id: AppView; label: string; icon: string }[] = [
   { id: 'main',      label: 'Main',       icon: '🗺️' },
   { id: 'telemetry', label: 'Telemetry',  icon: '📡' },
   { id: 'tradelog',  label: 'Tradelog',   icon: '📋' },
+  // Beside the Tradelog because they answer adjacent questions: the log says
+  // what executed, Helm says why it was entered. Its own view because an intent
+  // carries a thesis, a stated probability, a falsification condition and a
+  // critique — none of which fit a trade row, and all of which are the point.
+  { id: 'helm',      label: 'Helm',       icon: '🧭' },
   { id: 'ai',        label: 'AI Actions', icon: '🤖' },
   { id: 'console',   label: 'Console',    icon: '🖥️' },
   { id: 'setup',     label: 'Setup',      icon: '⚙️' },
@@ -901,6 +907,18 @@ export default function DashboardPage() {
           {config?.ghost_mode && <GhostBanner ghost />}
           <DarkFeedBanner feeds={status?.dark_market_feeds} />
           <TradelogPage availableAssets={availableAssets} />
+          <Footer />
+        </main>
+      )}
+
+      {/* ── Helm view ──────────────────────────────────────────────────────── */}
+      {activeView === 'helm' && (
+        <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+          {config?.ghost_mode && <GhostBanner ghost />}
+          <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <ErrorBoundary label="Helm">
+            <HelmPage />
+          </ErrorBoundary>
           <Footer />
         </main>
       )}

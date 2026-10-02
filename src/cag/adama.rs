@@ -697,6 +697,11 @@ where
             cancel.clone(),
         ).await.map_err(|e| anyhow::anyhow!("{e}"))?;
 
+        // The deployment row learns which squadron it produced, now that the
+        // id exists. `/api/deployments` answers the operator's "which one is
+        // mine?" from this, and the Helm intent's market lookup is keyed by it.
+        crate::helpers::db::set_deployment_squadron(&dep.id, &squadron_id).await;
+
         // Registered with the SAME token the patrol task selects on, so a
         // stand-down from the Control Tower actually reaches it.
         self.infra.cag.register_adama_squadron(

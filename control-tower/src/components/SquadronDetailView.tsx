@@ -35,6 +35,7 @@ import {
 import ViperCard, { fmtAgo, isTroubled } from '@/components/ViperCard';
 import { AdvancedRow } from '@/components/AdvancedConfigModal';
 import OpenPositionsCard from '@/components/OpenPositionsCard';
+import HelmIntentsPanel from '@/components/HelmIntentsPanel';
 import { useConfirm } from '@/components/ConfirmDialog';
 import { DEMO_MODE } from '@/lib/demo';
 
@@ -459,6 +460,9 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
           marketClass={marketClass}
         />
       </div>
+
+      {/* ── Helm: the operator's intents on this squadron ─────────────────── */}
+      {marketClass === 'helm' && <HelmIntentsPanel squadronId={squadron.id} />}
 
       {/* ── Performance stats for this squadron/asset ─────────────────────── */}
       {(() => {

@@ -22,6 +22,8 @@ import type { SquadronSummary, SquadronState, DeploymentStatus } from '@/lib/typ
 import { marketLabel } from '@/lib/types';
 import { getOpenPositions, getVipersForClass, getSquadronConfig, getDeployments, retryDeployment, dismissDeployment, VIPER_DEFS } from '@/lib/api';
 import DeploySquadronModal from './DeploySquadronModal';
+import TakeTheHelmModal from './TakeTheHelmModal';
+import { HelmLiveLine } from './HelmIntentsPanel';
 
 // ── State badge ───────────────────────────────────────────────────────────────
 
@@ -193,6 +195,11 @@ function SquadronRow({
               🗓 {sq.maker_market_name}
             </p>
           )}
+          {sq.stood_down_reason && (
+            <p className="text-[10px] font-mono text-gray-500 truncate mt-0.5" title={sq.stood_down_reason}>
+              🏁 retired: {sq.stood_down_reason} — this entry is removed shortly
+            </p>
+          )}
         </div>
       </div>
 
@@ -357,6 +364,7 @@ interface Props {
 
 export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick, onDeploySuccess }: Props) {
   const [deployModalOpen, setDeployModalOpen] = useState(false);
+  const [helmModalOpen, setHelmModalOpen] = useState(false);
   // A deploy this panel just made, held until the engine's own queue confirms
   // it. Optimistic on purpose: the API answered success, so the row is true the
   // moment it is shown, and it is retired by real state rather than by a timer.
@@ -494,6 +502,15 @@ export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick, 
               <span>+</span>
               <span>Deploy</span>
             </button>
+            {/* Take the Helm: a sibling of Deploy, because both create a squadron */}
+            <button
+              onClick={() => setHelmModalOpen(true)}
+              className="flex items-center gap-1.5 text-[10px] font-mono bg-teal-500/10 text-teal-300 border border-teal-500/20 rounded px-2 py-1 hover:bg-teal-500/20 transition-colors"
+              title="Enter your own position and have the engine hold the exit"
+            >
+              <span>🧭</span>
+              <span>Take the Helm</span>
+            </button>
           </div>
         </div>
 
@@ -552,6 +569,20 @@ export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick, 
         </>
       )}
     </div>
+
+    {/* One line, and only while an intent is live. The record of resolved
+        intents lives in the Helm view: intents outlive their squadrons — a Helm
+        squadron retires itself once its intents are terminal — so the
+        thesis-versus-outcome record cannot depend on a squadron card existing,
+        but it also does not belong in the middle of the operating view. */}
+    <HelmLiveLine />
+
+    {/* Take the Helm */}
+    <TakeTheHelmModal
+      isOpen={helmModalOpen}
+      onClose={() => setHelmModalOpen(false)}
+      onDone={() => { onDeploySuccess?.(); }}
+    />
 
     {/* Deploy Squadron Modal */}
     <DeploySquadronModal

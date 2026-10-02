@@ -897,6 +897,69 @@ pub const BOOKLINE_MAX_EXPOSURE_USDC: Decimal = dec!(30.0);
 /// whatever probability was paid, so a dozen small bets is a different risk from
 /// one large one.
 pub const BOOKLINE_MAX_OPEN_MARKETS: usize = 3;
+
+// ============================================================================
+// HELM — the operator's own position, with the engine holding the exit
+// ============================================================================
+
+/// Master switch: may Helm act on acknowledged intents at all? Off freezes
+/// every Helm squadron on this instance at "intent acknowledged" without
+/// touching the intents themselves. The intent is the operator's declaration;
+/// this is the engine's kill switch for the one path that spends.
+pub const HELM_ENABLED: bool = true;
+/// May Helm place REAL orders? Ships off. A Helm squadron in Simulation Mode
+/// enters and exits on paper regardless; a live squadron refuses to enter until
+/// the operator turns this on deliberately, in Setup, before taking the helm.
+pub const HELM_LIVE_ENABLED: bool = false;
+/// Ceiling on total Helm notional (entry price × shares) held across EVERY Helm
+/// squadron on this instance. Helm squadrons share one session and one position
+/// map, so the sum is over all of them, not per squadron.
+pub const HELM_MAX_EXPOSURE_USDC: Decimal = dec!(25.0);
+/// Most intents that may be open (not closed or superseded) across every Helm
+/// squadron at once. Two is a conviction; ten is a habit.
+pub const HELM_MAX_OPEN_INTENTS: usize = 2;
+/// Does a fee-dominated verdict REFUSE the entry, or only record itself?
+///
+/// Ships on. Helm went through phase 1 with the verdict recording and nothing
+/// acting on it, and intent #3 of 2026-10-02 shows why that is not enough: a
+/// time-limit posture entered at $0.1500, exited flat at $0.1500, and the whole
+/// $0.238 loss was the venue fee. The operator read the verdict and the trade
+/// happened anyway, because reading it was all the gate did.
+pub const HELM_FEE_VERDICT_ENFORCE: bool = true;
+/// Most of a stated profit target that venue fees may eat.
+///
+/// Applies where a target exists: a take-profit, or the distance to $1.00 for a
+/// hold-to-settlement posture. At 0.40 a trade must keep three fifths of what it
+/// aims for.
+pub const HELM_FEE_MAX_RATIO: Decimal = dec!(0.40);
+/// Most of notional the round trip may cost when the posture names NO price
+/// target — a stop or a time limit alone.
+///
+/// There is no target to take a ratio of in that case, so the round trip is
+/// itself the hurdle the conviction has to clear, and this is the largest hurdle
+/// allowed. `round_trip_fee_pct` is `2 × rate × (1 − p)`, so the binding cases
+/// are cheap longshots: at the 0.07 intl rate a taker round trip is 11.9% of
+/// notional at $0.15 against 1.5% at $0.89. At 0.05 a targetless TAKER entry
+/// below about $0.64 is refused ($0.58 on US at 0.06), and the answer is to name
+/// a take-profit or hold to settlement rather than to raise this. A resting
+/// entry is charged one leg, not two, so its boundary is near $0.29.
+pub const HELM_FEE_MAX_NOTIONAL_PCT: Decimal = dec!(0.05);
+/// How long a working entry may go unfilled before the intent is marked missed
+/// and closed. A taker FAK that misses re-fires inside this window (the venue
+/// sync and phantom cooldown pace it); at the end the intent is closed and the
+/// operator is told.
+pub const HELM_ENTRY_WINDOW_SECS: i64 = 300;
+/// Refuse to enter inside this many seconds of the market's close: a position
+/// opened at the bell can be managed by nothing but settlement.
+pub const HELM_MIN_SECS_TO_CLOSE: i64 = 120;
+/// Hard timeout on the one-shot critique. Past it the intent records
+/// `critique = unavailable` and acknowledgement proceeds; the critique can
+/// advise but it can neither block nor delay.
+pub const HELM_CRITIQUE_TIMEOUT_SECS: u64 = 10;
+/// Resolved intents (closed after holding a position) before any calibration
+/// figure may be shown. Below it the rows are recorded and nothing is
+/// displayed: ten probabilities invite a claim the sample cannot support.
+pub const HELM_CALIBRATION_MIN_RESOLVED: usize = 30;
 /// Edge above consensus for the resting take-profit ask. Settlement is the plan;
 /// this is the bonus when the market will pay the consensus plus an edge early.
 pub const BOOKLINE_RESTING_TP_EDGE: Decimal = dec!(0.03);
@@ -1554,6 +1617,13 @@ pub const KALSHI_SPORTS_GAME_SERIES: &str = "KXNFLGAME,KXNBAGAME,KXMLBGAME,KXNHL
 /// deploy, and is replaced with a fresh market when its own market closes. Turn
 /// this off to stop DRADIS committing capital to the class on its own.
 pub const AUTO_DEPLOY_POLITICS: bool = true;
+
+/// How long a squadron the ENGINE retired — market closed, Helm intents
+/// complete, game over — stays in the Control Tower's list before the CAG
+/// reaps it. Long enough to read why it ended; short enough that a day of
+/// hourly retirements never accumulates. An operator stand-down is a removal
+/// and never waits on this.
+pub const SQUADRON_RETIRE_LINGER_SECS: u64 = 600;
 
 /// Keep a sports squadron running without waiting to be asked.
 /// See [`AUTO_DEPLOY_POLITICS`] — same mechanism, same reasoning.

@@ -389,6 +389,96 @@ export async function deploySquadron(request: DeploySquadronRequest): Promise<De
 }
 
 import type { DeploymentStatus, StandDownResult } from './types';
+import type {
+  HelmIntent, HelmIntentDetail, HelmIntentContent, HelmSummary, CreateHelmIntentRequest,
+} from './types';
+
+// ── Helm: the operator's own position ───────────────────────────────────────
+
+/**
+ * A refusal from the Helm API, with every failing rule when the server named
+ * them (`violations`) and how long to wait when the critique is still pending
+ * (`retryAfterSecs`). The form shows the list, not the first line.
+ */
+export class HelmApiError extends Error {
+  status: number;
+  violations: string[];
+  retryAfterSecs?: number;
+  constructor(status: number, message: string, violations: string[] = [], retryAfterSecs?: number) {
+    super(message);
+    this.status = status;
+    this.violations = violations;
+    this.retryAfterSecs = retryAfterSecs;
+  }
+}
+
+async function helmRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    ...init,
+    headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
+    cache: 'no-store',
+  });
+  if (!res.ok) {
+    let message = `${init?.method ?? 'GET'} ${path} → ${res.status}`;
+    let violations: string[] = [];
+    let retryAfterSecs: number | undefined;
+    try {
+      const body = await res.json() as { error?: string; violations?: string[]; retry_after_secs?: number };
+      if (body.error) message = body.error;
+      if (Array.isArray(body.violations)) violations = body.violations;
+      if (typeof body.retry_after_secs === 'number') retryAfterSecs = body.retry_after_secs;
+    } catch {
+      // A non-JSON body keeps the status line as the message.
+    }
+    throw new HelmApiError(res.status, message, violations, retryAfterSecs);
+  }
+  return res.json() as Promise<T>;
+}
+
+export async function createHelmIntent(req: CreateHelmIntentRequest): Promise<HelmIntent> {
+  return helmRequest<HelmIntent>('/api/helm/intents', { method: 'POST', body: JSON.stringify(req) });
+}
+
+export async function getHelmIntent(id: number): Promise<HelmIntentDetail> {
+  return helmRequest<HelmIntentDetail>(`/api/helm/intents/${id}`);
+}
+
+export async function listHelmIntents(squadronId?: string, includeTerminal = false): Promise<HelmIntent[]> {
+  const params = new URLSearchParams();
+  if (squadronId) params.set('squadron_id', squadronId);
+  if (includeTerminal) params.set('include_terminal', 'true');
+  const q = params.toString();
+  return helmRequest<HelmIntent[]>(`/api/helm/intents${q ? `?${q}` : ''}`);
+}
+
+/** The operator confirms having read the critique (or its unavailability). */
+export async function acknowledgeHelmIntent(id: number): Promise<HelmIntentDetail> {
+  return helmRequest<HelmIntentDetail>(`/api/helm/intents/${id}/acknowledge`, {
+    method: 'POST', body: JSON.stringify({ read_critique: true }),
+  });
+}
+
+export async function cancelHelmIntent(id: number, reason?: string): Promise<HelmIntentDetail> {
+  return helmRequest<HelmIntentDetail>(`/api/helm/intents/${id}/cancel`, {
+    method: 'POST', body: JSON.stringify({ reason: reason ?? null }),
+  });
+}
+
+export async function reviseHelmIntent(id: number, reason: string, content: HelmIntentContent): Promise<HelmIntentDetail> {
+  return helmRequest<HelmIntentDetail>(`/api/helm/intents/${id}/revise`, {
+    method: 'POST', body: JSON.stringify({ reason, ...content }),
+  });
+}
+
+export async function scoreHelmCritique(id: number, outcome: 'named_it' | 'missed_it' | 'no_critique'): Promise<HelmIntentDetail> {
+  return helmRequest<HelmIntentDetail>(`/api/helm/intents/${id}/critique-outcome`, {
+    method: 'POST', body: JSON.stringify({ outcome }),
+  });
+}
+
+export async function getHelmSummary(): Promise<HelmSummary> {
+  return helmRequest<HelmSummary>('/api/helm/summary');
+}
 
 /// Stop one squadron without stopping the engine.
 ///
@@ -514,6 +604,14 @@ export const VIPER_DEFS: ViperDef[] = [
     statusKey: 'bookline',
     strategyName: 'BooklineStrategy',
     description: 'Sports moneylines, maker-first: rests a bid under the bookmaker consensus and holds to fee-free settlement. Simulated lane — it keeps its own books and places no venue order',
+  },
+  {
+    name: 'Helm',
+    enableKey: 'helm_enabled',
+    accentColor: 'teal',
+    statusKey: 'helm',
+    strategyName: 'HelmStrategy',
+    description: 'The operator\'s own position: an acknowledged intent is entered and its stated exit posture (stop, take-profit, time limit, hold-to-settlement, catastrophic floor) is enforced by the engine. Real orders are gated separately by Live Orders',
   },
 ];
 

@@ -27,6 +27,9 @@ const MARKET_TYPE_CONFIG: Record<MarketType, { icon: string; label: string; colo
   sports:   { icon: '🏈', label: 'Sports',   color: 'emerald' },
   politics: { icon: '🗳️', label: 'Politics', color: 'blue' },
   crypto:   { icon: '🪙', label: 'Crypto',   color: 'orange' },
+  // Not offered here: a Helm squadron is created by "Take the Helm", a
+  // sibling of this modal. Listed so the record stays total over MarketType.
+  helm:     { icon: '🧭', label: 'Helm',     color: 'teal' },
 };
 
 // ── Market Type Selector ──────────────────────────────────────────────────────
@@ -140,14 +143,16 @@ function QuickDeployPreview({ marketType, raptors, vipers, loading }: QuickPrevi
 
 // ── Manual Mode: Market Browser ───────────────────────────────────────────────
 
-interface MarketBrowserProps {
+export interface MarketBrowserProps {
   markets: AvailableMarket[];
   selected: string | null;
   onSelect: (conditionId: string) => void;
   loading: boolean;
 }
 
-function MarketBrowser({ markets, selected, onSelect, loading }: MarketBrowserProps) {
+/** The market picker. Exported because "Take the Helm" reuses it: both flows
+ *  create a squadron on a chosen market, and the browser is the shared part. */
+export function MarketBrowser({ markets, selected, onSelect, loading }: MarketBrowserProps) {
   if (loading) {
     return (
       <div className="bg-[#0a0a14] rounded-lg border border-[#1e1e32] p-4">

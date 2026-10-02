@@ -1875,8 +1875,21 @@ mod tests {
             // own copies of the Bookline parameters (every `bookline_board_*`
             // key) are excluded for the same reason: what an operator is
             // trying against the whole board is not risk appetite.
+            //
+            // `helm_live_enabled` is absent for the `ghost_mode` reason exactly:
+            // it decides whether the operator's own Helm intents place real
+            // orders, ships off, and is turned on deliberately. A profile
+            // switch must never arm it. The other Helm knobs (its kill switch,
+            // exposure cap, open-intent limit, windows) are risk appetite and
+            // are in every profile.
+            // A risk profile may set how strict a gate is. It may never turn a
+            // gate OFF: applying "aggressive" must not silently disable a safety
+            // check, which is why `helm_live_enabled` and
+            // `helm_fee_verdict_enforce` are here while the two fee ceilings
+            // they govern are profile-settable like any other risk dial.
             const NOT_IN_PROFILES: &[&str] = &[
-                "ghost_mode", "collateral_sweep_enabled",
+                "ghost_mode", "collateral_sweep_enabled", "helm_live_enabled",
+                "helm_fee_verdict_enforce",
                 "sports_ledger_enabled", "sports_ledger_leagues", "sports_ledger_snapshot_offsets_mins",
                 "sports_ledger_credit_reserve", "sports_ledger_quota_reset_day",
             ];

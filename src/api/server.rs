@@ -1646,7 +1646,7 @@ async fn get_position_quotes(State(s): State<ApiState>, Query(q): Query<AssetQue
 /// caller is an operator deciding whether to sell: an invented number is worse
 /// than a blank.
 #[cfg(feature = "intl_clob")]
-async fn fetch_side_price(
+pub(crate) async fn fetch_side_price(
     session: &crate::cag::session::SessionState,
     token: U256,
     side: Side,
@@ -2844,7 +2844,14 @@ async fn stand_down_squadron(
     if !s.cag.stand_down(&id) {
         return (StatusCode::NOT_FOUND, format!("squadron '{}' not found", id)).into_response();
     }
-    s.cag.update_state(&id, crate::squadron::SquadronState::StoodDown);
+    // The operator removed it, so it leaves the list now. It used to be
+    // marked STOOD_DOWN and kept, and nothing ever reaped it: the list grew
+    // until restart and a squadron the operator had just stopped sat in the
+    // drawer indefinitely. Engine retirements take the other path
+    // (`Cag::retire`) and linger with their reason before being reaped. The
+    // patrol task, which observes the cancel token on its own schedule, finds
+    // no entry to update and finishes quietly.
+    s.cag.remove(&id);
 
     let message = match &disabled {
         Some(f) => format!("Squadron {id} standing down. {f} switched off so it is not redeployed automatically."),

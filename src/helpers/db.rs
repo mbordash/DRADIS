@@ -3084,6 +3084,14 @@ pub async fn fetch_pending_deployments() -> Vec<PendingDeployment> {
 }
 
 /// Update deployment status in the queue.
+///
+/// `squadron_id` is set when given and **kept** when `None`. It used to be
+/// overwritten with whatever was passed, and every caller passed `None`, so
+/// the column was null on all 39 rows production had ever written — including
+/// deployments that had reached `completed` — while the Take-the-Helm modal
+/// polled it and hung. The runner that spawns the squadron records the id
+/// (`set_deployment_squadron`); the processor's own status writes must not
+/// erase it. `error` keeps its old semantics: each status write replaces it.
 pub async fn update_deployment_status(
     deployment_id: &str,
     status: &str,
@@ -3093,10 +3101,20 @@ pub async fn update_deployment_status(
     let Some(pool) = pool() else {
         return Err(anyhow::anyhow!("DB pool not initialized"));
     };
-    
+    update_deployment_status_in(pool, deployment_id, status, squadron_id, error).await
+}
+
+/// `update_deployment_status` against an explicit pool, for tests.
+pub async fn update_deployment_status_in(
+    pool: &SqlitePool,
+    deployment_id: &str,
+    status: &str,
+    squadron_id: Option<&str>,
+    error: Option<&str>,
+) -> Result<()> {
     sqlx::query(
         "UPDATE deployment_queue
-         SET status = ?, squadron_id = ?, error = ?, updated_at = datetime('now')
+         SET status = ?, squadron_id = COALESCE(?, squadron_id), error = ?, updated_at = datetime('now')
          WHERE id = ?"
     )
     .bind(status)
@@ -3104,9 +3122,49 @@ pub async fn update_deployment_status(
     .bind(error)
     .bind(deployment_id)
     .execute(pool).await?;
-    
+
     info!(deployment_id, status, "📋 Deployment status updated");
     Ok(())
+}
+
+/// Record which squadron a deployment produced, the moment the runner knows
+/// its id. Every `DeploymentRunner` calls this at spawn (a test in
+/// `venues::deployment` pins that), so `/api/deployments` can answer "which
+/// squadron is mine?" — the question the Take-the-Helm modal polls on — and
+/// so anything keyed by squadron id (the Helm intent's market id lookup) finds
+/// its row.
+pub async fn set_deployment_squadron(deployment_id: &str, squadron_id: &str) {
+    let Some(pool) = pool() else {
+        warn!("📋 Deployment {deployment_id}: no DB pool, squadron id {squadron_id} not recorded");
+        return;
+    };
+    if let Err(e) = set_deployment_squadron_in(pool, deployment_id, squadron_id).await {
+        warn!("📋 Deployment {deployment_id}: could not record squadron id {squadron_id}: {e}");
+    }
+}
+
+/// `set_deployment_squadron` against an explicit pool, for tests.
+pub async fn set_deployment_squadron_in(pool: &SqlitePool, deployment_id: &str, squadron_id: &str) -> Result<()> {
+    sqlx::query("UPDATE deployment_queue SET squadron_id = ?, updated_at = datetime('now') WHERE id = ?")
+        .bind(squadron_id)
+        .bind(deployment_id)
+        .execute(pool).await?;
+    info!(deployment_id, squadron_id, "📋 Deployment produced squadron");
+    Ok(())
+}
+
+/// `deployment_squadron_in` against the global pool.
+pub async fn deployment_squadron(deployment_id: &str) -> Option<String> {
+    let pool = pool()?;
+    deployment_squadron_in(pool, deployment_id).await
+}
+
+/// The squadron a deployment produced, if the runner has recorded it yet.
+pub async fn deployment_squadron_in(pool: &SqlitePool, deployment_id: &str) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>("SELECT squadron_id FROM deployment_queue WHERE id = ?")
+        .bind(deployment_id)
+        .fetch_optional(pool).await.ok().flatten().flatten()
+        .filter(|s| !s.is_empty())
 }
 
 /// Fetch all deployments from the queue (for status endpoint).
@@ -4553,6 +4611,11 @@ pub struct TradeRow {
     /// Total venue fees for the round trip. `pnl` is already net of this;
     /// `pnl + fees` recovers the gross figure. `None` on pre-fee rows.
     pub fees: Option<String>,
+    /// The Helm intent this trade belongs to, for the Tradelog's link into the
+    /// Helm view. `None` for every other viper: the log says what executed,
+    /// and only a Helm trade has a recorded reason for being entered at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4758,7 +4821,7 @@ pub async fn get_trade_stats_for(pool: &SqlitePool, ghost: bool) -> TradeStatsRo
 pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
     match sqlx::query(
         "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason,
-                venue, market_class, underlying, fees, ghost
+                venue, market_class, underlying, fees, ghost, intent_id
          FROM trades ORDER BY ts DESC LIMIT ?"
     )
     .bind(limit)
@@ -4779,6 +4842,7 @@ pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
             underlying:   r.try_get::<Option<String>, _>(11).ok().flatten(),
             fees:         r.try_get::<Option<String>, _>(12).ok().flatten(),
             ghost:        r.try_get::<i64, _>(13).map(|v| v != 0).unwrap_or(false),
+            intent_id:    r.try_get::<Option<i64>, _>(14).ok().flatten(),
         })).collect(),
         Err(e) => { error!("❌ DB get_recent_trades failed: {}", e); vec![] }
     }
@@ -4802,7 +4866,7 @@ pub async fn get_trade_stats(pool: &SqlitePool) -> TradeStatsRow {
 pub async fn get_all_trades(pool: &SqlitePool) -> Vec<TradeRow> {
     match sqlx::query(
         "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason,
-                venue, market_class, underlying, fees, ghost
+                venue, market_class, underlying, fees, ghost, intent_id
          FROM trades ORDER BY ts ASC"
     )
     .fetch_all(pool)
@@ -4822,6 +4886,7 @@ pub async fn get_all_trades(pool: &SqlitePool) -> Vec<TradeRow> {
             underlying:   r.try_get::<Option<String>, _>(11).ok().flatten(),
             fees:         r.try_get::<Option<String>, _>(12).ok().flatten(),
             ghost:        r.try_get::<i64, _>(13).map(|v| v != 0).unwrap_or(false),
+            intent_id:    r.try_get::<Option<i64>, _>(14).ok().flatten(),
         })).collect(),
         Err(e) => { error!("❌ DB get_all_trades failed: {}", e); vec![] }
     }
@@ -4938,7 +5003,7 @@ pub async fn get_session_trades(pool: &SqlitePool) -> Vec<TradeRow> {
     let sid = current_session_id();
     match sqlx::query(
         "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason,
-                venue, market_class, underlying, fees, ghost
+                venue, market_class, underlying, fees, ghost, intent_id
          FROM trades WHERE session_id = ? ORDER BY ts DESC"
     )
     .bind(sid)
@@ -4959,6 +5024,7 @@ pub async fn get_session_trades(pool: &SqlitePool) -> Vec<TradeRow> {
             underlying:   r.try_get::<Option<String>, _>(11).ok().flatten(),
             fees:         r.try_get::<Option<String>, _>(12).ok().flatten(),
             ghost:        r.try_get::<i64, _>(13).map(|v| v != 0).unwrap_or(false),
+            intent_id:    r.try_get::<Option<i64>, _>(14).ok().flatten(),
         })).collect(),
         Err(e) => { error!("❌ DB get_session_trades failed: {}", e); vec![] }
     }
@@ -4975,7 +5041,7 @@ pub async fn get_previous_session_trades(pool: &SqlitePool, limit: i64) -> Vec<T
     let sid = current_session_id();
     match sqlx::query(
         "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason,
-                venue, market_class, underlying, fees, ghost
+                venue, market_class, underlying, fees, ghost, intent_id
          FROM trades
          WHERE (session_id IS NULL OR session_id != ?)
          ORDER BY ts DESC LIMIT ?"
@@ -4999,6 +5065,7 @@ pub async fn get_previous_session_trades(pool: &SqlitePool, limit: i64) -> Vec<T
             underlying:   r.try_get::<Option<String>, _>(11).ok().flatten(),
             fees:         r.try_get::<Option<String>, _>(12).ok().flatten(),
             ghost:        r.try_get::<i64, _>(13).map(|v| v != 0).unwrap_or(false),
+            intent_id:    r.try_get::<Option<i64>, _>(14).ok().flatten(),
         })).collect(),
         Err(e) => { error!("❌ DB get_previous_session_trades failed: {}", e); vec![] }
     }
@@ -6832,6 +6899,34 @@ mod deployment_requeue_tests {
         // back would redeploy a market the operator already finished with.
         assert_eq!(status_of(&pool, "d-completed").await, "completed");
         assert_eq!(status_of(&pool, "d-failed").await, "failed");
+    }
+
+    /// A completed deployment carries the id of the squadron it produced.
+    ///
+    /// The runner records the id at spawn; the processor then writes `active`
+    /// and, when the patrol ends, `completed`, both with no squadron id of
+    /// their own. Those writes used to null the column — every row production
+    /// ever wrote had `squadron_id IS NULL` — so the modal polling for it hung
+    /// on a squadron that was up the whole time.
+    #[tokio::test]
+    async fn a_completed_deployment_keeps_the_squadron_it_produced() {
+        let pool = pool_with_queue().await;
+        insert(&pool, "d-helm", "pending").await;
+        update_deployment_status_in(&pool, "d-helm", "processing", None, None).await.unwrap();
+        assert_eq!(deployment_squadron_in(&pool, "d-helm").await, None, "not spawned yet");
+
+        set_deployment_squadron_in(&pool, "d-helm", "helm-open-accept1").await.unwrap();
+        update_deployment_status_in(&pool, "d-helm", "active", None, None).await.unwrap();
+        assert_eq!(deployment_squadron_in(&pool, "d-helm").await.as_deref(), Some("helm-open-accept1"));
+
+        update_deployment_status_in(&pool, "d-helm", "completed", None, None).await.unwrap();
+        assert_eq!(status_of(&pool, "d-helm").await, "completed");
+        assert_eq!(deployment_squadron_in(&pool, "d-helm").await.as_deref(), Some("helm-open-accept1"),
+            "the completed write must not erase the id");
+
+        // An explicit id on a status write still lands.
+        update_deployment_status_in(&pool, "d-helm", "completed", Some("helm-open-renamed"), None).await.unwrap();
+        assert_eq!(deployment_squadron_in(&pool, "d-helm").await.as_deref(), Some("helm-open-renamed"));
     }
 }
 

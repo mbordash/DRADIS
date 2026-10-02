@@ -54,6 +54,8 @@ interface LogEntry {
   pnl:       number | null; // realized for completed; unrealized for open
   reason:    string;
   ghost:     boolean;
+  /** Set only on Helm trades; links the row to the conviction behind it. */
+  intentId?: number | null;
   chainAdopted: boolean;
   tokenId?:  string;        // for RTB on open positions
   rawPosition?: OpenPositionRow; // kept for RTB modal
@@ -187,6 +189,7 @@ function assetToEntries(
       // that looked entirely real. Rows written before the column existed report
       // false, which is what they already displayed.
       ghost:      t.ghost ?? false,
+      intentId:   t.intent_id ?? null,
       chainAdopted: false,
     });
   }
@@ -885,6 +888,17 @@ export default function TradelogPage({ availableAssets }: Props) {
                           <span className="text-amber-400 opacity-70">👻 ghost</span>
                         ) : (
                           <span className="text-green-400 opacity-70">⚡ live</span>
+                        )}
+                        {/* The log says what executed; the intent says why it was
+                            entered. Only Helm records that, so only Helm rows link. */}
+                        {e.intentId != null && (
+                          <a
+                            href="#helm"
+                            title={`Helm intent #${e.intentId} — the thesis, the critique and how it resolved`}
+                            className="block text-[10px] font-mono text-teal-400/80 hover:text-teal-300 mt-0.5"
+                          >
+                            🧭 intent #{e.intentId} →
+                          </a>
                         )}
                       </td>
 

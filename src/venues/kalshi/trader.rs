@@ -497,6 +497,7 @@ pub async fn run_kalshi_trader(
             None,
             Some(&mut last_rotation_squadron),
             &tennis_rx,
+            None,
         ).await;
         market_cancel.cancel();
 
@@ -607,6 +608,7 @@ impl crate::venues::deployment::DeploymentRunner for KalshiDeploymentRunner {
             name,
             None,
             &self.tennis_rx,
+            Some(dep.id.as_str()),
         ).await;
         info!("📋 Deployed {class} squadron finished: {outcome:?}");
         Ok(())
@@ -913,6 +915,10 @@ async fn trade_one_market(
     // deployments, which do not rotate.
     last_rotation_squadron: Option<&mut Option<String>>,
     tennis_rx: &watch::Receiver<TennisSnapshot>,
+    // The `deployment_queue` row this market was deployed from, so the row can
+    // learn which squadron it produced. `None` for the rotation loop, which
+    // nobody queued.
+    deployment_id: Option<&str>,
 ) -> MarketOutcome {
     let asset = KALSHI_ASSET;
     let pair = selection.primary;
@@ -937,6 +943,9 @@ async fn trade_one_market(
     // ── Register the squadron so the Control Tower lists it ─────────────────
     let squadron = register_kalshi_squadron(cag, &pair, &raptors, deployed_as, squadron_name, tennis_rx, cancel);
     let squadron_id = squadron.id.clone();
+    if let Some(dep_id) = deployment_id {
+        crate::helpers::db::set_deployment_squadron(dep_id, &squadron_id).await;
+    }
     // Previous tick's ghost mode, so the registry is swept on the LIVE edge rather
     // than on every live tick: a level-triggered clear takes the registry's global
     // lock and walks the whole map on each pass to do nothing. Starts true so a
@@ -1684,7 +1693,11 @@ async fn dispatch_signal(
                     market: p.token_id.clone(),
                     filled: p.shares,
                     price: p.price,
-                    fee: Decimal::ZERO,
+// A simulated taker pays what a real one pays. This was ZERO, so every
+                    // ghost taker entry cost one leg instead of two and ghost P&L was
+                    // optimistic against live by the entry fee. A post-only order is exempt:
+                    // the CLOB charges the taker, so a resting quote pays nothing to open.
+                    fee: if p.post_only { Decimal::ZERO } else { crate::venues::taker_fee_per_share(p.price) * p.shares },
                 };
                 let (ga, gb) = (ghost_of(params), ghost_of(pp));
                 record_guard(squadron_id, positions, strategy_name, params, Some(&pp.token_id), &ga).await;
@@ -1925,7 +1938,11 @@ async fn dispatch_single(
             market: params.token_id.clone(),
             filled: params.shares,
             price: params.price,
-            fee: Decimal::ZERO,
+// A simulated taker pays what a real one pays. This was ZERO, so every
+            // ghost taker entry cost one leg instead of two and ghost P&L was
+            // optimistic against live by the entry fee. A post-only order is exempt:
+            // the CLOB charges the taker, so a resting quote pays nothing to open.
+            fee: if params.post_only { Decimal::ZERO } else { crate::venues::taker_fee_per_share(params.price) * params.shares },
         };
         if matches!(side, Side::Buy) {
             record_guard(squadron_id, positions, strategy_name, params, None, &ghost).await;

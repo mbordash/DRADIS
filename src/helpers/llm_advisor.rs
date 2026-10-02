@@ -375,19 +375,45 @@ impl LlmProvider {
         }
     }
 
+    /// The advisor's own call: its system prompt, the caller's user prompt.
     async fn chat(&self, client: &Client, user_prompt: &str) -> anyhow::Result<LlmReply> {
+        self.chat_with_system(client, &system_prompt(), user_prompt).await
+    }
+
+    /// One call with an explicit system prompt. The advisor loop passes its
+    /// own; the Helm critique passes a different one, because the advisor's
+    /// instructs the model to propose config changes and a critique must not.
+    async fn chat_with_system(&self, client: &Client, system: &str, user_prompt: &str) -> anyhow::Result<LlmReply> {
         match self {
             Self::Ollama { base_url, model } => {
-                call_ollama(client, base_url, model, user_prompt).await
+                call_ollama(client, base_url, model, system, user_prompt).await
             }
             Self::OpenAiCompatible { base_url, api_key, model } => {
-                call_openai_compatible(client, base_url, api_key, model, user_prompt).await
+                call_openai_compatible(client, base_url, api_key, model, system, user_prompt).await
             }
             Self::Anthropic { base_url, api_key, model } => {
-                call_anthropic(client, base_url, api_key, model, user_prompt).await
+                call_anthropic(client, base_url, api_key, model, system, user_prompt).await
             }
         }
     }
+}
+
+/// One inference call with its own system prompt, on the provider the
+/// environment configures, returning the reply text and a `provider/model`
+/// label. No timeout of its own beyond the connection timeout: the caller
+/// bounds it (`tokio::time::timeout`) and decides what an overrun means.
+/// Refuses before any network call when the advisor is switched off, so a
+/// disabled advisor is never contacted on the operator's behalf.
+pub async fn one_shot(system: &str, user_prompt: &str) -> anyhow::Result<(String, String)> {
+    if !advisor_enabled_setting() {
+        anyhow::bail!("LLM advisor is disabled (ENABLE_LLM_ADVISOR)");
+    }
+    let provider = LlmProvider::from_env()?;
+    let client = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    let reply = provider.chat_with_system(&client, system, user_prompt).await?;
+    Ok((reply.content, format!("{}/{}", provider.name(), provider.model())))
 }
 
 fn require_api_key(provider: &str) -> anyhow::Result<String> {
@@ -773,6 +799,7 @@ fn viper_key_prefix(strategy: &str) -> &'static str {
         "trendreversal" | "trendcapture" => "trendcapture",
         "fairvalue" => "fairvalue",
         "convergence" => "convergence",
+        "helm" => "helm",
         _ => "",
     }
 }
@@ -1343,6 +1370,7 @@ async fn call_ollama(
     client: &Client,
     ollama_base_url: &str,
     model: &str,
+    system: &str,
     user_prompt: &str,
 ) -> anyhow::Result<LlmReply> {
     let url = format!("{}/api/chat", ollama_base_url.trim_end_matches('/'));
@@ -1352,7 +1380,7 @@ async fn call_ollama(
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
-                content: system_prompt(),
+                content: system.to_string(),
             },
             ChatMessage {
                 role: "user".to_string(),
@@ -1397,6 +1425,7 @@ async fn call_openai_compatible(
     base_url: &str,
     api_key: &str,
     model: &str,
+    system: &str,
     user_prompt: &str,
 ) -> anyhow::Result<LlmReply> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
@@ -1404,7 +1433,7 @@ async fn call_openai_compatible(
     let request = OpenAiRequest {
         model: model.to_string(),
         messages: vec![
-            ChatMessage { role: "system".to_string(), content: system_prompt() },
+            ChatMessage { role: "system".to_string(), content: system.to_string() },
             ChatMessage { role: "user".to_string(), content: user_prompt.to_string() },
         ],
         max_tokens: max_output_tokens(),
@@ -1442,6 +1471,7 @@ async fn call_anthropic(
     base_url: &str,
     api_key: &str,
     model: &str,
+    system: &str,
     user_prompt: &str,
 ) -> anyhow::Result<LlmReply> {
     let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
@@ -1455,7 +1485,7 @@ async fn call_anthropic(
         // One breakpoint, on the only block that is byte-identical every call.
         system: vec![AnthropicSystemBlock {
             kind: "text",
-            text: system_prompt(),
+            text: system.to_string(),
             cache_control: Some(AnthropicCacheControl { kind: "ephemeral" }),
         }],
         messages: vec![ChatMessage { role: "user".to_string(), content: user_prompt.to_string() }],

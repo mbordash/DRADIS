@@ -109,6 +109,15 @@ pub fn ghosting_now() -> bool {
     global_config_tx().map(|tx| tx.borrow().ghost_mode).unwrap_or(false)
 }
 
+/// How long an engine-retired squadron stays listed before the CAG reaps it.
+/// Read outside any tick (the registry reaps when listed), so it comes off the
+/// global watch; the compile-time default applies until the channel is up.
+pub fn squadron_retire_linger_secs() -> u64 {
+    global_config_tx()
+        .map(|tx| tx.borrow().squadron_retire_linger_secs)
+        .unwrap_or(crate::config::SQUADRON_RETIRE_LINGER_SECS)
+}
+
 /// Should the intl order-book feed fold `price_change` updates into its local
 /// book between full snapshots (B36)? Read by the per-token WebSocket tasks on
 /// every `price_change`, so flipping the Control Tower knob takes effect on
@@ -264,6 +273,17 @@ fn default_bookline_pull_on_adverse_drift() -> Decimal { config::BOOKLINE_PULL_O
 fn default_bookline_pull_before_start_secs() -> i64 { config::BOOKLINE_PULL_BEFORE_START_SECS }
 fn default_bookline_trade_size_usdc() -> Decimal { config::BOOKLINE_TRADE_SIZE_USDC }
 fn default_bookline_max_exposure_usdc() -> Decimal { config::BOOKLINE_MAX_EXPOSURE_USDC }
+fn default_helm_enabled() -> bool { config::HELM_ENABLED }
+fn default_helm_live_enabled() -> bool { config::HELM_LIVE_ENABLED }
+fn default_helm_max_exposure_usdc() -> Decimal { config::HELM_MAX_EXPOSURE_USDC }
+fn default_helm_fee_verdict_enforce()   -> bool    { config::HELM_FEE_VERDICT_ENFORCE }
+fn default_helm_fee_max_ratio()         -> Decimal { config::HELM_FEE_MAX_RATIO }
+fn default_helm_fee_max_notional_pct()  -> Decimal { config::HELM_FEE_MAX_NOTIONAL_PCT }
+fn default_helm_max_open_intents() -> usize { config::HELM_MAX_OPEN_INTENTS }
+fn default_helm_entry_window_secs() -> i64 { config::HELM_ENTRY_WINDOW_SECS }
+fn default_helm_min_secs_to_close() -> i64 { config::HELM_MIN_SECS_TO_CLOSE }
+fn default_helm_critique_timeout_secs() -> u64 { config::HELM_CRITIQUE_TIMEOUT_SECS }
+fn default_helm_calibration_min_resolved() -> usize { config::HELM_CALIBRATION_MIN_RESOLVED }
 fn default_bookline_max_open_markets() -> usize { config::BOOKLINE_MAX_OPEN_MARKETS }
 fn default_bookline_resting_tp_edge() -> Decimal { config::BOOKLINE_RESTING_TP_EDGE }
 fn default_bookline_board_lane_enabled() -> bool { config::BOOKLINE_BOARD_LANE_ENABLED }
@@ -291,6 +311,7 @@ fn default_tennis_tour()                    -> String  { config::TENNIS_TOUR.to_
 fn default_deploy_max_days_to_close()       -> u32     { config::DEPLOY_MAX_DAYS_TO_CLOSE             }
 fn default_llm_max_output_tokens()          -> u32     { config::LLM_MAX_OUTPUT_TOKENS                }
 fn default_auto_deploy_politics()           -> bool    { config::AUTO_DEPLOY_POLITICS                 }
+fn default_squadron_retire_linger_secs()    -> u64     { config::SQUADRON_RETIRE_LINGER_SECS          }
 fn default_auto_deploy_sports()             -> bool    { config::AUTO_DEPLOY_SPORTS                   }
 fn default_kalshi_sports_game_series()      -> String  { config::KALSHI_SPORTS_GAME_SERIES.to_string() }
 fn default_event_market_retire_grace_secs() -> i64     { config::EVENT_MARKET_RETIRE_GRACE_SECS       }
@@ -672,6 +693,10 @@ pub struct DynamicConfig {
     /// Keep a politics squadron running without waiting for an operator deploy.
     #[serde(default = "default_auto_deploy_politics")]
     pub auto_deploy_politics:          bool,
+    /// Seconds an engine-retired squadron stays in the CAG list before it is
+    /// reaped. Operator stand-downs are removed at once and never wait on this.
+    #[serde(default = "default_squadron_retire_linger_secs")]
+    pub squadron_retire_linger_secs:   u64,
     /// Keep a sports squadron running without waiting for an operator deploy.
     #[serde(default = "default_auto_deploy_sports")]
     pub auto_deploy_sports:            bool,
@@ -1222,6 +1247,44 @@ pub struct DynamicConfig {
     pub bookline_trade_size_usdc: Decimal,
     #[serde(default = "default_bookline_max_exposure_usdc")]
     pub bookline_max_exposure_usdc: Decimal,
+
+    // ── Helm: the operator's own position ───────────────────────────────────
+    /// Kill switch for the path that spends: off freezes every Helm squadron at
+    /// "intent acknowledged". The intents themselves are untouched.
+    #[serde(default = "default_helm_enabled")]
+    pub helm_enabled: bool,
+    /// May Helm place REAL orders? Ships off; simulated squadrons ignore it.
+    #[serde(default = "default_helm_live_enabled")]
+    pub helm_live_enabled: bool,
+    /// Ceiling on total Helm notional across every Helm squadron (shared session).
+    #[serde(default = "default_helm_max_exposure_usdc")]
+    pub helm_max_exposure_usdc: Decimal,
+    /// Most open (non-terminal) intents across every Helm squadron at once.
+    #[serde(default = "default_helm_max_open_intents")]
+    pub helm_max_open_intents: usize,
+    /// Does a fee-dominated verdict refuse the entry, or only record itself?
+    #[serde(default = "default_helm_fee_verdict_enforce")]
+    pub helm_fee_verdict_enforce: bool,
+    /// Most of a stated profit target that venue fees may eat.
+    #[serde(default = "default_helm_fee_max_ratio")]
+    pub helm_fee_max_ratio: Decimal,
+    /// Most of notional the round trip may cost when the posture names no
+    /// price target, where there is no target to take a ratio of.
+    #[serde(default = "default_helm_fee_max_notional_pct")]
+    pub helm_fee_max_notional_pct: Decimal,
+    /// Seconds a working entry may go unfilled before the intent is closed as missed.
+    #[serde(default = "default_helm_entry_window_secs")]
+    pub helm_entry_window_secs: i64,
+    /// No Helm entry inside this many seconds of the market's close.
+    #[serde(default = "default_helm_min_secs_to_close")]
+    pub helm_min_secs_to_close: i64,
+    /// Hard timeout on the one-shot critique; past it the intent records
+    /// `unavailable` and acknowledgement proceeds.
+    #[serde(default = "default_helm_critique_timeout_secs")]
+    pub helm_critique_timeout_secs: u64,
+    /// Resolved intents before a calibration figure may be shown.
+    #[serde(default = "default_helm_calibration_min_resolved")]
+    pub helm_calibration_min_resolved: usize,
     #[serde(default = "default_bookline_max_open_markets")]
     pub bookline_max_open_markets: usize,
     #[serde(default = "default_bookline_resting_tp_edge")]
@@ -1391,6 +1454,7 @@ impl Default for DynamicConfig {
             maker_quote_size_usdc:    config::MAKER_QUOTE_SIZE_USDC,
             deploy_max_days_to_close:      config::DEPLOY_MAX_DAYS_TO_CLOSE,
             auto_deploy_politics:          config::AUTO_DEPLOY_POLITICS,
+            squadron_retire_linger_secs:   config::SQUADRON_RETIRE_LINGER_SECS,
             auto_deploy_sports:            config::AUTO_DEPLOY_SPORTS,
             kalshi_sports_game_series:     config::KALSHI_SPORTS_GAME_SERIES.to_string(),
             event_market_retire_grace_secs: config::EVENT_MARKET_RETIRE_GRACE_SECS,
@@ -1555,6 +1619,17 @@ impl Default for DynamicConfig {
             bookline_pull_before_start_secs: config::BOOKLINE_PULL_BEFORE_START_SECS,
             bookline_trade_size_usdc: config::BOOKLINE_TRADE_SIZE_USDC,
             bookline_max_exposure_usdc: config::BOOKLINE_MAX_EXPOSURE_USDC,
+            helm_enabled: config::HELM_ENABLED,
+            helm_live_enabled: config::HELM_LIVE_ENABLED,
+            helm_max_exposure_usdc: config::HELM_MAX_EXPOSURE_USDC,
+            helm_fee_verdict_enforce: config::HELM_FEE_VERDICT_ENFORCE,
+            helm_fee_max_ratio: config::HELM_FEE_MAX_RATIO,
+            helm_fee_max_notional_pct: config::HELM_FEE_MAX_NOTIONAL_PCT,
+            helm_max_open_intents: config::HELM_MAX_OPEN_INTENTS,
+            helm_entry_window_secs: config::HELM_ENTRY_WINDOW_SECS,
+            helm_min_secs_to_close: config::HELM_MIN_SECS_TO_CLOSE,
+            helm_critique_timeout_secs: config::HELM_CRITIQUE_TIMEOUT_SECS,
+            helm_calibration_min_resolved: config::HELM_CALIBRATION_MIN_RESOLVED,
             bookline_max_open_markets: config::BOOKLINE_MAX_OPEN_MARKETS,
             bookline_resting_tp_edge: config::BOOKLINE_RESTING_TP_EDGE,
             bookline_board_lane_enabled: config::BOOKLINE_BOARD_LANE_ENABLED,
@@ -1737,10 +1812,10 @@ impl DynamicConfig {
             "fairvalue"    => self.enable_fairvalue,
             "trendcapture" => self.enable_trendcapture,
             "bookline"     => self.bookline_enabled,
-            // Helm has no enable switch: the operator's intent is its switch,
-            // and a squadron with no intent reports "awaiting operator intent"
-            // rather than "disabled in config".
-            "helm"         => true,
+            // The engine's kill switch for the one path that spends; the intent
+            // is still the operator's declaration. `helm_live_enabled` gates
+            // real orders separately.
+            "helm"         => self.helm_enabled,
             _ => true,
         }
     }
@@ -1976,8 +2051,7 @@ impl DynamicConfig {
             "fairvalue"    => self.enable_fairvalue,
             "trendcapture" => self.enable_trendcapture,
             "bookline"     => self.bookline_enabled,
-            // Always on: Helm has no enable knob. See `strategy_enabled`.
-            "helm"         => true,
+            "helm"         => self.helm_enabled,
             _ => return None,
         })
     }
@@ -2341,6 +2415,11 @@ mod tests {
             "bookline_pull_before_start_secs",
             "bookline_trade_size_usdc",
             "bookline_max_exposure_usdc",
+            "helm_enabled", "helm_live_enabled", "helm_max_exposure_usdc",
+            "helm_max_open_intents", "helm_entry_window_secs", "helm_min_secs_to_close",
+            "helm_fee_verdict_enforce", "helm_fee_max_ratio", "helm_fee_max_notional_pct",
+            "helm_critique_timeout_secs", "helm_calibration_min_resolved",
+            "squadron_retire_linger_secs",
             "bookline_max_open_markets",
             "bookline_resting_tp_edge",
             "bookline_board_lane_enabled",

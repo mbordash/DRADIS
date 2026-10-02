@@ -120,6 +120,7 @@ export interface DynamicConfig {
   maker_quote_size_usdc: string;
   deploy_max_days_to_close:      number;
   auto_deploy_politics:          boolean;
+  squadron_retire_linger_secs?:  number;
   auto_deploy_sports:            boolean;
   event_market_retire_grace_secs: number;
   sports_game_over_after_secs?: number;
@@ -263,6 +264,16 @@ export interface DynamicConfig {
   bookline_max_exposure_usdc?: string;
   bookline_max_open_markets?: number;
   bookline_resting_tp_edge?: string;
+
+  // ── Helm Viper (the operator's own position, posture-enforced exit) ─────────
+  helm_enabled?: boolean;
+  helm_live_enabled?: boolean;
+  helm_max_exposure_usdc?: string;
+  helm_max_open_intents?: number;
+  helm_entry_window_secs?: number;
+  helm_min_secs_to_close?: number;
+  helm_critique_timeout_secs?: number;
+  helm_calibration_min_resolved?: number;
   // Board lane: instance-wide, rendered on the Sports Raptor card.
   bookline_board_lane_enabled?: boolean;
   bookline_board_max_open_markets?: number;
@@ -391,6 +402,12 @@ export interface TradeRow {
   fees?:         string | null;
   /** Was this a simulated fill? False on rows written before the column existed. */
   ghost?:        boolean;
+  /**
+   * The Helm intent this trade belongs to. Absent for every other viper: the
+   * log says what executed, and only a Helm trade carries a recorded reason for
+   * having been entered at all.
+   */
+  intent_id?:    number | null;
 }
 
 /** A position that has been entered but not yet exited (all strategies, ghost+live). */
@@ -668,6 +685,13 @@ export interface SquadronSummary {
   raptors?:          string[];
   /** Viper kinds meaningful for this market class, e.g. ["arbitrage","maker"]. */
   vipers?:           string[];
+
+  /** When the engine retired this squadron. Absent while it is alive, and absent
+   *  for an operator stand-down, which removes the squadron outright. A retired
+   *  squadron lingers only so the operator can read why it ended. */
+  stood_down_at?:     string;
+  /** Why the engine retired it, in the words of the retirement log line. */
+  stood_down_reason?: string;
 }
 
 // ── Field descriptor for ViperCard ───────────────────────────────────────────
@@ -740,7 +764,108 @@ export function fieldUnit(type: FieldType): string {
 // ── Squadron Deployment types ────────────────────────────────────────────────
 
 /** Market types available for squadron deployment. */
-export type MarketType = 'crypto' | 'sports' | 'politics';
+/** A deployable market class. `helm` is not a domain: it is the operator's
+ *  declaration that one squadron carries one position of their own, run by
+ *  `HelmStrategy` alone, and it wins over the venue's own category. */
+export type MarketType = 'crypto' | 'sports' | 'politics' | 'helm';
+
+// ── Helm: the operator's own position ───────────────────────────────────────
+
+export type HelmIntentStatus =
+  | 'proposed' | 'acknowledged' | 'working' | 'filled' | 'partial' | 'missed' | 'closed' | 'superseded';
+
+/** What the operator states. Decimals are strings, as everywhere in this API. */
+export interface HelmIntentContent {
+  thesis: string;
+  /** Strictly inside (0, 1). */
+  confidence: number;
+  horizon: 'expiry' | 'sooner';
+  falsification: string;
+  entry_kind: 'taker' | 'resting';
+  entry_limit_price?: string | null;
+  size_usdc: string;
+  stop_price?: string | null;
+  take_profit_price?: string | null;
+  /** RFC 3339, or null. */
+  time_limit_at?: string | null;
+  hold_to_settlement: boolean;
+  catastrophic_floor_pct?: string | null;
+}
+
+export interface HelmIntent {
+  id: number;
+  squadron_id: string;
+  market_id: string;
+  market_name: string;
+  side: 'YES' | 'NO';
+  /** Version 1, exactly as first submitted. Never changes. */
+  first: HelmIntentContent;
+  current_version: number;
+  status: HelmIntentStatus;
+  status_detail?: string | null;
+  critique?: string | null;
+  critique_at?: string | null;
+  critique_model?: string | null;
+  superseded_by?: number | null;
+  close_reason?: string | null;
+  ghost: boolean;
+  venue: string;
+  session_id: string;
+  created_at: string;
+  acknowledged_at?: string | null;
+  updated_at: string;
+  closed_at?: string | null;
+  token_id?: string | null;
+  entry_price?: string | null;
+  entry_shares?: string | null;
+  working_at?: string | null;
+  fee_verdict?: string | null;
+  critique_requested_at?: string | null;
+  critique_outcome?: 'named_it' | 'missed_it' | 'no_critique' | null;
+}
+
+export interface HelmIntentRevision {
+  id: number;
+  intent_id: number;
+  version: number;
+  reason: string;
+  content: HelmIntentContent;
+  created_at: string;
+}
+
+export interface HelmIntentEvent {
+  id: number;
+  intent_id: number;
+  at: string;
+  from_status?: HelmIntentStatus | null;
+  to_status: HelmIntentStatus;
+  detail?: string | null;
+}
+
+export interface HelmIntentDetail {
+  intent: HelmIntent;
+  /** What the engine reads: version 1 or the latest revision. */
+  current: HelmIntentContent;
+  revisions: HelmIntentRevision[];
+  events: HelmIntentEvent[];
+  /** Seconds the critique has been pending, or null once answered. */
+  critique_pending_secs?: number | null;
+}
+
+/** Counts and the calibration gate. `calibration` is always null in phase 1. */
+export interface HelmSummary {
+  total: number;
+  open: number;
+  resolved: number;
+  calibration_min_resolved: number;
+  calibration_visible: boolean;
+  calibration: null;
+}
+
+export type CreateHelmIntentRequest = HelmIntentContent & {
+  squadron_id: string;
+  side: 'YES' | 'NO';
+};
 
 /** Deployment region determines available market types. */
 export type DeploymentRegion = 'us' | 'intl' | 'kalshi';

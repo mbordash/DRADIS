@@ -152,16 +152,10 @@ pub(crate) fn apply_viper_budgets(
             // `viper_kinds_all_have_a_budget_slot` pins the two lists together.
             "fairvalue"    => &mut cfg.fairvalue_max_exposure_usdc,
             "bookline"     => &mut cfg.bookline_max_exposure_usdc,
-            // Helm takes no squadron exposure budget. Its size is declared on
-            // the intent, which does not exist yet, and a cap nothing reads
-            // would be a knob that lies. Said out loud rather than falling to
-            // the "unknown kind" arm below, which would call a seeded kind
-            // unknown. `budget_coverage_tests` lists it as deliberately
-            // unbudgeted.
-            "helm" => {
-                info!("Helm takes no deploy budget — size is declared on the intent; ignoring ${}", usdc);
-                continue;
-            }
+            // Helm's cap is the ceiling on the operator's own notional. It is
+            // read from the squadron's row like every other, and Helm squadrons
+            // share one position map, so a budget set here caps the sum.
+            "helm"         => &mut cfg.helm_max_exposure_usdc,
             other => {
                 warn!("Unknown viper kind '{}' in deploy budgets — skipped", other);
                 continue;
@@ -233,6 +227,7 @@ pub async fn run_deployment_processor<R: DeploymentRunner>(
             let dep_id = dep.id.clone();
             let class = dep.market_type.clone();
             let market_id = dep.market_id.clone();
+            let cag_t = cag.clone();
 
             tokio::spawn(async move {
                 info!("📋 Deploying {class} squadron on [{market_id}]");
@@ -240,6 +235,15 @@ pub async fn run_deployment_processor<R: DeploymentRunner>(
                     Ok(()) => {
                         info!("📋 Deployed {class} squadron finished");
                         let _ = db::update_deployment_status(&dep_id, "completed", None, None).await;
+                        // Venue-neutral retirement: the squadron this row
+                        // produced has finished its market. The intl patrol
+                        // retires itself with a precise reason first and this
+                        // is then a no-op; the Kalshi and US loops only mark
+                        // state, so without this their finished squadrons sat
+                        // in the registry until restart.
+                        if let Some(sq) = db::deployment_squadron(&dep_id).await {
+                            cag_t.retire(&sq, "deployment finished: its market closed");
+                        }
                     }
                     Err(e) => {
                         // Recorded against the row so the Control Tower can show
@@ -372,17 +376,44 @@ mod tests {
 }
 
 #[cfg(test)]
+mod runner_records_squadron_tests {
+    /// Every `DeploymentRunner` records the squadron its deployment produced.
+    ///
+    /// The processor writes `processing`, `active` and `completed` to the row
+    /// and knows no squadron id at any of them; only the runner that spawns
+    /// the squadron does. For a long time nothing wrote it: every row in the
+    /// production table had `squadron_id IS NULL`, and a modal polling for it
+    /// hung on a squadron that was patrolling the whole time. This scans the
+    /// source of each runner for the one call that records it, so a new
+    /// venue's runner cannot ship without one.
+    #[test]
+    fn every_deployment_runner_records_its_squadron_id() {
+        let files = [
+            ("src/cag/adama.rs", include_str!("../cag/adama.rs")),
+            ("src/venues/kalshi/trader.rs", include_str!("kalshi/trader.rs")),
+            ("src/venues/us/trader.rs", include_str!("us/trader.rs")),
+        ];
+        for (name, src) in files {
+            assert!(
+                src.contains("DeploymentRunner for"),
+                "{name} no longer implements DeploymentRunner — update this test's file list",
+            );
+            assert!(
+                src.contains("set_deployment_squadron("),
+                "{name} implements DeploymentRunner but never records the squadron it produced",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod budget_coverage_tests {
     /// Viper kinds `apply_viper_budgets` can route a deploy budget to. Kept
     /// beside the match above so the two are edited together.
     const BUDGETED_KINDS: &[&str] = &[
         "arbitrage", "time_decay", "momentum", "maker", "basis",
-        "gboost", "trendcapture", "convergence", "fairvalue", "bookline",
+        "gboost", "trendcapture", "convergence", "fairvalue", "bookline", "helm",
     ];
-
-    /// Viper kinds that deliberately take no squadron exposure budget, each
-    /// with an explicit arm in the match that says so. Helm sizes per intent.
-    const UNBUDGETED_KINDS: &[&str] = &["helm"];
 
     /// A viper seeded into `viper_kind` with no arm in the budget match has its
     /// deploy budget silently dropped: the squadron flies on the compile-time
@@ -394,30 +425,20 @@ mod budget_coverage_tests {
         let missing: Vec<&str> = crate::helpers::db::VIPER_KINDS
             .iter()
             .map(|(id, _, _)| *id)
-            .filter(|id| !BUDGETED_KINDS.contains(id) && !UNBUDGETED_KINDS.contains(id))
+            .filter(|id| !BUDGETED_KINDS.contains(id))
             .collect();
         assert!(missing.is_empty(), "viper kinds with no deploy-budget slot: {missing:?}");
     }
 
-    /// An unbudgeted kind is a decision about a seeded kind, not a hole: it
-    /// must exist in the seed, and it must not also claim a slot.
+    /// A Helm deploy budget lands on the Helm cap and nothing else.
     #[test]
-    fn unbudgeted_kinds_are_seeded_and_not_also_budgeted() {
-        let seeded: Vec<&str> = crate::helpers::db::VIPER_KINDS.iter().map(|(id, _, _)| *id).collect();
-        for k in UNBUDGETED_KINDS {
-            assert!(seeded.contains(k), "unbudgeted kind {k} is not seeded");
-            assert!(!BUDGETED_KINDS.contains(k), "{k} is listed both budgeted and unbudgeted");
-        }
-    }
-
-    /// The Helm arm skips rather than routes, so an operator budget on a Helm
-    /// deploy changes no exposure field and reports nothing applied.
-    #[test]
-    fn a_helm_budget_changes_nothing() {
+    fn a_helm_budget_sets_the_helm_cap() {
         let mut cfg = crate::helpers::dynamic_config::DynamicConfig::default();
         let before = cfg.clone();
-        let budgets = std::collections::HashMap::from([("helm".to_string(), 25.0_f64)]);
-        assert!(!super::apply_viper_budgets(&mut cfg, &budgets));
+        let budgets = std::collections::HashMap::from([("helm".to_string(), 12.5_f64)]);
+        assert!(super::apply_viper_budgets(&mut cfg, &budgets));
+        assert_eq!(cfg.helm_max_exposure_usdc, rust_decimal_macros::dec!(12.5));
+        cfg.helm_max_exposure_usdc = before.helm_max_exposure_usdc;
         assert_eq!(serde_json::to_string(&cfg).unwrap(), serde_json::to_string(&before).unwrap());
     }
 

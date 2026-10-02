@@ -765,6 +765,8 @@ impl Squadron {
                 // name it. "Unknown" read as a fault when it was a property of
                 // the design.
                 "Sports" => hourly_market_name.clone(),
+                // Helm: one market, no split, and that market is the squadron's.
+                "Single market" => hourly_market_name.clone(),
                 _ => String::from("Unknown"),
             };
             let status_key = sn
@@ -1209,6 +1211,24 @@ impl Squadron {
                                 "🏁 Squadron [{}] retiring: market \"{}\" {} and the squadron is flat — the class is free for the next deploy",
                                 self.id, hourly_market_name, why,
                             );
+                            // A Helm squadron retiring on the market's account
+                            // (not on its own completion) must not strand its
+                            // intents open: the position has settled or never
+                            // filled, so each one is closed with the market's
+                            // reason, and the retrospective sees why.
+                            if market_class_for_ctx == crate::vipers::helm_impl::KIND {
+                                let intent_reason = match reason {
+                                    RetireReason::HelmComplete => None,
+                                    RetireReason::PastClose | RetireReason::VenueClosed => Some("market closed"),
+                                    RetireReason::GameOver => Some("game over"),
+                                };
+                                if let (Some(r), Some(pool)) = (intent_reason, crate::helpers::db::pool_for(&asset_lc)) {
+                                    let n = crate::helpers::helm::close_open_for_squadron(&pool, &squadron_id, r).await;
+                                    if n > 0 {
+                                        info!("🧭 Squadron [{}] closed {} open Helm intent(s): {}", self.id, n, r);
+                                    }
+                                }
+                            }
                             // Flat means no POSITION; resting quotes are still
                             // orders, and they hold collateral until the venue
                             // clears them at resolution. Same treatment the
@@ -1218,8 +1238,12 @@ impl Squadron {
                                 error!("❌ Failed to cancel all orders after {} attempts. Standing down anyway; the venue clears the rest at resolution.", MAX_CANCEL_RETRIES);
                             }
                             self.stand_down();
-                            cag.update_state(&self.id, crate::squadron::SquadronState::StoodDown);
-                            cag.remove(&self.id);
+                            // Retired, not removed: the entry lingers, stood
+                            // down with this reason, so the operator can read
+                            // what ended it; the CAG reaps it after the linger.
+                            // An operator stand-down is the other path and
+                            // removes at once.
+                            cag.retire(&self.id, &format!("market \"{}\" {}", hourly_market_name, why));
                             self.cancel_ws();
                             // The dark-feed banner is keyed by asset; a retired
                             // market must not be reported dark until the next
@@ -2514,23 +2538,52 @@ impl Squadron {
                                     // a tick, so ghost P&L was pessimistic against live by ~1 tick
                                     // per entry and the two could not be compared.
                                     let actual_entry_price = params.price;
-                                    positions.lock().await.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: actual_entry_price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: token_m.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id.clone()), entry_fee: Decimal::ZERO });
+                                    // Charge the entry leg, as the live path does at the fill.
+                                    //
+                                    // This was ZERO, and the live path books the real figure from
+                                    // the venue's reported fill — which never arrives in ghost. So
+                                    // every simulated TAKER entry paid one leg instead of two and
+                                    // ghost P&L was optimistic against live by the entry fee: at
+                                    // the 0.07 intl rate, 4.06% of notional at $0.42. Helm intent #3
+                                    // of 2026-10-02 booked $0.238 against a true round trip of
+                                    // $0.476, and the comment above this one records a fix for ghost
+                                    // being *pessimistic* by a tick while it was optimistic by a
+                                    // whole leg. A post-only entry is exempt because it genuinely
+                                    // pays nothing — the CLOB charges the taker — which is why
+                                    // Maker's and Time Decay's ghost rows were already right.
+                                    let ghost_entry_fee = if params.post_only {
+                                        Decimal::ZERO
+                                    } else {
+                                        crate::venues::taker_fee_per_share(actual_entry_price) * params.shares
+                                    };
+                                    positions.lock().await.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: actual_entry_price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: token_m.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id.clone()), entry_fee: ghost_entry_fee });
                                     token_ownership.lock().await.insert(token_m.clone(), sn.clone());
                                     let side_g = side_of(&params.token_id);
                                     info!("👻 GHOST_MODE ENTRY {} [{}]: {} | ${:.4} x {:.1} (simulated)", side_g, sn, params.market_name, params.price, params.shares);
                                     { let side_g = side_of(&params.token_id); let sn_g = sn.clone(); let tid_g = params.token_id.to_string(); let mn_g = params.market_name.clone(); let side_gs = side_g.to_string(); let ep_g = actual_entry_price; let sh_g = params.shares; let asset_g = asset_lc.clone(); let scope_g = scope.clone(); tokio::spawn(async move { metrics::record_entry(&scope_g, sn_g, tid_g, mn_g, side_gs, ep_g, sh_g).await; }); }
                                     { let side_g = side_of(&params.token_id); let sn_g = sn.clone(); let tid_g = params.token_id.to_string(); let mn_g = params.market_name.clone(); let side_gs = side_g.to_string(); let ep_g = actual_entry_price; let sh_g = params.shares; let asset_g = asset_lc.clone(); let snap_g = entry_snap.clone(); tokio::spawn(async move { metrics::record_entry_signal(&asset_g, sn_g, tid_g, mn_g, side_gs, ep_g, sh_g, &snap_g).await; }); }
-                                    if let Some(pool) = db::pool_for(&asset_lc) { let side_g = side_of(&params.token_id); db::record_open_position(&pool, &scope, &squadron_id, &sn, &params.token_id.to_string(), &params.market_name, side_g, actual_entry_price, params.shares, true).await; }
+                                    if let Some(pool) = db::pool_for(&asset_lc) { let side_g = side_of(&params.token_id); db::record_open_position(&pool, &scope, &squadron_id, &sn, &params.token_id.to_string(), &params.market_name, side_g, actual_entry_price, params.shares, true).await; // Persist the entry fee as the live path does, or a restart reloads the
+                                      // position with a zero fee and the exit books a round trip as one leg.
+                                      db::set_open_position_entry_fee(&pool, &params.token_id.to_string(), ghost_entry_fee).await; }
                                     if let Some(pp) = pair_params {
                                         let pp_close_time = target_market_close_time;
                                         // Same as the primary leg: simulate at the touch.
                                         let actual_paired_entry_price = pp.price;
-                                        positions.lock().await.insert(PositionKey::new(sq_key.clone(), sn.clone(), pp.token_id.clone()), Position { shares: pp.shares, avg_entry: actual_paired_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: Some(token_m.clone()), entry_fee: Decimal::ZERO });
+                                        // The second leg pays its own entry fee, at its own price.
+                                        // Arbitrage buys both sides, so understating this halved the
+                                        // cost of the one strategy whose whole edge is a few cents of
+                                        // spread against two taker fees.
+                                        let ghost_paired_entry_fee = if pp.post_only {
+                                            Decimal::ZERO
+                                        } else {
+                                            crate::venues::taker_fee_per_share(actual_paired_entry_price) * pp.shares
+                                        };
+                                        positions.lock().await.insert(PositionKey::new(sq_key.clone(), sn.clone(), pp.token_id.clone()), Position { shares: pp.shares, avg_entry: actual_paired_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: Some(token_m.clone()), entry_fee: ghost_paired_entry_fee });
                                         token_ownership.lock().await.insert(pp.token_id.clone(), sn.clone());
                                         let side_gp = side_of(&pp.token_id);
                                         info!("👻 GHOST_MODE ENTRY {} (paired) [{}]: {} | ${:.4} x {:.1} (simulated)", side_gp, sn, pp.market_name, pp.price, pp.shares);
                                         { let side_gp = side_of(&pp.token_id); let sn_gp = sn.clone(); let tid_gp = pp.token_id.to_string(); let mn_gp = pp.market_name.clone(); let side_gps = side_gp.to_string(); let ep_gp = actual_paired_entry_price; let sh_gp = pp.shares; let asset_gp = asset_lc.clone(); let scope_gp = scope.clone(); tokio::spawn(async move { metrics::record_entry(&scope_gp, sn_gp, tid_gp, mn_gp, side_gps, ep_gp, sh_gp).await; }); }
-                                        if let Some(pool) = db::pool_for(&asset_lc) { let side_gp = side_of(&pp.token_id); db::record_open_position(&pool, &scope, &squadron_id, &sn, &pp.token_id.to_string(), &pp.market_name, side_gp, actual_paired_entry_price, pp.shares, true).await; }
+                                        if let Some(pool) = db::pool_for(&asset_lc) { let side_gp = side_of(&pp.token_id); db::record_open_position(&pool, &scope, &squadron_id, &sn, &pp.token_id.to_string(), &pp.market_name, side_gp, actual_paired_entry_price, pp.shares, true).await; db::set_open_position_entry_fee(&pool, &pp.token_id.to_string(), ghost_paired_entry_fee).await; }
                                     }
                                     last_trade_time.insert(sn.clone(), Instant::now());
                                 } else {
@@ -4379,6 +4432,10 @@ pub(crate) mod resting_exit {
                 // it inherited the Maker's switch and an operator turning the
                 // Maker's resting exits off would silently disable Bookline's.
                 "BooklineStrategy" => true,
+                // Helm's resting take-profit is the operator's stated posture,
+                // not an option: the intent named the price. Explicit so it
+                // never inherits the Maker's switch below.
+                "HelmStrategy" => true,
                 _ => self.maker,
             }
         }
@@ -4393,6 +4450,7 @@ pub(crate) mod resting_exit {
             "MomentumStrategy" => "Momentum resting TP".to_string(),
             "ConvergenceStrategy" => "Convergence resting TP".to_string(),
             "BooklineStrategy" => "Bookline resting TP".to_string(),
+            "HelmStrategy" => "Helm resting TP".to_string(),
             "GboostStrategy" => "GBoost resting TP".to_string(),
             other => format!("{other} resting exit"),
         }
@@ -5070,6 +5128,61 @@ pub mod fak_exit {
             assert_eq!(sell_fill(dec!(8), dec!(0)), (Some(dec!(8)), None));
             assert_eq!(sell_fill(dec!(2), dec!(5)), (Some(dec!(2)), None), "a price above $1 is a misread orientation");
         }
+    }
+}
+
+/// A simulated entry must cost what a real one costs.
+///
+/// The ghost branch created its position with `entry_fee: ZERO` because the
+/// live path takes the figure from the venue's reported fill, which never
+/// arrives in simulation. So every simulated TAKER entry paid one leg instead
+/// of two, and ghost P&L was optimistic against live by the whole entry fee —
+/// on every taker-entry viper at once. Helm intent #3 of 2026-10-02 recorded
+/// $0.238 of fees on a flat round trip whose true cost was $0.476, which is how
+/// this was found.
+///
+/// A post-only entry is exempt, and that exemption is the reason Maker's 308
+/// real trades matched a one-leg model exactly while this was broken: the CLOB
+/// charges the taker, so a resting quote genuinely pays nothing to open.
+#[cfg(test)]
+mod ghost_entry_fee_tests {
+    use super::*;
+
+    /// What the ghost branch now computes, extracted so the arithmetic is
+    /// testable without driving a whole patrol tick.
+    fn ghost_entry_fee(price: Decimal, shares: Decimal, post_only: bool) -> Decimal {
+        if post_only { Decimal::ZERO } else { crate::venues::taker_fee_per_share(price) * shares }
+    }
+
+    #[test]
+    fn a_taker_entry_is_charged_and_a_resting_one_is_not() {
+        let (price, shares) = (dec!(0.15), dec!(26.666666666666666666666666667));
+
+        let taker = ghost_entry_fee(price, shares, false);
+        assert!(taker > Decimal::ZERO, "a simulated taker entry must cost something");
+        // The same figure the live path books, and the same one intent #3 paid
+        // on its exit leg alone.
+        assert_eq!(taker.round_dp(4), dec!(0.2380));
+
+        assert_eq!(ghost_entry_fee(price, shares, true), Decimal::ZERO,
+                   "a post-only entry pays nothing: the CLOB charges the taker");
+    }
+
+    #[test]
+    fn a_flat_taker_round_trip_costs_two_legs_not_one() {
+        let (price, shares) = (dec!(0.15), dec!(26.666666666666666666666666667));
+        let entry = ghost_entry_fee(price, shares, false);
+        let exit = crate::venues::taker_fee_per_share(price) * shares; // flat exit, same price
+        assert_eq!((entry + exit).round_dp(4), dec!(0.4760),
+                   "intent #3 booked 0.2380 for this trade, which was one leg of two");
+    }
+
+    /// Nothing is charged where no fee exists, at either end of the book.
+    #[test]
+    fn a_resolved_contract_is_free_at_both_ends() {
+        let shares = dec!(10);
+        assert_eq!(ghost_entry_fee(Decimal::ZERO, shares, false), Decimal::ZERO);
+        assert_eq!(ghost_entry_fee(Decimal::ONE, shares, false), Decimal::ZERO);
     }
 }
 

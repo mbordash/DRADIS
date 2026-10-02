@@ -85,6 +85,11 @@ pub fn scope_for_group(group: &str) -> Option<ConfigScope> {
         "Sports Lines" => ConfigScope::Squadron,
         "Arbitrage" | "Basis" | "Bookline" | "Convergence" | "FairValue" | "GBoost"
         | "Maker" | "Momentum" | "Time Decay" | "TrendReversal" => ConfigScope::Squadron,
+        // Helm reads its knobs from the squadron snapshot like every viper. A
+        // Helm squadron's row is seeded from the global row at deploy, so the
+        // operator sets these in Setup first; the squadron page can then
+        // override them for that one position.
+        "Helm" => ConfigScope::Squadron,
         _ => return None,
     })
 }
@@ -975,6 +980,12 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(g, e, "deploy_max_days_to_close", "Max Days To Resolution", "secs", false,
             "Furthest-out market a Quick deploy will choose, in days. Browsing is not affected — the market list still shows everything, and you can always deploy a longer-dated market by picking it by hand. This only bounds the automatic choice. It matters because Kalshi structures politics and sports as multi-year futures, and the strategies available to those classes do not suit that horizon: Arbitrage locks your collateral until the market resolves, so a 2028 market ties it up for years to earn a few percent, and Maker rests quotes expecting them to fill and mean-revert within a session. Raise it if you want Quick deploy to consider longer-dated markets.")
             .range(1.0, 3650.0).step(1.0).unit("d"));
+        v.push(F::new(g, e, "squadron_retire_linger_secs", "Retired Squadron Linger", "int", true,
+            "How long a squadron the engine retired — its market closed, its Helm intents all resolved, its game \
+             ended — stays in the squadron list before it is removed. Long enough to read why it ended; short \
+             enough that a day of hourly retirements never piles up. A squadron you stand down yourself is \
+             removed at once and does not wait on this.")
+            .range(0.0, 86_400.0).step(60.0).unit("s"));
         v.push(F::new(g, e, "auto_deploy_politics", "Auto-Deploy Politics", "bool", false,
             "Keep a politics squadron running without waiting for you to deploy one. DRADIS picks \
              the highest-volume politics market inside the resolution horizon above, and replaces \
@@ -1178,6 +1189,68 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(bl, None, "bookline_resting_tp_edge", "Take Profit Edge", "price", true,
             "Edge above consensus for the resting take-profit ask. Settlement is the plan and it is fee-free; \
              this is the bonus when the market will pay the consensus plus an edge before the game starts."));
+
+        // Helm: the operator's own position, entered from an acknowledged intent
+        // and exited by the posture the intent states. No entry gates of its own
+        // beyond these risk controls, which is the point.
+        let hm = "Helm";
+        v.push(F::new(hm, None, "helm_enabled", "Enabled", "bool", false,
+            "Kill switch for the one path that spends on the operator's say-so. Off freezes every Helm squadron \
+             at \"intent acknowledged\": no entry is placed and no intent is touched. Exits on a position already \
+             held keep running — a switch that stranded a position would be worse than one that did nothing."));
+        v.push(F::new(hm, Some("helm_enabled"), "helm_live_enabled", "Live Orders", "bool", false,
+            "May Helm place real orders? Ships off. A squadron in Simulation Mode enters and exits on paper \
+             regardless; a live squadron refuses every entry with \"live orders disabled\" until this is on. \
+             Turn it on deliberately, in Setup, before deploying a Helm squadron: the squadron's own row is \
+             seeded from the global row at deploy."));
+        v.push(F::new(hm, Some("helm_enabled"), "helm_max_exposure_usdc", "Max Exposure", "usd", false,
+            "Ceiling on total Helm notional (entry price × shares) across EVERY Helm squadron on this instance. \
+             Helm squadrons share one session and one position map, so this is the sum over all of them, and \
+             it composes with the wallet's collateral gate, which every entry also passes.")
+            .min(0.0).step(1.0).unit("USDC"));
+        v.push(F::new(hm, Some("helm_enabled"), "helm_max_open_intents", "Max Open Intents", "int", false,
+            "Most intents that may be open (not closed or superseded) across every Helm squadron at once. \
+             Enforced when an intent is created. Two is a conviction; ten is a habit.")
+            .min(1.0).step(1.0));
+        v.push(F::new(hm, Some("helm_enabled"), "helm_fee_verdict_enforce", "Fee Verdict Blocks", "bool", false,
+            "Does a fee-dominated verdict REFUSE the entry, or only record itself? Ships on. Through phase 1 \
+             the verdict recorded and nothing acted on it: a time-limit intent entered at $0.1500 and exited \
+             flat at $0.1500, and the whole loss was the venue fee. Turning this off returns to recording \
+             only, which is worth doing to study a rule, not to get an entry past it."));
+        v.push(F::new(hm, Some("helm_fee_verdict_enforce"), "helm_fee_max_ratio", "Max Fee Share of Target", "pct", true,
+            "Most of a stated profit target that fees may eat. Applies where a target exists — a take-profit, \
+             or the distance to $1.00 when holding to settlement. At 40% a trade must keep three fifths of \
+             what it aims for.")
+            .min(0.0).step(1.0));
+        v.push(F::new(hm, Some("helm_fee_verdict_enforce"), "helm_fee_max_notional_pct", "Max Fee of Notional, No Target", "pct", true,
+            "Most of notional the round trip may cost when the posture names NO price target — a stop or a \
+             time limit alone. There is no target to take a ratio of, so the round trip IS the hurdle the \
+             conviction must clear. A taker leg costs rate × (1 − price), so this binds on cheap longshots: \
+             at the 0.07 intl rate a taker round trip is 11.9% of notional at $0.15 against 1.5% at $0.89. \
+             At 5% a targetless taker entry below about $0.64 is refused ($0.58 on US at 0.06). A resting \
+             entry pays one leg, not two, so it is refused below about $0.29. The answer is to name a \
+             take-profit or hold to settlement, not to raise this.")
+            .min(0.0).step(0.5));
+        v.push(F::new(hm, Some("helm_enabled"), "helm_entry_window_secs", "Entry Window", "int", true,
+            "How long a working entry may go unfilled before the intent is closed as missed and the operator \
+             is told. A taker that misses re-fires inside the window, paced by the venue sync; a resting bid \
+             is pulled at its end.")
+            .min(10.0).step(10.0).unit("s"));
+        v.push(F::new(hm, Some("helm_enabled"), "helm_min_secs_to_close", "Min Secs To Close", "int", true,
+            "No entry inside this many seconds of the market's close. A position opened at the bell can be \
+             managed by nothing but settlement.")
+            .min(0.0).step(10.0).unit("s"));
+        v.push(F::new(hm, Some("helm_enabled"), "helm_critique_timeout_secs", "Critique Timeout", "int", true,
+            "How long the LLM critique of a new intent may take. Past this the intent records the critique as \
+             unavailable and acknowledgement proceeds: the critique advises, it never blocks and never delays. \
+             It is given the thesis, the probability, the horizon, the falsification condition, the market's name \
+             and the current price — no Raptor state — so it reads the reasoning rather than the market.")
+            .min(3.0).step(1.0).unit("s"));
+        v.push(F::new(hm, Some("helm_enabled"), "helm_calibration_min_resolved", "Calibration Min Resolved", "int", true,
+            "How many intents must have resolved (closed after holding a position) before any calibration figure \
+             is shown. Below it everything is recorded and nothing is displayed: a handful of probabilities invites \
+             a claim the sample cannot support. Thirty is defensible; ten is not.")
+            .min(1.0).step(1.0));
         v.push(F::new("FairValue", Some("enable_sports_fairvalue"), "sports_fairvalue_max_dispersion", "Sports Max Dispersion", "price", true,
             "Widest book disagreement (highest minus lowest book probability) a sports FairValue entry will accept. A wide line is a soft line: if the books do not agree what the game is worth, neither does the consensus derived from them."));
         v.push(F::new("FairValue", Some("enable_sports_fairvalue"), "sports_fairvalue_settle_hold", "Sports Hold To Settlement", "bool", true,
