@@ -2256,6 +2256,12 @@ pub(crate) async fn book_ghost_settlements(
             // and a profile that flips it should get the matching fee without
             // anyone remembering to edit this list.
             "BasisStrategy" => !crate::config::BASIS_ENTRY_AS_MAKER,
+            // Helm's entry type will be the operator's choice per intent —
+            // taker at the ask or a resting bid — and the intent model that
+            // records it is a later increment. Until this reads the intent,
+            // charge the taker fee: the conservative answer never flatters a
+            // simulated Helm settlement, where booking it fee-free would.
+            crate::vipers::helm_impl::STRATEGY_NAME => true,
             // Maker, Arbitrage and TimeDecay are maker-entry by construction.
             _ => false,
         };

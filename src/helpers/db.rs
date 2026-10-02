@@ -848,6 +848,11 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
         ("sports",   "Sports"),
         ("politics", "Politics"),
         ("unknown",  "Unknown"),
+        // Not a domain: the class of a squadron the operator deployed to carry
+        // one position of their own, managed by `HelmStrategy` alone. It exists
+        // so that class resolution, which decides which vipers a squadron runs,
+        // has an answer that is exactly one viper. See `vipers::helm_impl`.
+        (crate::vipers::helm_impl::KIND, "Helm"),
     ] {
         sqlx::query("INSERT OR IGNORE INTO market_class (id, display) VALUES (?, ?)")
             .bind(id).bind(display).execute(pool).await?;
@@ -916,6 +921,12 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
         ("sports",   "bookline"),
         ("politics", "arbitrage"), ("politics", "maker"),
         ("unknown",  "arbitrage"), ("unknown",  "maker"),
+        // Exactly one. A Helm squadron is the operator's position and nothing
+        // else; the other vipers are absent from this class, not disabled in
+        // it, so no config row can bring the Maker onto the operator's market.
+        // No raptor row either: the exit posture is the whole plan, and a
+        // signal nothing consumes would be surface area without a decision.
+        (crate::vipers::helm_impl::KIND, crate::vipers::helm_impl::KIND),
     ] {
         sqlx::query("INSERT OR IGNORE INTO market_class_viper (market_class, viper_kind) VALUES (?, ?)")
             .bind(class).bind(viper).execute(pool).await?;
@@ -928,6 +939,11 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
         ("crypto",   "category", "crypto",   10),
         ("sports",   "category", "sports",   10),
         ("politics", "category", "politics", 10),
+        // The operator's declaration. `Squadron::classification_category` hands
+        // this exact string in for a Helm squadron ahead of the venue's own
+        // category, so a Bitcoin hourly market the operator takes the helm of
+        // resolves here and never reaches the `bitcoin` slug rule below.
+        (crate::vipers::helm_impl::KIND, "category", crate::vipers::helm_impl::KIND, 10),
         // sports leagues embedded in instrument symbols (e.g. aec-nfl-lac-ten-…)
         ("nfl",    "symbol_token", "sports", 20),
         ("nba",    "symbol_token", "sports", 20),
@@ -2995,6 +3011,9 @@ pub const VIPER_KINDS: &[(&str, &str, i32)] = &[
     // Sports-only, and not venue-agnostic: it prices from the bookmaker
     // consensus board, which exists for Polymarket International moneylines.
     ("bookline",     "Bookline",      0),
+    // The operator's own position, managed from the book alone, on any venue.
+    // Carried by the `helm` class and by nothing else; see `vipers::helm_impl`.
+    (crate::vipers::helm_impl::KIND, "Helm", 1),
 ];
 
 /// Fetch pending deployment requests from the queue.
@@ -6851,6 +6870,80 @@ mod venue_category_tests {
         let unknown = raptors_for_class(&pool, "unknown").await;
         assert!(sports.iter().any(|r| r == "sports"), "sports lost its raptor: {sports:?}");
         assert!(unknown.is_empty(), "unknown unexpectedly links raptors: {unknown:?}");
+    }
+}
+
+#[cfg(test)]
+mod helm_class_tests {
+    use super::*;
+    use crate::vipers::helm_impl::KIND as HELM;
+
+    async fn seeded() -> SqlitePool {
+        let pool = SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.expect("sqlite");
+        init_schema(&pool).await.expect("schema");
+        seed_market_taxonomy(&pool).await.expect("taxonomy");
+        pool
+    }
+
+    /// The market an operator is most likely to take the helm of, and the one
+    /// whose misclassification would be loudest in money and quietest in the
+    /// log: a Bitcoin hourly. Its title matches the `bitcoin` slug rule, so left
+    /// to the rules it is `crypto` and the squadron runs nine vipers.
+    #[tokio::test]
+    async fn a_helm_declaration_beats_a_crypto_market_s_own_rules() {
+        let pool = seeded().await;
+        // Intl token ids are decimal U256 strings: nothing for a symbol rule.
+        let symbols = ["1125…hex", "7781…hex"];
+        let title = "Bitcoin Up or Down - October 2, 3PM ET";
+
+        // Premise: without a declaration this is crypto, by title.
+        assert_eq!(classify_market(&pool, "", &symbols, title).await, "crypto");
+        // And a venue that files it under Crypto says the same.
+        assert_eq!(classify_market(&pool, "crypto", &symbols, title).await, "crypto");
+
+        // The declaration resolves first, by category priority, before any
+        // slug rule is consulted.
+        assert_eq!(classify_market(&pool, HELM, &symbols, title).await, HELM);
+    }
+
+    /// Same for a market whose symbol a sports rule recognizes: the declared
+    /// class, not the league token, decides.
+    #[tokio::test]
+    async fn a_helm_declaration_beats_a_sports_symbol_token() {
+        let pool = seeded().await;
+        let symbols = ["aec-nfl-lac-ten-2026#yes", "aec-nfl-lac-ten-2026#no"];
+        assert_eq!(classify_market(&pool, "", &symbols, "Chargers at Titans").await, "sports");
+        assert_eq!(classify_market(&pool, HELM, &symbols, "Chargers at Titans").await, HELM);
+    }
+
+    /// The whole point of the class: it carries exactly one viper and no
+    /// raptor. A second viper here is the failure increment 1 exists to make
+    /// impossible — a strategy with its own gates trading the operator's market.
+    #[tokio::test]
+    async fn the_helm_class_carries_exactly_one_viper_and_no_raptor() {
+        let pool = seeded().await;
+        assert_eq!(vipers_for_class(&pool, HELM).await, vec![HELM.to_string()]);
+        assert!(raptors_for_class(&pool, HELM).await.is_empty());
+        assert!(raptors_for_class_full(&pool, HELM).await.is_empty(), "not even a roadmapped raptor");
+    }
+
+    /// And no other class carries Helm: an operator deploying a sports or
+    /// crypto squadron must not find an operator-intent viper on it.
+    #[tokio::test]
+    async fn no_other_class_carries_helm() {
+        let pool = seeded().await;
+        for class in ["crypto", "sports", "politics", "unknown"] {
+            let vipers = vipers_for_class(&pool, class).await;
+            assert!(!vipers.iter().any(|v| v == HELM), "{class} carries helm: {vipers:?}");
+        }
+    }
+
+    /// `viper_kind` is the list the Setup view and the deploy budget router
+    /// read; Helm must be in it or the class row above points at nothing.
+    #[test]
+    fn helm_is_a_seeded_viper_kind() {
+        assert!(VIPER_KINDS.iter().any(|(id, _, _)| *id == HELM));
     }
 }
 

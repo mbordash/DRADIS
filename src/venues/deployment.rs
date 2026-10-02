@@ -152,6 +152,16 @@ pub(crate) fn apply_viper_budgets(
             // `viper_kinds_all_have_a_budget_slot` pins the two lists together.
             "fairvalue"    => &mut cfg.fairvalue_max_exposure_usdc,
             "bookline"     => &mut cfg.bookline_max_exposure_usdc,
+            // Helm takes no squadron exposure budget. Its size is declared on
+            // the intent, which does not exist yet, and a cap nothing reads
+            // would be a knob that lies. Said out loud rather than falling to
+            // the "unknown kind" arm below, which would call a seeded kind
+            // unknown. `budget_coverage_tests` lists it as deliberately
+            // unbudgeted.
+            "helm" => {
+                info!("Helm takes no deploy budget — size is declared on the intent; ignoring ${}", usdc);
+                continue;
+            }
             other => {
                 warn!("Unknown viper kind '{}' in deploy budgets — skipped", other);
                 continue;
@@ -370,6 +380,10 @@ mod budget_coverage_tests {
         "gboost", "trendcapture", "convergence", "fairvalue", "bookline",
     ];
 
+    /// Viper kinds that deliberately take no squadron exposure budget, each
+    /// with an explicit arm in the match that says so. Helm sizes per intent.
+    const UNBUDGETED_KINDS: &[&str] = &["helm"];
+
     /// A viper seeded into `viper_kind` with no arm in the budget match has its
     /// deploy budget silently dropped: the squadron flies on the compile-time
     /// exposure rather than the operator's, and the deploy UI still reports
@@ -380,9 +394,31 @@ mod budget_coverage_tests {
         let missing: Vec<&str> = crate::helpers::db::VIPER_KINDS
             .iter()
             .map(|(id, _, _)| *id)
-            .filter(|id| !BUDGETED_KINDS.contains(id))
+            .filter(|id| !BUDGETED_KINDS.contains(id) && !UNBUDGETED_KINDS.contains(id))
             .collect();
         assert!(missing.is_empty(), "viper kinds with no deploy-budget slot: {missing:?}");
+    }
+
+    /// An unbudgeted kind is a decision about a seeded kind, not a hole: it
+    /// must exist in the seed, and it must not also claim a slot.
+    #[test]
+    fn unbudgeted_kinds_are_seeded_and_not_also_budgeted() {
+        let seeded: Vec<&str> = crate::helpers::db::VIPER_KINDS.iter().map(|(id, _, _)| *id).collect();
+        for k in UNBUDGETED_KINDS {
+            assert!(seeded.contains(k), "unbudgeted kind {k} is not seeded");
+            assert!(!BUDGETED_KINDS.contains(k), "{k} is listed both budgeted and unbudgeted");
+        }
+    }
+
+    /// The Helm arm skips rather than routes, so an operator budget on a Helm
+    /// deploy changes no exposure field and reports nothing applied.
+    #[test]
+    fn a_helm_budget_changes_nothing() {
+        let mut cfg = crate::helpers::dynamic_config::DynamicConfig::default();
+        let before = cfg.clone();
+        let budgets = std::collections::HashMap::from([("helm".to_string(), 25.0_f64)]);
+        assert!(!super::apply_viper_budgets(&mut cfg, &budgets));
+        assert_eq!(serde_json::to_string(&cfg).unwrap(), serde_json::to_string(&before).unwrap());
     }
 
     /// And the reverse: a budget arm for a kind nobody seeds is dead code that

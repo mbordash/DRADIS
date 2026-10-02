@@ -97,6 +97,10 @@ tools/cleanup-phantom-single-leg-settlements.sh
 tools/dedupe-duplicate-settlements.sh
 /ROADMAP.md
 /ROADMAP-DETAILS.md
+# Private roadmap design docs: unbuilt features, their shape and their open
+# questions. Research spikes in docs/spikes/ that report on work already done
+# are public; a design doc for something not yet built is strategy, not record.
+docs/spikes/helm-design.md
 
 # Private keys
 *.pem

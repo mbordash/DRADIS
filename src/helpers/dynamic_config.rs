@@ -1737,6 +1737,10 @@ impl DynamicConfig {
             "fairvalue"    => self.enable_fairvalue,
             "trendcapture" => self.enable_trendcapture,
             "bookline"     => self.bookline_enabled,
+            // Helm has no enable switch: the operator's intent is its switch,
+            // and a squadron with no intent reports "awaiting operator intent"
+            // rather than "disabled in config".
+            "helm"         => true,
             _ => true,
         }
     }
@@ -1972,6 +1976,8 @@ impl DynamicConfig {
             "fairvalue"    => self.enable_fairvalue,
             "trendcapture" => self.enable_trendcapture,
             "bookline"     => self.bookline_enabled,
+            // Always on: Helm has no enable knob. See `strategy_enabled`.
+            "helm"         => true,
             _ => return None,
         })
     }

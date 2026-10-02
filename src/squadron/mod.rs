@@ -141,7 +141,104 @@ pub enum CryptoAsset {
     Custom(String),
 }
 
+/// The category hint `Squadron::classify_and_link` hands the rule table.
+///
+/// Precedence, and why each step exists:
+///
+/// 1. **A Helm squadron names its class outright, and nothing outranks it.**
+///    `helm` is not a domain a venue could report: it says *who* manages the
+///    market — the operator, through one `HelmStrategy` — not what the market
+///    is about. Had Gamma's "Crypto" or "Sports" won here, the squadron would
+///    resolve to that class and run its whole viper suite, with the Maker
+///    quoting both sides of the operator's market, and the only sign would be
+///    a log line listing nine vipers. This is deliberately not "a Custom asset
+///    always wins": the Polymarket US wings are `Custom("us")` and
+///    `Custom("us-crypto")` and rely on the venue's category to rescue markets
+///    their symbol rules miss (`db::venue_category_tests`). Only the one name
+///    that is a declaration rather than a storage identity takes precedence.
+/// 2. **The venue's own category** when it gives one — a domain statement,
+///    where `asset` is a storage identity that happens to match a rule for
+///    crypto and nothing else.
+/// 3. **Crypto assets self-identify.** Any other Custom asset offers its own
+///    name: an operator who deploys a market as "politics" has declared the
+///    class, and the category rule matches it exactly at the highest priority.
+///    Names that match no category rule — "us", "us-crypto" — fall through to
+///    the symbol-token and slug rules, because the category test requires an
+///    exact match rather than merely a non-empty string.
+pub(crate) fn classification_category<'a>(
+    asset: &'a CryptoAsset,
+    venue_category: Option<&'a str>,
+) -> &'a str {
+    if asset.is_helm() {
+        return crate::vipers::helm_impl::KIND;
+    }
+    match venue_category.filter(|c| !c.is_empty()) {
+        Some(c) => c,
+        None => match asset {
+            CryptoAsset::Btc | CryptoAsset::Eth | CryptoAsset::Sol => "crypto",
+            CryptoAsset::Custom(name) => name.as_str(),
+        },
+    }
+}
+
+/// The failure these guard is silent: a Helm squadron that resolves to the
+/// venue's class comes up looking healthy, logs nine vipers, and trades the
+/// operator's market with every one of them.
+#[cfg(test)]
+mod classification_category_tests {
+    use super::{classification_category, CryptoAsset};
+
+    fn custom(s: &str) -> CryptoAsset { CryptoAsset::Custom(s.to_string()) }
+
+    /// The case that decides increment 1: Gamma files the market under
+    /// "Crypto" (or "Sports"), the operator deployed it as Helm, Helm wins.
+    #[test]
+    fn helm_beats_the_venue_s_category() {
+        assert_eq!(classification_category(&custom("helm"), Some("Crypto")), "helm");
+        assert_eq!(classification_category(&custom("helm"), Some("sports")), "helm");
+        assert_eq!(classification_category(&custom("helm"), None), "helm");
+        // The deploy path lowercases; the Control Tower may not.
+        assert_eq!(classification_category(&custom("HELM"), Some("Crypto")), "helm");
+    }
+
+    /// Not "Custom always wins": the US wings depend on the venue category
+    /// rescuing markets their symbol rules miss, exactly as before.
+    #[test]
+    fn other_custom_assets_still_defer_to_the_venue() {
+        assert_eq!(classification_category(&custom("us"), Some("sports")), "sports");
+        assert_eq!(classification_category(&custom("us-crypto"), Some("crypto")), "crypto");
+        assert_eq!(classification_category(&custom("politics"), Some("Sports")), "Sports");
+    }
+
+    /// Unchanged fallbacks: crypto assets self-identify, other Custom assets
+    /// offer their own name, and an empty venue category counts as none.
+    #[test]
+    fn fallbacks_are_unchanged() {
+        assert_eq!(classification_category(&CryptoAsset::Btc, None), "crypto");
+        assert_eq!(classification_category(&CryptoAsset::Eth, Some("")), "crypto");
+        assert_eq!(classification_category(&CryptoAsset::Sol, Some("Crypto")), "Crypto");
+        assert_eq!(classification_category(&custom("politics"), None), "politics");
+        assert_eq!(classification_category(&custom("us"), Some("")), "us");
+    }
+
+    #[test]
+    fn is_helm_is_exact_and_case_insensitive() {
+        assert!(custom("helm").is_helm());
+        assert!(custom("Helm").is_helm());
+        assert!(!custom("helms").is_helm());
+        assert!(!custom("us").is_helm());
+        assert!(!CryptoAsset::Btc.is_helm());
+    }
+}
+
 impl CryptoAsset {
+    /// Is this the Helm asset — a squadron deployed to carry one operator
+    /// position under `HelmStrategy` alone? Case-insensitive, because the
+    /// deploy path lowercases the asset and the Control Tower may not.
+    pub fn is_helm(&self) -> bool {
+        matches!(self, Self::Custom(name) if name.eq_ignore_ascii_case(crate::vipers::helm_impl::KIND))
+    }
+
     /// Upper-case trading symbol as used by Binance WS streams.
     /// e.g. `CryptoAsset::Btc.symbol()` → `"BTC"`
     pub fn symbol(&self) -> String {
@@ -457,24 +554,7 @@ impl Squadron {
         let Some(pool) = crate::helpers::db::pool() else {
             return "unknown".to_string();
         };
-        // Crypto assets self-identify. A Custom asset offers its own name as the
-        // category: an operator who deploys a market as "politics" has declared
-        // the class, and the category rule matches it exactly at the highest
-        // priority. Names that match no category rule — "us", "us-crypto" —
-        // simply fall through to the symbol-token and slug rules, because the
-        // category test requires an exact match rather than merely a non-empty
-        // string. So this strengthens a declared class without altering any
-        // venue that does not declare one.
-        // The venue's own category wins when it gives one — it is a domain
-        // statement, where `asset` is a storage identity that happens to match
-        // a rule for crypto and nothing else.
-        let category = match self.venue_category.as_deref().filter(|c| !c.is_empty()) {
-            Some(c) => c,
-            None => match &self.asset {
-                CryptoAsset::Btc | CryptoAsset::Eth | CryptoAsset::Sol => "crypto",
-                CryptoAsset::Custom(name) => name.as_str(),
-            },
-        };
+        let category = classification_category(&self.asset, self.venue_category.as_deref());
         let symbols = [self.market.yes_token.as_str(), self.market.no_token.as_str()];
         let class = crate::helpers::db::classify_market(
             pool, category, &symbols, &self.market.market_name,

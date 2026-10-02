@@ -25,6 +25,7 @@ use crate::vipers::trendreversal_impl::TrendReversalStrategyImpl;
 use crate::vipers::convergence_impl::ConvergenceStrategyImpl;
 use crate::vipers::fairvalue_impl::FairValueStrategyImpl;
 use crate::vipers::bookline_impl::BooklineStrategy;
+use crate::vipers::helm_impl::HelmStrategy;
 use crate::config;
 use rust_decimal_macros::dec;
 use tracing::info;
@@ -123,6 +124,10 @@ impl StrategyRegistry {
             Box::new(ConvergenceStrategyImpl::new())       as Box<dyn Strategy>,
             Box::new(FairValueStrategyImpl::new())         as Box<dyn Strategy>,
             Box::new(BooklineStrategy::new())              as Box<dyn Strategy>,
+            // The operator's viper. Selected only by the `helm` class, which
+            // carries nothing else; on every other class the kind filter below
+            // leaves it out. Inert until the intent model lands.
+            Box::new(HelmStrategy::new())                  as Box<dyn Strategy>,
         ]
     }
 
@@ -177,6 +182,11 @@ impl StrategyRegistry {
             "ConvergenceStrategy",
             "FairValueStrategy",
             "BooklineStrategy",
+            // Last, so it is the lowest adoption priority: an on-chain orphan
+            // that no running viper claims must never be adopted as the
+            // operator's conviction. Inside a Helm squadron the running set is
+            // Helm alone, so adoption there is correct by construction.
+            crate::vipers::helm_impl::STRATEGY_NAME,
         ]
         .into_iter().map(|s| s.to_string()).collect()
     }
@@ -208,6 +218,7 @@ pub fn strategy_name_to_kind(name: &str) -> &'static str {
         "BooklineStrategy"      => "bookline",
         "TrendReversalStrategy" => "trendcapture",
         "TrendCaptureStrategy"  => "trendcapture", // legacy alias (pre-rename positions)
+        crate::vipers::helm_impl::STRATEGY_NAME => crate::vipers::helm_impl::KIND,
         _ => "",
     }
 }
@@ -258,6 +269,40 @@ mod class_filter_tests {
     #[tokio::test]
     async fn empty_class_runs_nothing_rather_than_everything() {
         assert!(StrategyRegistry::create_strategies_for_kinds(&[]).is_empty());
+    }
+
+    /// The Helm class carries one kind, and that kind must select exactly the
+    /// Helm strategy — not Helm plus whatever shares a prefix or a default arm.
+    #[tokio::test]
+    async fn helm_kind_selects_exactly_the_helm_strategy() {
+        let got = StrategyRegistry::create_strategies_for_kinds(&kinds(&["helm"]));
+        let names: Vec<_> = got.iter().map(|s| s.name()).collect();
+        assert_eq!(names, vec!["HelmStrategy"]);
+    }
+
+    /// The reverse: the crypto suite, as the taxonomy seeds it, must not pull
+    /// Helm in. The kinds here mirror `db::seed_market_taxonomy`'s crypto rows.
+    #[tokio::test]
+    async fn the_crypto_suite_does_not_include_helm() {
+        let crypto = kinds(&[
+            "arbitrage", "maker", "momentum", "gboost", "basis",
+            "time_decay", "trendcapture", "convergence", "fairvalue",
+        ]);
+        let got = StrategyRegistry::create_strategies_for_kinds(&crypto);
+        assert_eq!(got.len(), 9);
+        assert!(!got.iter().any(|s| s.name() == "HelmStrategy"));
+    }
+
+    /// Lowest adoption priority, so an orphan nothing else claims is never
+    /// labeled as the operator's conviction.
+    #[test]
+    fn helm_is_last_in_adoption_order() {
+        let names = StrategyRegistry::strategy_names();
+        assert_eq!(names.last().map(String::as_str), Some("HelmStrategy"));
+        assert_eq!(
+            StrategyRegistry::get_strategy_priority("HelmStrategy"),
+            Some(names.len() - 1),
+        );
     }
 
     /// The pre-rename position label still selects the renamed impl.

@@ -32,6 +32,7 @@ pub mod fairvalue_impl;
 /// Bookline: the maker-first sports viper (ghost-only, disabled by default).
 pub mod bookline_impl;
 pub mod bookline_board;
+pub mod helm_impl;
 
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
