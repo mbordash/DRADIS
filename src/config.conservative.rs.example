@@ -1449,6 +1449,18 @@ pub const FAIRVALUE_BAIL_PROB: f64 = 0.80;
 pub const FAIRVALUE_MIN_EXIT_BID: Decimal = dec!(0.05);
 pub const FAIRVALUE_MAX_SNAPSHOT_AGE_SECS: i64 = 900; // daily book is quiet; FAK orders can't fill vs phantom quotes
 pub const FAIRVALUE_POST_EXIT_COOLDOWN_SECS: i64 = 1200;
+/// Record a counterfactual for every position the percentage stop closes.
+///
+/// Observe-first, like MOMENTUM_BREAK_EVEN_GATE_ENFORCE: the live stop keeps
+/// firing exactly as before; this only opens a row when a stop FILL is booked
+/// and follows the market to the venue's resolution, recording what holding
+/// those shares would have returned (pure hold, and hold with the catastrophic
+/// floor still armed). Production evidence, 30 real FairValue round trips: all
+/// of the net loss was in the 14 stops (−$14.54, 78% of fee spend) while the 8
+/// holds to settlement made +$7.83 — a split the stop produces by selecting
+/// the bad paths, so it proves nothing about the stop until the stopped paths
+/// are scored at settlement. That is what this records. Off writes nothing.
+pub const FAIRVALUE_STOP_COUNTERFACTUAL_RECORD: bool = true;
 
 // ============================================================================
 // TIME DECAY (THETA) STRATEGY PARAMETERS

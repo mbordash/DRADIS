@@ -365,6 +365,7 @@ fn default_fairvalue_settle_hold_min_prob() -> Decimal { decimal_from_f64(config
 fn default_fairvalue_bail_secs()            -> i64     { config::FAIRVALUE_BAIL_SECS                   }
 fn default_fairvalue_bail_prob()            -> Decimal { decimal_from_f64(config::FAIRVALUE_BAIL_PROB) }
 fn default_fairvalue_min_exit_bid()         -> Decimal { config::FAIRVALUE_MIN_EXIT_BID                }
+fn default_fairvalue_stop_counterfactual_record() -> bool { config::FAIRVALUE_STOP_COUNTERFACTUAL_RECORD }
 
 fn default_time_decay_max_fast_velocity_pct()      -> Decimal { config::TIME_DECAY_MAX_FAST_VELOCITY_PCT      }
 fn default_time_decay_max_slow_drift_pct()         -> Decimal { config::TIME_DECAY_MAX_SLOW_DRIFT_PCT         }
@@ -1058,6 +1059,12 @@ pub struct DynamicConfig {
     /// stops being sellable and therefore rides to settlement instead.
     #[serde(default = "default_fairvalue_min_exit_bid")]
     pub fairvalue_min_exit_bid:           Decimal,
+    /// Record, for every position the percentage stop closes, what holding it
+    /// to settlement would have returned. Observe-only: a row opens when a stop
+    /// fill is booked and is scored at the venue's resolution; the live stop is
+    /// untouched. See `vipers::fairvalue_impl::stop_counterfactual`.
+    #[serde(default = "default_fairvalue_stop_counterfactual_record")]
+    pub fairvalue_stop_counterfactual_record: bool,
 
     // ── Convergence Viper ─────────────────────────────────────────────────────
     #[serde(default = "default_convergence_enable")]
@@ -1500,6 +1507,7 @@ impl Default for DynamicConfig {
             fairvalue_bail_secs:              config::FAIRVALUE_BAIL_SECS,
             fairvalue_bail_prob:              decimal_from_f64(config::FAIRVALUE_BAIL_PROB),
             fairvalue_min_exit_bid:           config::FAIRVALUE_MIN_EXIT_BID,
+            fairvalue_stop_counterfactual_record: config::FAIRVALUE_STOP_COUNTERFACTUAL_RECORD,
 
             enable_convergence:               config::ENABLE_CONVERGENCE_TRADING,
             convergence_position_size_usdc:   config::CONVERGENCE_POSITION_SIZE_USDC,
@@ -2301,6 +2309,7 @@ mod tests {
             "momentum_max_break_even_win_rate", "momentum_break_even_gate_enforce",
             "fairvalue_settle_hold_secs", "fairvalue_settle_hold_min_prob",
             "fairvalue_bail_secs", "fairvalue_bail_prob", "fairvalue_min_exit_bid",
+            "fairvalue_stop_counterfactual_record",
             "convergence_max_fee_to_target_ratio", "convergence_tp_fee_margin_mult", "convergence_resting_tp_enabled",
             "gboost_planb_trade_size_usdc", "gboost_planb_margin", "gboost_planb_take_profit_pct", "gboost_planb_stop_loss_pct", "gboost_planb_tp_ceiling",
             "gboost_planb_min_ask", "gboost_planb_max_ask", "gboost_planb_first_minute", "gboost_planb_last_minute",
@@ -2376,6 +2385,7 @@ mod tests {
         assert_eq!(cfg.arb_settle_grace_secs, config::ARB_SETTLE_GRACE_SECS);
         assert_eq!(cfg.fairvalue_settle_snipe_hold, config::FAIRVALUE_SETTLE_SNIPE_HOLD);
         assert_eq!(cfg.fairvalue_resting_tp_enabled, config::FAIRVALUE_RESTING_TP_ENABLED);
+        assert_eq!(cfg.fairvalue_stop_counterfactual_record, config::FAIRVALUE_STOP_COUNTERFACTUAL_RECORD);
     }
 
     /// The orphan settle grace is a naked-exposure window, so it must stay well

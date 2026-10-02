@@ -1068,6 +1068,45 @@ pub enum StrategyStatus {
     Error,
 }
 
+/// One exit fill the venue confirmed and the ledger booked, as reported back to
+/// the strategy that asked for it through [`crate::orchestrator::Strategy::on_exit_filled`].
+///
+/// Observation only. Nothing about the live trade changes on the strength of
+/// this report — the trade row is already written when it is sent — so a
+/// strategy may use it to keep records about its own exits (FairValue's stop
+/// counterfactual) without being on the path that moves money. Carries the
+/// booked slice rather than the whole position: a FAK can fill part of a
+/// position and leave the remainder under management, in which case the
+/// remainder's fill is reported separately when it happens.
+#[derive(Debug, Clone)]
+pub struct ExitFill {
+    /// Squadron the position belonged to (part of its `PositionKey`).
+    pub squadron_id: String,
+    /// Underlying / shard the position was filed under (`btc`, `eth`, …).
+    pub asset: String,
+    pub token_id: MarketId,
+    pub market_name: String,
+    pub condition_id: String,
+    pub market_close_time: Option<DateTime<Utc>>,
+    /// `"YES"` or `"NO"`, as the ledger labels it.
+    pub side: String,
+    /// `Position::opened_at` of the position this slice came from.
+    pub opened_at: DateTime<Utc>,
+    pub avg_entry: Decimal,
+    /// Entry fee attributed to the shares in this slice.
+    pub entry_fee_booked: Decimal,
+    /// Shares the venue matched on this fill.
+    pub shares: Decimal,
+    /// Average price those shares sold at.
+    pub exit_price: Decimal,
+    /// Taker fee paid on this fill.
+    pub exit_fee: Decimal,
+    /// Net P&L booked for this slice, as the trade row records it.
+    pub pnl: Decimal,
+    /// The reason string the strategy emitted the exit with.
+    pub reason: String,
+}
+
 /// Parameters required to place an order on the CLOB.
 #[derive(Debug, Clone)]
 pub struct OrderParams {

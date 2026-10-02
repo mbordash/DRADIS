@@ -906,6 +906,17 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              raising it widens the band in which a collapsed position stops being sellable at all and therefore \
              rides to settlement by default, which is the opposite of what a higher floor sounds like it does.")
             .range(0.0, 0.5).step(0.005));
+        v.push(F::new(g, e, "fairvalue_stop_counterfactual_record", "Stop Counterfactual Recorder", "bool", true,
+            "Record, for every position the percentage stop closes, what holding those shares to settlement would \
+             have returned instead. Observe-only, like Momentum's break-even gate: the live stop keeps firing and \
+             nothing is refused or held. A row opens when a stop FILL is booked (price and fees the venue actually \
+             charged), the book is followed until the market closes (lowest bid, and whether it reached the \
+             catastrophic floor), and the row is scored at the venue's own resolution: pure hold to settlement, \
+             and hold with the catastrophic floor still armed, the sports lane's posture. Production evidence \
+             behind it: every dollar of FairValue's net loss sat in its stop exits while its holds to settlement \
+             were all profitable — a split the stop produces by selecting the bad paths, which only scoring those \
+             paths at settlement can settle. Read the record at GET /api/fairvalue/stop-counterfactual?asset=btc. \
+             Polymarket International only: the resolution comes from Gamma."));
         v.push(F::new(g, e, "fairvalue_post_exit_cooldown_secs", "Post-Exit Cooldown", "secs", true,
             "Seconds a token is locked out after any FairValue exit. Second entries into a market the viper had \
              just left went 0-for-4 for −$1.88 gross on 2026-08-13/14 while first entries were flat, and the \

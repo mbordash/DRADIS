@@ -1375,6 +1375,280 @@ pub async fn gboost_shadow_returns(pool: &SqlitePool, asset: &str, model_version
         .unwrap_or_else(|e| { error!("❌ DB gboost shadow returns read failed: {}", e); Vec::new() })
 }
 
+// ─── FairValue stop counterfactual ───────────────────────────────────────────
+//
+// The question the table answers: for every position FairValue's percentage
+// stop closed, what would holding those shares to settlement have returned?
+// The live stop keeps running and keeps closing positions; nothing here acts.
+//
+// A row is opened when a stop FILL is booked (`fairvalue_stop_shadow_open`),
+// then followed by the viper's sweep for as long as the market is quoted —
+// min and max bid after the stop, whether the bid ever reached the
+// catastrophic floor (`floor_hit_*`), whether the viper re-entered the token
+// live — and scored once the venue resolves the market:
+//
+// * `hold_pnl`       — pure hold to settlement, no stop of any kind:
+//                      `(settle − entry) × shares − entry_fee`. Settlement
+//                      pays no exit fee.
+// * `hold_floor_pnl` — hold with the catastrophic floor still armed, which is
+//                      the posture the sports lane runs: if the bid reached
+//                      the floor after the stop, a taker exit at that bid
+//                      (fee charged); else `hold_pnl`. For a live catastrophic
+//                      stop this equals `stop_pnl` by construction — the floor
+//                      IS what fired.
+//
+// `status` is `open` while the sweep follows it, `scored` once settlement is
+// in, `unresolved` when the venue never priced it inside the deferral bound
+// (the row is then closed with no counterfactual, like a GBoost shadow trade
+// written off unscored — a guess is worse than a gap).
+
+/// The slice a stop fill booked, as the viper hands it to the ledger.
+#[derive(Debug, Clone)]
+pub struct FairValueStopShadowOpen {
+    pub asset: String,
+    pub squadron_id: String,
+    pub condition_id: String,
+    pub token_id: String,
+    pub market: String,
+    pub side: String,
+    pub opened_at: DateTime<Utc>,
+    pub stopped_at: DateTime<Utc>,
+    pub close_time: Option<DateTime<Utc>>,
+    pub entry_price: f64,
+    pub shares: f64,
+    pub entry_fee: f64,
+    /// `percentage` or `catastrophic`.
+    pub stop_kind: String,
+    pub stop_exit_price: f64,
+    pub stop_exit_fee: f64,
+    pub stop_pnl: f64,
+    pub stop_pct: f64,
+    pub floor_price: f64,
+    pub fair_at_stop: Option<f64>,
+    pub bid_marked_at_stop: f64,
+}
+
+/// One stop-counterfactual row, every column, for the sweep and the API.
+#[derive(Debug, Clone, Serialize)]
+pub struct FairValueStopShadowRow {
+    pub id: i64,
+    pub asset: String,
+    pub squadron_id: String,
+    pub condition_id: String,
+    pub token_id: String,
+    pub market: String,
+    pub side: String,
+    pub opened_at: String,
+    pub stopped_at: String,
+    pub close_time: Option<String>,
+    pub entry_price: f64,
+    pub shares: f64,
+    pub entry_fee: f64,
+    pub stop_kind: String,
+    pub stop_exit_price: f64,
+    pub stop_exit_fee: f64,
+    pub stop_pnl: f64,
+    pub stop_pct: f64,
+    pub floor_price: f64,
+    pub fair_at_stop: Option<f64>,
+    pub bid_marked_at_stop: f64,
+    pub min_bid_after: Option<f64>,
+    pub max_bid_after: Option<f64>,
+    pub last_bid_at: Option<String>,
+    pub floor_hit_at: Option<String>,
+    pub floor_hit_bid: Option<f64>,
+    pub live_reentered: bool,
+    pub settle_price: Option<f64>,
+    pub settle_source: Option<String>,
+    pub hold_pnl: Option<f64>,
+    pub hold_floor_pnl: Option<f64>,
+    pub status: String,
+    pub closed_at: Option<String>,
+}
+
+const FAIRVALUE_STOP_SHADOW_COLUMNS: &str =
+    "id, asset, squadron_id, condition_id, token_id, market, side, opened_at, stopped_at, close_time,
+     entry_price, shares, entry_fee, stop_kind, stop_exit_price, stop_exit_fee, stop_pnl, stop_pct,
+     floor_price, fair_at_stop, bid_marked_at_stop, min_bid_after, max_bid_after, last_bid_at,
+     floor_hit_at, floor_hit_bid, live_reentered, settle_price, settle_source, hold_pnl,
+     hold_floor_pnl, status, closed_at";
+
+fn fairvalue_stop_shadow_row(r: &sqlx::sqlite::SqliteRow) -> FairValueStopShadowRow {
+    FairValueStopShadowRow {
+        id: r.get("id"), asset: r.get("asset"), squadron_id: r.get("squadron_id"),
+        condition_id: r.get("condition_id"), token_id: r.get("token_id"), market: r.get("market"),
+        side: r.get("side"), opened_at: r.get("opened_at"), stopped_at: r.get("stopped_at"),
+        close_time: r.get("close_time"), entry_price: r.get("entry_price"), shares: r.get("shares"),
+        entry_fee: r.get("entry_fee"), stop_kind: r.get("stop_kind"), stop_exit_price: r.get("stop_exit_price"),
+        stop_exit_fee: r.get("stop_exit_fee"), stop_pnl: r.get("stop_pnl"), stop_pct: r.get("stop_pct"),
+        floor_price: r.get("floor_price"), fair_at_stop: r.get("fair_at_stop"),
+        bid_marked_at_stop: r.get("bid_marked_at_stop"), min_bid_after: r.get("min_bid_after"),
+        max_bid_after: r.get("max_bid_after"), last_bid_at: r.get("last_bid_at"),
+        floor_hit_at: r.get("floor_hit_at"), floor_hit_bid: r.get("floor_hit_bid"),
+        live_reentered: r.get::<i64, _>("live_reentered") != 0, settle_price: r.get("settle_price"),
+        settle_source: r.get("settle_source"), hold_pnl: r.get("hold_pnl"),
+        hold_floor_pnl: r.get("hold_floor_pnl"), status: r.get("status"), closed_at: r.get("closed_at"),
+    }
+}
+
+/// Open a counterfactual row for one booked stop fill. Returns the row id, or
+/// `None` when the write failed — in which case nothing is recorded and the
+/// caller has nothing to follow.
+pub async fn fairvalue_stop_shadow_open(pool: &SqlitePool, o: &FairValueStopShadowOpen) -> Option<i64> {
+    match sqlx::query(
+        "INSERT INTO fairvalue_stop_shadow
+            (asset, squadron_id, condition_id, token_id, market, side, opened_at, stopped_at, close_time,
+             entry_price, shares, entry_fee, stop_kind, stop_exit_price, stop_exit_fee, stop_pnl, stop_pct,
+             floor_price, fair_at_stop, bid_marked_at_stop, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')")
+        .bind(&o.asset).bind(&o.squadron_id).bind(&o.condition_id).bind(&o.token_id).bind(&o.market).bind(&o.side)
+        .bind(o.opened_at.to_rfc3339()).bind(o.stopped_at.to_rfc3339()).bind(o.close_time.map(|t| t.to_rfc3339()))
+        .bind(o.entry_price).bind(o.shares).bind(o.entry_fee).bind(&o.stop_kind)
+        .bind(o.stop_exit_price).bind(o.stop_exit_fee).bind(o.stop_pnl).bind(o.stop_pct)
+        .bind(o.floor_price).bind(o.fair_at_stop).bind(o.bid_marked_at_stop)
+        .execute(pool).await
+    {
+        Ok(r) => Some(r.last_insert_rowid()),
+        Err(e) => { error!("❌ DB fairvalue stop shadow open failed: {}", e); None }
+    }
+}
+
+/// Every row the sweep still has to follow for this asset, oldest first.
+pub async fn fairvalue_stop_shadow_open_rows(pool: &SqlitePool, asset: &str) -> Vec<FairValueStopShadowRow> {
+    sqlx::query(&format!(
+        "SELECT {FAIRVALUE_STOP_SHADOW_COLUMNS} FROM fairvalue_stop_shadow
+          WHERE asset = ? AND status = 'open' ORDER BY id"))
+        .bind(asset)
+        .fetch_all(pool).await
+        .map(|rows| rows.iter().map(fairvalue_stop_shadow_row).collect())
+        .unwrap_or_else(|e| { error!("❌ DB fairvalue stop shadow read failed: {}", e); Vec::new() })
+}
+
+/// Record what the sweep observed of the token's book since the stop. The
+/// floor fields are written once, the first time the bid reaches the floor,
+/// and never overwritten; the others track the whole observed path.
+#[allow(clippy::too_many_arguments)]
+pub async fn fairvalue_stop_shadow_path(
+    pool: &SqlitePool, id: i64,
+    min_bid: Option<f64>, max_bid: Option<f64>, last_bid_at: Option<DateTime<Utc>>,
+    floor_hit: Option<(DateTime<Utc>, f64)>, live_reentered: bool,
+) -> bool {
+    match sqlx::query(
+        "UPDATE fairvalue_stop_shadow
+            SET min_bid_after = ?, max_bid_after = ?, last_bid_at = ?,
+                floor_hit_at  = COALESCE(floor_hit_at, ?),
+                floor_hit_bid = COALESCE(floor_hit_bid, ?),
+                live_reentered = CASE WHEN ? THEN 1 ELSE live_reentered END
+          WHERE id = ? AND status = 'open'")
+        .bind(min_bid).bind(max_bid).bind(last_bid_at.map(|t| t.to_rfc3339()))
+        .bind(floor_hit.map(|(t, _)| t.to_rfc3339())).bind(floor_hit.map(|(_, b)| b))
+        .bind(live_reentered).bind(id)
+        .execute(pool).await
+    {
+        Ok(r) => r.rows_affected() > 0,
+        Err(e) => { error!("❌ DB fairvalue stop shadow path update failed: {}", e); false }
+    }
+}
+
+/// Score a row against the venue's resolution and close it.
+pub async fn fairvalue_stop_shadow_score(
+    pool: &SqlitePool, id: i64, settle_price: f64, settle_source: &str, hold_pnl: f64, hold_floor_pnl: f64,
+) -> bool {
+    match sqlx::query(
+        "UPDATE fairvalue_stop_shadow
+            SET settle_price = ?, settle_source = ?, hold_pnl = ?, hold_floor_pnl = ?,
+                status = 'scored', closed_at = ?
+          WHERE id = ? AND status = 'open'")
+        .bind(settle_price).bind(settle_source).bind(hold_pnl).bind(hold_floor_pnl)
+        .bind(Utc::now().to_rfc3339()).bind(id)
+        .execute(pool).await
+    {
+        Ok(r) => r.rows_affected() > 0,
+        Err(e) => { error!("❌ DB fairvalue stop shadow score failed: {}", e); false }
+    }
+}
+
+/// Close a row the venue never resolved, recording no counterfactual.
+pub async fn fairvalue_stop_shadow_abandon(pool: &SqlitePool, id: i64) -> bool {
+    match sqlx::query(
+        "UPDATE fairvalue_stop_shadow
+            SET status = 'unresolved', settle_source = 'unresolved', closed_at = ?
+          WHERE id = ? AND status = 'open'")
+        .bind(Utc::now().to_rfc3339()).bind(id)
+        .execute(pool).await
+    {
+        Ok(r) => r.rows_affected() > 0,
+        Err(e) => { error!("❌ DB fairvalue stop shadow abandon failed: {}", e); false }
+    }
+}
+
+/// The most recent rows for this asset, newest first, for the API.
+pub async fn fairvalue_stop_shadow_rows(pool: &SqlitePool, asset: &str, limit: i64) -> Vec<FairValueStopShadowRow> {
+    sqlx::query(&format!(
+        "SELECT {FAIRVALUE_STOP_SHADOW_COLUMNS} FROM fairvalue_stop_shadow
+          WHERE asset = ? ORDER BY id DESC LIMIT ?"))
+        .bind(asset).bind(limit)
+        .fetch_all(pool).await
+        .map(|rows| rows.iter().map(fairvalue_stop_shadow_row).collect())
+        .unwrap_or_else(|e| { error!("❌ DB fairvalue stop shadow list failed: {}", e); Vec::new() })
+}
+
+/// The record so far, over SCORED rows only — a row that is still open or was
+/// never resolved has no counterfactual and must not dilute the sums.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FairValueStopShadowSummary {
+    pub asset: String,
+    /// Rows in each state.
+    pub open: i64,
+    pub scored: i64,
+    pub unresolved: i64,
+    /// Scored rows where the live stop was the catastrophic floor.
+    pub scored_catastrophic: i64,
+    /// Scored rows whose token settled at $1 / at $0 / at $0.50.
+    pub settled_won: i64,
+    pub settled_lost: i64,
+    pub settled_tied: i64,
+    /// Scored rows where the bid reached the catastrophic floor after a percentage stop.
+    pub floor_hits: i64,
+    /// Scored rows where FairValue re-entered the same token live after the stop.
+    pub reentered: i64,
+    /// Sums over scored rows, in dollars.
+    pub stop_pnl_sum: f64,
+    pub hold_pnl_sum: f64,
+    pub hold_floor_pnl_sum: f64,
+    pub stop_exit_fee_sum: f64,
+}
+
+pub async fn fairvalue_stop_shadow_summary(pool: &SqlitePool, asset: &str) -> FairValueStopShadowSummary {
+    type Row = (i64, i64, i64, i64, i64, i64, i64, i64, i64, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT COUNT(CASE WHEN status = 'open' THEN 1 END),
+                COUNT(CASE WHEN status = 'scored' THEN 1 END),
+                COUNT(CASE WHEN status = 'unresolved' THEN 1 END),
+                COUNT(CASE WHEN status = 'scored' AND stop_kind = 'catastrophic' THEN 1 END),
+                COUNT(CASE WHEN status = 'scored' AND settle_price > 0.5 THEN 1 END),
+                COUNT(CASE WHEN status = 'scored' AND settle_price < 0.5 THEN 1 END),
+                COUNT(CASE WHEN status = 'scored' AND settle_price = 0.5 THEN 1 END),
+                COUNT(CASE WHEN status = 'scored' AND stop_kind = 'percentage' AND floor_hit_at IS NOT NULL THEN 1 END),
+                COUNT(CASE WHEN status = 'scored' AND live_reentered <> 0 THEN 1 END),
+                SUM(CASE WHEN status = 'scored' THEN stop_pnl END),
+                SUM(CASE WHEN status = 'scored' THEN hold_pnl END),
+                SUM(CASE WHEN status = 'scored' THEN hold_floor_pnl END),
+                SUM(CASE WHEN status = 'scored' THEN stop_exit_fee END)
+           FROM fairvalue_stop_shadow WHERE asset = ?")
+        .bind(asset)
+        .fetch_optional(pool).await
+        .unwrap_or_else(|e| { error!("❌ DB fairvalue stop shadow summary failed: {}", e); None });
+    let Some(r) = row else { return FairValueStopShadowSummary { asset: asset.to_string(), ..Default::default() } };
+    FairValueStopShadowSummary {
+        asset: asset.to_string(),
+        open: r.0, scored: r.1, unresolved: r.2, scored_catastrophic: r.3,
+        settled_won: r.4, settled_lost: r.5, settled_tied: r.6, floor_hits: r.7, reentered: r.8,
+        stop_pnl_sum: r.9.unwrap_or(0.0), hold_pnl_sum: r.10.unwrap_or(0.0),
+        hold_floor_pnl_sum: r.11.unwrap_or(0.0), stop_exit_fee_sum: r.12.unwrap_or(0.0),
+    }
+}
+
 /// Add new columns to existing tables that pre-date the session tracking feature.
 /// Uses sqlx error suppression rather than IF NOT EXISTS (SQLite does not support that syntax).
 pub(crate) async fn run_migrations(pool: &SqlitePool) {
@@ -1456,6 +1730,58 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) {
     let _ = sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_bookline_shadow_lane
              ON bookline_shadow(lane, asset, closed_at)"
+    ).execute(pool).await;
+
+    // FairValue's stop counterfactual. One row per stop FILL the live
+    // percentage stop booked (a partial fill and its remainder are two rows,
+    // each for its own shares, and sum per position by `token_id, opened_at`),
+    // carrying what the live stop realized and, once the market resolves, what
+    // holding those shares instead would have returned. See the "FairValue stop
+    // counterfactual" section for the accessors and the rules behind each
+    // column. Its own table rather than a lane in `gboost_shadow_trades` or
+    // `bookline_shadow`: those are simulated ENTRIES scored on their own exit
+    // rule, while every row here is a REAL exit scored against an alternative,
+    // and a reader summing a shadow table must not find real stops in it.
+    let _ = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS fairvalue_stop_shadow (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset               TEXT    NOT NULL,
+            squadron_id         TEXT    NOT NULL,
+            condition_id        TEXT    NOT NULL,
+            token_id            TEXT    NOT NULL,
+            market              TEXT    NOT NULL,
+            side                TEXT    NOT NULL,
+            opened_at           TEXT    NOT NULL,
+            stopped_at          TEXT    NOT NULL,
+            close_time          TEXT,
+            entry_price         REAL    NOT NULL,
+            shares              REAL    NOT NULL,
+            entry_fee           REAL    NOT NULL,
+            stop_kind           TEXT    NOT NULL,
+            stop_exit_price     REAL    NOT NULL,
+            stop_exit_fee       REAL    NOT NULL,
+            stop_pnl            REAL    NOT NULL,
+            stop_pct            REAL    NOT NULL,
+            floor_price         REAL    NOT NULL,
+            fair_at_stop        REAL,
+            bid_marked_at_stop  REAL    NOT NULL,
+            min_bid_after       REAL,
+            max_bid_after       REAL,
+            last_bid_at         TEXT,
+            floor_hit_at        TEXT,
+            floor_hit_bid       REAL,
+            live_reentered      INTEGER NOT NULL DEFAULT 0,
+            settle_price        REAL,
+            settle_source       TEXT,
+            hold_pnl            REAL,
+            hold_floor_pnl      REAL,
+            status              TEXT    NOT NULL DEFAULT 'open',
+            closed_at           TEXT
+        )"
+    ).execute(pool).await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_fairvalue_stop_shadow_open
+             ON fairvalue_stop_shadow(asset, status)"
     ).execute(pool).await;
 
     // Add session_id to trades
@@ -6292,6 +6618,80 @@ mod reconcile_tests {
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE market = 'MarketG'")
             .fetch_one(&pool).await.unwrap();
         assert_eq!(n, 1);
+    }
+
+    // ── FairValue stop counterfactual ────────────────────────────────────────
+
+    fn stop_shadow_open(asset: &str, token: &str, kind: &str) -> FairValueStopShadowOpen {
+        let stopped = Utc::now() - chrono::Duration::minutes(3);
+        FairValueStopShadowOpen {
+            asset: asset.into(), squadron_id: "btc-open".into(), condition_id: "cid-cf".into(),
+            token_id: token.into(), market: "Bitcoin Up or Down - October 2, 3PM ET".into(), side: "YES".into(),
+            opened_at: stopped - chrono::Duration::minutes(12), stopped_at: stopped,
+            close_time: Some(stopped + chrono::Duration::minutes(40)),
+            entry_price: 0.78, shares: 5.0, entry_fee: 0.06, stop_kind: kind.into(),
+            stop_exit_price: 0.69, stop_exit_fee: 0.07, stop_pnl: -0.58, stop_pct: 0.12,
+            floor_price: 0.5928, fair_at_stop: Some(0.81), bid_marked_at_stop: 0.68,
+        }
+    }
+
+    /// The whole life of a counterfactual row: opened on a stop fill, followed
+    /// (path flushed, floor latched once), scored at the resolution, and read
+    /// back by the summary over scored rows only. A second row the venue never
+    /// resolves is written off and counted, not summed; the summary of an asset
+    /// with no rows reads zeros rather than failing to decode a NULL.
+    #[tokio::test]
+    async fn the_fairvalue_stop_counterfactual_round_trips() {
+        let pool = mem_pool().await;
+        let empty = fairvalue_stop_shadow_summary(&pool, "btc").await;
+        assert_eq!((empty.open, empty.scored, empty.unresolved), (0, 0, 0));
+        assert_eq!(empty.stop_pnl_sum, 0.0);
+
+        let id = fairvalue_stop_shadow_open(&pool, &stop_shadow_open("btc", "tok-a", "percentage")).await
+            .expect("the row is written");
+        let open = fairvalue_stop_shadow_open_rows(&pool, "btc").await;
+        assert_eq!(open.len(), 1);
+        assert_eq!((open[0].id, open[0].status.as_str(), open[0].stop_kind.as_str()), (id, "open", "percentage"));
+        assert!(open[0].floor_hit_at.is_none() && open[0].settle_price.is_none());
+        assert!(fairvalue_stop_shadow_open_rows(&pool, "eth").await.is_empty(), "scoped to the asset");
+
+        // Two flushes: the floor latches on the first and is not moved by the second.
+        let t1 = Utc::now();
+        assert!(fairvalue_stop_shadow_path(&pool, id, Some(0.59), Some(0.75), Some(t1), Some((t1, 0.59)), false).await);
+        let t2 = t1 + chrono::Duration::seconds(5);
+        assert!(fairvalue_stop_shadow_path(&pool, id, Some(0.40), Some(0.75), Some(t2), Some((t2, 0.40)), true).await);
+        let r = &fairvalue_stop_shadow_open_rows(&pool, "btc").await[0];
+        assert_eq!((r.min_bid_after, r.max_bid_after), (Some(0.40), Some(0.75)));
+        assert_eq!(r.floor_hit_bid, Some(0.59), "first touch stays");
+        assert_eq!(r.floor_hit_at.as_deref(), Some(t1.to_rfc3339().as_str()));
+        assert!(r.live_reentered, "once flagged, stays flagged");
+        assert!(!fairvalue_stop_shadow_path(&pool, id, None, None, None, None, false).await || r.live_reentered,
+            "a later flush with the flag off does not clear it");
+
+        assert!(fairvalue_stop_shadow_score(&pool, id, 1.0, "resolved", 1.04, -1.37).await);
+        assert!(!fairvalue_stop_shadow_score(&pool, id, 1.0, "resolved", 1.04, -1.37).await, "scored once");
+        assert!(fairvalue_stop_shadow_open_rows(&pool, "btc").await.is_empty());
+
+        let id2 = fairvalue_stop_shadow_open(&pool, &stop_shadow_open("btc", "tok-b", "catastrophic")).await.unwrap();
+        assert!(fairvalue_stop_shadow_abandon(&pool, id2).await);
+        assert!(!fairvalue_stop_shadow_abandon(&pool, id2).await, "written off once");
+
+        let s = fairvalue_stop_shadow_summary(&pool, "btc").await;
+        assert_eq!((s.open, s.scored, s.unresolved), (0, 1, 1));
+        assert_eq!((s.settled_won, s.settled_lost, s.settled_tied), (1, 0, 0));
+        assert_eq!((s.floor_hits, s.reentered, s.scored_catastrophic), (1, 1, 0));
+        assert!((s.stop_pnl_sum - -0.58).abs() < 1e-9, "scored rows only: {}", s.stop_pnl_sum);
+        assert!((s.hold_pnl_sum - 1.04).abs() < 1e-9);
+        assert!((s.hold_floor_pnl_sum - -1.37).abs() < 1e-9);
+        assert!((s.stop_exit_fee_sum - 0.07).abs() < 1e-9, "the written-off row's fee is not summed");
+
+        let rows = fairvalue_stop_shadow_rows(&pool, "btc", 10).await;
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), vec![id2, id], "newest first");
+        assert_eq!(rows[0].status, "unresolved");
+        assert_eq!(rows[0].settle_source.as_deref(), Some("unresolved"));
+        assert_eq!(rows[1].status, "scored");
+        assert_eq!(rows[1].settle_source.as_deref(), Some("resolved"));
+        assert_eq!(rows[1].hold_pnl, Some(1.04));
     }
 }
 

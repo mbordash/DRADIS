@@ -906,6 +906,25 @@ async fn get_bookline_record() -> Response {
     Json(serde_json::json!({ "lanes": lanes })).into_response()
 }
 
+/// GET /api/fairvalue/stop-counterfactual?asset=btc&limit=200
+///
+/// FairValue's stop counterfactual record for one asset: the summary over scored
+/// rows (what the live stops realized against what holding to settlement would
+/// have, with and without the catastrophic floor armed) and the most recent
+/// rows. See `vipers::fairvalue_impl::stop_counterfactual` for what each column
+/// means and what the record does and does not prove. Summary sums cover scored
+/// rows only; open and unresolved rows are counted but carry no number.
+async fn get_fairvalue_stop_counterfactual(Query(q): Query<AssetQuery>) -> Response {
+    let asset = q.asset.clone().unwrap_or_else(|| "btc".to_string()).to_lowercase();
+    let Some(pool) = db::pool_for_opt_retry(Some(&asset)).await else {
+        return (StatusCode::SERVICE_UNAVAILABLE, format!("no database for asset '{asset}'")).into_response();
+    };
+    let limit = q.limit.unwrap_or(200).clamp(1, 2000);
+    let summary = db::fairvalue_stop_shadow_summary(&pool, &asset).await;
+    let rows = db::fairvalue_stop_shadow_rows(&pool, &asset, limit).await;
+    Json(serde_json::json!({ "summary": summary, "rows": rows })).into_response()
+}
+
 /// GET /api/gboost/planb/status?asset=btc
 ///
 /// The GBoost plan-B training pipeline's full state for one asset: backfill
@@ -4494,6 +4513,7 @@ pub async fn run_api_server(
         .route("/api/vipers/status",         get(get_vipers_status))
         .route("/api/bookline/record",       get(get_bookline_record))
         .route("/api/gboost/planb/status",   get(get_gboost_planb_status))
+        .route("/api/fairvalue/stop-counterfactual", get(get_fairvalue_stop_counterfactual))
         .route("/api/positions",             get(get_open_positions))
         .route("/api/positions/pending",     get(get_pending_positions))
         .route("/api/positions/confirmed",   get(get_confirmed_positions))

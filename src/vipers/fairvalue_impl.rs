@@ -227,6 +227,11 @@ struct FairValueGlobals {
     /// When each (condition_id, side) book last became — and has since stayed —
     /// clear of `fairvalue_obi_adverse_block`. Feeds the OBI clear dwell.
     obi_clear_since: StdMutex<HashMap<(String, bool), Instant>>,
+    /// The stop counterfactual recorder's state: the stop each token's position
+    /// was last emitted with (so the fill hook can price the floor the live
+    /// rule used), and the open rows the sweep follows. See
+    /// [`stop_counterfactual`].
+    stop_shadow: StdMutex<stop_counterfactual::State>,
 }
 
 /// Record this tick's OBI verdict for one (market, side): a clear book keeps
@@ -307,6 +312,7 @@ impl FairValueGlobals {
             settle_hold_latched: StdMutex::new(HashMap::new()),
             sports_opened: StdMutex::new(std::collections::HashSet::new()),
             obi_clear_since:  StdMutex::new(HashMap::new()),
+            stop_shadow:      StdMutex::new(stop_counterfactual::State::default()),
         }
     }
 }
@@ -1714,6 +1720,11 @@ impl Strategy for FairValueStrategyImpl {
 
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config;
+        // The stop counterfactual's sweep follows the book for positions the
+        // stop has ALREADY closed, so it has no position to act on and emits
+        // nothing. Run before the map is locked: it awaits the database, and
+        // the patrol tick waits on that lock.
+        stop_counterfactual::sweep(ctx).await;
         let positions = ctx.positions.lock().await;
 
         // The two settlement probabilities are operator knobs stored as Decimal;
@@ -2108,6 +2119,25 @@ impl Strategy for FairValueStrategyImpl {
                     snap_age_secs, veto_note,
                     if settle_snipe { " posture=settle-snipe" } else { "" },
                 );
+                // Stop counterfactual recorder: remember the stop this emission
+                // was priced on, so the fill hook can open its row with the
+                // floor the live rule used. A memory write and nothing more —
+                // the signal below is exactly what it was before this existed.
+                if dc.fairvalue_stop_counterfactual_record {
+                    stop_counterfactual::note_emission(
+                        &ctx.crypto_filter, token_id.as_str(),
+                        stop_counterfactual::Emission {
+                            opened_at: position.opened_at,
+                            stop_pct: dc.fairvalue_stop_loss_pct,
+                            floor_price: stop_counterfactual::floor_price(avg_entry, dc.fairvalue_stop_loss_pct),
+                            fair_at_stop: fair_side,
+                            bid_marked: bid,
+                            close_time: market.market_close_time,
+                            condition_id: market.condition_id.clone(),
+                            market_name: market.market_name.clone(),
+                        },
+                    );
+                }
                 return Ok(StrategySignal::Exit {
                     params: exit_params(bid),
                     reason: if catastrophic {
@@ -2187,10 +2217,545 @@ impl Strategy for FairValueStrategyImpl {
     }
 
     fn status(&self) -> StrategyStatus { StrategyStatus::Active }
+
+    /// A booked stop fill opens its counterfactual row; every other exit is
+    /// ignored. Observation only, after the trade row exists.
+    fn on_exit_filled(&self, fill: &crate::state::ExitFill) {
+        stop_counterfactual::on_exit_filled(fill);
+    }
+
     fn name(&self) -> String { "FairValueStrategy".to_string() }
     fn venue(&self) -> &'static str { "Window/Daily" }
     fn max_exposure(&self) -> Decimal { config::FAIRVALUE_MAX_EXPOSURE_USDC }
     fn risk_model(&self) -> &'static str { "Gross one-sided" }
+}
+
+// ─── Stop counterfactual recorder ────────────────────────────────────────────
+/// Records, for every position the percentage stop closes, what holding those
+/// shares to settlement would have returned instead. Observe-only: the live
+/// stop keeps firing and nothing here emits a signal or places an order.
+///
+/// # Why this exists
+///
+/// On production (Polymarket International, 30 real FairValue round trips) every
+/// dollar of net loss sat in the 14 stop exits (−$14.54, 78% of the viper's fee
+/// spend), while the 8 holds to settlement made +$7.83. That split is
+/// survivorship-biased by construction — the stop selects the bad paths and
+/// settlement the good ones — so it cannot say whether the stop is saving money
+/// or spending it. The sports lane already runs the other posture
+/// (`SPORTS_FAIRVALUE_SETTLE_HOLD`: hold, catastrophic floor armed) on the
+/// argument that a percentage stop "measures a different strategy". This
+/// recorder measures that strategy on the crypto positions the stop actually
+/// closed, against the venue's own resolution, so the decision can be made on
+/// the stopped paths rather than on the survivors.
+///
+/// # What is recorded, and from where
+///
+/// * **The row opens on a booked stop FILL**, not on the stop signal: a stop
+///   FAK can miss and re-fire for minutes, and the counterfactual must start
+///   from the price the venue actually paid, net of the fees it actually
+///   charged. The patrol reports every booked exit slice through
+///   [`crate::orchestrator::Strategy::on_exit_filled`]; only reasons that begin
+///   `FairValueSL:` or `FairValueCatastrophicSL:` open a row. The floor the
+///   live rule priced on rides along from the stop's own emission
+///   (`note_emission`, rule 4), so the counterfactual uses the same
+///   `entry × (1 − 2 × stop)` the live floor would have.
+/// * **The resolution comes from the venue**, by the same Gamma rule the sports
+///   ledger and GBoost's shadow lane use (`settled_prices_for_market`: $0 or
+///   $1 outright, $0.50 only when UMA reports `resolved`). Not from the oracle:
+///   the model's strike and Binance print are an approximation of the venue's
+///   resolution source, and a measurement meant to settle a real-money
+///   question should not inherit the model's own errors. The probe starts
+///   `SETTLE_GRACE_SECS` after the stated close and gives up after
+///   `GIVE_UP_SECS`, leaving the row `unresolved` with no number.
+/// * **The path after the stop is followed from the book the stop read**, at
+///   tick cadence, for as long as the squadron quotes the market: lowest and
+///   highest bid, when the bid was last seen, and the first instant the bid
+///   reached the catastrophic floor. The hourly squadron rotates at the close,
+///   so coverage runs to the close in the ordinary case; `last_bid_at` says
+///   how far it actually ran for each row.
+///
+/// # Two counterfactuals, not one
+///
+/// `hold_pnl` is the pure hold: settlement value less entry, less the entry
+/// fee already paid; settlement pays no exit fee. `hold_floor_pnl` keeps the
+/// catastrophic floor armed, as the sports posture does: if the bid reached
+/// `floor_price` after the stop (and was sellable — above `Min Exit Bid`), the
+/// counterfactual sells there as a taker, fee charged; otherwise it is the pure
+/// hold. For a live catastrophic stop the floor-armed counterfactual IS the
+/// live trade, so `hold_floor_pnl == stop_pnl` there and only `hold_pnl` adds
+/// information. The faithful comparison for "turn the percentage stop off,
+/// keep the floor" is `hold_floor_pnl − stop_pnl` summed over scored rows; the
+/// pure hold answers the stricter "no stop at all" the sports comment
+/// describes. The floor is modeled from the book at tick cadence, which is
+/// how the live floor reads it; a flicker shorter than one tick is invisible
+/// to both.
+///
+/// # Re-entry
+///
+/// On the shipped profiles a stop trips the market's circuit breaker
+/// (`FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET = 1`), so FairValue does not re-enter
+/// a market it was stopped on and the counterfactual's capital is never
+/// double-counted. The breaker is a knob, so the sweep also flags a row whose
+/// token FairValue re-entered live after the stop (`live_reentered`); those
+/// rows are a different experiment (the hold would have occupied the capital
+/// the re-entry used) and the summary counts them so they can be set aside.
+///
+/// # What the record will not say
+///
+/// It scores the exact shares the stop sold, at the venue's resolution, with
+/// the fees the venue charges. It does not model what the hold would have done
+/// to the REST of the book: capital held to settlement is capital the viper
+/// could not deploy on the next entry under `Max Exposure`, and that
+/// portfolio effect is outside a per-position record. It also does not model
+/// the live rules that would still have been armed under a hold — the model
+/// reversal exit, the endgame bail, the resting take-profit — so the two
+/// columns bracket the hold posture rather than reproduce the sports lane
+/// rule for rule. And the sample is the stops the live rule fired, under the
+/// live rule's entry filters; a decision to change the stop also changes
+/// which positions exist to be stopped.
+pub(crate) mod stop_counterfactual {
+    use std::collections::HashMap;
+    use std::sync::{Mutex as StdMutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    use chrono::{DateTime, Utc};
+    use rust_decimal::Decimal;
+    use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+    use rust_decimal_macros::dec;
+    use tracing::{info, warn};
+
+    use crate::helpers::db::{self, FairValueStopShadowOpen, FairValueStopShadowRow};
+    use crate::orchestrator::StrategyContext;
+    use crate::state::{ExitFill, PositionKey};
+    use crate::venues::core::MarketId;
+
+    /// How often the sweep flushes observations and re-reads the open rows.
+    pub(crate) const REFRESH_SECS: u64 = 5;
+    /// How long after the stated close the first resolution probe is sent.
+    pub(crate) const SETTLE_GRACE_SECS: i64 = 60;
+    /// How often one market's resolution is asked for while undecided.
+    pub(crate) const PROBE_SECS: u64 = 60;
+    /// Past this, an undecided row is closed unscored — the same bound the
+    /// live settlement sweep and the GBoost shadow lane use.
+    pub(crate) const GIVE_UP_SECS: i64 = 24 * 3600;
+    const HTTP_TIMEOUT_SECS: u64 = 5;
+    /// Emissions older than this are forgotten; a stop that has not filled in
+    /// two hours belongs to a market that has rotated away.
+    const EMISSION_TTL_SECS: i64 = 2 * 3600;
+
+    pub(crate) const STOP_KIND_PERCENTAGE: &str = "percentage";
+    pub(crate) const STOP_KIND_CATASTROPHIC: &str = "catastrophic";
+
+    /// What rule 4 knew when it emitted a stop on this token's position.
+    #[derive(Debug, Clone)]
+    pub(crate) struct Emission {
+        pub opened_at: DateTime<Utc>,
+        pub stop_pct: Decimal,
+        pub floor_price: Decimal,
+        pub fair_at_stop: Option<f64>,
+        pub bid_marked: Decimal,
+        pub close_time: Option<DateTime<Utc>>,
+        pub condition_id: String,
+        pub market_name: String,
+    }
+
+    /// One open row as the sweep follows it between flushes.
+    #[derive(Debug, Clone)]
+    pub(crate) struct Followed {
+        pub id: i64,
+        pub token_id: String,
+        pub condition_id: String,
+        pub market: String,
+        pub side: String,
+        pub stopped_at: DateTime<Utc>,
+        pub close_time: Option<DateTime<Utc>>,
+        pub entry: Decimal,
+        pub shares: Decimal,
+        pub entry_fee: Decimal,
+        pub stop_pnl: Decimal,
+        pub stop_exit_price: Decimal,
+        pub live_catastrophic: bool,
+        pub floor_price: Decimal,
+        pub min_bid: Option<Decimal>,
+        pub max_bid: Option<Decimal>,
+        pub last_bid_at: Option<DateTime<Utc>>,
+        pub floor_hit: Option<(DateTime<Utc>, Decimal)>,
+        pub live_reentered: bool,
+        dirty: bool,
+    }
+
+    impl Followed {
+        pub(crate) fn from_row(r: &FairValueStopShadowRow) -> Option<Self> {
+            let d = |x: f64| Decimal::from_f64(x).unwrap_or_default();
+            let stopped_at = parse_ts(&r.stopped_at)?;
+            let live_catastrophic = r.stop_kind == STOP_KIND_CATASTROPHIC;
+            let mut floor_hit = match (r.floor_hit_at.as_deref().and_then(parse_ts), r.floor_hit_bid) {
+                (Some(t), Some(b)) => Some((t, d(b))),
+                _ => None,
+            };
+            // The live catastrophic stop IS the floor firing: the row carries
+            // that as its floor hit from the start, so the floor-armed
+            // counterfactual reads the same way whichever branch produced it.
+            let mut dirty = false;
+            if live_catastrophic && floor_hit.is_none() {
+                floor_hit = Some((stopped_at, d(r.stop_exit_price)));
+                dirty = true;
+            }
+            Some(Self {
+                id: r.id, token_id: r.token_id.clone(), condition_id: r.condition_id.clone(),
+                market: r.market.clone(), side: r.side.clone(), stopped_at,
+                close_time: r.close_time.as_deref().and_then(parse_ts),
+                entry: d(r.entry_price), shares: d(r.shares), entry_fee: d(r.entry_fee),
+                stop_pnl: d(r.stop_pnl), stop_exit_price: d(r.stop_exit_price), live_catastrophic,
+                floor_price: d(r.floor_price),
+                min_bid: r.min_bid_after.map(d), max_bid: r.max_bid_after.map(d),
+                last_bid_at: r.last_bid_at.as_deref().and_then(parse_ts),
+                floor_hit, live_reentered: r.live_reentered, dirty,
+            })
+        }
+
+        /// One reading of the token's best bid after the stop.
+        pub(crate) fn observe(&mut self, bid: Decimal, now: DateTime<Utc>, min_exit_bid: Decimal) {
+            if bid <= Decimal::ZERO { return; }
+            self.min_bid = Some(self.min_bid.map_or(bid, |m| m.min(bid)));
+            self.max_bid = Some(self.max_bid.map_or(bid, |m| m.max(bid)));
+            self.last_bid_at = Some(now);
+            if self.floor_hit.is_none() && floor_would_fire(bid, self.floor_price, min_exit_bid) {
+                self.floor_hit = Some((now, bid));
+            }
+            self.dirty = true;
+        }
+    }
+
+    #[derive(Default)]
+    pub(crate) struct State {
+        /// token → the stop last emitted on its position.
+        emissions: HashMap<String, Emission>,
+        followed: Vec<Followed>,
+        refreshed_at: Option<Instant>,
+        /// condition_id → when its resolution was last asked for.
+        probed: HashMap<String, Instant>,
+        /// token → settled price the venue reported.
+        resolved: HashMap<String, f64>,
+    }
+
+    fn lock(m: &StdMutex<State>) -> std::sync::MutexGuard<'_, State> {
+        match m.lock() { Ok(g) => g, Err(p) => p.into_inner() }
+    }
+
+    fn state(asset: &str) -> &'static StdMutex<State> {
+        &super::globals(asset).stop_shadow
+    }
+
+    fn http() -> &'static reqwest::Client {
+        static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+        CLIENT.get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+                .build()
+                .unwrap_or_default()
+        })
+    }
+
+    fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
+        DateTime::parse_from_rfc3339(s).ok().map(|t| t.with_timezone(&Utc))
+    }
+
+    // ── Pure rules ───────────────────────────────────────────────────────────
+
+    /// Where the catastrophic floor sits for an entry: two stop widths down,
+    /// exactly as rule 4 prices it (`profit_margin <= −2 × stop`).
+    pub(crate) fn floor_price(entry: Decimal, stop_pct: Decimal) -> Decimal {
+        entry * (Decimal::ONE - dec!(2) * stop_pct)
+    }
+
+    /// Would the live catastrophic floor have fired on this bid? It needs the
+    /// bid at or under the floor AND sellable: rule 4 declines to FAK into a
+    /// bid under `Min Exit Bid`, and that position rides to settlement.
+    pub(crate) fn floor_would_fire(bid: Decimal, floor: Decimal, min_exit_bid: Decimal) -> bool {
+        bid <= floor && bid >= min_exit_bid
+    }
+
+    /// Which stop a booked exit's reason names, if it names one.
+    pub(crate) fn stop_kind_of(reason: &str) -> Option<&'static str> {
+        if reason.starts_with("FairValueCatastrophicSL:") { Some(STOP_KIND_CATASTROPHIC) }
+        else if reason.starts_with("FairValueSL:") { Some(STOP_KIND_PERCENTAGE) }
+        else { None }
+    }
+
+    /// `(hold_pnl, hold_floor_pnl)` for one row at the venue's resolution.
+    ///
+    /// * pure hold: `(settle − entry) × shares − entry_fee` — settlement pays
+    ///   no exit fee;
+    /// * floor armed: the live trade itself when the live stop was the floor;
+    ///   a taker sale at the first bid that reached the floor, fee at that
+    ///   price, when the percentage stop fired first and the floor was reached
+    ///   later; the pure hold otherwise.
+    pub(crate) fn counterfactual_pnls(
+        entry: Decimal, shares: Decimal, entry_fee: Decimal, settle: Decimal,
+        floor_hit_bid: Option<Decimal>, live_catastrophic: bool, stop_pnl: Decimal,
+    ) -> (Decimal, Decimal) {
+        let hold = (settle - entry) * shares - entry_fee;
+        let hold_floor = if live_catastrophic {
+            stop_pnl
+        } else if let Some(b) = floor_hit_bid {
+            (b - entry) * shares - entry_fee - crate::venues::taker_fee_per_share(b) * shares
+        } else {
+            hold
+        };
+        (hold, hold_floor)
+    }
+
+    /// The row to open for a booked exit, or nothing when the exit was not a
+    /// stop. Pure so the mapping from fill + emission to row can be checked.
+    pub(crate) fn open_for(fill: &ExitFill, e: &Emission) -> Option<FairValueStopShadowOpen> {
+        let kind = stop_kind_of(&fill.reason)?;
+        let f = |d: Decimal| d.to_f64().unwrap_or(0.0);
+        Some(FairValueStopShadowOpen {
+            asset: fill.asset.to_lowercase(),
+            squadron_id: fill.squadron_id.clone(),
+            condition_id: if fill.condition_id.is_empty() { e.condition_id.clone() } else { fill.condition_id.clone() },
+            token_id: fill.token_id.to_string(),
+            market: if fill.market_name.is_empty() { e.market_name.clone() } else { fill.market_name.clone() },
+            side: fill.side.clone(),
+            opened_at: fill.opened_at,
+            stopped_at: Utc::now(),
+            // The emission read the close from the market the token was priced
+            // on (`venue_for_token`); the fill's is the patrol's view of the
+            // same thing and stands in only when the emission had none.
+            close_time: e.close_time.or(fill.market_close_time),
+            entry_price: f(fill.avg_entry),
+            shares: f(fill.shares),
+            entry_fee: f(fill.entry_fee_booked),
+            stop_kind: kind.to_string(),
+            stop_exit_price: f(fill.exit_price),
+            stop_exit_fee: f(fill.exit_fee),
+            stop_pnl: f(fill.pnl),
+            stop_pct: f(e.stop_pct),
+            floor_price: f(e.floor_price),
+            fair_at_stop: e.fair_at_stop,
+            bid_marked_at_stop: f(e.bid_marked),
+        })
+    }
+
+    // ── Emission bookkeeping (rule 4 → fill hook) ────────────────────────────
+
+    /// Remember the stop just emitted on `token`'s position. Re-emissions of
+    /// the same stop overwrite, which is right: the fill books against the
+    /// latest book the stop was priced on.
+    pub(crate) fn note_emission(asset: &str, token: &str, e: Emission) {
+        let mut st = lock(state(asset));
+        let now = Utc::now();
+        st.emissions.retain(|_, x| (now - x.opened_at).num_seconds() < EMISSION_TTL_SECS);
+        st.emissions.insert(token.to_string(), e);
+    }
+
+    /// The stop emission for this exact position, if rule 4 noted one.
+    pub(crate) fn emission_for(asset: &str, token: &str, opened_at: DateTime<Utc>) -> Option<Emission> {
+        let st = lock(state(asset));
+        st.emissions.get(token).filter(|e| e.opened_at == opened_at).cloned()
+    }
+
+    /// The fill hook: a booked stop opens its row; anything else is ignored.
+    /// The database write is spawned so the patrol tick never waits on it.
+    pub(crate) fn on_exit_filled(fill: &ExitFill) {
+        if stop_kind_of(&fill.reason).is_none() { return; }
+        let Some(e) = emission_for(&fill.asset, fill.token_id.as_str(), fill.opened_at) else {
+            // Recording is off (rule 4 notes nothing), or the stop was priced
+            // by a process that has since restarted. Either way there is no
+            // floor to measure against, and a row without one would be a guess.
+            return;
+        };
+        let Some(open) = open_for(fill, &e) else { return };
+        let Some(pool) = db::pool_for(&fill.asset) else {
+            warn!("🔭 FairValue stop counterfactual: no database for asset {} — stop on {} not recorded",
+                  fill.asset, fill.market_name);
+            return;
+        };
+        tokio::spawn(async move {
+            match db::fairvalue_stop_shadow_open(&pool, &open).await {
+                Some(id) => info!(
+                    "🔭 FairValue stop counterfactual opened #{} [{}] {} {}: {:.4} sh entry=${:.4} → {} stop @ ${:.4} (marked ${:.4}) pnl=${:.4} fee=${:.4} | floor=${:.4} fair_at_stop={} | following the book to settlement",
+                    id, open.asset, open.market, open.side, open.shares, open.entry_price, open.stop_kind,
+                    open.stop_exit_price, open.bid_marked_at_stop, open.stop_pnl, open.stop_exit_fee, open.floor_price,
+                    open.fair_at_stop.map_or_else(|| "n/a".to_string(), |p| format!("{p:.3}")),
+                ),
+                None => warn!("🔭 FairValue stop counterfactual: row for {} {} NOT recorded", open.market, open.side),
+            }
+        });
+    }
+
+    // ── The sweep ────────────────────────────────────────────────────────────
+
+    /// Follow every open row: read the book each tick, flush and re-read every
+    /// `REFRESH_SECS`, and once a market is past its close ask the venue what
+    /// it resolved to, scoring the row when it answers.
+    pub(crate) async fn sweep(ctx: &StrategyContext) {
+        let asset = ctx.crypto_filter.clone();
+        let dc = &ctx.dynamic_config;
+        let now = Utc::now();
+
+        // Every tick, no I/O: the book for each followed token.
+        let refresh_due = {
+            let mut st = lock(state(&asset));
+            for row in st.followed.iter_mut() {
+                let token = MarketId::new(row.token_id.as_str());
+                if let Some((market, snap)) = crate::vipers::venue_for_token(ctx, &token) {
+                    let bid = if token == market.yes_token { snap.yes_bid } else { snap.no_bid };
+                    row.observe(bid, now, dc.fairvalue_min_exit_bid);
+                }
+            }
+            st.refreshed_at.is_none_or(|t| t.elapsed().as_secs() >= REFRESH_SECS)
+        };
+        if !refresh_due { return; }
+
+        // Every refresh: has the viper re-entered any followed token live?
+        {
+            let map = ctx.positions.lock().await;
+            let mut st = lock(state(&asset));
+            for row in st.followed.iter_mut().filter(|r| !r.live_reentered) {
+                let key = PositionKey::new(ctx.squadron_id.clone(), "FairValueStrategy", MarketId::new(row.token_id.as_str()));
+                if map.get(&key).is_some_and(|p| p.opened_at > row.stopped_at) {
+                    row.live_reentered = true;
+                    row.dirty = true;
+                }
+            }
+        }
+
+        let Some(pool) = db::pool_for(&asset) else {
+            lock(state(&asset)).refreshed_at = Some(Instant::now());
+            return;
+        };
+
+        // Flush what the ticks observed.
+        let dirty: Vec<Followed> = {
+            let mut st = lock(state(&asset));
+            let out = st.followed.iter().filter(|r| r.dirty).cloned().collect();
+            for r in st.followed.iter_mut() { r.dirty = false; }
+            out
+        };
+        for r in &dirty {
+            db::fairvalue_stop_shadow_path(
+                &pool, r.id, r.min_bid.and_then(|d| d.to_f64()), r.max_bid.and_then(|d| d.to_f64()),
+                r.last_bid_at, r.floor_hit.map(|(t, b)| (t, b.to_f64().unwrap_or(0.0))), r.live_reentered,
+            ).await;
+        }
+
+        // Re-read: rows another path opened appear, rows no longer open leave.
+        let open_rows = db::fairvalue_stop_shadow_open_rows(&pool, &asset).await;
+        {
+            let mut st = lock(state(&asset));
+            st.followed.retain(|r| open_rows.iter().any(|o| o.id == r.id));
+            for o in &open_rows {
+                if st.followed.iter().any(|r| r.id == o.id) { continue; }
+                if let Some(f) = Followed::from_row(o) { st.followed.push(f); }
+            }
+            st.refreshed_at = Some(Instant::now());
+        }
+
+        // Past the close: probe, score or write off.
+        let (probes, scores, abandons) = {
+            let mut st = lock(state(&asset));
+            let mut probes: Vec<(String, String)> = Vec::new();
+            let mut scores: Vec<(Followed, f64)> = Vec::new();
+            let mut abandons: Vec<Followed> = Vec::new();
+            let State { followed, probed, resolved, .. } = &mut *st;
+            for row in followed.iter() {
+                // A row with no stated close is judged from the stop itself.
+                let since_close = (now - row.close_time.unwrap_or(row.stopped_at)).num_seconds();
+                if since_close < SETTLE_GRACE_SECS { continue; }
+                if let Some(px) = resolved.get(&row.token_id) {
+                    scores.push((row.clone(), *px));
+                } else if since_close >= GIVE_UP_SECS {
+                    abandons.push(row.clone());
+                } else {
+                    let due = probed.get(&row.condition_id).is_none_or(|t| t.elapsed().as_secs() >= PROBE_SECS);
+                    if due {
+                        probed.insert(row.condition_id.clone(), Instant::now());
+                        probes.push((row.condition_id.clone(), row.token_id.clone()));
+                    }
+                }
+            }
+            probed.retain(|_, t| t.elapsed().as_secs() < 2 * GIVE_UP_SECS as u64);
+            (probes, scores, abandons)
+        };
+
+        // Spawned, never awaited here: a Gamma call is allowed five seconds and
+        // `evaluate_exit` runs inside the orchestrator's per-strategy timeout.
+        for (cid, token) in probes {
+            let asset_c = asset.clone();
+            tokio::spawn(async move {
+                let got = crate::raptors::sports_ledger::settled_prices_for_market(
+                    http(), &cid, std::slice::from_ref(&token),
+                ).await;
+                if let Some(px) = got.get(&token).copied() {
+                    let mut st = lock(state(&asset_c));
+                    st.resolved.insert(token, px);
+                    if st.resolved.len() > 512 { st.resolved.clear(); }
+                }
+            });
+        }
+
+        for (row, px) in scores {
+            let settle = Decimal::from_f64(px).unwrap_or_default();
+            let source = if (px - 0.5).abs() < 1e-9 { "tie" } else { "resolved" };
+            let (hold, hold_floor) = counterfactual_pnls(
+                row.entry, row.shares, row.entry_fee, settle,
+                row.floor_hit.map(|(_, b)| b), row.live_catastrophic, row.stop_pnl,
+            );
+            let ok = db::fairvalue_stop_shadow_score(
+                &pool, row.id, px, source, hold.to_f64().unwrap_or(0.0), hold_floor.to_f64().unwrap_or(0.0),
+            ).await;
+            if !ok { continue; }
+            {
+                let mut st = lock(state(&asset));
+                st.followed.retain(|r| r.id != row.id);
+                st.resolved.remove(&row.token_id);
+            }
+            info!(
+                "🔭 FairValue stop counterfactual scored #{} [{}] {} {}: live {} stop pnl ${:+.4} | hold to settlement (${:.2}) ${:+.4} | hold with floor armed ${:+.4}{} | delta vs live ${:+.4} | bid after stop min={} max={}{}",
+                row.id, asset, row.market, row.side, if row.live_catastrophic { "catastrophic" } else { "percentage" },
+                row.stop_pnl, settle, hold, hold_floor,
+                match row.floor_hit {
+                    Some((t, b)) if !row.live_catastrophic => format!(" (floor ${:.4} reached at {} @ ${:.4})", row.floor_price, t.format("%H:%M:%S"), b),
+                    _ => String::new(),
+                },
+                hold_floor - row.stop_pnl,
+                row.min_bid.map_or_else(|| "n/a".to_string(), |b| format!("${b:.4}")),
+                row.max_bid.map_or_else(|| "n/a".to_string(), |b| format!("${b:.4}")),
+                if row.live_reentered { " | re-entered live after the stop" } else { "" },
+            );
+        }
+
+        for row in abandons {
+            if db::fairvalue_stop_shadow_abandon(&pool, row.id).await {
+                lock(state(&asset)).followed.retain(|r| r.id != row.id);
+                warn!(
+                    "🔭 FairValue stop counterfactual #{} [{}] {} {} written off unscored: the venue never resolved it {}h after close",
+                    row.id, asset, row.market, row.side, GIVE_UP_SECS / 3600,
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn followed_for_test(asset: &str) -> Vec<Followed> {
+        lock(state(asset)).followed.clone()
+    }
+
+    /// Make the next sweep refresh (flush, re-read, probe/score) regardless of
+    /// the cadence, so a test does not have to wait `REFRESH_SECS`.
+    #[cfg(test)]
+    pub(crate) fn force_refresh_for_test(asset: &str) {
+        lock(state(asset)).refreshed_at = None;
+    }
+
+    /// Stand in for the venue's answer to a resolution probe.
+    #[cfg(test)]
+    pub(crate) fn set_resolved_for_test(asset: &str, token: &str, px: f64) {
+        lock(state(asset)).resolved.insert(token.to_string(), px);
+    }
 }
 
 #[cfg(test)]
@@ -3809,6 +4374,298 @@ mod entry_book_tests {
         assert_eq!(params.price, dec!(0.16));
         assert!(!params.post_only && params.order_type == TimeInForce::Fak, "a stop crosses");
         assert!(reason.starts_with("FairValueSL: bid=$0.1600, loss=-20.00%"), "{reason}");
+    }
+
+    // ── Stop counterfactual recorder ─────────────────────────────────────────
+
+    /// The same stop as above, with the recorder on (the shipped default):
+    /// rule 4 must leave behind the floor it priced on — two stop widths under
+    /// the entry — keyed to this exact position, so the fill hook can open the
+    /// row against the live rule's own floor rather than recomputing one. With
+    /// the knob off, nothing is noted and the fill hook has nothing to open.
+    #[tokio::test]
+    async fn a_stop_emission_leaves_the_floor_the_live_rule_priced_on() {
+        use crate::state::Position;
+        use super::stop_counterfactual as sc;
+
+        for (asset, record) in [("btc-cf-emit-on", true), ("btc-cf-emit-off", false)] {
+            let mut hourly = book(dec!(200), dec!(150));
+            hourly.no_bid = dec!(0.16); hourly.no_bid_depth = dec!(50);
+            hourly.no_ask = dec!(0.18); hourly.no_ask_depth = dec!(50);
+            hourly.yes_bid = dec!(0.82); hourly.yes_ask = dec!(0.84);
+            let mut c = ctx(hourly, book(dec!(100), dec!(100)));
+            c.crypto_filter = asset.to_string();
+            let mut dc = DynamicConfig::default();
+            dc.enable_fairvalue = true;
+            dc.fairvalue_target_profit_pct = dec!(0.20);
+            dc.fairvalue_stop_loss_pct = dec!(0.15);
+            dc.fairvalue_stop_counterfactual_record = record;
+            c.dynamic_config = Arc::new(dc);
+
+            let no_token = c.market.no_token.clone();
+            let opened = Utc::now() - chrono::Duration::seconds(config::FAIRVALUE_MIN_HOLD_SECS_BEFORE_STOP_LOSS + 30);
+            c.positions.lock().await.insert(
+                PositionKey::new(c.squadron_id.clone(), "FairValueStrategy", no_token.clone()),
+                Position {
+                    shares: dec!(28), avg_entry: dec!(0.20), opened_at: opened,
+                    close_time: c.market.market_close_time,
+                    market_name: c.market.market_name.clone(),
+                    pair_token_id: c.market.yes_token.clone(),
+                    fill_confirmed_at: Some(opened), paired_leg_token_id: None,
+                    entry_fee: dec!(0.3136),
+                },
+            );
+
+            let strat = FairValueStrategyImpl::default();
+            let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+            assert!(matches!(sig, StrategySignal::Exit { .. }), "the stop itself is unchanged by the recorder, got {sig:?}");
+
+            let noted = sc::emission_for(asset, no_token.as_str(), opened);
+            if !record {
+                assert!(noted.is_none(), "recording off must note nothing");
+                continue;
+            }
+            let e = noted.expect("the stop emission is noted for the fill hook");
+            assert_eq!(e.stop_pct, dec!(0.15));
+            assert_eq!(e.floor_price, dec!(0.14), "two stop widths under a $0.20 entry");
+            assert_eq!(e.bid_marked, dec!(0.16));
+            assert_eq!(e.condition_id, "cid-hourly");
+            assert!(e.fair_at_stop.is_none(), "no oracle in this harness, so no model reading");
+            assert!(sc::emission_for(asset, no_token.as_str(), opened + chrono::Duration::seconds(1)).is_none(),
+                "a different position on the same token is not this emission");
+        }
+    }
+
+    /// The fill hook opens a row for a booked stop and for nothing else. The
+    /// row carries what the venue charged (price, fee, net P&L from the fill)
+    /// and what the rule priced on (stop width, floor) from the emission.
+    #[test]
+    fn the_fill_hook_maps_a_stop_fill_to_its_row_and_ignores_every_other_exit() {
+        use super::stop_counterfactual as sc;
+        use crate::state::ExitFill;
+
+        let opened = Utc::now() - chrono::Duration::minutes(10);
+        let e = sc::Emission {
+            opened_at: opened, stop_pct: dec!(0.12), floor_price: sc::floor_price(dec!(0.78), dec!(0.12)),
+            fair_at_stop: Some(0.81), bid_marked: dec!(0.68), close_time: None,
+            condition_id: "cid-emit".into(), market_name: "Bitcoin Up or Down - October 2, 3PM ET".into(),
+        };
+        let fill = |reason: &str| ExitFill {
+            squadron_id: "btc-open".into(), asset: "BTC".into(), token_id: MarketId::new("h-yes"),
+            market_name: "Bitcoin Up or Down - October 2, 3PM ET".into(), condition_id: "cid-emit".into(),
+            market_close_time: Some(Utc::now() + chrono::Duration::minutes(20)), side: "YES".into(),
+            opened_at: opened, avg_entry: dec!(0.78), entry_fee_booked: dec!(0.06), shares: dec!(5),
+            exit_price: dec!(0.69), exit_fee: dec!(0.07), pnl: dec!(-0.58), reason: reason.into(),
+        };
+
+        let row = sc::open_for(&fill("FairValueSL: bid=$0.6800, loss=-12.82% | ask=$0.80"), &e)
+            .expect("a percentage stop opens a row");
+        assert_eq!(row.stop_kind, sc::STOP_KIND_PERCENTAGE);
+        assert_eq!(row.asset, "btc", "filed under the lowercase shard");
+        assert_eq!((row.entry_price, row.shares, row.entry_fee), (0.78, 5.0, 0.06));
+        assert_eq!((row.stop_exit_price, row.stop_exit_fee, row.stop_pnl), (0.69, 0.07, -0.58));
+        assert_eq!(row.stop_pct, 0.12);
+        assert!((row.floor_price - 0.5928).abs() < 1e-9, "floor = 0.78 × (1 − 0.24), got {}", row.floor_price);
+        assert_eq!(row.fair_at_stop, Some(0.81));
+        assert_eq!(row.bid_marked_at_stop, 0.68);
+        assert!(row.close_time.is_some(), "with no close on the emission, the fill's stands in");
+        let e_closed = sc::Emission { close_time: Some(opened + chrono::Duration::hours(1)), ..e.clone() };
+        let row2 = sc::open_for(&fill("FairValueSL: bid=$0.6800"), &e_closed).unwrap();
+        assert_eq!(row2.close_time, e_closed.close_time, "the emission's close (the token's own market) wins");
+
+        let cat = sc::open_for(&fill("FairValueCatastrophicSL: bid=$0.5000, loss=-35.90% (min-hold bypassed @ 70s)"), &e)
+            .expect("a catastrophic stop opens a row");
+        assert_eq!(cat.stop_kind, sc::STOP_KIND_CATASTROPHIC);
+
+        for other in [
+            "FairValueTP: bid=$0.9400, profit=20.51%",
+            "FairValueReversal: fair=0.400 < 0.507",
+            "FairValueBail: 90s left, fair=0.600 < 0.75, bid=$0.7000",
+            "FairValueSnipeExit: bid=$0.9500 net=$0.9467 >= fair=0.940",
+            "FairValueRestingTP: ask=$0.9360 entry=$0.7800 target=+20.00%",
+            "Settlement (won)",
+        ] {
+            assert!(sc::open_for(&fill(other), &e).is_none(), "{other:?} is not a stop and must open nothing");
+        }
+    }
+
+    /// The two counterfactual columns, worked by hand. Settlement pays no exit
+    /// fee; the floor-armed variant sells as a taker at the first bid that
+    /// reached the floor; a live catastrophic stop is its own floor variant.
+    #[test]
+    fn the_counterfactual_columns_follow_the_stated_rules() {
+        use super::stop_counterfactual as sc;
+        let (entry, shares, fee) = (dec!(0.78), dec!(5), dec!(0.06));
+        let stop_pnl = dec!(-0.58);
+
+        // Settled in the position's favor, floor never reached: both columns are the pure hold.
+        let (hold, hold_floor) = sc::counterfactual_pnls(entry, shares, fee, dec!(1), None, false, stop_pnl);
+        assert_eq!(hold, dec!(1.04), "(1 − 0.78) × 5 − 0.06");
+        assert_eq!(hold_floor, hold);
+
+        // Settled against it: the whole stake plus the entry fee, no exit fee to add.
+        let (hold, hold_floor) = sc::counterfactual_pnls(entry, shares, fee, dec!(0), None, false, stop_pnl);
+        assert_eq!(hold, dec!(-3.96), "(0 − 0.78) × 5 − 0.06");
+        assert_eq!(hold_floor, hold);
+
+        // Floor reached after the percentage stop, then settled in favor: the
+        // floor-armed variant sold at $0.55 as a taker and never saw the $1.
+        let floor_bid = dec!(0.55);
+        let (hold, hold_floor) = sc::counterfactual_pnls(entry, shares, fee, dec!(1), Some(floor_bid), false, stop_pnl);
+        assert_eq!(hold, dec!(1.04));
+        let expected = (floor_bid - entry) * shares - fee - crate::venues::taker_fee_per_share(floor_bid) * shares;
+        assert_eq!(hold_floor, expected);
+        assert!(hold_floor < stop_pnl, "selling two widths down is worse than the stop that fired at one");
+
+        // The live stop WAS the floor: the floor-armed variant is the live trade, whatever settled.
+        let (hold, hold_floor) = sc::counterfactual_pnls(entry, shares, fee, dec!(1), Some(dec!(0.50)), true, stop_pnl);
+        assert_eq!(hold, dec!(1.04));
+        assert_eq!(hold_floor, stop_pnl);
+
+        // A tie settles at $0.50.
+        let (hold, _) = sc::counterfactual_pnls(entry, shares, fee, dec!(0.5), None, false, stop_pnl);
+        assert_eq!(hold, dec!(-1.46), "(0.5 − 0.78) × 5 − 0.06");
+    }
+
+    /// The floor fires on a bid at or under two stop widths, and only when the
+    /// live rule could have sold there: under Min Exit Bid rule 4 holds.
+    #[test]
+    fn the_modeled_floor_needs_a_sellable_bid_at_or_under_two_widths() {
+        use super::stop_counterfactual as sc;
+        let floor = sc::floor_price(dec!(0.78), dec!(0.12));
+        assert_eq!(floor, dec!(0.5928));
+        let min_exit = dec!(0.05);
+        assert!(sc::floor_would_fire(dec!(0.5928), floor, min_exit), "at the floor");
+        assert!(sc::floor_would_fire(dec!(0.40), floor, min_exit), "under it");
+        assert!(!sc::floor_would_fire(dec!(0.60), floor, min_exit), "one tick above holds");
+        assert!(!sc::floor_would_fire(dec!(0.03), floor, min_exit), "a vaporized bid is unexitable and rides to settlement");
+        assert!(sc::floor_would_fire(dec!(0.05), floor, min_exit), "exactly Min Exit Bid is sellable");
+        assert_eq!(sc::stop_kind_of("FairValueSL: bid=$0.68"), Some(sc::STOP_KIND_PERCENTAGE));
+        assert_eq!(sc::stop_kind_of("FairValueCatastrophicSL: bid=$0.50"), Some(sc::STOP_KIND_CATASTROPHIC));
+        assert_eq!(sc::stop_kind_of("FairValueSLx"), None, "prefix match stops at the colon");
+    }
+
+    /// Following a row tick by tick: min and max track the path, the floor
+    /// latches on the FIRST touch and is never moved by a deeper one, and a
+    /// row opened from a live catastrophic stop starts with its floor already
+    /// hit at the stop's own fill.
+    #[test]
+    fn observing_the_book_after_the_stop_tracks_the_path_and_latches_the_first_floor_touch() {
+        use super::stop_counterfactual as sc;
+        use crate::helpers::db::FairValueStopShadowRow;
+
+        let stopped = Utc::now() - chrono::Duration::minutes(5);
+        let row = |kind: &str| FairValueStopShadowRow {
+            id: 7, asset: "btc".into(), squadron_id: "btc-open".into(), condition_id: "cid".into(),
+            token_id: "h-yes".into(), market: "m".into(), side: "YES".into(),
+            opened_at: (stopped - chrono::Duration::minutes(10)).to_rfc3339(), stopped_at: stopped.to_rfc3339(),
+            close_time: Some((stopped + chrono::Duration::minutes(30)).to_rfc3339()),
+            entry_price: 0.78, shares: 5.0, entry_fee: 0.06, stop_kind: kind.into(),
+            stop_exit_price: if kind == sc::STOP_KIND_CATASTROPHIC { 0.50 } else { 0.69 },
+            stop_exit_fee: 0.07, stop_pnl: -0.58, stop_pct: 0.12, floor_price: 0.5928, fair_at_stop: Some(0.81),
+            bid_marked_at_stop: 0.68, min_bid_after: None, max_bid_after: None, last_bid_at: None,
+            floor_hit_at: None, floor_hit_bid: None, live_reentered: false, settle_price: None,
+            settle_source: None, hold_pnl: None, hold_floor_pnl: None, status: "open".into(), closed_at: None,
+        };
+
+        let mut f = sc::Followed::from_row(&row(sc::STOP_KIND_PERCENTAGE)).expect("a well-formed row is followed");
+        assert!(f.floor_hit.is_none() && f.min_bid.is_none());
+        let t0 = Utc::now();
+        f.observe(dec!(0.70), t0, dec!(0.05));
+        f.observe(dec!(0.75), t0 + chrono::Duration::seconds(1), dec!(0.05));
+        f.observe(dec!(0.59), t0 + chrono::Duration::seconds(2), dec!(0.05));
+        f.observe(dec!(0.40), t0 + chrono::Duration::seconds(3), dec!(0.05));
+        f.observe(dec!(0), t0 + chrono::Duration::seconds(4), dec!(0.05));
+        assert_eq!((f.min_bid, f.max_bid), (Some(dec!(0.40)), Some(dec!(0.75))));
+        assert_eq!(f.last_bid_at, Some(t0 + chrono::Duration::seconds(3)), "an empty bid is not an observation");
+        assert_eq!(f.floor_hit, Some((t0 + chrono::Duration::seconds(2), dec!(0.59))), "first touch, not the deepest");
+
+        let c = sc::Followed::from_row(&row(sc::STOP_KIND_CATASTROPHIC)).expect("followed");
+        assert!(c.live_catastrophic);
+        assert_eq!(c.floor_hit, Some((stopped, dec!(0.50))), "the live catastrophic fill is the floor hit");
+    }
+
+    /// The sweep end to end against a registered in-memory shard: a row opened
+    /// by the fill hook is picked up, the book is read each tick (the YES bid
+    /// here sits under the floor, so the floor latches), a live re-entry on the
+    /// token is flagged, and when the venue's resolution is in hand the row is
+    /// scored with both columns and leaves the follow list. Nothing the sweep
+    /// does touches the position map or produces a signal.
+    #[tokio::test]
+    async fn the_sweep_follows_a_stopped_token_to_its_resolution() {
+        use crate::state::Position;
+        use crate::helpers::db::{self, FairValueStopShadowOpen};
+        use super::stop_counterfactual as sc;
+
+        let asset = "cfsweep-btc";
+        db::init_shard(asset, ":memory:", "test").await.expect("in-memory shard");
+        let pool = db::pool_for(asset).expect("registered");
+
+        let stopped = Utc::now() - chrono::Duration::minutes(3);
+        let close = stopped + chrono::Duration::minutes(1); // already past close + grace
+        let id = db::fairvalue_stop_shadow_open(&pool, &FairValueStopShadowOpen {
+            asset: asset.into(), squadron_id: "btc-open".into(), condition_id: "cid-hourly".into(),
+            token_id: "h-yes".into(), market: "Bitcoin Up or Down - September 2, 5PM ET".into(), side: "YES".into(),
+            opened_at: stopped - chrono::Duration::minutes(12), stopped_at: stopped, close_time: Some(close),
+            entry_price: 0.78, shares: 5.0, entry_fee: 0.06, stop_kind: sc::STOP_KIND_PERCENTAGE.into(),
+            stop_exit_price: 0.69, stop_exit_fee: 0.07, stop_pnl: -0.58, stop_pct: 0.12,
+            floor_price: 0.5928, fair_at_stop: Some(0.81), bid_marked_at_stop: 0.68,
+        }).await.expect("row opened");
+
+        // The hourly YES bid reads $0.55: under the floor, above Min Exit Bid.
+        let mut hourly = book(dec!(200), dec!(150));
+        hourly.yes_bid = dec!(0.55); hourly.yes_ask = dec!(0.60);
+        hourly.no_bid = dec!(0.40); hourly.no_ask = dec!(0.45);
+        let mut c = ctx(hourly, book(dec!(100), dec!(100)));
+        c.crypto_filter = asset.to_string();
+        c.market.market_close_time = Some(close);
+
+        // Sweep 1: nothing followed yet, so the refresh loads the row.
+        sc::sweep(&c).await;
+        let f = sc::followed_for_test(asset);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].id, id);
+        assert!(f[0].floor_hit.is_none(), "the row is loaded before any tick has read the book");
+
+        // Sweep 2 (within the cadence): the book is read, the floor latches in memory.
+        sc::sweep(&c).await;
+        let f = sc::followed_for_test(asset);
+        assert_eq!(f[0].floor_hit.map(|(_, b)| b), Some(dec!(0.55)));
+        assert_eq!((f[0].min_bid, f[0].max_bid), (Some(dec!(0.55)), Some(dec!(0.55))));
+        let still_open = db::fairvalue_stop_shadow_open_rows(&pool, asset).await;
+        assert!(still_open[0].floor_hit_at.is_none(), "not flushed until the cadence allows");
+
+        // A live re-entry on the token, then the venue resolves YES at $1.
+        c.positions.lock().await.insert(
+            PositionKey::new(c.squadron_id.clone(), "FairValueStrategy", c.market.yes_token.clone()),
+            Position {
+                shares: dec!(5), avg_entry: dec!(0.60), opened_at: Utc::now(),
+                close_time: Some(close), market_name: c.market.market_name.clone(),
+                pair_token_id: c.market.no_token.clone(), fill_confirmed_at: Some(Utc::now()),
+                paired_leg_token_id: None, entry_fee: dec!(0.05),
+            },
+        );
+        sc::set_resolved_for_test(asset, "h-yes", 1.0);
+        sc::force_refresh_for_test(asset);
+
+        // Sweep 3: flush the path, then score at the resolution.
+        sc::sweep(&c).await;
+        assert!(sc::followed_for_test(asset).is_empty(), "a scored row leaves the follow list");
+        assert!(db::fairvalue_stop_shadow_open_rows(&pool, asset).await.is_empty());
+        let rows = db::fairvalue_stop_shadow_rows(&pool, asset, 5).await;
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.status, "scored");
+        assert_eq!((r.settle_price, r.settle_source.as_deref()), (Some(1.0), Some("resolved")));
+        assert_eq!(r.floor_hit_bid, Some(0.55));
+        assert!(r.live_reentered, "the re-entry after the stop is flagged");
+        assert_eq!(r.min_bid_after, Some(0.55));
+        assert!((r.hold_pnl.unwrap() - 1.04).abs() < 1e-9, "(1 − 0.78) × 5 − 0.06, got {:?}", r.hold_pnl);
+        let expected_floor = (dec!(0.55) - dec!(0.78)) * dec!(5) - dec!(0.06)
+            - crate::venues::taker_fee_per_share(dec!(0.55)) * dec!(5);
+        assert!((r.hold_floor_pnl.unwrap() - expected_floor.to_f64().unwrap()).abs() < 1e-9,
+            "floor-armed hold sold at $0.55 as a taker, got {:?}", r.hold_floor_pnl);
+        assert_eq!(c.positions.lock().await.len(), 1, "the sweep moves no position");
     }
 
     /// A position below the venue's minimum order cannot be sold: the venue

@@ -2062,6 +2062,8 @@ impl Squadron {
                                             let pnl_m;
                                             let fees_m;
                                             let entry_fee_m;
+                                            let exit_fee_m;
+                                            let opened_m;
 
                                             {
                                                 let mut map = positions.lock().await;
@@ -2107,10 +2109,12 @@ impl Squadron {
                                                     pnl_m = st.pnl;
                                                     fees_m = st.fees();
                                                     entry_fee_m = st.entry_fee_booked;
+                                                    exit_fee_m = st.exit_fee;
+                                                    opened_m = p.opened_at;
                                                     remainder_m = st.remainder;
                                                 } else { continue; }
                                             }
-                                            let _ = (rc_m, entry_fee_m);
+                                            let _ = rc_m;
                                             // Release the token claim only when nothing is left to manage.
                                             if remainder_m < config::MIN_ORDER_SHARES {
                                                 token_ownership.lock().await.remove(&tid_m);
@@ -2145,6 +2149,39 @@ impl Squadron {
                                                     } else {
                                                         db::close_open_position(&pool, &sn, &tid_m.to_string()).await;
                                                     }
+                                                }
+                                                // Report the booked slice back to the viper that asked
+                                                // for it (FairValue's stop counterfactual keeps its
+                                                // record from this). After the row is written, synchronous
+                                                // and non-blocking; the hook returns nothing to act on.
+                                                if let Some(strat) = strategies.iter().find(|s| s.name() == sn) {
+                                                    // The close of the market the token BELONGS to, not
+                                                    // `target_market_close_time`: that follows the strategy's
+                                                    // declared venue, and FairValue declares "Window/Daily"
+                                                    // while trading the hourly book (see the YES/NO labeling
+                                                    // note above for the same trap).
+                                                    let fill_close_time = if tid_m == hourly_yes_token || tid_m == hourly_no_token {
+                                                        hourly_market_close_time
+                                                    } else {
+                                                        maker_market_config.as_ref().and_then(|mk| mk.market_close_time)
+                                                    };
+                                                    strat.on_exit_filled(&crate::state::ExitFill {
+                                                        squadron_id: sq_key.clone(),
+                                                        asset: asset_lc.clone(),
+                                                        token_id: tid_m.clone(),
+                                                        market_name: params.market_name.clone(),
+                                                        condition_id: params.condition_id.clone(),
+                                                        market_close_time: fill_close_time,
+                                                        side: side_of(&tid).to_string(),
+                                                        opened_at: opened_m,
+                                                        avg_entry: re_m,
+                                                        entry_fee_booked: entry_fee_m,
+                                                        shares: rs_m,
+                                                        exit_price: aep_exit,
+                                                        exit_fee: exit_fee_m,
+                                                        pnl: pnl_m,
+                                                        reason: reason.clone(),
+                                                    });
                                                 }
                                             } else {
                                                 // The venue matched nothing: no P&L, no ledger row, the

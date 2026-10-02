@@ -138,4 +138,14 @@ pub trait Strategy: Send + Sync {
     /// placements and the cooldown intentionally paces re-fires there.
     /// Default: no-op.
     fn on_exit_order_failed(&self, _token_id: &crate::venues::core::MarketId) {}
+
+    /// Notify the strategy that an exit it emitted FILLED and has been booked
+    /// to the ledger. Called after the trade row is written, with the slice the
+    /// venue actually matched (`ExitFill`), so a strategy can keep its own
+    /// records about its exits. Strictly observational: the position, the
+    /// trade row and the P&L are already final when this is called, and the
+    /// hook returns nothing the patrol could act on. Implementations must not
+    /// block — the patrol tick is waiting — so any I/O belongs in a spawned
+    /// task. Default: no-op.
+    fn on_exit_filled(&self, _fill: &crate::state::ExitFill) {}
 }
