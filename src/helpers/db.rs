@@ -835,6 +835,10 @@ pub(crate) async fn init_schema(pool: &SqlitePool) -> Result<()> {
 
     seed_market_taxonomy(pool).await?;
 
+    // Helm intents and the `intent_id` join columns on `open_positions` and
+    // `trades`. Lives in its own module; see `helpers::helm`.
+    crate::helpers::helm::init_schema(pool).await?;
+
     Ok(())
 }
 

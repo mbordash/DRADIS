@@ -4552,6 +4552,10 @@ pub async fn run_api_server(
         // decided from, and intl-only for the same reason manual-exit is.
         .route("/api/positions/quotes",      get(get_position_quotes));
 
+    // Helm intents: the operator's conviction record. Mounted here so the
+    // API-key and read-only gates below apply to its writes like any other.
+    let protected_routes = protected_routes.merge(crate::api::helm::routes());
+
     let protected_routes = protected_routes
         // API-key check applied to all matched routes (inner layer — runs after CORS).
         // No-op when DRADIS_API_KEY is unset so local-dev workflow is unchanged.

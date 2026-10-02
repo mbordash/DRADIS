@@ -76,6 +76,10 @@ const BASE_CANCEL_RETRY_DELAY_MS: u64 = 200;
 /// trading parameter, so it stays a constant; the operator-facing choice is the
 /// retire grace that runs from the first "no".
 const EVENT_MARKET_STATUS_POLL_SECS: u64 = 60;
+/// How often a Helm squadron re-reads its intent tally for the Helm-complete
+/// retirement check. Operator actions arrive on a human cadence, and the
+/// read is one indexed COUNT on the primary pool.
+const HELM_INTENT_POLL_SECS: u64 = 5;
 
 /// How often a resting maker exit's on-chain balance is polled to detect that
 /// the ask was lifted. The patrol tick is 50ms; polling the chain at that rate
@@ -398,6 +402,13 @@ impl Squadron {
         let mut book_absent_since: Option<Instant> = None;
         // Since when the game has continuously read as over.
         let mut game_over_since: Option<Instant> = None;
+        // Helm-complete probe state for a single-member HELM squadron: the
+        // intent tally, re-read every HELM_INTENT_POLL_SECS. Fires on the
+        // first tick like the venue probe.
+        let mut helm_intents_probed_at = Instant::now()
+            .checked_sub(Duration::from_secs(HELM_INTENT_POLL_SECS))
+            .unwrap_or_else(Instant::now);
+        let mut helm_tally: Option<crate::helpers::helm::IntentTally> = None;
 
         // Squadron's hourly market fields
         let hourly_yes_token         = self.market.yes_token.clone();
@@ -1140,10 +1151,41 @@ impl Squadron {
                             game_over_due = sports_game_over_due(game_over_verdict, game_over_held, grace, holding);
                         }
 
+                        // ── Helm-complete probe (helm only) ─────────────────
+                        // The fourth retirement signal, and the only one not
+                        // about the market. A Helm squadron exists to carry the
+                        // operator's intent; once every intent it was given is
+                        // terminal and it holds nothing, it is done, whatever the
+                        // market's clock says. Deliberately "intent terminal and
+                        // flat", not "position closed": an entry that never
+                        // filled has no position and would otherwise sit on its
+                        // subscription until the close, and a stop whose FAK
+                        // missed still holds, so the holding guard keeps it
+                        // patrolling exactly as for every other reason.
+                        let mut helm_complete_due = false;
+                        if market_class_for_ctx == crate::vipers::helm_impl::KIND {
+                            if helm_intents_probed_at.elapsed() >= Duration::from_secs(HELM_INTENT_POLL_SECS) {
+                                helm_intents_probed_at = Instant::now();
+                                if let Some(pool) = crate::helpers::db::pool_for(&asset_lc) {
+                                    let t = crate::helpers::helm::squadron_tally(&pool, &squadron_id).await;
+                                    if t.complete() && helm_tally.map_or(true, |prev| !prev.complete()) {
+                                        info!(
+                                            "🏁 Squadron [{}] Helm intents complete ({} intent(s), all terminal) — retiring once flat",
+                                            self.id, t.total,
+                                        );
+                                    }
+                                    helm_tally = Some(t);
+                                }
+                            }
+                            helm_complete_due = helm_complete_retire_due(true, helm_tally, holding);
+                        }
+
                         let retire = event_market_retire_reason(
                             true, hourly_market_close_time, now, grace, holding,
                             venue_accepting_orders, venue_closed_for,
-                        ).or(if game_over_due { Some(RetireReason::GameOver) } else { None });
+                        )
+                        .or(if game_over_due { Some(RetireReason::GameOver) } else { None })
+                        .or(if helm_complete_due { Some(RetireReason::HelmComplete) } else { None });
                         if let Some(reason) = retire {
                             let why = match reason {
                                 RetireReason::PastClose => format!(
@@ -1157,6 +1199,10 @@ impl Squadron {
                                 RetireReason::GameOver => format!(
                                     "is over although the venue still reports it open ({})",
                                     game_over_verdict.map(|v| v.describe()).unwrap_or_default(),
+                                ),
+                                RetireReason::HelmComplete => format!(
+                                    "has no open Helm intent ({} intent(s), all terminal)",
+                                    helm_tally.map_or(0, |t| t.total),
                                 ),
                             };
                             info!(
@@ -3582,6 +3628,10 @@ pub(crate) enum RetireReason {
     /// A sports market whose game is demonstrably over although the venue still
     /// reports it open: see `sports_game_over_verdict`.
     GameOver,
+    /// A Helm squadron whose every intent is terminal and which holds nothing:
+    /// the operator's position is done, so the squadron is. See
+    /// `helm_complete_retire_due`.
+    HelmComplete,
 }
 
 /// Should a single-market squadron stand itself down, and why?
@@ -3621,6 +3671,29 @@ pub(crate) fn event_market_retire_reason(
         return Some(RetireReason::PastClose);
     }
     None
+}
+
+/// Is a Helm squadron done?
+///
+/// A sibling of `event_market_retire_reason`, ORed in at the call site the way
+/// `GameOver` is, rather than a parameter on `event_market_retire_due`: that
+/// rule is about the market's clock and its tests say so, and this one is not
+/// about the market at all.
+///
+/// True when the squadron is a Helm squadron, it has been given at least one
+/// intent and every one of them is terminal (`IntentTally::complete`), and it
+/// holds no position. A squadron never given an intent is not complete — it
+/// retires on the market's close like any other single-market squadron. The
+/// holding guard is the same one every retirement reason obeys: a stop whose
+/// FAK missed still holds, and the intent that produced it is not terminal
+/// until the position is gone, so both conditions have to agree before the
+/// squadron may leave. `tally` is `None` until the first probe answers.
+pub(crate) fn helm_complete_retire_due(
+    helm_squadron: bool,
+    tally: Option<crate::helpers::helm::IntentTally>,
+    holding_position: bool,
+) -> bool {
+    helm_squadron && !holding_position && tally.is_some_and(|t| t.complete())
 }
 
 /// May this squadron's own market serve as its maker (window/daily) venue?
@@ -3698,6 +3771,50 @@ mod event_market_retire_tests {
     fn never_retires_while_holding_a_position() {
         let (close, now) = at(86_400);
         assert!(!event_market_retire_due(true, Some(close), now, 300, true));
+    }
+
+    // ── Helm-complete ───────────────────────────────────────────────────
+
+    fn tally(total: i64, open: i64) -> Option<crate::helpers::helm::IntentTally> {
+        Some(crate::helpers::helm::IntentTally { total, open })
+    }
+
+    /// The signal: every intent terminal, nothing held, a Helm squadron.
+    #[test]
+    fn helm_retires_when_every_intent_is_terminal_and_it_is_flat() {
+        assert!(helm_complete_retire_due(true, tally(1, 0), false));
+        assert!(helm_complete_retire_due(true, tally(3, 0), false));
+    }
+
+    /// An open intent — proposed, acknowledged, working, filled, missed — keeps
+    /// the squadron up. An unfilled entry is an open intent, which is why this
+    /// is not "position closed".
+    #[test]
+    fn helm_stays_while_any_intent_is_open() {
+        assert!(!helm_complete_retire_due(true, tally(1, 1), false));
+        assert!(!helm_complete_retire_due(true, tally(3, 1), false));
+    }
+
+    /// Never given an intent: nothing to be complete about. The market's own
+    /// close retires it, as for any single-market squadron.
+    #[test]
+    fn helm_with_no_intents_is_not_complete() {
+        assert!(!helm_complete_retire_due(true, tally(0, 0), false));
+        assert!(!helm_complete_retire_due(true, None, false));
+    }
+
+    /// The holding guard every retirement reason obeys. A stop whose FAK
+    /// missed still holds; the squadron keeps patrolling so the exit can fire.
+    #[test]
+    fn helm_never_retires_while_holding() {
+        assert!(!helm_complete_retire_due(true, tally(1, 0), true));
+    }
+
+    /// Only a Helm squadron reads this signal; a sports squadron with a stray
+    /// tally (there is none, but the guard is explicit) is unaffected.
+    #[test]
+    fn only_a_helm_squadron_reads_the_signal() {
+        assert!(!helm_complete_retire_due(false, tally(1, 0), false));
     }
 
     /// A crypto squadron is rotated by the venue's own loop. If this fired on
