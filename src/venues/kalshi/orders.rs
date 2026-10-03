@@ -327,6 +327,9 @@ impl Execution for KalshiVenue {
         Ok(Some(MarketFacts {
             market_id: market.clone(),
             question: m.title,
+            // Kalshi's record carries no free-text criteria field; the title is the
+            // whole statement of the question on this venue.
+            criteria: String::new(),
             yes_token: MarketId::new(crate::venues::kalshi::leg_id(&ticker, true)),
             no_token: MarketId::new(crate::venues::kalshi::leg_id(&ticker, false)),
             leg_labels: None,

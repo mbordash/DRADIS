@@ -512,6 +512,7 @@ impl Execution for IntlClobVenue {
         Ok(Some(MarketFacts {
             market_id: market.clone(),
             question: info.question,
+            criteria: info.description,
             yes_token: MarketId::new(info.yes_token),
             no_token: MarketId::new(info.no_token),
             leg_labels: None,

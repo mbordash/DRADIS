@@ -3215,6 +3215,16 @@ struct AvailableMarketsQuery {
 pub(crate) struct AvailableMarket {
     pub(crate) condition_id: String,
     pub(crate) question: String,
+    /// The venue's resolution criteria, verbatim, or empty where it publishes none.
+    ///
+    /// The question is frequently not enough to choose a market on: "Bitcoin Up or
+    /// Down on October 3?" names no reference price, because the market compares
+    /// two timestamps rather than quoting a strike. The criteria say which candle,
+    /// on which exchange, at which two times. This was already being fetched and
+    /// thrown away (bound as `_desc`), so an operator picking a market to take the
+    /// helm on could not see what they were actually betting on.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) criteria: String,
     pub(crate) market_class: String,
     pub(crate) end_date: Option<String>,
     pub(crate) liquidity: f64,
@@ -3529,10 +3539,11 @@ pub(crate) async fn fetch_markets_by_type(
         let mut out: Vec<AvailableMarket> = candidates
             .into_iter()
             .filter(|(_, _, _, vol, _, _, _, _)| *vol >= min_liquidity)
-            .map(|(tokens, question, _slug, liquidity, _priority, end_date, _desc, condition_id)| {
+            .map(|(tokens, question, _slug, liquidity, _priority, end_date, desc, condition_id)| {
                 AvailableMarket {
                     condition_id,
                     question,
+                    criteria: desc,
                     market_class: "crypto".to_string(),
                     end_date: end_date.map(|dt| dt.to_rfc3339()),
                     liquidity,
@@ -3646,6 +3657,8 @@ pub(crate) async fn fetch_markets_by_type(
             out.push(AvailableMarket {
                 condition_id,
                 question,
+                // Straight from the same record the question came from.
+                criteria: m.get("description").and_then(|d| d.as_str()).unwrap_or_default().to_string(),
                 market_class: "politics".to_string(),
                 end_date: close_time.map(|ct| ct.to_rfc3339()),
                 liquidity: volume,
@@ -3834,6 +3847,7 @@ async fn fetch_sports_markets_by_tags(
                 out.push(AvailableMarket {
                     condition_id,
                     question,
+                    criteria: m.get("description").and_then(|d| d.as_str()).unwrap_or_default().to_string(),
                     market_class: "sports".to_string(),
                     end_date: close_time.map(|ct| ct.to_rfc3339()),
                     liquidity: volume,
@@ -3960,6 +3974,8 @@ pub(crate) async fn fetch_markets_by_type(
         out.push(AvailableMarket {
             condition_id: p.slug,
             question: p.question,
+            // The venue's own description of what settles this market.
+            criteria: p.description.clone(),
             market_class: market_type.to_string(),
             end_date: p.close_time.map(|ct| ct.to_rfc3339()),
             liquidity: p.volume,
@@ -4042,6 +4058,10 @@ pub(crate) async fn fetch_markets_by_type(
                     out.push(AvailableMarket {
                         condition_id: m.ticker.clone(),
                         question,
+                        // Kalshi states the question in the title; it publishes no
+                        // separate criteria field, so this is deliberately empty rather
+                        // than a duplicate of the question.
+                        criteria: String::new(),
                         market_class: market_type.to_string(),
                         end_date: close.map(|ct| ct.to_rfc3339()),
                         liquidity: volume,
@@ -4090,6 +4110,10 @@ pub(crate) async fn fetch_markets_by_type(
             out.push(AvailableMarket {
                 condition_id: m.ticker.clone(),
                 question,
+                // Kalshi states the question in the title; it publishes no
+                // separate criteria field, so this is deliberately empty rather
+                // than a duplicate of the question.
+                criteria: String::new(),
                 market_class: market_type.to_string(),
                 end_date: close.map(|ct| ct.to_rfc3339()),
                 liquidity: volume,

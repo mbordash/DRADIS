@@ -601,6 +601,15 @@ pub struct MarketFacts {
     pub market_id: MarketId,
     /// The question as the venue words it, for the operator's own record.
     pub question: String,
+    /// The venue's own resolution criteria, verbatim, or empty where it publishes
+    /// none.
+    ///
+    /// A question is often not enough to form a conviction on: "Bitcoin Up or Down
+    /// on October 3?" names no reference price, because the market compares two
+    /// timestamps rather than quoting a strike. The criteria say which candle, on
+    /// which exchange, at which two times — which is the difference between an
+    /// informed conviction and a guess about what the question means.
+    pub criteria: String,
     /// The two tokens, in the venue's own ordering.
     pub yes_token: MarketId,
     pub no_token: MarketId,

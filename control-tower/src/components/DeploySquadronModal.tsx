@@ -211,6 +211,20 @@ export function MarketBrowser({ markets, selected, onSelect, loading }: MarketBr
               <p className="text-xs font-mono text-gray-200 truncate" title={market.question}>
                 {market.question}
               </p>
+              {/* What is actually being bet on. The question often does not say:
+                  "Bitcoin Up or Down on October 3?" names no reference price,
+                  because the market compares two timestamps rather than quoting a
+                  strike. The criteria name the candle, the exchange and the two
+                  times. Shown in full on the selected row, since that is the one
+                  the operator is about to commit to. */}
+              {market.criteria && (
+                <p
+                  className={`text-[10px] font-mono text-gray-500 mt-0.5 ${isSelected ? '' : 'truncate'}`}
+                  title={market.criteria}
+                >
+                  {market.criteria}
+                </p>
+              )}
             </div>
             <div className="flex items-center gap-3 flex-shrink-0">
               <span className="text-[10px] font-mono text-gray-500">

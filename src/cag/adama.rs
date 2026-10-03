@@ -338,6 +338,16 @@ where
 /// Market info needed for squadron spawning.
 pub struct MarketInfo {
     pub question: String,
+    /// Gamma's resolution criteria, verbatim.
+    ///
+    /// The question alone is not enough to form a conviction on. "Bitcoin Up or
+    /// Down on October 3?" names no reference price, because an Up/Down market
+    /// compares two timestamps rather than quoting a strike — so
+    /// `extract_strike_price` finds nothing in the name and the operator is told
+    /// only that it is about Bitcoin. The description says what is actually being
+    /// asked: which candle, on which exchange, at which two times. Carried so the
+    /// Helm form can show it before the operator commits.
+    pub description: String,
     pub yes_token: String,
     pub no_token: String,
     /// When the market resolves, from Gamma's `endDate`.
@@ -557,6 +567,11 @@ pub async fn fetch_market_info(http: &reqwest::Client, condition_id: &str) -> Op
         return None;
     }
     
+    let description = market
+        .get("description")
+        .and_then(|d| d.as_str())
+        .unwrap_or_default()
+        .to_string();
     let Some(question) = market.get("question").and_then(|q| q.as_str()).map(String::from) else {
         warn!(%condition_id, "Gamma market has no question field");
         return None;
@@ -595,7 +610,7 @@ pub async fn fetch_market_info(http: &reqwest::Client, condition_id: &str) -> Op
 
     let taker_fee_rate = parse_gamma_fee_rate(market);
 
-    Some(MarketInfo { question, yes_token, no_token, close_time, taker_fee_rate })
+    Some(MarketInfo { question, description, yes_token, no_token, close_time, taker_fee_rate })
 }
 
 /// Run the Admiral Adama deployment processor.
@@ -854,6 +869,7 @@ mod sports_seeder_tests {
         AvailableMarket {
             condition_id: cid.into(),
             question: format!("{cid}?"),
+            criteria: String::new(),
             market_class: "sports".into(),
             end_date: None,
             liquidity,

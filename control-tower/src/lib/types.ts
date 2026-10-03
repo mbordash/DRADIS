@@ -887,6 +887,14 @@ export interface AvailableMarket {
     yes_id: string;
     no_id: string;
   };
+  /**
+   * The venue's resolution criteria, verbatim. Absent where it publishes none.
+   *
+   * The question alone often does not say what is being bet on: "Bitcoin Up or
+   * Down on October 3?" names no reference price, because the market compares two
+   * timestamps rather than quoting a strike.
+   */
+  criteria?:     string;
 }
 
 /** Response from GET /api/markets/available. */

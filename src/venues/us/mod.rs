@@ -1031,6 +1031,7 @@ impl Execution for UsRetailVenue {
             // prove the facts describe the market it asked about.
             market_id: MarketId::new(pair.slug.clone()),
             question: pair.question.clone(),
+            criteria: pair.description.clone(),
             yes_token: pair.long.clone(),
             no_token: pair.short.clone(),
             leg_labels,
