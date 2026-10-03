@@ -2853,10 +2853,64 @@ async fn stand_down_squadron(
     // no entry to update and finishes quietly.
     s.cag.remove(&id);
 
-    let message = match &disabled {
+    // A Helm squadron's open intents go with it.
+    //
+    // Nothing closed them on this path. The engine's own retirement closes them
+    // (`patrol_impl`, the `RetireReason` arm), but an operator stand-down
+    // cancels the patrol token and removes the registry entry, so that arm never
+    // runs. The intents stayed open forever against a squadron that no longer
+    // exists, and `helm_max_open_intents` counts them: two hand-stood-down Helm
+    // squadrons would have blocked every future intent on the instance with
+    // nothing to clear them but a manual cancel.
+    //
+    // A held position is deliberately NOT closed here, only its intent record.
+    // Standing a squadron down does not sell anything, and the position is
+    // reconciled by the chain-sync path like any other orphan.
+    // Same shard the squadron's own patrol writes to: `summary.asset` is
+    // `CryptoAsset::symbol()`, which for a Helm squadron is `helm`.
+    let mut helm_warning: Option<String> = None;
+    // `pool_for("helm")` with a fallback: the shard is aliased to `helm` on every
+    // venue that can deploy one, but falling back to the primary means a missing
+    // alias degrades to "looked in the wrong place" rather than "silently did
+    // nothing".
+    let helm_pool = crate::helpers::db::pool_for(&summary.asset.to_lowercase())
+        .or_else(|| crate::helpers::db::pool_for(crate::vipers::helm_impl::KIND));
+    if let Some(pool) = helm_pool {
+        // Say so if a position is still held. Standing a squadron down cancels
+        // its patrol, so nothing evaluates the exit posture afterwards: the stop,
+        // the take-profit and the time limit stop being enforced the moment this
+        // returns. Chain-sync re-adopts and labels an orphan, it does not enforce
+        // an operator's stop. The operator who set that stop needs telling, which
+        // is the difference between a known risk and a silent one.
+        let held = crate::helpers::helm::held_shares_for_squadron(&pool, &id).await;
+        let n = crate::helpers::helm::close_open_for_squadron(
+            &pool, &id, "squadron stood down by the operator",
+        ).await;
+        if n > 0 {
+            info!("🧭 Squadron [{id}] closed {n} open Helm intent(s): stood down by the operator");
+        }
+        if held > rust_decimal::Decimal::ZERO {
+            let msg = format!(
+                "{held} shares are still held and their exit posture is NO LONGER \
+                 ENFORCED: nothing evaluates the stop, take-profit or time limit \
+                 once the patrol stops. Exit it manually, or redeploy to resume \
+                 management."
+            );
+            warn!("🧭 Squadron [{id}] stood down holding {held} shares — posture no longer enforced");
+            helm_warning = Some(msg);
+        }
+    } else {
+        warn!("🧭 Squadron [{id}]: no pool resolved — open Helm intents were NOT closed");
+    }
+
+    let mut message = match &disabled {
         Some(f) => format!("Squadron {id} standing down. {f} switched off so it is not redeployed automatically."),
         None => format!("Squadron {id} standing down."),
     };
+    if let Some(w) = helm_warning {
+        message.push(' ');
+        message.push_str(&w);
+    }
     Json(StandDownResponse {
         success: true,
         squadron_id: id,
@@ -4152,13 +4206,21 @@ async fn deploy_squadron(
     // (Arbitrage, Maker) have always been mapped to those classes. Crypto is
     // deployable everywhere too — a venue's own rotation loop or wing owning a
     // class is not a reason the operator cannot add a squadron to it.
+    // `helm` is a deployment kind rather than a market class: the operator names
+    // the market and Helm carries no view about what kind it should be. Omitting
+    // it here left everything wired in `kalshi/trader.rs` unreachable through the
+    // API, which answered "Unknown market type 'helm'" — the same shape as the
+    // Polymarket US routing gap, found the same way.
     #[cfg(all(not(feature = "intl_clob"), feature = "kalshi"))]
-    if !matches!(req.market_type.as_str(), "crypto" | "politics" | "sports") {
+    if !matches!(
+        req.market_type.as_str(),
+        "crypto" | "politics" | "sports" | crate::vipers::helm_impl::KIND
+    ) {
         return Json(DeploySquadronResponse {
             success: false,
             squadron_id: None,
             error: Some(format!(
-                "Unknown market type '{}' — Kalshi supports crypto, politics and sports",
+                "Unknown market type '{}' — Kalshi supports crypto, politics, sports and helm",
                 req.market_type
             )),
         }).into_response();

@@ -44,6 +44,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
+// The venue is reached through its trait, which is what keeps this file free of
+// `#[cfg]` arms: `session.venue` is the concrete per-venue type and dispatch is
+// static, so nothing here names a venue.
+use crate::venues::core::Execution;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::{info, warn};
@@ -72,14 +76,7 @@ fn helm_pool() -> Option<sqlx::SqlitePool> {
         .or_else(|| crate::helpers::db::pool().cloned())
 }
 
-fn venue_label() -> &'static str {
-    #[cfg(feature = "intl_clob")]
-    { "intl_clob" }
-    #[cfg(all(not(feature = "intl_clob"), feature = "us_retail"))]
-    { "us_retail" }
-    #[cfg(all(not(feature = "intl_clob"), not(feature = "us_retail")))]
-    { "kalshi" }
-}
+
 
 fn err(status: StatusCode, msg: impl Into<String>) -> Response {
     let msg = msg.into();
@@ -144,63 +141,83 @@ fn squadron_is_ghost(squadron_id: &str) -> bool {
 /// from the venue, the close time from Gamma, the engine's minimums from the
 /// global row. Phase 1 is Polymarket International; the other builds refuse
 /// here, before anything is written, with the reason.
-#[cfg(feature = "intl_clob")]
 async fn book_facts(s: &ApiState, market_id: &str, side: &str) -> Result<BookFacts, Response> {
-    use polymarket_client_sdk_v2::clob::types::Side;
     if market_id.is_empty() {
         return Err(err(
             StatusCode::SERVICE_UNAVAILABLE,
             "this squadron's deployment row records no market id (it was deployed before the engine wrote one); stand it down and deploy it again",
         ));
     }
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap_or_default();
-    let Some(info) = crate::cag::adama::fetch_market_info(&http, market_id).await else {
-        return Err(err(StatusCode::SERVICE_UNAVAILABLE, format!("could not read market {market_id} from Gamma; try again")));
-    };
-    let token = if side.trim().eq_ignore_ascii_case("YES") { info.yes_token } else { info.no_token };
-    // The primary session's venue client, deliberately not a Helm session:
-    // there is none. Sessions are registered at boot for the fleet's assets
-    // only (`main.rs` → `Cag::set_session`), and a Helm squadron is deployed
-    // at runtime under asset `helm` and patrols on `AdamaInfrastructure::
-    // default_session` — the same primary session. A book price is
-    // venue-wide, not asset-specific, so any registered session's client
-    // answers the same question; the primary is the one guaranteed to exist
-    // once the engine is up.
+    // Everything below goes through the venue, so this function is venue-neutral.
+    //
+    // It used to call Gamma for the tokens and reach into
+    // `venues::intl::u256_from_market_id` plus `api::server::fetch_side_price`
+    // for the book, which is why Helm entry was gated to one venue and why this
+    // file carried `#[cfg]` arms the project reserves for `src/venues/mod.rs`.
+    // `SessionState` has held `venue: Arc<ActiveVenue>` since the venue
+    // abstraction landed — the concrete per-venue type, static dispatch, no
+    // vtable — so the handle was already here and simply unused.
+    //
+    // Deliberately the primary session rather than a Helm one: there is none.
+    // Sessions are registered at boot for the fleet's assets only
+    // (`main.rs` -> `Cag::set_session`), while a Helm squadron is deployed at
+    // runtime under asset `helm` and patrols on the same primary session. A book
+    // is venue-wide, not asset-specific.
     let Some(session) = s.cag.session() else {
         return Err(err(
             StatusCode::SERVICE_UNAVAILABLE,
             "no venue session is registered yet — the engine is still starting; retry in a few seconds",
         ));
     };
-    let u = match crate::venues::intl::u256_from_market_id(&crate::venues::core::MarketId::new(&token)) {
-        Ok(u) => u,
-        Err(e) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("bad token id {token}: {e}"))),
+    let market = crate::venues::core::MarketId::new(market_id);
+    let facts = match session.venue.market_facts(&market).await {
+        Ok(Some(f)) => f,
+        Ok(None) => return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("the venue could not resolve market {market_id}; try again"),
+        )),
+        Err(e) => return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("reading market {market_id} from the venue failed: {e}"),
+        )),
     };
-    let bid = crate::api::server::fetch_side_price(&session, u, Side::Buy).await;
-    let ask = crate::api::server::fetch_side_price(&session, u, Side::Sell).await;
+    // Prove the facts describe the market asked about. Squadron ids are reused
+    // across redeploys, so a mismatch here is the difference between validating
+    // a posture against this market and against its predecessor.
+    if facts.market_id != market {
+        return Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("the venue answered for {} when asked about {market_id}", facts.market_id),
+        ));
+    }
+    let token = if side.trim().eq_ignore_ascii_case("YES") { facts.yes_token } else { facts.no_token };
+    // `quote_both`, not `best_bid` + `best_ask`: on Polymarket International
+    // `best_ask` deliberately keeps the trait default, because implementing it
+    // would arm the shared lifecycle's naked-leg re-hedge on a venue that already
+    // re-hedges in its own arbiter sweep. A read-only validator must not decide
+    // that. It also costs one round trip instead of two.
+    let (bid, ask) = match session.venue.quote_both(&token).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!("Helm: book read failed for {token}: {e}");
+            (None, None)
+        }
+    };
     if bid.is_none() && ask.is_none() {
         return Err(err(
             StatusCode::SERVICE_UNAVAILABLE,
-            format!("the venue returned no bid and no ask for the {} token of {market_id}; the book may be dark or the venue slow — try again", side.trim().to_ascii_uppercase()),
+            format!("the venue returned no bid and no ask for the {} side of {market_id}; the book may be dark or the venue slow — try again", side.trim().to_ascii_uppercase()),
         ));
     }
     let dc = s.config_rx.borrow().clone();
     Ok(BookFacts {
         bid: bid.unwrap_or_default(),
         ask: ask.unwrap_or_default(),
-        close_time: info.close_time,
+        close_time: facts.close_time,
         now: Utc::now(),
         min_shares: crate::venues::min_order_shares(),
         min_secs_to_close: dc.helm_min_secs_to_close,
     })
-}
-
-#[cfg(not(feature = "intl_clob"))]
-async fn book_facts(_s: &ApiState, _market_id: &str, _side: &str) -> Result<BookFacts, Response> {
-    Err(err(StatusCode::SERVICE_UNAVAILABLE, "Helm is Polymarket International only in phase 1"))
 }
 
 // ── Create ───────────────────────────────────────────────────────────────────
@@ -280,7 +297,7 @@ async fn create_intent(State(s): State<ApiState>, Json(req): Json<CreateIntentRe
         side: req.side.clone(),
         content: req.content.clone(),
         ghost: squadron_is_ghost(&req.squadron_id),
-        venue: venue_label().to_string(),
+        venue: crate::venues::venue_name().to_string(),
     };
     match helm::create(&pool, &new).await {
         Ok(id) => {
@@ -686,7 +703,7 @@ async fn supersede_intent(State(s): State<ApiState>, Path(id): Path<i64>, Json(r
         side,
         content: req.content.clone(),
         ghost: squadron_is_ghost(&old.squadron_id),
-        venue: venue_label().to_string(),
+        venue: crate::venues::venue_name().to_string(),
     };
     match helm::supersede(&pool, id, &new, &req.reason).await {
         Ok(new_id) => {

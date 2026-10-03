@@ -3583,9 +3583,9 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "polymarket-us"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f767da22cd20c58207851e38168790ac956beddaae0743157bfcf23f2ba27faf"
+checksum = "b20c449c5c48fe23cb158b80656b6c28006a53842456af180d1bbcc5126b31ea"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",

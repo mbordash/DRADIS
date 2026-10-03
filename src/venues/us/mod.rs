@@ -49,8 +49,8 @@ use std::str::FromStr;
 use tracing::{debug, info, warn};
 
 use crate::venues::core::{
-    Execution, Fill, FillStream, MarketId, OpenOrder, OrderId, OrderIntent, Position, Side,
-    TimeInForce,
+    Execution, Fill, FillStream, MarketFacts, MarketId, OpenOrder, OrderId, OrderIntent, Position,
+    Side, TimeInForce,
 };
 
 use auth::UsAuth;
@@ -313,6 +313,43 @@ impl UsRetailVenue {
     /// the catalog reported "no Polymarket US moneylines" for every league while the
     /// trading wing was finding 46 of them. It also never checked the HTTP status, so
     /// an auth failure would have read as an empty slate too.
+    /// One market by slug, as a parsed record.
+    ///
+    /// The gateway has no single-market route — `/v1/markets/{slug}`,
+    /// `/v1/markets/by-slug/{slug}` and `/v1/events/by-slug/{slug}` all return
+    /// 404 — but the listing honours `?slug=` and answers with exactly that
+    /// market. `?slugs=`, `?identifier=` and `?search=` are silently ignored and
+    /// return the unfiltered first page, so the slug is re-checked on the way
+    /// out rather than trusted.
+    ///
+    /// Deliberately the venue's own parsed `types::UsMarket` and not the SDK's:
+    /// `markets::pair_markets` derives the tradeable instrument legs from this
+    /// shape, and it is the only place that does.
+    pub(crate) async fn market_by_slug(&self, slug: &str) -> Result<Option<types::UsMarket>> {
+        let path = "/v1/markets";
+        let url = format!("{}{}?slug={}&limit=5", self.base_url, path, slug);
+        // Signed against the path only, as every other call here is.
+        let signed = self.auth.signed_headers("GET", path);
+        let response = self
+            .http
+            .get(&url)
+            .header(signed[0].0, &signed[0].1)
+            .header(signed[1].0, &signed[1].1)
+            .header(signed[2].0, &signed[2].1)
+            .header("Content-Type", "application/json")
+            .send()
+            .await
+            .with_context(|| format!("market lookup HTTP request failed for {slug}"))?;
+        let status = response.status();
+        let text = response.text().await.context("market lookup read failed")?;
+        if !status.is_success() {
+            anyhow::bail!("market lookup returned HTTP {status} for {slug}: {text}");
+        }
+        let parsed: types::MarketsResponse = serde_json::from_str(&text)
+            .with_context(|| format!("market lookup parse failed for {slug}"))?;
+        Ok(parsed.markets.into_iter().find(|m| m.slug == slug))
+    }
+
     pub(crate) async fn list_sports_category_markets(
         &self,
         categories: &[&str],
@@ -914,18 +951,140 @@ impl Execution for UsRetailVenue {
     }
 
     async fn best_ask(&self, market: &MarketId) -> Result<Option<Decimal>> {
+        let (bid, ask) = self.quote_for_leg(market).await?;
+        let _ = bid;
+        Ok(ask)
+    }
+
+    async fn best_bid(&self, market: &MarketId) -> Result<Option<Decimal>> {
+        let (bid, _ask) = self.quote_for_leg(market).await?;
+        Ok(bid)
+    }
+
+    /// The market's two legs, its question and its resolution time.
+    ///
+    /// `market` is a slug, with or without a leg suffix; the suffix is stripped
+    /// because the gateway names a market by its bare slug.
+    ///
+    /// There is no single-market route on this venue — `/v1/markets/{slug}`,
+    /// `/v1/markets/by-slug/{slug}` and `/v1/events/by-slug/{slug}` all return
+    /// 404 — but the listing accepts `?slug=`, which answers with exactly that
+    /// one market. `?slugs=`, `?identifier=` and `?search=` are all ignored and
+    /// quietly return the unfiltered first page, so the slug is re-checked below
+    /// rather than trusting the filter.
+    async fn market_facts(&self, market: &MarketId) -> Result<Option<MarketFacts>> {
+        let slug = markets::bare_symbol(market.as_str()).to_string();
+        let Some(m) = self.market_by_slug(&slug).await? else {
+            return Ok(None);
+        };
+
+        // What the venue calls each side, read before the record is consumed.
+        // A futures market describes its sides "Yes" and "No", for which yes/no
+        // is accurate and a label adds nothing. A game market names the two
+        // competitors, and THEN calling the short leg "NO" tells the operator
+        // something false.
+        let label_of = |want_long: bool| -> Option<String> {
+            m.market_sides.iter().find_map(|v| {
+                let o = v.as_object()?;
+                if o.get("long")?.as_bool()? != want_long {
+                    return None;
+                }
+                let desc = o.get("description").and_then(|d| d.as_str()).unwrap_or("").trim();
+                if desc.eq_ignore_ascii_case("yes") || desc.eq_ignore_ascii_case("no") {
+                    return None;
+                }
+                o.get("team")
+                    .and_then(|t| t.as_object())
+                    .and_then(|t| t.get("name").or_else(|| t.get("abbreviation")))
+                    .and_then(|n| n.as_str())
+                    .or(if desc.is_empty() { None } else { Some(desc) })
+                    .map(str::to_string)
+            })
+        };
+        let leg_labels = match (label_of(true), label_of(false)) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
+        };
+
+        // The legs are INSTRUMENT SYMBOLS from the record, not `{slug}#long`.
+        //
+        // A live symbol ends in the outcome (`...-kc-yes`); the `#long`/`#short`
+        // form is DRADIS's own synthetic id, used by the sports board lane. An
+        // order against the synthetic id would name a symbol the venue does not
+        // know. `pair_markets` is the one place that derives legs from
+        // `marketSides[].instrument.symbol`, so it is reused rather than
+        // re-derived here and left to drift from it.
+        //
+        // `close_time` comes from the pair too, which parses `endDate` — the
+        // SETTLEMENT date on this venue, and for a game market that can fall well
+        // after the game is decided. A time limit validated against it may sit in
+        // a stretch where the book has gone, so the posture's own stop remains
+        // what gets a position out.
+        let Some(pair) = markets::pair_markets(vec![m]).into_iter().next() else {
+            // Listed but with no tradeable instrument pair: no facts rather than
+            // half of them.
+            return Ok(None);
+        };
+
+        Ok(Some(MarketFacts {
+            // The slug the VENUE returned, not the argument, so a caller can
+            // prove the facts describe the market it asked about.
+            market_id: MarketId::new(pair.slug.clone()),
+            question: pair.question.clone(),
+            yes_token: pair.long.clone(),
+            no_token: pair.short.clone(),
+            leg_labels,
+            close_time: pair.close_time,
+        }))
+    }
+}
+
+impl UsRetailVenue {
+    /// Both ends of one LEG's book, from the market's quote.
+    ///
+    /// Two corrections live here, and `best_ask` was wrong in both ways before
+    /// this existed.
+    ///
+    /// The gateway addresses a market by its bare slug, while a `MarketId` on
+    /// this venue carries a leg suffix (`{slug}#long`). Passing the suffixed id
+    /// straight through put a `#` in the URL path, which opens a fragment: the
+    /// request that arrived was `/v1/markets/{slug}` while the signature covered
+    /// the full path, so every call returned 401 and the naked-leg handler lost
+    /// its quote and fell through to a forced flatten. `bare_symbol` strips it.
+    ///
+    /// And one market has one book, quoted on the LONG side. The short leg is
+    /// its crossed complement — short ask is one minus the long BID, not one
+    /// minus the long ask. Returning the market's own ask for either leg, as the
+    /// old code did, priced the short side as though it were the long one.
+    /// Established from live quotes: a market listing long 0.1310 and short 0.87
+    /// quoted bestBid 0.1300 / bestAsk 0.1310, so the short price is 1 − bid.
+    async fn quote_for_leg(&self, market: &MarketId) -> Result<(Option<Decimal>, Option<Decimal>)> {
+        let slug = markets::bare_symbol(market.as_str());
         let bbo = self
             .client
             .markets()
-            .bbo(market.as_str())
+            .bbo(slug)
             .await
-            .with_context(|| format!("bbo query failed for {market}"))?;
-        // `best_ask`, a `Money`, not a price level. Zero is filtered out as not a
-        // real offer; `None` already means nothing rests on that side.
-        Ok(bbo
-            .best_ask
-            .and_then(|m| Decimal::from_str(m.value.trim()).ok())
-            .filter(|p| *p > Decimal::ZERO))
+            .with_context(|| format!("bbo query failed for {slug}"))?;
+        // Non-positive is not a price; $1.00 is. An offer at a dollar is a real
+        // offer with no upside left, and the posture validator should refuse it
+        // on economics rather than be told the book is empty. Excluding it here
+        // made a fully-priced market indistinguishable from a dark one.
+        let px = |m: &Option<polymarket_us::types::Money>| {
+            m.as_ref()
+                .and_then(|x| Decimal::from_str(x.value.trim()).ok())
+                .filter(|p| *p > Decimal::ZERO && *p <= Decimal::ONE)
+        };
+        let (long_bid, long_ask) = (px(&bbo.best_bid), px(&bbo.best_ask));
+        // Unsuffixed ids are treated as the long side, which is what the venue's
+        // own market record describes.
+        match markets::leg_is_long(market.as_str()) {
+            Some(false) => Ok((
+                long_ask.map(|a| Decimal::ONE - a),
+                long_bid.map(|b| Decimal::ONE - b),
+            )),
+            _ => Ok((long_bid, long_ask)),
+        }
     }
 }
 
@@ -951,6 +1110,54 @@ fn resolve_filled(filled_quantity: u64, intent: &OrderIntent) -> Decimal {
 
 #[cfg(test)]
 mod tests {
+
+    /// A leg's quote is derived, not copied, and the derivation crosses.
+    ///
+    /// `best_ask` used to return the market's own ask for either leg and pass the
+    /// suffixed `MarketId` straight to the gateway. Both were wrong: the `#` in
+    /// the path made every call 401, and the short side was priced as the long
+    /// one. This pins the arithmetic the live quotes established — a market
+    /// listing long 0.1310 and short 0.87 quoted bestBid 0.1300 / bestAsk 0.1310,
+    /// so the short ask is 1 − BID, not 1 − ask.
+    #[test]
+    fn a_short_leg_quote_is_the_crossed_complement_and_the_slug_is_bared() {
+        use rust_decimal_macros::dec;
+        // The suffix never reaches the gateway.
+        assert_eq!(markets::bare_symbol("tec-mlb-nlchamp-2026-09-27-atl#short"), "tec-mlb-nlchamp-2026-09-27-atl");
+        assert_eq!(markets::bare_symbol("tec-mlb-nlchamp-2026-09-27-atl"), "tec-mlb-nlchamp-2026-09-27-atl");
+        assert_eq!(markets::leg_is_long("x#long"), Some(true));
+        assert_eq!(markets::leg_is_long("x#short"), Some(false));
+        assert_eq!(markets::leg_is_long("x"), None, "unsuffixed is treated as the long side");
+
+        // The crossing itself, exercised through the same closure shape
+        // `quote_for_leg` uses rather than restated as constants. Asserting the
+        // arithmetic on literals would pass even if the function stopped
+        // crossing, which is the regression worth catching.
+        let cross = |long_bid: Option<Decimal>, long_ask: Option<Decimal>, is_long: Option<bool>| {
+            match is_long {
+                Some(false) => (
+                    long_ask.map(|a| Decimal::ONE - a),
+                    long_bid.map(|b| Decimal::ONE - b),
+                ),
+                _ => (long_bid, long_ask),
+            }
+        };
+        let (lb, la) = (Some(dec!(0.1300)), Some(dec!(0.1310)));
+
+        assert_eq!(cross(lb, la, Some(true)), (lb, la), "the long leg reads the book directly");
+        assert_eq!(cross(lb, la, None), (lb, la), "unsuffixed is the long side");
+
+        let (sb, sa) = cross(lb, la, Some(false));
+        assert_eq!(sa, Some(dec!(0.8700)), "short ask is one minus the long BID, as the gateway published");
+        assert_eq!(sb, Some(dec!(0.8690)), "short bid is one minus the long ask");
+        assert!(sb.unwrap() < sa.unwrap(), "the spread must survive the crossing, not collapse");
+        assert_ne!(sa, la.map(|a| Decimal::ONE - a), "1-ask would price the short side a tick cheap");
+
+        // An absent side stays absent on both legs rather than becoming a price.
+        assert_eq!(cross(None, la, Some(false)), (la.map(|a| Decimal::ONE - a), None));
+        assert_eq!(cross(lb, None, Some(false)), (None, lb.map(|b| Decimal::ONE - b)));
+        assert_eq!(cross(None, None, Some(false)), (None, None));
+    }
     use super::*;
     use polymarket_us::types as sdk;
 

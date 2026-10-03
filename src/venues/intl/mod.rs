@@ -42,7 +42,7 @@ use async_trait::async_trait;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::str::FromStr;
-use tracing::info;
+use tracing::{debug, info};
 
 use alloy::primitives::{address, Address, U256};
 use alloy::signers::local::LocalSigner;
@@ -61,8 +61,10 @@ use tokio::sync::Mutex;
 use crate::config;
 use crate::helpers::nonce::fetch_next_nonce;
 use crate::venues::core::{
-    Execution, Fill, MarketId, OpenOrder, OrderId, OrderIntent, Position, Side, TimeInForce,
+    Execution, Fill, MarketFacts, MarketId, OpenOrder, OrderId, OrderIntent, Position, Side,
+    TimeInForce,
 };
+use polymarket_client_sdk_v2::clob::types::request::PriceRequest;
 
 // ── V2 CTF Exchange verifying contracts (per neg-risk routing) ───────────────
 // Mirrors the constants in `squadron/patrol_tasks.rs`; kept private to the venue.
@@ -452,6 +454,101 @@ impl Execution for IntlClobVenue {
             }
         }
         Ok(result)
+    }
+    /// Best bid on `market`'s book.
+    ///
+    /// Lifted from `api::server::fetch_side_price`, which took a whole
+    /// `SessionState` only to reach `session.venue.trading_client()`. Helm's
+    /// posture validator needs both ends of the book and had been reaching into
+    /// `venues::intl` directly to get them, which is what kept the Helm API
+    /// compiled for one venue.
+    ///
+    /// A zero is not a bid. The venue returns zero rather than an error when a
+    /// side is empty, and passing it through would let a stop validate against a
+    /// price nobody is offering.
+    async fn best_bid(&self, market: &MarketId) -> Result<Option<Decimal>> {
+        Ok(self.quote(market, ClobSide::Buy).await)
+    }
+
+    /// Both ends of the book in one call, for a validator rather than a trader.
+    ///
+    /// Separate from `best_ask` on purpose: see the note above. This is also one
+    /// round trip's worth of latency cheaper than two sequential calls, which
+    /// matters because an operator is waiting on it.
+    async fn quote_both(&self, market: &MarketId) -> Result<(Option<Decimal>, Option<Decimal>)> {
+        let (bid, ask) = tokio::join!(
+            self.quote(market, ClobSide::Buy),
+            self.quote(market, ClobSide::Sell),
+        );
+        Ok((bid, ask))
+    }
+
+    // `best_ask` is deliberately NOT implemented here, so this venue keeps the
+    // trait's `None` default.
+    //
+    // It is not a missing feature. `venues::lifecycle.rs` gates a FAK BUY of a
+    // missing partner leg on `best_ask` returning `Some`, and intl already
+    // re-hedges naked legs in its own ARB ARBITER sweep
+    // (`squadron/patrol_tasks.rs`, every 300s). Implementing it here would arm a
+    // SECOND re-hedge path on the live wallet, so two tasks could buy the same
+    // partner leg. The shared lifecycle's version exists for the venues that have
+    // no arbiter of their own.
+    //
+    // Helm does not need it: its posture validator wants the bid it would sell
+    // into and the ask it would lift, and reads both through `quote_both` below,
+    // which no order-placing path consults.
+
+    /// The market's tokens, question and close, from Gamma.
+    ///
+    /// A binary market here really is a yes/no question, so `leg_labels` is
+    /// `None`. `market` is the condition id, which is how this venue names a
+    /// market everywhere outside `src/venues/`.
+    async fn market_facts(&self, market: &MarketId) -> Result<Option<MarketFacts>> {
+        let Some(info) =
+            crate::cag::adama::fetch_market_info(self.shared_http(), market.as_str()).await
+        else {
+            return Ok(None);
+        };
+        Ok(Some(MarketFacts {
+            market_id: market.clone(),
+            question: info.question,
+            yes_token: MarketId::new(info.yes_token),
+            no_token: MarketId::new(info.no_token),
+            leg_labels: None,
+            close_time: info.close_time,
+        }))
+    }
+}
+
+impl IntlClobVenue {
+    /// One side of a token's book, or `None` when the venue cannot price it.
+    ///
+    /// Bounded at five seconds: a quote that has not arrived by then is no use
+    /// to a validator the operator is waiting on, and the caller treats absence
+    /// as a refusal rather than a zero.
+    async fn quote(&self, market: &MarketId, side: ClobSide) -> Option<Decimal> {
+        let token = u256_from_market_id(market).ok()?;
+        let req = PriceRequest::builder().token_id(token).side(side).build();
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.trading_client().price(&req),
+        )
+        .await
+        {
+            Ok(Ok(r)) if r.price > Decimal::ZERO => Some(r.price),
+            Ok(Ok(_)) => {
+                debug!("quote: venue returned a non-positive price for {market}");
+                None
+            }
+            Ok(Err(e)) => {
+                debug!("quote: price fetch failed for {market}: {e}");
+                None
+            }
+            Err(_) => {
+                debug!("quote: price fetch timed out for {market}");
+                None
+            }
+        }
     }
 }
 #[cfg(test)]

@@ -105,7 +105,6 @@ pub const INTENT_HELD: &str = "intent filled: position held under its posture";
 pub const INTENTS_COMPLETE: &str = "all intents terminal, squadron retiring";
 pub const DISABLED: &str = "disabled in config (helm_enabled)";
 pub const LIVE_DISABLED: &str = "live orders disabled (helm_live_enabled)";
-pub const PHASE_1_VENUE: &str = "Helm entry is Polymarket International only (phase 1)";
 pub const NO_DATABASE: &str = "database unavailable: cannot record the intent going to work";
 
 /// How often the strategy re-reads its squadron's intents. The patrol ticks
@@ -636,14 +635,14 @@ impl Strategy for HelmStrategy {
             return Ok(StrategySignal::MakerCancel { tokens: vec![MarketId::new(token)] });
         }
 
-        #[cfg(not(feature = "intl_clob"))]
-        {
-            let _ = follow;
-            self.report(ctx, if snap.open.iter().any(|i| i.status == IntentStatus::Acknowledged) { PHASE_1_VENUE } else { snap.reason() });
-            return Ok(StrategySignal::NoSignal);
-        }
-
-        #[cfg(feature = "intl_clob")]
+        // Every venue from here. The gate that used to stand here reported
+        // a phase-1 refusal and returned on any build but Polymarket
+        // International, because the API's posture validator reached into
+        // `venues::intl` for the book. It now goes through `session.venue`, and
+        // nothing in this path names a venue: the book comes from `ctx.market`
+        // and the order from `ctx`, both of which the `Strategy` trait supplies
+        // venue-neutrally. `helm_live_enabled` still ships false everywhere, so
+        // each venue earns a ghost acceptance run before it can place an order.
         {
             // A working taker whose FAK missed: re-emit within the window. The
             // patrol's phantom cooldown paces the retries; the intent is already

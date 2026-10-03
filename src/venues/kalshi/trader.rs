@@ -610,6 +610,28 @@ impl crate::venues::deployment::DeploymentRunner for KalshiDeploymentRunner {
             &self.tennis_rx,
             Some(dep.id.as_str()),
         ).await;
+        // A Helm squadron's open intents go with it, whichever way the loop ended.
+        //
+        // The intl path does this inside `patrol_impl`'s retirement arm, which
+        // this loop never reaches: it runs its own loop over the shared
+        // `evaluate_strategies` rather than `squadron.patrol()`. Without this a
+        // finished Helm squadron leaves its intents open forever, and they still
+        // count against `helm_max_open_intents` — two of them block every future
+        // intent on the instance.
+        if class == crate::vipers::helm_impl::KIND {
+            if let Some(sq) = db::deployment_squadron(&dep.id).await {
+                if let Some(pool) = db::pool_for(crate::vipers::helm_impl::KIND) {
+                    let n = crate::helpers::helm::close_open_for_squadron(
+                        &pool, &sq, "the squadron's market loop ended",
+                    ).await;
+                    if n > 0 {
+                        info!("🧭 Squadron [{sq}] closed {n} open Helm intent(s): market loop ended");
+                    }
+                } else {
+                    warn!("🧭 Squadron [{sq}]: no `helm` pool — open Helm intents were NOT closed");
+                }
+            }
+        }
         info!("📋 Deployed {class} squadron finished: {outcome:?}");
         Ok(())
     }
@@ -927,7 +949,21 @@ async fn trade_one_market(
     // ── Raptor intelligence for the market's underlying ─────────────────────
     // Identity for logs and the viper-status registry: the crypto underlying
     // where there is one, the market class otherwise.
-    let status_scope = if pair.is_crypto() { pair.underlying } else { deployed_as.unwrap_or("deployed") };
+    // A Helm squadron scopes to `helm` whatever it trades.
+    //
+    // The crypto branch would otherwise win on a crypto-underlying ticker and
+    // scope it to `btc`, which sets `crypto_filter` to BTC and leaves
+    // `pool_for("helm")` resolving to nothing: the intents would never be written
+    // and the stand-down handler would silently fail to close them. The squadron
+    // is a Helm squadron because the operator deployed it as one, not because of
+    // what its market happens to be about.
+    let status_scope = if deployed_as == Some(crate::vipers::helm_impl::KIND) {
+        crate::vipers::helm_impl::KIND
+    } else if pair.is_crypto() {
+        pair.underlying
+    } else {
+        deployed_as.unwrap_or("deployed")
+    };
 
     let raptors = if pair.is_crypto() {
         info!(

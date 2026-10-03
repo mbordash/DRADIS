@@ -138,6 +138,14 @@ pub const US_CRYPTO_ASSET: &str = "us-crypto";
 /// Shard for the politics wing.
 pub const US_POLITICS_ASSET: &str = "us-politics";
 
+/// Helm's asset, and deliberately bare `helm` rather than `us-helm`.
+///
+/// `CryptoAsset::is_helm()` compares against `helm_impl::KIND` case-insensitively
+/// and `db::pool_for("helm")` resolves the shard, so the name is load-bearing in
+/// two places outside this venue. A `us-helm` would satisfy neither, and the
+/// squadron would classify as whatever its market is instead of running Helm.
+pub const US_HELM_ASSET: &str = "helm";
+
 /// Which market domain a US trading wing hunts. The venue runs one wing per
 /// domain concurrently: the general wing keeps the original behavior (sports /
 /// politics / anything non-crypto → order-book vipers), while the crypto wing
@@ -156,6 +164,14 @@ pub(crate) enum Wing {
     /// Crypto — the only class with a per-market price signal, and so the only
     /// one that can fly all nine vipers.
     Crypto,
+    /// Helm — one market the operator chose, carrying only `HelmStrategy`.
+    ///
+    /// Not a discovery wing: it never rotates and is never in the asset list the
+    /// rotation loops iterate. It exists so a hand deployment of class `helm`
+    /// resolves to the `helm` asset, which is what makes
+    /// `CryptoAsset::is_helm()` true and the squadron run one viper instead of
+    /// the market's own class set.
+    Helm,
 }
 
 impl Wing {
@@ -164,6 +180,7 @@ impl Wing {
             Wing::Sports => US_ASSET,
             Wing::Politics => US_POLITICS_ASSET,
             Wing::Crypto => US_CRYPTO_ASSET,
+            Wing::Helm => US_HELM_ASSET,
         }
     }
     /// Does this wing trade `pair`?
@@ -185,6 +202,10 @@ impl Wing {
             Wing::Crypto => pair_is_crypto(pair).await,
             Wing::Politics => category == "politics",
             Wing::Sports => pair.is_game_moneyline(),
+            // The operator chose this market. A class definition that could
+            // refuse it would be second-guessing the conviction, which is the
+            // one thing Helm exists not to do.
+            Wing::Helm => true,
         }
     }
 
@@ -193,6 +214,7 @@ impl Wing {
             Wing::Sports => "sports",
             Wing::Politics => "politics",
             Wing::Crypto => "crypto",
+            Wing::Helm => "helm",
         }
     }
     /// Wing-appropriate market discovery. The crypto wing goes through
@@ -213,6 +235,10 @@ impl Wing {
             Wing::Politics => venue.discover_politics_markets_via_search().await,
             Wing::Sports => venue.discover_binary_markets().await,
             Wing::Crypto => venue.discover_crypto_markets_via_search().await,
+            // Helm does not discover. Its market is the one the operator named,
+            // resolved by slug in `run_pinned`; an empty list here keeps the
+            // rotation loops from ever selecting a Helm market on their own.
+            Wing::Helm => Ok(Vec::new()),
         }
     }
 }
@@ -539,6 +565,11 @@ pub(crate) fn wing_for_class(class: &str) -> Wing {
     match class {
         "politics" => Wing::Politics,
         "crypto" => Wing::Crypto,
+        // Before this arm existed, `helm` fell through to the sports wing: a
+        // Helm deployment was refused as "not a sports market", and any that got
+        // through registered as `Custom("US-SPORTS")`, so `is_helm()` was false
+        // and the squadron ran the sports viper set instead of Helm.
+        c if c == crate::vipers::helm_impl::KIND => Wing::Helm,
         _ => Wing::Sports,
     }
 }
@@ -556,16 +587,32 @@ impl crate::venues::deployment::DeploymentRunner for UsDeploymentRunner {
         let class = dep.market_type.as_str();
         let wing = wing_for_class(class);
 
-        // Resolve the id against what this wing discovers, so a deployed market
-        // is the same shape as a rotated one — the gateway has no single
-        // "market by id" call that returns the paired legs.
-        let pairs = wing.discover(&self.venue).await
-            .map_err(|e| anyhow::anyhow!("{class} discovery failed: {e}"))?;
-        let pair = pairs.into_iter()
-            .find(|p| p.slug == market_id)
-            .ok_or_else(|| anyhow::anyhow!(
-                "market {market_id} is no longer listed under {class} — it may have closed"
-            ))?;
+        // Helm resolves its market directly, because it has no wing to discover
+        // through: the operator names the market and Helm carries no view about
+        // what kind of market it should be. Everything else resolves against its
+        // wing's discovery, so a deployed market is the same shape as a rotated
+        // one — the gateway has no single "market by id" call returning paired
+        // legs, which is why `market_by_slug` exists.
+        let pair = if wing == Wing::Helm {
+            let slug = crate::venues::us::markets::bare_symbol(market_id);
+            let m = self.venue.market_by_slug(slug).await
+                .map_err(|e| anyhow::anyhow!("Helm market lookup failed for {slug}: {e}"))?
+                .ok_or_else(|| anyhow::anyhow!("the venue does not list market {slug}"))?;
+            crate::venues::us::markets::pair_markets(vec![m])
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "market {slug} is listed but has no tradeable instrument pair"
+                ))?
+        } else {
+            let pairs = wing.discover(&self.venue).await
+                .map_err(|e| anyhow::anyhow!("{class} discovery failed: {e}"))?;
+            pairs.into_iter()
+                .find(|p| p.slug == market_id)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "market {market_id} is no longer listed under {class} — it may have closed"
+                ))?
+        };
         // The class is a definition, not a label: a market the wing does not
         // claim runs on no wing. Refusing here is what makes the seeder's
         // class filter above hold for hand deployments too, and it names the
@@ -592,6 +639,29 @@ impl crate::venues::deployment::DeploymentRunner for UsDeploymentRunner {
             Some(dep.id.as_str()),
         ).await;
         let _ = outcome;
+
+        // A Helm squadron's open intents go with it, whichever way the loop ended.
+        //
+        // The intl path does this inside `patrol_impl`'s retirement arm, which
+        // these venue loops never reach: they run their own loop over the shared
+        // `evaluate_strategies` rather than `squadron.patrol()`. Without this a
+        // finished Helm squadron leaves its intents open forever, and they still
+        // count against `helm_max_open_intents` — two of them block every future
+        // intent on the instance.
+        if wing == Wing::Helm {
+            if let Some(sq) = db::deployment_squadron(&dep.id).await {
+                if let Some(pool) = db::pool_for(US_HELM_ASSET) {
+                    let n = crate::helpers::helm::close_open_for_squadron(
+                        &pool, &sq, "the squadron's market loop ended",
+                    ).await;
+                    if n > 0 {
+                        info!("🧭 Squadron [{sq}] closed {n} open Helm intent(s): market loop ended");
+                    }
+                } else {
+                    warn!("🧭 Squadron [{sq}]: no `{US_HELM_ASSET}` pool — open Helm intents were NOT closed");
+                }
+            }
+        }
         info!("📋 Deployed {class} squadron finished");
         Ok(())
     }
@@ -723,6 +793,9 @@ async fn wing_auto_deploy_enabled(wing: Wing) -> bool {
         Wing::Politics => cfg.auto_deploy_politics,
         Wing::Sports => cfg.auto_deploy_sports,
         Wing::Crypto => true,
+        // Never auto-deployed: a Helm squadron exists only because an operator
+        // took the helm on a specific market.
+        Wing::Helm => false,
     }
 }
 
@@ -2704,19 +2777,40 @@ fn register_us_squadron(
         Wing::Sports => "US Sports Arb",
         Wing::Politics => "US Politics Arb",
         Wing::Crypto => "US Crypto Squadron",
+        Wing::Helm => "US Helm",
     };
     // Anything still addressing the sports wing by its former bare "us" — a
     // saved dashboard link, a stale client — resolves to the renamed shard
     // rather than 500ing on a missing pool.
     db::alias_pool("us", US_ASSET);
+    // Helm's shard. `CryptoAsset::Custom("HELM").symbol()` lowercases to `helm`,
+    // which is what `db::pool_for("helm")` and `helm_pool()` look for, and what
+    // the stand-down handler uses to close a squadron's open intents. Without the
+    // alias those resolve to no pool and the intents are silently never written
+    // or never closed — the same gap the intl path covers with its own
+    // `alias_pool("helm", ...)`.
+    if wing == Wing::Helm {
+        db::alias_pool(US_HELM_ASSET, US_ASSET);
+    }
 
-    let squadron = Squadron::new_with_category(
+    // A Helm squadron is named after its market, so two of them cannot collide.
+    //
+    // `new_with_category` passes `None` for the name, which yields the bare
+    // `{asset}-{cadence}` id — `helm-open` for every Helm squadron on this venue.
+    // Two on different markets would then share one registry entry (the second
+    // `insert` replacing the first and its cancel token), one set of
+    // `PositionKey`s, and one intent namespace, so closing one squadron's intents
+    // would close the other's. Helm is the class where concurrency is expected:
+    // `helm_max_open_intents` defaults to two. The intl and Kalshi paths already
+    // pass a name; this venue dropped it.
+    let squadron = Squadron::new_named(
         CryptoAsset::Custom(wing.asset().to_uppercase()),
         SquadronConfig::arb_wing(name),
         market,
         raptors,
         // "sports", "crypto", … straight from the venue.
         Some(pair.category.clone()).filter(|c| !c.is_empty()),
+        if wing == Wing::Helm { Some(pair.slug.as_str()) } else { None },
     );
     cag.register_with_cancel(&squadron, cancel.clone());
     squadron

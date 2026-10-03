@@ -34,7 +34,8 @@ use async_trait::async_trait;
 use rust_decimal::Decimal;
 
 use crate::venues::core::{
-    Execution, Fill, OpenOrder, OrderId, OrderIntent, MarketId, Position, Side, TimeInForce,
+    Execution, Fill, MarketFacts, MarketId, OpenOrder, OrderId, OrderIntent, Position, Side,
+    TimeInForce,
 };
 
 use super::{split_market_id, types, KalshiVenue};
@@ -272,6 +273,65 @@ impl Execution for KalshiVenue {
             book.best_yes_bid().map(|(p, _)| Decimal::ONE - p)
         };
         Ok(ask)
+    }
+
+    /// Best bid on the requested leg — the mirror of `best_ask` above.
+    ///
+    /// Kalshi publishes one book per market, quoted on the YES side, so the NO
+    /// leg is the crossed complement: its bid is one minus the YES ASK, exactly
+    /// as its ask is one minus the YES bid. Taking `1 − yes_bid` for both would
+    /// collapse the spread to a single price and make a stop look reachable when
+    /// it is not.
+    async fn best_bid(&self, market: &MarketId) -> Result<Option<Decimal>> {
+        let (ticker, is_yes) = split_market_id(market.as_str());
+        let book = self.orderbook(&ticker).await?;
+        let bid = if is_yes {
+            book.best_yes_bid().map(|(p, _)| p)
+        } else {
+            book.best_yes_ask().map(|(p, _)| Decimal::ONE - p)
+        };
+        Ok(bid)
+    }
+
+    /// The market's two legs, its title and when it closes.
+    ///
+    /// `market` may arrive with or without a leg suffix; either way the ticker
+    /// identifies the market and `leg_id` recomposes both legs.
+    ///
+    /// A Kalshi market publishes two times: `close_time`, when trading stops,
+    /// and `expected_expiration_time`, when it expects to settle.
+    ///
+    /// `close_time` alone is used, deliberately, even though a market can close
+    /// early. It is the figure the tick enforces against
+    /// (`pair_from_market_untethered` reads `close_time_utc()`), and a validator
+    /// that judges a posture on a different number than the engine will act on is
+    /// worse than one that is slightly generous: taking the earlier of the two
+    /// made the API refuse a legitimate in-play entry as "too close to market
+    /// close" while the tick saw plenty of time, and refused nothing the tick
+    /// would have caught. One figure, in both places.
+    ///
+    /// `leg_labels` stays `None`: a Kalshi market really is a yes/no question, so
+    /// labelling the legs would add nothing an operator does not already know.
+    async fn market_facts(&self, market: &MarketId) -> Result<Option<MarketFacts>> {
+        let (ticker, _) = split_market_id(market.as_str());
+        let m = self.market(&ticker).await?;
+        let parse = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s.trim())
+                .ok()
+                .map(|d| d.with_timezone(&chrono::Utc))
+        };
+        // No fallback to `expected_expiration_time`: when `close_time` fails to
+        // parse the tick gets `None`, so falling back here would once again judge
+        // a posture on a figure the engine will not act on.
+        let close_time = parse(&m.close_time);
+        Ok(Some(MarketFacts {
+            market_id: market.clone(),
+            question: m.title,
+            yes_token: MarketId::new(crate::venues::kalshi::leg_id(&ticker, true)),
+            no_token: MarketId::new(crate::venues::kalshi::leg_id(&ticker, false)),
+            leg_labels: None,
+            close_time,
+        }))
     }
 }
 

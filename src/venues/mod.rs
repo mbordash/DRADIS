@@ -197,6 +197,20 @@ pub fn taker_fee_rate() -> Decimal { dec!(0.07) }
 /// fee, which switched off every fee-aware gate and floor on that build.
 #[cfg(feature = "us_retail")]
 pub fn taker_fee_rate() -> Decimal { crate::venues::us::live_taker_fee_rate() }
+/// The venue this binary was compiled for, as a stable string.
+///
+/// Recorded on rows that outlive a process and may be read on an instance built
+/// for a different venue — a Helm intent carries it so the operator's record
+/// says where the conviction was taken. Lives here because this module is the
+/// only one permitted `#[cfg]` arms; callers that needed this were growing their
+/// own copies of the same three-way match.
+#[cfg(feature = "intl_clob")]
+pub fn venue_name() -> &'static str { "intl_clob" }
+#[cfg(feature = "us_retail")]
+pub fn venue_name() -> &'static str { "us_retail" }
+#[cfg(feature = "kalshi")]
+pub fn venue_name() -> &'static str { "kalshi" }
+
 
 /// The smallest order the venue accepts, in shares or contracts. Sizing that
 /// falls below it is an order the venue refuses, however sound the signal.
@@ -521,6 +535,17 @@ mod startup_sweep_gate_tests {
 
     #[async_trait]
     impl Execution for CountingVenue {
+        // Explicit rather than inherited: the trait has no defaults for these, so
+        // a venue (or a mock) that cannot answer has to say so in code. That is
+        // what stops a real venue silently falling through to "book unknown" and
+        // refusing every Helm intent at runtime.
+        async fn best_bid(&self, _market: &MarketId) -> Result<Option<rust_decimal::Decimal>> {
+            Ok(None)
+        }
+        async fn market_facts(&self, _market: &MarketId) -> Result<Option<crate::venues::core::MarketFacts>> {
+            Ok(None)
+        }
+
         async fn place_order(&self, _: OrderIntent) -> Result<Fill> {
             unreachable!("the startup sweep must never place an order")
         }
@@ -586,3 +611,4 @@ mod startup_sweep_gate_tests {
             "a live startup must sweep all leftovers the venue reports");
     }
 }
+

@@ -538,6 +538,88 @@ pub trait Execution: Send + Sync {
     async fn best_ask(&self, _market: &MarketId) -> Result<Option<Decimal>> {
         Ok(None)
     }
+
+    /// Best bid currently resting on `market`'s book, if the venue can report it
+    /// cheaply. The sibling of [`Execution::best_ask`].
+    ///
+    /// Helm needs both ends to validate a posture before the operator commits:
+    /// a stop is checked against the bid it would sell into, and an entry
+    /// against the ask it would lift. `None` means "book unknown", which Helm
+    /// treats as a refusal rather than a zero — a zero bid reads as a real price
+    /// to anything pricing an exit.
+    /// No default, deliberately: a venue that cannot answer this must say so in
+    /// code rather than inherit a silent `None`. `market_facts` is the same.
+    /// A source-scanning test used to guard this and was worthless — it passed on
+    /// a comment, and it passed on Polymarket US while a Helm squadron could not
+    /// be deployed there at all. The compiler is the right guard.
+    ///
+    /// `best_ask` keeps its default on purpose: see `quote_both`.
+    async fn best_bid(&self, market: &MarketId) -> Result<Option<Decimal>>;
+
+    /// Both ends of `market`'s book, for a validator rather than a trader.
+    ///
+    /// Distinct from `best_bid` + `best_ask` because `best_ask` is load-bearing
+    /// elsewhere: `venues::lifecycle` gates a FAK BUY of a missing partner leg on
+    /// it returning `Some`, so a venue that already re-hedges by another route
+    /// must keep `best_ask`'s `None` default or arm a second one. Polymarket
+    /// International is exactly that venue. A validator that only reads prices
+    /// has no business being coupled to that decision, so it asks here.
+    ///
+    /// The default composes the two, which is correct for any venue where
+    /// `best_ask` is safe to implement. Override it to fetch both in one round
+    /// trip, or to supply an ask where the trait's `best_ask` deliberately does
+    /// not.
+    async fn quote_both(&self, market: &MarketId) -> Result<(Option<Decimal>, Option<Decimal>)> {
+        let (bid, ask) = (self.best_bid(market).await?, self.best_ask(market).await?);
+        Ok((bid, ask))
+    }
+
+    /// The YES and NO tokens of `market`, its question, and when it resolves.
+    ///
+    /// Venue-neutral because every venue identifies a market its own way — an
+    /// on-chain condition id, a slug, a series ticker — and Helm must validate a
+    /// posture against the close time without knowing which. `None` means the
+    /// venue could not resolve it, which is a refusal: an intent whose market
+    /// cannot be read is one whose posture cannot be checked.
+    async fn market_facts(&self, market: &MarketId) -> Result<Option<MarketFacts>>;
+}
+
+/// What a venue can say about one market, in terms no venue owns.
+///
+/// Deliberately the minimum Helm's posture validator needs rather than a general
+/// market record: the two tokens it may hold, a name to show the operator, and
+/// the close time a time limit has to sit inside.
+#[derive(Clone, Debug)]
+pub struct MarketFacts {
+    /// The venue's own id for this market, echoed back.
+    ///
+    /// Carried so a caller can prove the facts describe the market it asked
+    /// about. Squadron ids are deliberately timestamp-free and reused across
+    /// redeploys (`squadron/mod.rs`), so anything that caches or passes these
+    /// facts around must compare this against the market it meant, or a
+    /// redeployed squadron silently validates against its predecessor's book.
+    pub market_id: MarketId,
+    /// The question as the venue words it, for the operator's own record.
+    pub question: String,
+    /// The two tokens, in the venue's own ordering.
+    pub yes_token: MarketId,
+    pub no_token: MarketId,
+    /// What the venue calls each side, when "YES" and "NO" would mislead.
+    ///
+    /// On Polymarket International a binary market really is a yes/no question.
+    /// On Polymarket US the two legs of one book are `#long` and `#short`, which
+    /// for a game market are the two TEAMS — so an operator told they are buying
+    /// "NO" has been told something false. `None` means yes/no is accurate.
+    pub leg_labels: Option<(String, String)>,
+    /// When the market resolves, taken as the EARLIEST credible close the venue
+    /// publishes.
+    ///
+    /// `None` where the venue does not publish one it can be held to, which
+    /// forbids a hold-to-settlement posture rather than guessing a date. That is
+    /// deliberate: a `Some` that is too late makes "the time limit sits inside
+    /// the close" pass when it should fail, and the position is then held past a
+    /// market that has already resolved.
+    pub close_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 

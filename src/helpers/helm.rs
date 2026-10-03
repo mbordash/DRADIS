@@ -964,6 +964,34 @@ pub async fn mark_working(
 /// Close every open intent a squadron still has, with one reason. The
 /// retirement path calls this when the market, not the intent, ended things.
 /// Returns how many were closed.
+/// Shares this squadron's Helm strategy still holds, if any.
+///
+/// Read before standing a squadron down, because standing it down cancels the
+/// patrol and nothing evaluates the exit posture afterwards: the stop, the
+/// take-profit and the time limit stop being enforced. An operator who set a stop
+/// is entitled to be told it is no longer live, which is the difference between a
+/// known risk and a silent one.
+pub async fn held_shares_for_squadron(pool: &SqlitePool, squadron_id: &str) -> rust_decimal::Decimal {
+    // The shares are summed as `Decimal` from TEXT rows rather than in SQL.
+    //
+    // `SELECT COALESCE(SUM(CAST(shares AS REAL)), 0)` returns a REAL (or INTEGER
+    // zero), which `query_scalar::<_, String>` cannot decode — and the `.ok()`
+    // on that error reported zero held shares every time, so the stand-down
+    // warning could never fire. Summing here also avoids rounding a position
+    // size through f64 on the way past.
+    sqlx::query_scalar::<_, String>(
+        "SELECT shares FROM open_positions WHERE squadron_id = ? AND strategy = ?",
+    )
+    .bind(squadron_id)
+    .bind(crate::vipers::helm_impl::STRATEGY_NAME)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .filter_map(|s| rust_decimal::Decimal::from_str_exact(s.trim()).ok())
+    .sum()
+}
+
 pub async fn close_open_for_squadron(pool: &SqlitePool, squadron_id: &str, reason: &str) -> usize {
     let mut n = 0;
     for intent in list_for_squadron(pool, squadron_id, false).await {
