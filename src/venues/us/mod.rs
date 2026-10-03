@@ -195,28 +195,39 @@ impl UsRetailVenue {
     pub fn auth_for_sports(&self) -> &UsAuth { &self.auth }
     pub fn http_for_sports(&self) -> &reqwest::Client { &self.http }
 
-    /// Best bid and ask for one leg, as the sports ledger wants them.
+    /// Best bid and ask for one MARKET, as the sports ledger wants them.
     ///
-    /// Same BBO call `best_ask` uses; this returns both sides with their sizes, and
-    /// `None` only when the query itself fails. A missing level stays `None` rather
-    /// than becoming a zero, because a zero bid reads as a real price downstream.
+    /// Takes the market slug, which is what the gateway's BBO route addresses:
+    /// `GET /v1/markets/{slug}/bbo`. The parameter used to be called
+    /// `leg_symbol` and callers duly passed DRADIS's internal leg id,
+    /// `{slug}#long`. A `#` opens a URL fragment, so the request that reached
+    /// the gateway was `/v1/markets/{slug}` while the signature had been
+    /// computed over the full path — every call came back 401 "Invalid API key
+    /// signature", and the `.ok()?` below turned that into `None`. The US board
+    /// lane therefore never saw a book and never said why.
+    ///
+    /// A missing side stays `None` rather than becoming a zero, because a zero
+    /// bid reads as a real price downstream. Sizes come from the quote's own
+    /// `bidShares`/`askShares`, which is the depth at the touch.
     pub async fn bbo_for_sports(
         &self,
-        leg_symbol: &str,
+        market_slug: &str,
     ) -> Option<(Option<f64>, Option<f64>, Option<f64>, Option<f64>)> {
         use rust_decimal::prelude::ToPrimitive;
-        let bbo = self.client.markets().bbo(leg_symbol).await.ok()?;
-        let num = |s: &str| Decimal::from_str(s.trim()).ok().and_then(|d| d.to_f64());
-        // `quantity`, not `size` — the SDK's own field name for the level's depth.
-        let lvl = |l: &Option<polymarket_us::types::PriceLevel>| -> (Option<f64>, Option<f64>) {
-            match l {
-                Some(x) => (num(&x.price), num(&x.quantity)),
-                None => (None, None),
+        // Logged, not swallowed. A silent `None` here is indistinguishable from
+        // an empty book, which is how the 401s above went unnoticed for weeks.
+        let bbo = match self.client.markets().bbo(market_slug).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("US BBO query failed for {market_slug}: {e}");
+                return None;
             }
         };
-        let (bid, bid_sz) = lvl(&bbo.bid);
-        let (ask, ask_sz) = lvl(&bbo.ask);
-        Some((bid, bid_sz, ask, ask_sz))
+        let num = |s: &str| Decimal::from_str(s.trim()).ok().and_then(|d| d.to_f64());
+        let px = |m: &Option<polymarket_us::types::Money>| {
+            m.as_ref().and_then(|x| num(&x.value))
+        };
+        Some((px(&bbo.best_bid), num(&bbo.bid_shares), px(&bbo.best_ask), num(&bbo.ask_shares)))
     }
 
     /// The venue's own resolution for one leg, for the sports ledger's results pass.
@@ -909,9 +920,11 @@ impl Execution for UsRetailVenue {
             .bbo(market.as_str())
             .await
             .with_context(|| format!("bbo query failed for {market}"))?;
+        // `best_ask`, a `Money`, not a price level. Zero is filtered out as not a
+        // real offer; `None` already means nothing rests on that side.
         Ok(bbo
-            .ask
-            .and_then(|lvl| Decimal::from_str(lvl.price.trim()).ok())
+            .best_ask
+            .and_then(|m| Decimal::from_str(m.value.trim()).ok())
             .filter(|p| *p > Decimal::ZERO))
     }
 }

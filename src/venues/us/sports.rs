@@ -261,9 +261,35 @@ impl SportsCatalog for UsSportsCatalog {
         _http: &reqwest::Client,
         leg_id: &str,
     ) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
-        // One BBO call per leg, which is how `best_ask` already reads this venue.
         let Some(venue) = self.venue().await else { return (None, None, None, None) };
-        match venue.bbo_for_sports(leg_id).await {
+
+        // The gateway's BBO route addresses a MARKET by slug, and this receives
+        // DRADIS's internal leg id, `{slug}#long` or `{slug}#short`. Passing the
+        // leg id through is what broke this: a `#` opens a URL fragment, so the
+        // signed path and the requested path differed and every call returned
+        // 401. Strip the suffix.
+        let (slug, side) = match leg_id.split_once('#') {
+            Some((slug, side)) => (slug, side),
+            // No suffix: treat the whole thing as a slug.
+            None => (leg_id, "long"),
+        };
+
+        // One book per market, so only the long side can be read directly.
+        //
+        // The short leg's quote is NOT derived here. On the one market observed
+        // after the 401s were fixed, `bestBid` 0.2300 and `bestAsk` 0.7700 summed
+        // to exactly $1.00, which is either a genuine 54-cent spread on an
+        // illiquid tennis book or the gateway quoting the two SIDES rather than
+        // the two ends of one side's spread. Those imply opposite formulas for
+        // the short leg, and picking the wrong one would misprice every US
+        // sports quote while looking plausible. So the short leg reports no book
+        // until the convention is established from real data — which is now
+        // possible, because the call finally works and its failures are logged.
+        if !side.eq_ignore_ascii_case("long") {
+            return (None, None, None, None);
+        }
+
+        match venue.bbo_for_sports(slug).await {
             Some((bid, bid_sz, ask, ask_sz)) => (bid, bid_sz, ask, ask_sz),
             None => (None, None, None, None),
         }
