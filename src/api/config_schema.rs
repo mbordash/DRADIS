@@ -1201,8 +1201,10 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(hm, Some("helm_enabled"), "helm_live_enabled", "Live Orders", "bool", false,
             "May Helm place real orders? Ships off. A squadron in Simulation Mode enters and exits on paper \
              regardless; a live squadron refuses every entry with \"live orders disabled\" until this is on. \
-             Turn it on deliberately, in Setup, before deploying a Helm squadron: the squadron's own row is \
-             seeded from the global row at deploy."));
+             Turn it on deliberately, here on this squadron's Helm card: the squadron's row is seeded \
+             from the global row at deploy and the strategy reads the squadron's row each tick. This \
+             switch rendered nowhere at all until the card learned to show boolean knobs, so arming \
+             Helm meant a hand-written PATCH."));
         v.push(F::new(hm, Some("helm_enabled"), "helm_max_exposure_usdc", "Max Exposure", "usd", false,
             "Ceiling on total Helm notional (entry price × shares) across EVERY Helm squadron on this instance. \
              Helm squadrons share one session and one position map, so this is the sum over all of them, and \
@@ -1481,6 +1483,41 @@ mod tests {
     /// Reads the frontend source because that is where the card names live. Skipped
     /// rather than failed when the file is absent, so a build without the Control
     /// Tower checkout (a container that compiles only the engine) still passes.
+    /// Every non-advanced knob must have somewhere to be edited.
+    ///
+    /// A viper card renders its group's `advanced: false` fields, and the
+    /// Advanced modal renders the `advanced: true` ones. Bools used to be
+    /// filtered out of the card (`ViperCard.tsx`, `f.type !== 'bool'`) while
+    /// being excluded from the modal for not being advanced, so an
+    /// `advanced: false` bool rendered NOWHERE: `helm_live_enabled`, the switch
+    /// that arms real Helm orders, could only be set by a hand-written PATCH, and
+    /// so could `helm_fee_verdict_enforce`, a safety gate. The card now renders
+    /// bools, and this fails if that filter comes back.
+    #[test]
+    fn a_non_advanced_bool_is_editable_on_its_card() {
+        let Ok(card) = std::fs::read_to_string("control-tower/src/components/ViperCard.tsx") else {
+            eprintln!("control-tower source not present — skipping");
+            return;
+        };
+        assert!(
+            card.contains("basicBools"),
+            "ViperCard renders no bools, so every `advanced: false` bool in a viper group \
+             is unreachable in the UI — including the switch that arms live Helm orders",
+        );
+        assert!(
+            !card.contains("f.type !== 'bool'") || card.contains("f.type === 'bool'"),
+            "bools are filtered out of the card and nothing puts them back",
+        );
+        // And the knob that matters is still a non-advanced bool, so it is the
+        // card's job to render it rather than the modal's.
+        let live = config_schema()
+            .into_iter()
+            .find(|f| f.key == "helm_live_enabled")
+            .expect("helm_live_enabled is in the schema");
+        assert_eq!(live.value_type, "bool");
+        assert!(!live.advanced, "if this becomes advanced, the modal renders it and this test should change");
+    }
+
     #[test]
     fn every_viper_group_names_a_control_tower_card() {
         let Ok(defs) = std::fs::read_to_string("control-tower/src/lib/api.ts") else {

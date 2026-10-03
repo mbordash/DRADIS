@@ -142,6 +142,48 @@ interface ParamRowProps {
   disabled: boolean;
 }
 
+/// A boolean knob on a viper card.
+///
+/// `ParamRow` handles numbers and text through `toDisplay`/`fromDisplay`, so
+/// bools were filtered out of the card entirely — and because the Advanced modal
+/// only shows `advanced: true` fields, an `advanced: false` bool rendered
+/// NOWHERE in the Control Tower. `helm_live_enabled`, the switch that arms real
+/// Helm orders, was unreachable: the only way to set it was a PATCH by hand. So
+/// was `helm_fee_verdict_enforce`, a safety gate. The card's own on/off switch is
+/// hardwired to `viper.enableKey`, which is why that one bool had a home and
+/// every other one did not.
+function BoolRow({ field, config, onPatch, disabled }: ParamRowProps) {
+  const cfgKey = field.key as keyof DynamicConfig;
+  const value = config[cfgKey] === true;
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const flip = useCallback(async () => {
+    if (DEMO_MODE || disabled) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await onPatch({ [cfgKey]: !value } as Partial<DynamicConfig>);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'failed');
+    } finally {
+      setBusy(false);
+    }
+  }, [cfgKey, value, onPatch, disabled]);
+
+  return (
+    <div className="flex items-center justify-between gap-2 py-0.5">
+      <span className="text-[11px] font-mono text-gray-400 truncate" title={field.description}>
+        {field.label}
+      </span>
+      <div className="flex items-center gap-2 shrink-0">
+        {err && <span className="text-[10px] font-mono text-red-400">{err}</span>}
+        <Toggle enabled={value} onToggle={flip} loading={busy || DEMO_MODE || disabled} />
+      </div>
+    </div>
+  );
+}
+
 function ParamRow({ field, config, onPatch, disabled }: ParamRowProps) {
   const type     = field.type as FieldType;
   const cfgKey   = field.key as keyof DynamicConfig;
@@ -250,6 +292,11 @@ export default function ViperCard({ viper, config, onPatch, market, status }: Pr
   });
   const basicFields = schema.filter(
     f => f.group === viper.name && !f.advanced && f.type !== 'bool',
+  );
+  // Bools too, minus the card's own on/off switch, which is rendered in the
+  // header. Without this they appear nowhere in the UI at all.
+  const basicBools = schema.filter(
+    f => f.group === viper.name && !f.advanced && f.type === 'bool' && f.key !== viper.enableKey,
   );
 
   const [toggleErr, setToggleErr] = useState<string | null>(null);
@@ -401,7 +448,16 @@ export default function ViperCard({ viper, config, onPatch, market, status }: Pr
 
       {/* Params */}
       <div className="flex flex-col">
-        {schemaLoading && basicFields.length === 0 ? (
+        {basicBools.map(f => (
+          <BoolRow
+            key={f.key}
+            field={f}
+            config={config}
+            onPatch={onPatch}
+            disabled={!enabled || DEMO_MODE}
+          />
+        ))}
+        {schemaLoading && basicFields.length === 0 && basicBools.length === 0 ? (
           <p className="text-[11px] text-gray-600 py-1">Loading parameters…</p>
         ) : (
           basicFields.map(f => (
