@@ -274,24 +274,35 @@ impl SportsCatalog for UsSportsCatalog {
             None => (leg_id, "long"),
         };
 
-        // One book per market, so only the long side can be read directly.
+        // One book per market, and the short leg is its complement CROSSED.
         //
-        // The short leg's quote is NOT derived here. On the one market observed
-        // after the 401s were fixed, `bestBid` 0.2300 and `bestAsk` 0.7700 summed
-        // to exactly $1.00, which is either a genuine 54-cent spread on an
-        // illiquid tennis book or the gateway quoting the two SIDES rather than
-        // the two ends of one side's spread. Those imply opposite formulas for
-        // the short leg, and picking the wrong one would misprice every US
-        // sports quote while looking plausible. So the short leg reports no book
-        // until the convention is established from real data — which is now
-        // possible, because the call finally works and its failures are logged.
-        if !side.eq_ignore_ascii_case("long") {
-            return (None, None, None, None);
-        }
+        // Established from live quotes on 2026-10-02. A two-sided market lists
+        // both sides with a price, and the quote is the long side's own book:
+        //
+        //   tec-mlb-nlchamp-2026-09-27-atl  long 0.1310  short 0.87
+        //   bbo: bestBid 0.1300  bestAsk 0.1310
+        //
+        // `bestAsk` is the long price, and the short price is `1 - bestBid`:
+        // 0.8700, and 0.9160 and 0.8380 on the other two markets sampled, exact
+        // every time. So selling the long side at its bid IS buying the short
+        // side at one minus that bid, and the mapping crosses:
+        //
+        //   short bid  = 1 - long ask        short ask  = 1 - long bid
+        //   short bid size = long ask size   short ask size = long bid size
+        //
+        // Taking the obvious `1 - ask` for the short ask instead gives 0.8690
+        // against a real 0.8700 — one tick, in the direction that makes every
+        // short entry look cheaper than it is. Which is why this was left
+        // unimplemented until the quotes could be read rather than guessed at.
+        let complement = |p: Option<f64>| p.map(|v| 1.0 - v);
 
-        match venue.bbo_for_sports(slug).await {
-            Some((bid, bid_sz, ask, ask_sz)) => (bid, bid_sz, ask, ask_sz),
-            None => (None, None, None, None),
+        let Some((bid, bid_sz, ask, ask_sz)) = venue.bbo_for_sports(slug).await else {
+            return (None, None, None, None);
+        };
+        if side.eq_ignore_ascii_case("long") {
+            (bid, bid_sz, ask, ask_sz)
+        } else {
+            (complement(ask), ask_sz, complement(bid), bid_sz)
         }
     }
 
@@ -318,6 +329,36 @@ impl SportsCatalog for UsSportsCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The short leg's quote crosses the long leg's, and one tick matters.
+    ///
+    /// Captured live on 2026-10-02 from `tec-mlb-nlchamp-2026-09-27-atl`, whose
+    /// quote was bestBid 0.1300 / bestAsk 0.1310 while the gateway listed the
+    /// long side at 0.1310 and the short at 0.87. The short price is `1 - bid`,
+    /// so a short entry pays 0.8700 — not the `1 - ask` = 0.8690 that the
+    /// obvious formula gives. The error is one tick in the direction that makes
+    /// every short entry look cheaper than it is, which is why this mapping was
+    /// left unimplemented until the live quotes settled it.
+    #[test]
+    fn the_short_leg_is_the_crossed_complement_of_the_long() {
+        let complement = |p: Option<f64>| p.map(|v| 1.0 - v);
+        let (bid, bid_sz, ask, ask_sz) = (Some(0.1300), Some(85000.0), Some(0.1310), Some(110000.0));
+
+        // Long reads the book as it stands.
+        assert_eq!((bid, bid_sz, ask, ask_sz), (Some(0.1300), Some(85000.0), Some(0.1310), Some(110000.0)));
+
+        // Short crosses: its ask is one minus the long BID, matching the 0.87
+        // the gateway published for that side.
+        let (s_bid, s_bid_sz, s_ask, s_ask_sz) = (complement(ask), ask_sz, complement(bid), bid_sz);
+        assert!((s_ask.unwrap() - 0.8700).abs() < 1e-9, "short ask was {s_ask:?}, gateway said 0.87");
+        assert!((s_bid.unwrap() - 0.8690).abs() < 1e-9, "short bid is one minus the long ask");
+        assert_ne!(s_ask, complement(ask), "crossing matters: 1-ask would be 0.8690, a tick cheap");
+
+        // Sizes cross with the prices: selling the long side at its ask is what
+        // a short buyer is lifting, so the depth follows the leg it came from.
+        assert_eq!(s_bid_sz, Some(110000.0), "short bid depth is the long ask depth");
+        assert_eq!(s_ask_sz, Some(85000.0), "short ask depth is the long bid depth");
+    }
 
     /// The captured live record, verbatim in the fields that matter.
     ///
