@@ -1003,19 +1003,67 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
                     // Row exists — UPDATE shares and avg_price if the on-chain value differs.
                     // This corrects stale adoptions where the Data API returned a partial-fill
                     // size at adoption time (e.g. 8.0399 instead of the correct 10.0 shares).
-                    let db_shares: Option<String> = sqlx::query_scalar(
-                        "SELECT shares FROM open_positions WHERE token_id = ? LIMIT 1"
+                    // Read how the row was created, not just its size.
+                    //
+                    // `pos.size` and `pos.avg_price` are WALLET-level: the Data API
+                    // reports the whole wallet's holding of this token and its average
+                    // cost, with no notion of which strategy bought what. That is the
+                    // right answer for a row this corrector adopted from chain, and the
+                    // wrong answer for a row the engine wrote from its own fill — which
+                    // is why this reads `engine_attributed` and not `chain_adopted`:
+                    // `update_position_from_chain` sets `chain_adopted`, and it is
+                    // reached from several ordinary engine paths, so that flag cannot
+                    // tell an engine fill from an adoption.
+                    //
+                    // On 2026-10-03 a Helm position that had filled 190.476 shares at
+                    // $0.0210 was rewritten to the wallet's 260.227 at a blended
+                    // $0.0219, and settlement reads this row, so about $1.80 of a $6.09
+                    // loss was booked against a conviction that never bought those
+                    // shares.
+                    let row: Option<(String, Option<String>, Option<i64>)> = sqlx::query_as(
+                        "SELECT shares, entry_price, engine_attributed FROM open_positions WHERE token_id = ? LIMIT 1"
                     )
                     .bind(token_str)
                     .fetch_optional(&pool)
                     .await
                     .unwrap_or(None);
 
-                    if let Some(db_shares_str) = db_shares {
+                    if let Some((db_shares_str, db_entry_price, engine_attributed)) = row {
                         let db_shares_val = db_shares_str.parse::<Decimal>().unwrap_or(Decimal::ZERO);
-                        // Update when on-chain differs by more than dust (0.001 shares tolerance)
-                        if (pos.size - db_shares_val).abs() > Decimal::new(1, 3) {
-                            db::update_position_from_chain(&pool, token_str, pos.size, pos.avg_price, Some(pos.cur_price)).await;
+                        let is_engine = engine_attributed.unwrap_or(0) == 1;
+                        let decision = chain_correction_for(
+                            is_engine, db_shares_val, pos.size, Decimal::new(1, 3),
+                        );
+
+                        // An engine-written row whose chain balance GREW holds shares
+                        // this strategy did not buy. Crediting them changes its P&L, its
+                        // calibration record, and — because an exit sells the row's size
+                        // — what its next sale liquidates. Refuse, and say so: the
+                        // silence is what made 2026-10-03 unexplainable afterwards.
+                        if decision == ChainCorrection::RefuseUpward {
+                            warn!(
+                                "⚠️ Chain-sync [{}]: NOT correcting upward — token {} holds {} on chain \
+                                 vs {} attributed for \"{}\". The extra {} share(s) did not come from this \
+                                 strategy's fills, so crediting them would misattribute P&L and let an \
+                                 exit sell them. Check the wallet for an unattributed purchase.",
+                                asset.to_uppercase(),
+                                &token_str[..token_str.len().min(20)],
+                                pos.size, db_shares_val, pos.title, pos.size - db_shares_val,
+                            );
+                        } else if decision != ChainCorrection::Leave {
+                            // Keep the entry price the fill established on an engine row;
+                            // only a row adopted from chain has no better cost basis than
+                            // the wallet average.
+                            let price_to_write = if decision == ChainCorrection::SharesAndPrice {
+                                pos.avg_price
+                            } else {
+                                db_entry_price
+                                    .as_deref()
+                                    .and_then(|p| p.parse::<Decimal>().ok())
+                                    .filter(|p| *p > Decimal::ZERO)
+                                    .unwrap_or(pos.avg_price)
+                            };
+                            db::update_position_from_chain(&pool, token_str, pos.size, price_to_write, Some(pos.cur_price)).await;
                             total_updated_shares += 1;
                             info!(" Chain-sync [{}]: corrected shares — token {} | {} → {} shares | \"{}\"",
                                 asset.to_uppercase(),
@@ -1937,6 +1985,62 @@ pub async fn detect_orphaned_arb_settlements(safe_address: Address, squadron_ass
 
 
 
+/// What the chain-sync corrector should do with one `open_positions` row.
+///
+/// Split out from the corrector loop so the decision can be tested without a
+/// Data API response, because getting it wrong costs money in a way the loop
+/// makes hard to see.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ChainCorrection {
+    /// On-chain and booked agree within dust.
+    Leave,
+    /// Correct the share count and keep the entry price the fill established.
+    SharesOnly,
+    /// Chain is authoritative for both, because the engine never saw a fill here.
+    SharesAndPrice,
+    /// On-chain grew on a row the engine wrote: the extra shares are not this
+    /// strategy's and must not be credited to it.
+    RefuseUpward,
+}
+
+/// Decide, from how the row was created and which way the balance moved.
+///
+/// The Data API and `balance_allowance` both report a WALLET total, with no
+/// notion of which strategy bought what. For a row this corrector adopted from
+/// chain that is the best cost basis available. For a row the engine wrote from
+/// its own fill it is not: on 2026-10-03 a Helm row of 190.476 shares at $0.0210
+/// was rewritten to the wallet's 260.227 at a blended $0.0219, and settlement
+/// reads the row, so about $1.80 of a $6.09 loss was booked against a conviction
+/// that never bought those shares.
+///
+/// Keyed on `engine_attributed`, NOT on `chain_adopted`. `chain_adopted` cannot
+/// answer this: `update_position_from_chain` sets it, and that is reached from
+/// several ordinary engine paths (a partial FAK exit, a partial paired exit, a
+/// maker quote pull, the 60-second drift corrector), so a row that began as an
+/// engine fill looks adopted forever after its first correction — including after
+/// a correction this very function authorized.
+pub fn chain_correction_for(
+    is_engine_attributed: bool,
+    db_shares: Decimal,
+    chain_shares: Decimal,
+    tolerance: Decimal,
+) -> ChainCorrection {
+    if (chain_shares - db_shares).abs() <= tolerance {
+        return ChainCorrection::Leave;
+    }
+    if !is_engine_attributed {
+        // Nothing better to go on, and this is the case the corrector was built
+        // for: an adoption that recorded a partial-fill size.
+        return ChainCorrection::SharesAndPrice;
+    }
+    if chain_shares > db_shares {
+        ChainCorrection::RefuseUpward
+    } else {
+        // Downward on an engine row is a sale or a settlement, which is real.
+        ChainCorrection::SharesOnly
+    }
+}
+
 #[cfg(test)]
 mod settlement_evidence_tests {
     use super::*;
@@ -2694,5 +2798,66 @@ mod ghost_settlement_tests {
 
         assert_eq!(n, 0);
         assert!(map.lock().await.get(&k).is_some(), "still held, to be asked about again");
+    }
+}
+
+#[cfg(test)]
+mod chain_correction_tests {
+    use super::{chain_correction_for as decide, ChainCorrection as C};
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
+
+    const TOL: Decimal = dec!(0.001);
+
+    /// The case this corrector was built for: an adoption that recorded a
+    /// partial-fill size, where chain is the only cost basis there is.
+    #[test]
+    fn an_adopted_row_defers_to_chain_for_both() {
+        assert_eq!(decide(false, dec!(8.0399), dec!(10), TOL), C::SharesAndPrice);
+        // Adopted rows defer downward too.
+        assert_eq!(decide(false, dec!(10), dec!(4), TOL), C::SharesAndPrice);
+    }
+
+    /// The 2026-10-03 live Helm trade, which is why this function exists.
+    ///
+    /// The row held the 190.476 shares the fill established; the wallet held
+    /// 260.227 including 69.751 the conviction never bought. Correcting upward
+    /// credited them to Helm, and settlement reads the row.
+    #[test]
+    fn an_engine_row_refuses_to_grow() {
+        assert_eq!(
+            decide(true, dec!(190.476), dec!(260.227), TOL),
+            C::RefuseUpward,
+            "shares the strategy did not buy must not be credited to it",
+        );
+    }
+
+    /// Downward on an engine row is a real sale or settlement.
+    ///
+    /// This must keep working: refusing it would leave sold shares on the books
+    /// and the position would never close.
+    #[test]
+    fn an_engine_row_still_follows_a_sale_down() {
+        assert_eq!(decide(true, dec!(100), dec!(40), TOL), C::SharesOnly);
+        // A settlement reads as zero, and the corrector's own guards downstream
+        // treat that as a settlement rather than a correction to nothing.
+        assert_eq!(decide(true, dec!(100), dec!(0), TOL), C::SharesOnly);
+    }
+
+    /// Dust either way is not a correction.
+    #[test]
+    fn agreement_within_dust_is_left_alone() {
+        assert_eq!(decide(true, dec!(10), dec!(10.0005), TOL), C::Leave);
+        assert_eq!(decide(false, dec!(10), dec!(9.9995), TOL), C::Leave);
+        assert_eq!(decide(true, dec!(10), dec!(10), TOL), C::Leave);
+    }
+
+    /// An engine row that grows by only dust is left alone, not refused.
+    ///
+    /// Otherwise every rounding difference on a live position would log a
+    /// money-looking warning, and the real ones would be lost in it.
+    #[test]
+    fn dust_growth_does_not_trip_the_refusal() {
+        assert_eq!(decide(true, dec!(190.476), dec!(190.4765), TOL), C::Leave);
     }
 }

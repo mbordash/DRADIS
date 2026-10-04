@@ -463,6 +463,28 @@ pub async fn run_us_trader(
     let filter = std::env::var(ENV_MARKET_FILTER).ok().filter(|s| !s.is_empty());
     info!("🇺🇸 US trader starting — market filter={filter:?}");
 
+    // Register a session with the CAG so the venue-neutral API handlers work.
+    //
+    // `Cag::set_session` was called in exactly one place, inside main.rs's
+    // `intl_clob` block, so on this venue `Cag::session()` was always `None` and
+    // every Helm endpoint answered "no venue session is registered yet — the
+    // engine is still starting; retry in a few seconds", permanently and
+    // misleadingly. The `Execution` implementations Helm reads the book through
+    // were wired and unit-tested here but unreachable.
+    //
+    // `Cag::session()` returns any registered session and Helm uses only its
+    // `venue`, which is one object per process, so a single registration is
+    // enough. The balance is a starting figure the API refreshes; the asset name
+    // is the venue's primary wing.
+    {
+        let startup_balance = venue.collateral().await.unwrap_or_default();
+        cag.set_session(crate::cag::SessionState::new(
+            startup_balance,
+            US_ASSET,
+            Arc::clone(&venue),
+        ));
+    }
+
     crate::venues::cancel_leftover_orders_at_startup(venue.as_ref(), crate::helpers::dynamic_config::ghosting_now()).await;
 
     // Three concurrent wings over the same venue connection — sports, politics

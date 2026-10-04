@@ -2619,14 +2619,90 @@ impl Squadron {
                                     token_ownership.lock().await.insert(token_m.clone(), sn.clone());
                                     { pending_orders.lock().await.insert(pos_key.clone(), Instant::now() + Duration::from_secs(3)); }
                                     info!("🟢 ENTRY [{}]: {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares);
-                                    let primary_baseline = {
+                                    // A FAILED baseline read and a true zero are different answers.
+                                    //
+                                    // Both arms below return `dec!(0)` and that fails OPEN: the whole
+                                    // wallet holding then gets credited to this entry, because the
+                                    // attributed size is `chain - baseline`. That is not only a
+                                    // bookkeeping problem — an exit sells the attributed size, so a stop
+                                    // would liquidate shares the strategy never bought. The bool says
+                                    // whether the zero was observed or merely assumed, so a caller that
+                                    // cannot tolerate fail-open can refuse instead.
+                                    let (primary_baseline, primary_baseline_read_ok) = {
                                         let mut req = BalanceAllowanceRequest::default(); req.asset_type = AssetType::Conditional; req.token_id = Some(u256_from_market_id(&params.token_id).unwrap_or_default());
                                         match tokio::time::timeout(Duration::from_secs(10), trading_client.balance_allowance(req)).await {
-                                            Ok(Ok(resp)) => Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
-                                            Ok(Err(e)) => { warn!("⚠️ entry baseline balance_allowance error [{}]: {}", sn, e); dec!(0) }
-                                            Err(_) => { warn!("⚠️ entry baseline balance_allowance timed out (10s) [{}]", sn); dec!(0) }
+                                            Ok(Ok(resp)) => (Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000), true),
+                                            Ok(Err(e)) => { warn!("⚠️ entry baseline balance_allowance error [{}]: {}", sn, e); (dec!(0), false) }
+                                            Err(_) => { warn!("⚠️ entry baseline balance_allowance timed out (10s) [{}]", sn); (dec!(0), false) }
                                         }
                                     };
+                                    // Helm refuses an entry it cannot attribute cleanly.
+                                    //
+                                    // The conviction record is the whole point of this viper: the
+                                    // operator is being scored on calls they made by hand, so a position
+                                    // that mixes their shares with the wallet's is worse than no position.
+                                    // On 2026-10-03 the first live Helm trade ordered 190.476 shares and
+                                    // was settled on 260.227 at a blended price, and about $1.80 of a
+                                    // $6.09 loss was never the conviction's.
+                                    //
+                                    // Two refusals, both fail-CLOSED:
+                                    //   - the wallet already holds a meaningful amount of this token, so
+                                    //     `chain - baseline` cannot separate the two purchases if the
+                                    //     baseline is later re-read (the paired path blocks on exactly
+                                    //     this, as its orphan accumulation guard);
+                                    //   - the baseline read did not succeed, so a zero is an assumption.
+                                    //     Entering here would attribute the entire wallet holding to this
+                                    //     trade, and Helm's stop sells the attributed size.
+                                    //
+                                    // A cooldown is set so this cannot spin at tick rate; the intent then
+                                    // closes `Missed` at the end of its entry window, which is the honest
+                                    // outcome for a conviction that could not be taken cleanly.
+                                    // A FAILED baseline read fails CLOSED for every strategy.
+                                    //
+                                    // The attributed size is `chain - baseline`, so a baseline
+                                    // wrongly taken as zero credits the whole wallet holding to
+                                    // this entry — and an exit sells the attributed size, so a
+                                    // stop would liquidate shares the strategy never bought.
+                                    // That holds for every viper, not only Helm: the row is
+                                    // protected now, but the in-memory position is not.
+                                    //
+                                    // Only a FAILED read refuses here. A genuine zero is the
+                                    // normal case and must still trade; an existing holding is a
+                                    // judgement Helm makes for its conviction record and the
+                                    // paired path makes through its orphan guard, both below.
+                                    if !primary_baseline_read_ok {
+                                        warn!(
+                                            "🛡️ Entry REFUSED [{}] for \"{}\": baseline balance read failed, so a \
+                                             zero holding is an assumption rather than an observation. Entering \
+                                             would attribute the whole wallet balance to this trade, and an exit \
+                                             would sell it.",
+                                            sn, params.market_name,
+                                        );
+                                        positions.lock().await.remove(&pos_key);
+                                        pending_orders.lock().await.remove(&pos_key);
+                                        { let mut own = token_ownership.lock().await; own.remove(&token_m); }
+                                        last_trade_time.insert(sn.clone(), Instant::now());
+                                        continue;
+                                    }
+
+                                    if sn == crate::vipers::helm_impl::STRATEGY_NAME {
+                                        if let Err(reason) = crate::helpers::helm::entry_attribution_check(
+                                            primary_baseline_read_ok, primary_baseline, config::MIN_ORDER_SHARES,
+                                        ) {
+                                            warn!(
+                                                "🛡️ Helm entry REFUSED [{}] for \"{}\": {} — an exit sells the \
+                                                 attributed size, so this would risk selling shares Helm never bought",
+                                                sn, params.market_name, reason,
+                                            );
+                                            positions.lock().await.remove(&pos_key);
+                                            pending_orders.lock().await.remove(&pos_key);
+                                            { let mut own = token_ownership.lock().await; own.remove(&token_m); }
+                                            { let mut cd = phantom_cooldowns.lock().await; cd.insert(format!("{}:{}", sn, params.token_id), tokio::time::Instant::now()); }
+                                            last_trade_time.insert(sn.clone(), Instant::now());
+                                            continue;
+                                        }
+                                    }
+
                                     let vc = if target_is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
 
                                     if let Some(pp) = pair_params {
@@ -2723,6 +2799,20 @@ impl Squadron {
                                                         // Update to confirmed (Mission In-Flight) + record entry
                                                         if let Some(pool) = db::pool_for(&asset_a) {
                                                             db::confirm_position_status(&pool, &db_sn_a, &db_tid_a).await;
+                                                            // Persist what the sync attributed to THIS strategy.
+                                                            //
+                                                            // The sync assigns `chain - baseline` to the in-memory
+                                                            // position; without this the row keeps the requested size
+                                                            // and the only thing that ever corrects it is the
+                                                            // whole-wallet chain corrector.
+                                                            let attributed = ps_s.lock().await
+                                                                .get(&PositionKey::new(sq_bal.clone(), sn_s.clone(), tn_s.clone()))
+                                                                .map(|p| (p.shares, p.entry_fee));
+                                                            if let Some((sh, fee)) = attributed {
+                                                                db::set_open_position_attribution(
+                                                                    &pool, &db_sn_a, &db_tid_a, sh, primary_baseline, fee,
+                                                                ).await;
+                                                            }
                                                         }
                                                         metrics::record_entry(&scope_a, db_sn_a, db_tid_a, db_mn_a, db_side_a.to_string(), db_ep_a, db_sh_a).await;
                                                     }
@@ -2754,6 +2844,16 @@ impl Squadron {
                                                         // Update to confirmed (Mission In-Flight) + record entry
                                                         if let Some(pool) = db::pool_for(&asset_b) {
                                                             db::confirm_position_status(&pool, &db_sn_b, &db_tid_b).await;
+                                                            // Persist what the sync attributed to THIS strategy
+                                                            // rather than leaving the row at the requested size.
+                                                            let attributed = ps_p.lock().await
+                                                                .get(&PositionKey::new(sq_bal.clone(), sn_p.clone(), tn_p.clone()))
+                                                                .map(|p| (p.shares, p.entry_fee));
+                                                            if let Some((sh, fee)) = attributed {
+                                                                db::set_open_position_attribution(
+                                                                    &pool, &db_sn_b, &db_tid_b, sh, pair_baseline, fee,
+                                                                ).await;
+                                                            }
                                                         }
                                                         metrics::record_entry(&scope_b, db_sn_b, db_tid_b, db_mn_b, db_side_b.to_string(), db_ep_b, db_sh_b).await;
                                                     }
@@ -2929,6 +3029,17 @@ impl Squadron {
                                                 // Update to confirmed (Mission In-Flight) + record entry
                                                 if let Some(pool) = db::pool_for(&asset_s) {
                                                     db::confirm_position_status(&pool, &db_sn_s, &db_tid_s).await;
+                                                    // Persist what the sync attributed to THIS strategy rather
+                                                    // than leaving the row at the requested size. This is the
+                                                    // single-leg path Helm uses.
+                                                    let attributed = ps_s.lock().await
+                                                        .get(&PositionKey::new(sq_bal.clone(), sn_s.clone(), tn_s.clone()))
+                                                        .map(|p| (p.shares, p.entry_fee));
+                                                    if let Some((sh, fee)) = attributed {
+                                                        db::set_open_position_attribution(
+                                                            &pool, &db_sn_s, &db_tid_s, sh, primary_baseline, fee,
+                                                        ).await;
+                                                    }
                                                 }
                                                 metrics::record_entry(&scope_s, db_sn_s.clone(), db_tid_s.clone(), db_mn_s.clone(), db_side_s.to_string(), db_ep_s, db_sh_s).await;
                                                 metrics::record_entry_signal(&asset_s, db_sn_s, db_tid_s, db_mn_s, db_side_s.to_string(), db_ep_s, db_sh_s, &feat_snap_s).await;

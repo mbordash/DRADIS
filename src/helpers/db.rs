@@ -440,7 +440,9 @@ pub(crate) async fn init_schema(pool: &SqlitePool) -> Result<()> {
             entry_price    TEXT    NOT NULL,
             shares         TEXT    NOT NULL,
             ghost_mode     INTEGER NOT NULL DEFAULT 0,
-            chain_adopted  INTEGER NOT NULL DEFAULT 0
+            chain_adopted  INTEGER NOT NULL DEFAULT 0,
+            engine_attributed INTEGER NOT NULL DEFAULT 0,
+            baseline_shares TEXT
         )"
     ).execute(pool).await?;
 
@@ -449,6 +451,41 @@ pub(crate) async fn init_schema(pool: &SqlitePool) -> Result<()> {
     // so we suppress the "duplicate column" error silently.
     let _ = sqlx::query(
         "ALTER TABLE open_positions ADD COLUMN chain_adopted INTEGER NOT NULL DEFAULT 0"
+    ).execute(pool).await;
+
+    // engine_attributed: this row's share count came from the engine's OWN order
+    // and fill, not from reading a wallet balance.
+    //
+    // `chain_adopted` cannot answer that question, which is why this exists.
+    // `update_position_from_chain` sets `chain_adopted = 1` and is reached from
+    // several ordinary engine paths (a partial FAK exit, a partial paired exit, a
+    // maker quote pull, the 60-second drift corrector), so a row that began as an
+    // engine fill looks adopted forever after the first correction.
+    //
+    // The distinction matters because the Data API and `balance_allowance` both
+    // report a WALLET total with no notion of which strategy bought what. For a
+    // row adopted from chain that is the only cost basis available; for a row the
+    // engine wrote from its own fill, taking it overwrites the truth. On
+    // 2026-10-03 a Helm position of 190.476 shares at $0.0210 was rewritten to
+    // the wallet's 260.227 at a blended $0.0219, and about $1.80 of a $6.09 loss
+    // was booked against a conviction that never bought those shares.
+    //
+    // Existing rows default to 0, so nothing already on the books acquires a new
+    // refusal from this migration.
+    let _ = sqlx::query(
+        "ALTER TABLE open_positions ADD COLUMN engine_attributed INTEGER NOT NULL DEFAULT 0"
+    ).execute(pool).await;
+
+    // baseline_shares: how much of this token the wallet already held when the
+    // entry was placed.
+    //
+    // The attributed size of a position is `chain - baseline`, and the baseline
+    // existed only as a local variable inside a spawned task, so every
+    // chain-derived path credited the whole wallet balance to the newest trade.
+    // Persisting it lets a correction subtract what was already there, and makes
+    // a stray balance diagnosable rather than merely visible.
+    let _ = sqlx::query(
+        "ALTER TABLE open_positions ADD COLUMN baseline_shares TEXT"
     ).execute(pool).await;
 
     // strategy: records which strategy owns the position (ArbitrageStrategy, GboostStrategy, etc.).
@@ -3606,10 +3643,14 @@ pub async fn record_open_position_with_status(
     // If a row for this token already exists (chain-adopted or from a prior cycle),
     // we skip the insert — chain-sync will keep the shares count accurate via UPDATE.
     match sqlx::query(
+        // `engine_attributed = 1`: this row's share count comes from the engine's
+        // own order, so a later wallet-level read must not overwrite it. Set here
+        // and never by `update_position_from_chain`, which is why `chain_adopted`
+        // could not serve as this flag.
         "INSERT INTO open_positions
          (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, status, squadron_id,
-          venue, market_class, underlying)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          venue, market_class, underlying, engine_attributed)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1
          WHERE NOT EXISTS (
              SELECT 1 FROM open_positions
              WHERE token_id = ? AND strategy = ?
@@ -3641,6 +3682,51 @@ pub async fn record_open_position_with_status(
 }
 
 /// Update a pending position to confirmed status after blockchain confirmation.
+/// Write the share count the engine attributed to this strategy's own fill, and
+/// the wallet holding that predated it.
+///
+/// Scoped by `(strategy, token_id)` because two vipers can hold the same token
+/// independently — that is the core position-keying invariant — and every
+/// chain-derived writer is scoped by `token_id` alone.
+///
+/// `sync_position_balance` computes `chain - baseline` and, before this existed,
+/// assigned it only to the in-memory `Position`. The row kept the REQUESTED
+/// size, and the one thing that ever updated the row was the whole-wallet
+/// corrector. So the engine's own best answer never reached the database, and
+/// settlement (which reads the row) could not use it. On 2026-10-03 that is how
+/// a Helm conviction of 190.476 shares came to settle on the wallet's 260.227.
+/// `entry_fee` travels with the share count, because it is a dollar figure for a
+/// specific fill size rather than a rate. The sync has already rescaled its
+/// in-memory copy by `actual / expected`, so this writes that value instead of
+/// re-deriving it: a partial FAK (say 114 of 190 shares accepted after 120s)
+/// would otherwise keep the fee for 190 shares against a position of 114 and
+/// over-charge it in every later P&L calculation. Before the attributed size
+/// reached the row, the chain corrector happened to rescale the fee on its way
+/// past; now it sees agreement and never runs.
+pub async fn set_open_position_attribution(
+    pool: &SqlitePool,
+    strategy: &str,
+    token_id: &str,
+    attributed_shares: Decimal,
+    baseline_shares: Decimal,
+    entry_fee: Decimal,
+) {
+    if let Err(e) = sqlx::query(
+        "UPDATE open_positions
+            SET shares = ?, baseline_shares = ?, entry_fee = ?
+          WHERE strategy = ? AND token_id = ? AND engine_attributed = 1"
+    )
+    .bind(attributed_shares.to_string())
+    .bind(baseline_shares.to_string())
+    .bind(entry_fee.to_string())
+    .bind(strategy)
+    .bind(token_id)
+    .execute(pool)
+    .await {
+        error!("❌ DB set_open_position_attribution failed: {}", e);
+    }
+}
+
 pub async fn confirm_position_status(
     pool: &SqlitePool,
     strategy: &str,
@@ -4175,7 +4261,41 @@ pub async fn purge_stale_open_positions(
         if let Some((resolved_mark, chain_size)) = redeemable_marks.get(&token_id) {
             let entry = entry_price.parse::<Decimal>().unwrap_or(Decimal::ZERO);
             let row_qty = shares.parse::<Decimal>().unwrap_or(Decimal::ZERO);
-            let qty = if *chain_size > Decimal::ZERO { *chain_size } else { row_qty };
+            // `chain_size` is a WALLET total, so preferring it books every share
+            // of this token against whichever strategy's row settles first.
+            //
+            // It is still preferred in two cases, both deliberate:
+            //   - a row not attributed to an engine fill has nothing better;
+            //   - a `pending` row's share count is not trustworthy, and a
+            //     redeemable wallet holding proves the fill happened.
+            //
+            // For a confirmed, engine-attributed row the row is the better answer.
+            // That is only true because `set_open_position_attribution` now writes
+            // the synced `chain - baseline` to it: before that the row held the
+            // REQUESTED size, and capping here would have under-booked every
+            // legitimate over-fill. Capped by the wallet so a manual sale cannot
+            // book more than is held.
+            //
+            // On 2026-10-03 a Helm row of 190.476 shares settled against the
+            // wallet's 260.227: about $1.80 of a $6.09 loss belonged to shares the
+            // conviction never bought. This is a SECOND whole-wallet path, so
+            // fixing the chain-sync corrector alone would still have booked it.
+            let row_is_engine: bool = sqlx::query_scalar::<_, i64>(
+                "SELECT COALESCE(engine_attributed, 0) FROM open_positions WHERE id = ?"
+            )
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(Some(0))
+            .unwrap_or(0)
+                == 1;
+            let qty = if !row_is_engine || is_pending {
+                if *chain_size > Decimal::ZERO { *chain_size } else { row_qty }
+            } else if *chain_size > Decimal::ZERO {
+                row_qty.min(*chain_size)
+            } else {
+                row_qty
+            };
             // Settlement pays exactly $1.00 or $0.00; cur_price on a redeemable
             // position is ~0.9995/~0.0005 — snap to the true payout.
             let resolved_px = if *resolved_mark >= Decimal::new(5, 1) { Decimal::ONE } else { Decimal::ZERO };
@@ -6029,6 +6149,106 @@ mod reconcile_tests {
     /// so a chain-sync share correction has to carry it along. Trade 356 filled
     /// 3.04 of the 3.6363 shares requested; leaving the fee unscaled would
     /// describe a fill that never happened.
+    /// An engine row carries the attributed fill, not the requested size.
+    ///
+    /// This is the foundation the whole [B49] fix stands on. Before it, the row
+    /// held `params.shares` (the REQUESTED size) and `sync_position_balance`
+    /// corrected only the in-memory position, so the engine's own answer never
+    /// reached the database and every chain-derived path overwrote it with a
+    /// wallet total.
+    #[tokio::test]
+    async fn an_engine_row_records_the_attributed_fill_and_its_baseline() {
+        let pool = mem_pool().await;
+        let requested = dec_of("190.476");
+        record_open_position_with_status(
+            &pool, &TradeScope::shard_only("test"), "sq-1", "HelmStrategy", "tok-attr",
+            "BTC up or down", "YES", dec_of("0.0210"), requested, false, "pending",
+        ).await;
+
+        // The engine stamp must be set by the insert, because no corrector sets it.
+        let flag: i64 = sqlx::query_scalar(
+            "SELECT engine_attributed FROM open_positions WHERE token_id = 'tok-attr'"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(flag, 1, "an engine-written row must be marked as such");
+
+        // A FAK that over-fills: 190.476 requested, 191.2 actually attributed.
+        // Capping settlement at the row would have UNDER-booked this before the
+        // attributed size was persisted.
+        set_open_position_attribution(&pool, "HelmStrategy", "tok-attr", dec_of("191.2"), dec_of("0"), dec_of("0.28")).await;
+        let (sh, base): (String, Option<String>) = sqlx::query_as(
+            "SELECT shares, baseline_shares FROM open_positions WHERE token_id = 'tok-attr'"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(sh.parse::<Decimal>().unwrap(), dec_of("191.2"), "the over-fill must reach the row");
+        assert_eq!(base.unwrap().parse::<Decimal>().unwrap(), Decimal::ZERO);
+
+        // And the wallet holding that predated the entry is kept, so a stray
+        // balance is diagnosable rather than merely visible.
+        set_open_position_attribution(&pool, "HelmStrategy", "tok-attr", dec_of("190.476"), dec_of("69.751"), dec_of("0.27")).await;
+        let base2: Option<String> = sqlx::query_scalar(
+            "SELECT baseline_shares FROM open_positions WHERE token_id = 'tok-attr'"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(base2.unwrap().parse::<Decimal>().unwrap(), dec_of("69.751"));
+
+        // The fee travels with the share count. `entry_fee` is a dollar figure
+        // for a specific fill size, so a partial FAK that leaves `shares` at the
+        // filled amount while `entry_fee` still describes the requested amount
+        // over-charges the position in every later P&L calculation. Before the
+        // attributed size reached the row, the chain corrector happened to rescale
+        // the fee on its way past; now it sees agreement and never runs.
+        set_open_position_attribution(&pool, "HelmStrategy", "tok-attr", dec_of("114"), dec_of("0"), dec_of("0.162")).await;
+        let (sh3, fee3): (String, Option<String>) = sqlx::query_as(
+            "SELECT shares, entry_fee FROM open_positions WHERE token_id = 'tok-attr'"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(sh3.parse::<Decimal>().unwrap(), dec_of("114"), "the partial fill must reach the row");
+        assert_eq!(
+            fee3.unwrap().parse::<Decimal>().unwrap(), dec_of("0.162"),
+            "the fee must describe the shares actually held, not the shares requested",
+        );
+    }
+
+    /// The attribution write is scoped, and refuses rows it does not own.
+    ///
+    /// Every chain-derived writer is scoped by `token_id` alone, while two vipers
+    /// can hold the same token independently — that is the core position-keying
+    /// invariant. A write that ignored the strategy would be the same class of bug
+    /// this fix exists to close.
+    #[tokio::test]
+    async fn the_attribution_write_is_scoped_to_one_strategy_and_engine_rows() {
+        let pool = mem_pool().await;
+        record_open_position_with_status(
+            &pool, &TradeScope::shard_only("test"), "sq-1", "MakerStrategy", "tok-shared",
+            "BTC hourly", "YES", dec_of("0.40"), dec_of("10"), false, "pending",
+        ).await;
+        // A second viper on the SAME token, which must be untouched.
+        sqlx::query(
+            "INSERT INTO open_positions (ts, session_id, strategy, token_id, market, side, entry_price, shares, engine_attributed)
+             VALUES ('2026-10-04T00:00:00Z','s1','TimeDecayStrategy','tok-shared','BTC hourly','YES','0.42','7', 1)"
+        ).execute(&pool).await.unwrap();
+
+        set_open_position_attribution(&pool, "MakerStrategy", "tok-shared", dec_of("12"), dec_of("0"), dec_of("0.1")).await;
+
+        let maker: String = sqlx::query_scalar(
+            "SELECT shares FROM open_positions WHERE token_id='tok-shared' AND strategy='MakerStrategy'"
+        ).fetch_one(&pool).await.unwrap();
+        let decay: String = sqlx::query_scalar(
+            "SELECT shares FROM open_positions WHERE token_id='tok-shared' AND strategy='TimeDecayStrategy'"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(maker.parse::<Decimal>().unwrap(), dec_of("12"));
+        assert_eq!(decay.parse::<Decimal>().unwrap(), dec_of("7"), "the other viper's row must not move");
+
+        // A chain-adopted row (engine_attributed = 0) is not an engine fill, so
+        // the attribution write must not claim it.
+        sqlx::query(
+            "INSERT INTO open_positions (ts, session_id, strategy, token_id, market, side, entry_price, shares, engine_attributed)
+             VALUES ('2026-10-04T00:00:00Z','s1','HelmStrategy','tok-adopted','BTC hourly','YES','0.30','5', 0)"
+        ).execute(&pool).await.unwrap();
+        set_open_position_attribution(&pool, "HelmStrategy", "tok-adopted", dec_of("99"), dec_of("0"), dec_of("0.5")).await;
+        let adopted: String = sqlx::query_scalar(
+            "SELECT shares FROM open_positions WHERE token_id='tok-adopted'"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(adopted.parse::<Decimal>().unwrap(), dec_of("5"), "an adopted row is not engine-attributed");
+    }
+
     #[tokio::test]
     async fn entry_fee_follows_a_chain_sync_share_correction() {
         let pool = mem_pool().await;

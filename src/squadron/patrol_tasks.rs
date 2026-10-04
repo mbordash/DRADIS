@@ -415,7 +415,43 @@ async fn calculate_positions_value(
                           pos.token_id, db_shares, c);
                 }
                 let entry = pos.entry_price.parse::<Decimal>().unwrap_or(dec!(0));
-                db::update_position_from_chain(pool, &pos.token_id, c, entry, None).await;
+                // `c` is a WALLET balance, so this is the fastest of the
+                // whole-wallet writers: it runs on the 60-second snapshot ticker
+                // and `persist_chain_correction` returns true for any non-zero
+                // chain reading.
+                //
+                // That made it the path that defeated every other fix. On
+                // 2026-10-03 a Helm row of 190.476 shares against a wallet of
+                // 260.227 would be rewritten here within the minute AND stamped
+                // `chain_adopted = 1`, after which the chain-sync corrector and
+                // settlement both treated the row as adopted and preferred the
+                // wallet figure. Keyed on `engine_attributed`, which no corrector
+                // writes, so the stamp cannot launder an engine row into an
+                // adopted one.
+                let is_engine = sqlx::query_scalar::<_, i64>(
+                    "SELECT COALESCE(engine_attributed, 0) FROM open_positions \
+                      WHERE strategy = ? AND token_id = ? LIMIT 1"
+                )
+                .bind(&pos.strategy)
+                .bind(&pos.token_id)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(Some(0))
+                .unwrap_or(0)
+                    == 1;
+                let decision = crate::tasks::cleanup::chain_correction_for(
+                    is_engine, db_shares, c, (db_shares.abs() * dec!(0.05)).max(dec!(0.0001)),
+                );
+                if decision == crate::tasks::cleanup::ChainCorrection::RefuseUpward {
+                    warn!(
+                        "⚠️ Position drift [{}]: chain says {:.4} vs {:.4} attributed to {} — NOT correcting \
+                         upward, the extra {:.4} share(s) did not come from this strategy's fills. Check the \
+                         wallet for an unattributed purchase.",
+                        pos.token_id, c, db_shares, pos.strategy, c - db_shares,
+                    );
+                } else {
+                    db::update_position_from_chain(pool, &pos.token_id, c, entry, None).await;
+                }
             } else if drifted {
                 if c <= dec!(0) && pos.status == "pending" && !pos.chain_adopted {
                     debug!("Position drift [{}]: chain says 0 for a quote still resting ({:.4} on the row) — not a correction",

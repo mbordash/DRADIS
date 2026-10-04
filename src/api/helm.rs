@@ -280,7 +280,17 @@ async fn create_intent(State(s): State<ApiState>, Json(req): Json<CreateIntentRe
             format!("open-intent limit reached: {open} open of {max_open} allowed (helm_max_open_intents); close or supersede one first"),
         );
     }
-    let market_id = helm::market_id_for_squadron(&pool, &req.squadron_id).await.unwrap_or_default();
+    // `deployment_queue` is venue-wide and lives in the PRIMARY pool.
+    //
+    // Helm's own records (intents) live in the helm shard, which is what
+    // `helm_pool()` resolves to, so reading the deployment from there found
+    // nothing on any venue where the two differ. On Polymarket US the helm shard
+    // aliases to `us-sports-dradis.db` while deployments are written to
+    // `us-dradis.db`, so every intent creation failed with "records no market id
+    // … deploy it again" after a perfectly good deploy. Intl and Kalshi happen to
+    // coincide, which is why this was invisible there.
+    let deploy_pool = crate::helpers::db::pool().cloned().unwrap_or_else(|| pool.clone());
+    let market_id = helm::market_id_for_squadron(&deploy_pool, &req.squadron_id).await.unwrap_or_default();
     let book = match book_facts(&s, &market_id, &req.side).await {
         Ok(b) => b,
         Err(r) => return r,

@@ -435,6 +435,27 @@ pub async fn run_kalshi_trader(
     let series = configured_series();
     info!("🏛️ Kalshi trader starting — series={series:?} filter={filter:?}");
 
+    // Register a session with the CAG so the venue-neutral API handlers work.
+    //
+    // `Cag::set_session` was called in exactly one place, inside main.rs's
+    // `intl_clob` block, so on this venue `Cag::session()` was always `None` and
+    // every Helm endpoint answered "no venue session is registered yet — the
+    // engine is still starting; retry in a few seconds", permanently. The
+    // `Execution` implementations Helm reads the book through were wired and
+    // unit-tested here but unreachable.
+    //
+    // `Cag::session()` returns any registered session and Helm uses only its
+    // `venue`, which is one object per process, so a single registration is
+    // enough. The balance is a starting figure the API refreshes.
+    {
+        let startup_balance = venue.collateral().await.unwrap_or_default();
+        cag.set_session(crate::cag::SessionState::new(
+            startup_balance,
+            KALSHI_ASSET,
+            Arc::clone(&venue),
+        ));
+    }
+
     crate::venues::cancel_leftover_orders_at_startup(venue.as_ref(), crate::helpers::dynamic_config::ghosting_now()).await;
 
     // Venue-lifetime private fill feed (event-precise fill confirmation).

@@ -1824,3 +1824,78 @@ mod tests {
         assert!(get(&p, id).await.unwrap().is_some());
     }
 }
+
+/// Whether a Helm entry can be attributed to the operator's conviction alone.
+///
+/// `Err(reason)` means refuse the entry. The reason is operator-facing text.
+///
+/// Helm exists to score calls a person made by hand, so a position that mixes
+/// their shares with the wallet's is worse than no position at all. The first
+/// live Helm trade, 2026-10-03, ordered 190.476 shares and was settled on
+/// 260.227 at a blended price: roughly $1.80 of a $6.09 loss belonged to shares
+/// the conviction never bought.
+///
+/// Both refusals fail CLOSED, which is the opposite of what the entry path did
+/// before. The attributed size of a position is `chain - baseline`, and an exit
+/// sells the attributed size, so a baseline wrongly taken as zero does not just
+/// misreport: a stop would liquidate shares Helm never bought.
+pub fn entry_attribution_check(
+    baseline_read_ok: bool,
+    baseline_shares: Decimal,
+    min_order_shares: Decimal,
+) -> Result<(), String> {
+    if !baseline_read_ok {
+        // A failed read and an observed zero are different answers, and the
+        // entry path used to return zero for both.
+        return Err(
+            "baseline balance read failed, so a zero holding is an assumption rather than an \
+             observation; entering would credit the whole wallet balance to this conviction"
+                .to_string(),
+        );
+    }
+    if baseline_shares >= min_order_shares {
+        return Err(format!(
+            "wallet already holds {baseline_shares:.4} shares of this token (at or above the \
+             {min_order_shares:.4} minimum order), so this conviction's fills could not be told \
+             apart from what was already there"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod entry_attribution_tests {
+    use super::entry_attribution_check as chk;
+    use rust_decimal_macros::dec;
+
+    /// The ordinary case: nothing held, the read worked.
+    #[test]
+    fn a_clean_wallet_admits_the_entry() {
+        assert!(chk(true, dec!(0), dec!(5)).is_ok());
+        // Dust below the minimum order cannot be sold on its own, so it cannot
+        // be what an exit liquidates.
+        assert!(chk(true, dec!(0.4), dec!(5)).is_ok());
+    }
+
+    /// A pre-existing holding contaminates the record.
+    #[test]
+    fn a_held_balance_refuses_the_entry() {
+        let e = chk(true, dec!(69.751), dec!(5)).unwrap_err();
+        assert!(e.contains("69.7510"), "the operator needs the number: {e}");
+        // The boundary is inclusive, matching the paired path's orphan guard.
+        assert!(chk(true, dec!(5), dec!(5)).is_err());
+    }
+
+    /// A failed read must not be treated as an empty wallet.
+    ///
+    /// This is the fail-open that made the 2026-10-03 trade unattributable: both
+    /// the error and the timeout arms of the baseline read returned zero, and a
+    /// zero baseline credits the entire wallet holding to the new entry.
+    #[test]
+    fn an_unread_baseline_refuses_the_entry() {
+        let e = chk(false, dec!(0), dec!(5)).unwrap_err();
+        assert!(e.contains("assumption"), "{e}");
+        // Even a zero that *looks* clean is refused when it was not observed.
+        assert!(chk(false, dec!(0), dec!(5)).is_err());
+    }
+}
