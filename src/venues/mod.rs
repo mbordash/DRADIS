@@ -211,6 +211,23 @@ pub fn venue_name() -> &'static str { "us_retail" }
 #[cfg(feature = "kalshi")]
 pub fn venue_name() -> &'static str { "kalshi" }
 
+/// How this build's loop carries a Helm take-profit to the book. See
+/// `helpers::helm::TakeProfitLeg` for what each answer costs.
+///
+/// The intl patrol loop implements `StrategySignal::MakerRestingExit` and rests
+/// a post-only ask at the target. The Polymarket US and Kalshi loops ignore
+/// that signal (`venues/{us,kalshi}/trader.rs`, with the reason), so on those
+/// builds the take-profit is a FAK at the bid once the bid reaches the target.
+/// One arm per venue and no fallback: a venue added without an arm fails to
+/// compile instead of being quoted the intl fee. Any venue that later
+/// implements the resting exit flips its arm here and nothing else.
+#[cfg(feature = "intl_clob")]
+pub fn helm_take_profit_leg() -> crate::helpers::helm::TakeProfitLeg { crate::helpers::helm::TakeProfitLeg::Resting }
+#[cfg(feature = "us_retail")]
+pub fn helm_take_profit_leg() -> crate::helpers::helm::TakeProfitLeg { crate::helpers::helm::TakeProfitLeg::Taker }
+#[cfg(feature = "kalshi")]
+pub fn helm_take_profit_leg() -> crate::helpers::helm::TakeProfitLeg { crate::helpers::helm::TakeProfitLeg::Taker }
+
 
 /// The smallest order the venue accepts, in shares or contracts. Sizing that
 /// falls below it is an order the venue refuses, however sound the signal.

@@ -529,28 +529,72 @@ fn settles_without_selling(c: &IntentContent) -> bool {
     c.hold_to_settlement && c.time_limit_at.is_none() && c.catastrophic_floor_pct.is_none()
 }
 
-/// What the posture will actually be charged, as a fraction of entry notional.
+/// How the venue this binary runs on carries a Helm take-profit to the book.
+///
+/// Helm emits its take-profit as `StrategySignal::MakerRestingExit`. The intl
+/// patrol loop owns the resting-exit machinery and posts a post-only ask at the
+/// target, which is lifted for free. The Polymarket US and Kalshi loops do not
+/// implement that signal (`venues/{us,kalshi}/trader.rs` ignore it, and say
+/// why), so on those venues no ask ever rests: the take-profit fires only
+/// through `posture_action`'s taker branch, a FAK at the bid once the bid
+/// reaches the target, and that FAK pays a taker leg. Same intent, same
+/// posture, a different number of fee legs depending on the build.
+///
+/// Supplied by `crate::venues::helm_take_profit_leg()`, one `#[cfg]` arm per
+/// venue and no fallback arm, so a new venue fails to compile rather than
+/// inheriting an answer. Deliberately no `Default`: a default that happened to
+/// be right on intl is exactly how the verdict came to quote one leg on the two
+/// venues that charge two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TakeProfitLeg {
+    /// A post-only ask rests at the target; the lift pays no taker fee.
+    Resting,
+    /// Nothing rests; the target is sold at the bid as a taker, and that leg
+    /// is charged.
+    Taker,
+}
+
+/// What the entry leg costs, as a fraction of entry notional.
 ///
 /// Legs are counted, not assumed. A post-only order pays nothing — the CLOB
-/// charges the taker — so a resting entry is free to open and a resting
-/// take-profit is free to close. Charging a flat round trip everywhere refused
-/// entries that cost one leg or none at all.
-fn expected_fee_pct(c: &IntentContent, p: Decimal, exit_is_taker: bool) -> Decimal {
-    let entry = match c.entry_kind {
+/// charges the taker — so a resting entry is free to open. Charging a flat
+/// round trip everywhere refused entries that cost one leg or none at all.
+fn entry_leg_pct(c: &IntentContent, p: Decimal) -> Decimal {
+    match c.entry_kind {
         EntryKind::Resting => Decimal::ZERO,                      // post-only bid
         EntryKind::Taker   => crate::venues::entry_only_fee_pct(p),
-    };
-    let exit = if exit_is_taker { crate::venues::exit_only_fee_pct(p) } else { Decimal::ZERO };
-    entry + exit
+    }
 }
 
 /// The fee verdict the operator is shown before acknowledging, and the gate.
 ///
+/// The take-profit leg is read from the venue this binary was built for, so
+/// the two call sites (the API at create/revise/supersede and the strategy at
+/// the tick) cannot disagree with each other or with the loop that will carry
+/// the exit. [`fee_verdict_on`] is the same verdict with the leg stated, for
+/// callers and tests that need to name it.
+pub fn fee_verdict(
+    c: &IntentContent,
+    b: &BookFacts,
+    max_ratio: Decimal,
+    max_notional_pct: Decimal,
+) -> FeeVerdict {
+    fee_verdict_on(c, b, crate::venues::helm_take_profit_leg(), max_ratio, max_notional_pct)
+}
+
+/// The fee verdict for a stated take-profit leg.
+///
 /// Three postures, and only two of them have a denominator:
 ///
 /// 1. **A take-profit.** The target is stated, so the fee's share of it is the
-///    question and `max_ratio` answers it. The take-profit rests post-only, so
-///    only the entry leg is charged — and nothing at all for a resting entry.
+///    question and `max_ratio` answers it. What the exit costs depends on how
+///    the venue carries it (`TakeProfitLeg`): a resting post-only ask is free,
+///    so only the entry leg is charged — nothing at all for a resting entry —
+///    while a venue that sells the target at the bid pays a taker leg there
+///    too, priced at the target rather than the entry because that is where
+///    the fill happens and the quadratic schedule charges more on the way up
+///    below $0.50. Quoting one leg on a two-leg venue understated every US
+///    and Kalshi verdict by the whole exit.
 /// 2. **Hold to settlement, with nothing that can sell early.** The target is
 ///    the distance to $1.00, the best any binary can pay, and resolution charges
 ///    no taker fee, so only the entry leg costs anything. The most fee-efficient
@@ -568,9 +612,10 @@ fn expected_fee_pct(c: &IntentContent, p: Decimal, exit_is_taker: bool) -> Decim
 /// longshot is the expensive entry per notional. At the 0.07 intl rate a taker
 /// round trip is 11.9% at $0.15 against 1.5% at $0.89, so case 3 bites hardest
 /// exactly where a targetless punt is most tempting.
-pub fn fee_verdict(
+pub fn fee_verdict_on(
     c: &IntentContent,
     b: &BookFacts,
+    tp_leg: TakeProfitLeg,
     max_ratio: Decimal,
     max_notional_pct: Decimal,
 ) -> FeeVerdict {
@@ -579,31 +624,47 @@ pub fn fee_verdict(
         return FeeVerdict::pass("no entry price on the book to measure fees against".to_string());
     };
 
-    // Cases 1 and 2: a measurable target, and an exit that pays no taker fee —
-    // a resting take-profit, or resolution.
-    let target = c.take_profit_price.filter(|tp| *tp > p).map(|tp| ((tp - p) / p, "take-profit"))
-        .or_else(|| settles_without_selling(c).then(|| ((Decimal::ONE - p) / p, "settlement")));
+    // Cases 1 and 2: a measurable target. The exit leg's cost is what the venue
+    // charges to reach it: nothing for a resting ask or for resolution, a taker
+    // leg at the target price where the loop sells the target at the bid.
+    let target = c.take_profit_price.filter(|tp| *tp > p).map(|tp| {
+        let target_pct = (tp - p) / p;
+        let exit = match tp_leg {
+            TakeProfitLeg::Resting => Decimal::ZERO,
+            TakeProfitLeg::Taker   => crate::venues::exit_fee_pct_at_gain(p, target_pct),
+        };
+        (target_pct, exit, "take-profit")
+    })
+    .or_else(|| settles_without_selling(c).then(|| ((Decimal::ONE - p) / p, Decimal::ZERO, "settlement")));
 
-    if let Some((target_pct, which)) = target {
-        let fee = expected_fee_pct(c, p, false);
+    if let Some((target_pct, exit, which)) = target {
+        let fee = entry_leg_pct(c, p) + exit;
         let share = if target_pct > Decimal::ZERO { fee / target_pct } else { Decimal::ZERO };
+        // Say which legs were counted, so a US or Kalshi operator reading a
+        // figure twice the intl one knows it is the exit, not a rate change.
+        let legs = match (which, tp_leg) {
+            ("take-profit", TakeProfitLeg::Taker) =>
+                " (entry plus a taker exit: this venue sells the take-profit at the bid rather than resting an ask)",
+            _ => "",
+        };
         if fee > Decimal::ZERO && share > max_ratio {
             return FeeVerdict::refuse(format!(
-                "fee-dominated: fee {:.2}% is {:.0}% of the {:.1}% {which} target at ${p:.2} (max {:.0}%)",
+                "fee-dominated: fee {:.2}%{legs} is {:.0}% of the {:.1}% {which} target at ${p:.2} (max {:.0}%)",
                 fee * Decimal::ONE_HUNDRED, share * Decimal::ONE_HUNDRED,
                 target_pct * Decimal::ONE_HUNDRED, max_ratio * Decimal::ONE_HUNDRED,
             ));
         }
         return FeeVerdict::pass(format!(
-            "fee share within limits: fee {:.2}% is {:.0}% of the {:.1}% {which} target at ${p:.2} (max {:.0}%)",
+            "fee share within limits: fee {:.2}%{legs} is {:.0}% of the {:.1}% {which} target at ${p:.2} (max {:.0}%)",
             fee * Decimal::ONE_HUNDRED, share * Decimal::ONE_HUNDRED,
             target_pct * Decimal::ONE_HUNDRED, max_ratio * Decimal::ONE_HUNDRED,
         ));
     }
 
-    // Case 3: no price target. Whatever closes this crosses the spread, so the
-    // exit leg is charged; the entry leg depends on how it was opened.
-    let fee = expected_fee_pct(c, p, true);
+    // Case 3: no price target. Whatever closes this crosses the spread on every
+    // venue, so the exit leg is charged; the entry leg depends on how it was
+    // opened. The exit price is unknown here, so it is taken at the entry.
+    let fee = entry_leg_pct(c, p) + crate::venues::exit_only_fee_pct(p);
     if fee > max_notional_pct {
         return FeeVerdict::refuse(format!(
             "fee-dominated: this posture names no price target, so the fee is the hurdle — \
@@ -1623,16 +1684,19 @@ mod tests {
     }
 
     /// Where a target exists, the fee's share of it is the question.
+    ///
+    /// The leg is stated so the assertion holds on every venue build; what the
+    /// venue actually does to the take-profit is tested separately below.
     #[test]
     fn the_fee_verdict_measures_against_the_take_profit() {
         let mut c = content();
         c.take_profit_price = Some(dec!(0.43)); // ~2.4% target: fee-dominated
-        let v = fee_verdict(&c, &book(), dec!(0.40), dec!(0.05));
+        let v = fee_verdict_on(&c, &book(), TakeProfitLeg::Resting, dec!(0.40), dec!(0.05));
         assert!(v.text.contains("fee-dominated"), "{}", v.text);
         assert!(v.refusal.is_some(), "a fee-dominated target must refuse, not just report");
 
         c.take_profit_price = Some(dec!(0.80));
-        let v = fee_verdict(&c, &book(), dec!(0.40), dec!(0.05));
+        let v = fee_verdict_on(&c, &book(), TakeProfitLeg::Resting, dec!(0.40), dec!(0.05));
         assert!(v.text.contains("within limits"), "{}", v.text);
         assert!(v.refusal.is_none());
     }
@@ -1755,7 +1819,7 @@ mod tests {
         resting.entry_limit_price = Some(p);
         resting.stop_price = None;
         resting.take_profit_price = Some(dec!(0.50));
-        let v = fee_verdict(&resting, &b, dec!(0.40), dec!(0.05));
+        let v = fee_verdict_on(&resting, &b, TakeProfitLeg::Resting, dec!(0.40), dec!(0.05));
         assert!(v.text.contains("fee 0.00%"), "both legs rest, so nothing is charged: {}", v.text);
         assert!(v.refusal.is_none());
 
@@ -1764,10 +1828,106 @@ mod tests {
         let mut taker = resting.clone();
         taker.entry_kind = EntryKind::Taker;
         taker.entry_limit_price = None;
-        let vt = fee_verdict(&taker, &b, dec!(0.40), dec!(0.05));
+        let vt = fee_verdict_on(&taker, &b, TakeProfitLeg::Resting, dec!(0.40), dec!(0.05));
         assert!(!vt.text.contains("fee 0.00%"), "a taker entry pays to get in: {}", vt.text);
         let one_leg = crate::venues::entry_only_fee_pct(dec!(0.42)) * Decimal::ONE_HUNDRED;
         assert!(vt.text.contains(&format!("fee {:.2}%", one_leg)), "{}", vt.text);
+        assert!(!vt.text.contains("sells the take-profit at the bid"),
+                "a resting ask must not be described as a taker exit: {}", vt.text);
+    }
+
+    /// On a venue whose loop does not rest the take-profit, the exit is a FAK
+    /// at the bid and that leg is charged.
+    ///
+    /// Helm emits `MakerRestingExit`; the US and Kalshi loops ignore it, so the
+    /// take-profit on those builds only fires through `posture_action`'s taker
+    /// branch. The verdict was quoting the one-leg figure there regardless, a
+    /// whole exit leg short of the truth. The exit leg is priced at the TARGET,
+    /// not the entry: that is where the fill happens, and on a quadratic
+    /// schedule the two differ.
+    #[test]
+    fn a_venue_that_sells_the_take_profit_at_the_bid_is_charged_the_exit_leg() {
+        let b = book();
+        let p = dec!(0.42);
+        let tp = dec!(0.80);
+        let mut c = content();
+        c.stop_price = None;
+        c.take_profit_price = Some(tp);
+
+        let resting = fee_verdict_on(&c, &b, TakeProfitLeg::Resting, dec!(0.40), dec!(0.05));
+        let taker = fee_verdict_on(&c, &b, TakeProfitLeg::Taker, dec!(0.40), dec!(0.05));
+
+        let entry_leg = crate::venues::entry_only_fee_pct(p);
+        let exit_at_target = crate::venues::exit_fee_pct_at_gain(p, (tp - p) / p);
+        let exit_at_entry = crate::venues::exit_only_fee_pct(p);
+        assert!(exit_at_target > Decimal::ZERO && exit_at_target != exit_at_entry,
+                "the test needs a target where the two exit prices disagree");
+
+        let pct = |d: Decimal| format!("fee {:.2}%", d * Decimal::ONE_HUNDRED);
+        assert!(resting.text.contains(&pct(entry_leg)), "{}", resting.text);
+        assert!(taker.text.contains(&pct(entry_leg + exit_at_target)),
+                "expected {} (entry plus the exit at the target) in: {}", pct(entry_leg + exit_at_target), taker.text);
+        assert!(!taker.text.contains(&pct(entry_leg + exit_at_entry)),
+                "the exit must be priced at the target, not the entry: {}", taker.text);
+        assert!(taker.text.contains("sells the take-profit at the bid"),
+                "the operator is told why the figure doubled: {}", taker.text);
+
+        // A resting entry on such a venue is not free: it still pays the exit.
+        let mut rest_in = c.clone();
+        rest_in.entry_kind = EntryKind::Resting;
+        rest_in.entry_limit_price = Some(dec!(0.35));
+        let v = fee_verdict_on(&rest_in, &b, TakeProfitLeg::Taker, dec!(0.40), dec!(0.05));
+        assert!(!v.text.contains("fee 0.00%"), "a resting entry with a taker exit pays one leg: {}", v.text);
+        let p2 = dec!(0.35);
+        let exit2 = crate::venues::exit_fee_pct_at_gain(p2, (tp - p2) / p2);
+        assert!(v.text.contains(&pct(exit2)), "{}", v.text);
+
+        // And the gate turns on the two-leg figure: a target the one-leg
+        // reading passes can be fee-dominated once the exit is counted.
+        let mut tight = c.clone();
+        tight.take_profit_price = Some(dec!(0.52)); // ~24% target
+        let one_leg = fee_verdict_on(&tight, &b, TakeProfitLeg::Resting, dec!(0.20), dec!(0.05));
+        let two_legs = fee_verdict_on(&tight, &b, TakeProfitLeg::Taker, dec!(0.20), dec!(0.05));
+        assert!(one_leg.refusal.is_none(), "{}", one_leg.text);
+        assert!(two_legs.refusal.is_some(), "the same target must refuse once the exit is charged: {}", two_legs.text);
+    }
+
+    /// The take-profit leg is about the take-profit. Settlement charges nothing
+    /// to exit on any venue, and a targetless posture already counts a taker
+    /// exit on every venue, so neither verdict moves with the leg.
+    #[test]
+    fn the_take_profit_leg_does_not_touch_settlement_or_targetless_postures() {
+        let mut settle = content();
+        settle.take_profit_price = None;
+        settle.stop_price = None;
+        settle.hold_to_settlement = true;
+        let r = fee_verdict_on(&settle, &book(), TakeProfitLeg::Resting, dec!(0.40), dec!(0.05));
+        let t = fee_verdict_on(&settle, &book(), TakeProfitLeg::Taker, dec!(0.40), dec!(0.05));
+        assert_eq!(r.text, t.text);
+        assert!(r.text.contains("settlement target"), "{}", r.text);
+
+        let mut stop_only = content();
+        stop_only.take_profit_price = None;
+        stop_only.stop_price = Some(dec!(0.30));
+        let r = fee_verdict_on(&stop_only, &book(), TakeProfitLeg::Resting, dec!(0.40), dec!(0.05));
+        let t = fee_verdict_on(&stop_only, &book(), TakeProfitLeg::Taker, dec!(0.40), dec!(0.05));
+        assert_eq!(r.text, t.text);
+        assert!(r.text.contains("names no price target") || r.text.contains("no price target named"), "{}", r.text);
+    }
+
+    /// `fee_verdict` asks the venue which leg it is on, so the API and the
+    /// strategy's tick gate quote the venue the operator is actually on.
+    #[test]
+    fn fee_verdict_reads_the_take_profit_leg_from_the_venue() {
+        let mut c = content();
+        c.take_profit_price = Some(dec!(0.80));
+        let venue_leg = crate::venues::helm_take_profit_leg();
+        let v = fee_verdict(&c, &book(), dec!(0.40), dec!(0.05));
+        assert_eq!(v.text, fee_verdict_on(&c, &book(), venue_leg, dec!(0.40), dec!(0.05)).text);
+        // The other leg's verdict differs for a taker entry with a target, so
+        // the equality above is not vacuous.
+        let other = match venue_leg { TakeProfitLeg::Resting => TakeProfitLeg::Taker, TakeProfitLeg::Taker => TakeProfitLeg::Resting };
+        assert_ne!(v.text, fee_verdict_on(&c, &book(), other, dec!(0.40), dec!(0.05)).text);
     }
 
     #[test]

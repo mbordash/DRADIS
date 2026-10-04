@@ -2709,14 +2709,41 @@ impl Squadron {
                                         let pp_token_m = pp.token_id.clone(); // neutral key (slice 2a)
                                         let actual_pair_entry_price = if pp.post_only { pp.price } else { (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE) };
                                         let vc_p = if pp.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
-                                        let pair_baseline = {
+                                        // Same `(value, read_ok)` shape as the primary leg: a failed
+                                        // read and an observed zero are different answers, and both
+                                        // arms used to return zero. A zero baseline attributes the
+                                        // whole wallet holding to this leg, and it also defeats the
+                                        // orphan accumulation guard below, which compares the
+                                        // baseline against the order minimum and passes on zero.
+                                        let (pair_baseline, pair_baseline_read_ok) = {
                                             let mut req = BalanceAllowanceRequest::default(); req.asset_type = AssetType::Conditional; req.token_id = Some(u256_from_market_id(&pp.token_id).unwrap_or_default());
                                             match tokio::time::timeout(Duration::from_secs(10), trading_client.balance_allowance(req)).await {
-                                                Ok(Ok(resp)) => Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
-                                                Ok(Err(e)) => { warn!("⚠️ pair baseline balance_allowance error [{}]: {}", sn, e); dec!(0) }
-                                                Err(_) => { warn!("⚠️ pair baseline balance_allowance timed out (10s) [{}]", sn); dec!(0) }
+                                                Ok(Ok(resp)) => (Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000), true),
+                                                Ok(Err(e)) => { warn!("⚠️ pair baseline balance_allowance error [{}]: {}", sn, e); (dec!(0), false) }
+                                                Err(_) => { warn!("⚠️ pair baseline balance_allowance timed out (10s) [{}]", sn); (dec!(0), false) }
                                             }
                                         };
+                                        // The paired entry needs BOTH baselines observed. Refusing
+                                        // here rather than inside the orphan guard keeps the two
+                                        // reasons distinct in the log: this is "we do not know what
+                                        // the wallet holds", not "the wallet holds too much".
+                                        if !pair_baseline_read_ok {
+                                            warn!(
+                                                "🛡️ Paired entry REFUSED [{}] for \"{}\": pair baseline balance read failed, \
+                                                 so a zero holding is an assumption rather than an observation. Entering would \
+                                                 attribute the whole wallet balance to the paired leg, and an exit would sell it.",
+                                                sn, params.market_name,
+                                            );
+                                            positions.lock().await.remove(&pos_key);
+                                            pending_orders.lock().await.remove(&pos_key);
+                                            {
+                                                let mut own = token_ownership.lock().await;
+                                                own.remove(&token_m);
+                                                own.remove(&pp_token_m);
+                                            }
+                                            last_trade_time.insert(sn.clone(), Instant::now());
+                                            continue;
+                                        }
 
                                         if primary_baseline >= config::MIN_ORDER_SHARES || pair_baseline >= config::MIN_ORDER_SHARES {
                                             warn!("🛡️ Paired entry BLOCKED [{}]: orphan accumulation guard — primary on-chain={:.4} pair on-chain={:.4} for \"{}\" (re-checking in {}s)", sn, primary_baseline, pair_baseline, params.market_name, crate::helpers::balance::PHANTOM_COOLDOWN_SECS);
@@ -3232,7 +3259,30 @@ impl Squadron {
                                                     warn!("⚠️ Maker quote-pull [{}]: {} — balance appeared on retry {} ({:.4} shares): settlement lag confirmed", sn, tok, attempt, held);
                                                 }
                                             }
-                                            held
+                                            // A wallet reading is not a fill. It is the whole
+                                            // wallet's holding of this token, so if another
+                                            // strategy already holds some of it through its own
+                                            // fill, adopting the full figure here claims that
+                                            // position's shares — and an exit would then sell
+                                            // them. Subtract what is provably someone else's.
+                                            //
+                                            // The venue-reported `m` above needs no such
+                                            // correction: it is this order's own matched size.
+                                            let others = match db::pool_for(&asset_lc) {
+                                                Some(pool) => db::attributed_shares_other_strategies(
+                                                    &pool, tok.as_str(), &sn,
+                                                ).await,
+                                                None => dec!(0),
+                                            };
+                                            if others > dec!(0) {
+                                                warn!(
+                                                    "⚠️ Maker quote-pull [{}]: wallet holds {:.4} of {} but {:.4} is \\
+                                                     attributed to other strategies — adopting {:.4} as this quote's \\
+                                                     fill. Adopting the wallet total would claim another viper's shares.",
+                                                    sn, held, tok, others, (held - others).max(dec!(0)),
+                                                );
+                                            }
+                                            (held - others).max(dec!(0))
                                         } else {
                                             // Order was found on the book and cancelled with
                                             // sub-threshold matched size — genuinely unfilled.

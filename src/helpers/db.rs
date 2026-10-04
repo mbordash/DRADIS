@@ -3618,7 +3618,14 @@ pub async fn record_open_position(
 /// squadron's *current* mode, and the two can disagree mid-flip. The order
 /// path's own flag is the truth for this row.
 #[allow(clippy::too_many_arguments)]
-pub async fn record_open_position_with_status(
+/// The one INSERT both the fill path and the adoption path go through.
+///
+/// `engine_attributed` is a parameter rather than a literal so the two callers
+/// cannot drift: the whole value of that column is that it distinguishes a share
+/// count the engine filled from one it read off a wallet, and a second copy of
+/// this statement would eventually disagree with the first.
+#[allow(clippy::too_many_arguments)]
+async fn insert_open_position(
     pool: &SqlitePool,
     // Filing dimensions — see `record_open_position`.
     scope: &TradeScope,
@@ -3632,6 +3639,7 @@ pub async fn record_open_position_with_status(
     shares: Decimal,
     ghost_mode: bool,
     status: &str,
+    engine_attributed: bool,
 ) {
     let ts = Utc::now().to_rfc3339();
     let sid = current_session_id();
@@ -3650,7 +3658,7 @@ pub async fn record_open_position_with_status(
         "INSERT INTO open_positions
          (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, status, squadron_id,
           venue, market_class, underlying, engine_attributed)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          WHERE NOT EXISTS (
              SELECT 1 FROM open_positions
              WHERE token_id = ? AND strategy = ?
@@ -3671,6 +3679,7 @@ pub async fn record_open_position_with_status(
     .bind(venue)
     .bind(scope.market_class.clone())
     .bind(scope.underlying.clone())
+    .bind(engine_attributed as i32)
     .bind(token_id)
     .bind(strategy)
     .bind(squadron_id)
@@ -3681,7 +3690,130 @@ pub async fn record_open_position_with_status(
     }
 }
 
-/// Update a pending position to confirmed status after blockchain confirmation.
+/// Record a position the engine filled through its own order.
+///
+/// Carries `engine_attributed = 1`: the share count comes from this engine's
+/// fill, so a later wallet-level read must not overwrite it. See
+/// `record_adopted_position` for the other case.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_open_position_with_status(
+    pool: &SqlitePool,
+    scope: &TradeScope,
+    squadron_id: &str,
+    strategy: &str,
+    token_id: &str,
+    market: &str,
+    side: &str,
+    entry_price: Decimal,
+    shares: Decimal,
+    ghost_mode: bool,
+    status: &str,
+) {
+    insert_open_position(
+        pool, scope, squadron_id, strategy, token_id, market, side,
+        entry_price, shares, ghost_mode, status, true,
+    ).await;
+}
+
+/// Record a venue-reported holding as an open position, NOT attributed to a fill.
+///
+/// The adoption twin of `record_open_position`: same filing columns, same
+/// `INSERT ... WHERE NOT EXISTS`, status `confirmed`, but `engine_attributed = 0`
+/// because the share count came from a wallet or portfolio reading rather than
+/// from the engine's own order. A row that claimed the stamp would be allowed to
+/// override a later wallet read, which is exactly backwards for a row that IS a
+/// wallet read.
+///
+/// No `ghost_mode` parameter: a venue never reports a simulated holding.
+///
+/// Exists because `engine_attributed` is only worth anything if it cannot be
+/// forged, and every caller of `record_open_position` was stamping it — including
+/// the US and Kalshi dashboard paths that adopt a venue-reported size. A named
+/// function is harder to misuse than a trailing bool.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_adopted_position(
+    pool: &SqlitePool,
+    scope: &TradeScope,
+    squadron_id: &str,
+    strategy: &str,
+    token_id: &str,
+    market: &str,
+    side: &str,
+    entry_price: Decimal,
+    shares: Decimal,
+) {
+    insert_open_position(
+        pool, scope, squadron_id, strategy, token_id, market, side,
+        entry_price, shares, false, "confirmed", false,
+    ).await;
+}
+
+/// How many shares of a token are provably attributed to OTHER strategies.
+///
+/// The wallet holds everything at once, so a path that can only read a wallet
+/// balance cannot tell its own fill from someone else's position. What it CAN do
+/// is subtract the part another strategy has already claimed through its own
+/// fill, which is what this returns. Ghost rows are excluded: they hold no real
+/// shares.
+///
+/// This is the general form of the 2026-10-03 lesson — a wallet total is not a
+/// position, and the difference belongs to whoever filled it.
+pub async fn attributed_shares_other_strategies(
+    pool: &SqlitePool,
+    token_id: &str,
+    excluding_strategy: &str,
+) -> Decimal {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT shares FROM open_positions
+          WHERE token_id = ? AND strategy != ? AND engine_attributed = 1 AND ghost_mode = 0"
+    )
+    .bind(token_id)
+    .bind(excluding_strategy)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    rows.iter()
+        .filter_map(|(s,)| s.parse::<Decimal>().ok())
+        .sum()
+}
+
+/// The share count the engine attributed to this strategy for a token, and the
+/// wallet holding that predated it, from whichever shard holds the row.
+///
+/// `None` when no engine-attributed row exists, which is the honest answer for a
+/// position that was adopted from chain rather than filled by the engine: there
+/// is no attribution to report and the caller must fall back to the wallet.
+///
+/// Searches every shard the way `lookup_entry_from_csv` does, because a caller
+/// in the reconciliation path does not know which asset owns the token.
+pub async fn attributed_shares_for_token(
+    strategy: &str,
+    token_id: &str,
+) -> Option<(Decimal, Decimal)> {
+    for asset in available_assets() {
+        let Some(pool) = pool_for(&asset) else { continue };
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT shares, baseline_shares FROM open_positions
+              WHERE strategy = ? AND token_id = ? AND engine_attributed = 1
+              LIMIT 1"
+        )
+        .bind(strategy)
+        .bind(token_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap_or(None);
+        if let Some((shares, baseline)) = row {
+            let sh = shares.parse::<Decimal>().ok()?;
+            let base = baseline
+                .as_deref()
+                .and_then(|b| b.parse::<Decimal>().ok())
+                .unwrap_or(Decimal::ZERO);
+            return Some((sh, base));
+        }
+    }
+    None
+}
+
 /// Write the share count the engine attributed to this strategy's own fill, and
 /// the wallet holding that predated it.
 ///
@@ -3727,6 +3859,7 @@ pub async fn set_open_position_attribution(
     }
 }
 
+/// Update a pending position to confirmed status after blockchain confirmation.
 pub async fn confirm_position_status(
     pool: &SqlitePool,
     strategy: &str,
@@ -4289,13 +4422,46 @@ pub async fn purge_stale_open_positions(
             .unwrap_or(Some(0))
             .unwrap_or(0)
                 == 1;
-            let qty = if !row_is_engine || is_pending {
+
+            // A `pending` row may only claim the wallet when it is the ONLY row
+            // for this token.
+            //
+            // Preferring `chain_size` for a pending row is deliberate: its share
+            // count is not trustworthy, and a redeemable wallet holding proves a
+            // fill happened. But when a second viper also holds the token, the
+            // pending row books the whole wallet at ITS price — and because
+            // `market_has_settlement_trade` dedups on quantity, the true owner's
+            // row is then skipped as already recorded. Row order is by rowid, so
+            // whichever viper quoted first wins a booking that is not its own.
+            // Maker is the realistic case: it rests `pending` for up to 600s with
+            // a zero baseline and no orphan guard, so it can be mid-quote on a
+            // token Helm or TimeDecay holds when the market resolves.
+            let token_row_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM open_positions WHERE token_id = ? AND ghost_mode = 0"
+            )
+            .bind(&token_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(Some(1))
+            .unwrap_or(1);
+            let pending_may_claim_wallet = is_pending && token_row_count <= 1;
+
+            let qty = if !row_is_engine || pending_may_claim_wallet {
                 if *chain_size > Decimal::ZERO { *chain_size } else { row_qty }
             } else if *chain_size > Decimal::ZERO {
                 row_qty.min(*chain_size)
             } else {
                 row_qty
             };
+            if is_pending && !pending_may_claim_wallet {
+                warn!(
+                    "⚠️ Settlement [{}]: a pending row for token {} shares it with {} other row(s), so it \
+                     books its own {:.4} share(s) rather than the wallet's {:.4}. A pending row that claimed \
+                     the wallet here would book another viper's position under its own name and dedup the \
+                     real owner's booking away.",
+                    strategy, &token_id[..token_id.len().min(20)], token_row_count - 1, qty, chain_size,
+                );
+            }
             // Settlement pays exactly $1.00 or $0.00; cur_price on a redeemable
             // position is ~0.9995/~0.0005 — snap to the true payout.
             let resolved_px = if *resolved_mark >= Decimal::new(5, 1) { Decimal::ONE } else { Decimal::ZERO };
@@ -6149,6 +6315,163 @@ mod reconcile_tests {
     /// so a chain-sync share correction has to carry it along. Trade 356 filled
     /// 3.04 of the 3.6363 shares requested; leaving the fee unscaled would
     /// describe a fill that never happened.
+    /// [B54] A pending row may claim the wallet only when it is alone on a token.
+    ///
+    /// Preferring the chain size for a pending row is deliberate: its share count
+    /// is untrustworthy and a redeemable holding proves a fill happened. But when
+    /// a second viper holds the token, the pending row books the whole wallet at
+    /// ITS price, and `market_has_settlement_trade` then dedups the true owner's
+    /// booking away on matching quantity. Maker is the realistic case: it rests
+    /// pending for up to 600s with no orphan guard.
+    #[tokio::test]
+    async fn a_pending_row_counts_its_company_before_claiming_the_wallet() {
+        let pool = mem_pool().await;
+        // Helm holds the token through its own fill.
+        record_open_position_with_status(
+            &pool, &TradeScope::shard_only("test"), "sq-1", "HelmStrategy", "tok-b54",
+            "BTC up or down", "YES", dec_of("0.0210"), dec_of("190.476"), false, "confirmed",
+        ).await;
+        let alone: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM open_positions WHERE token_id = 'tok-b54' AND ghost_mode = 0"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(alone, 1, "one row: a pending row here would be the only claimant");
+
+        // Maker rests a quote on the same token.
+        record_open_position_with_status(
+            &pool, &TradeScope::shard_only("test"), "sq-1", "MakerStrategy", "tok-b54",
+            "BTC up or down", "YES", dec_of("0.42"), dec_of("7"), false, "pending",
+        ).await;
+        let shared: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM open_positions WHERE token_id = 'tok-b54' AND ghost_mode = 0"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(shared, 2, "two rows: the pending row must book its own size, not the wallet");
+
+        // Ghost rows are excluded from the count, so a simulated position cannot
+        // stop a real pending row from settling normally.
+        record_open_position_with_status(
+            &pool, &TradeScope::shard_only("test"), "sq-1", "GboostStrategy", "tok-b54",
+            "BTC up or down", "YES", dec_of("0.50"), dec_of("3"), true, "pending",
+        ).await;
+        let still_two: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM open_positions WHERE token_id = 'tok-b54' AND ghost_mode = 0"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(still_two, 2, "a ghost row is not company");
+    }
+
+    /// [B56] The attribution stamp cannot be acquired by an adoption.
+    ///
+    /// `engine_attributed` is only worth something if it cannot be forged, and
+    /// every caller of `record_open_position` was stamping it — including the US
+    /// and Kalshi dashboard paths that adopt a venue-reported WALLET size. Such a
+    /// row would then be allowed to override a later wallet read, which is
+    /// backwards for a row that IS a wallet read.
+    #[tokio::test]
+    async fn an_adopted_position_does_not_carry_the_attribution_stamp() {
+        let pool = mem_pool().await;
+        record_adopted_position(
+            &pool, &TradeScope::shard_only("test"), "sq-1", "MakerStrategy", "tok-b56",
+            "Chiefs vs Bills", "YES", dec_of("0.55"), dec_of("18"),
+        ).await;
+        let (flag, status): (i64, String) = sqlx::query_as(
+            "SELECT engine_attributed, status FROM open_positions WHERE token_id = 'tok-b56'"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(flag, 0, "a venue-reported holding is not an engine fill");
+        assert_eq!(status, "confirmed", "an adopted holding is already filled");
+
+        // The engine path on the same shape still stamps it, so the two are
+        // genuinely distinguished rather than both being 0.
+        record_open_position_with_status(
+            &pool, &TradeScope::shard_only("test"), "sq-1", "MakerStrategy", "tok-b56-filled",
+            "Chiefs vs Bills", "YES", dec_of("0.55"), dec_of("18"), false, "pending",
+        ).await;
+        let filled: i64 = sqlx::query_scalar(
+            "SELECT engine_attributed FROM open_positions WHERE token_id = 'tok-b56-filled'"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(filled, 1, "an engine fill keeps its stamp");
+
+        // And an adopted row cannot be promoted by the attribution writer, which
+        // is scoped to engine rows.
+        set_open_position_attribution(
+            &pool, "MakerStrategy", "tok-b56", dec_of("999"), dec_of("0"), dec_of("1"),
+        ).await;
+        let (after, sh): (i64, String) = sqlx::query_as(
+            "SELECT engine_attributed, shares FROM open_positions WHERE token_id = 'tok-b56'"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(after, 0, "the stamp cannot be acquired after the fact");
+        assert_eq!(sh.parse::<Decimal>().unwrap(), dec_of("18"), "and the row is untouched");
+    }
+
+    /// A wallet total is not a position: the rest may be someone else's.
+    ///
+    /// [B55] The maker quote-pull path can only read a wallet balance when its
+    /// order has left the book, and it adopted the whole figure as its own fill.
+    /// If another viper held part of it, that claimed their shares — and an exit
+    /// sells the adopted size.
+    #[tokio::test]
+    async fn shares_held_by_other_strategies_are_not_claimable() {
+        let pool = mem_pool().await;
+        // Helm filled 190.476 of this token through its own order.
+        record_open_position_with_status(
+            &pool, &TradeScope::shard_only("test"), "sq-1", "HelmStrategy", "tok-shared-b55",
+            "BTC up or down", "YES", dec_of("0.0210"), dec_of("190.476"), false, "pending",
+        ).await;
+        set_open_position_attribution(
+            &pool, "HelmStrategy", "tok-shared-b55", dec_of("190.476"), dec_of("0"), dec_of("0.27"),
+        ).await;
+
+        // Maker, pulling a quote on the same token, must not count Helm's shares.
+        let others = attributed_shares_other_strategies(&pool, "tok-shared-b55", "MakerStrategy").await;
+        assert_eq!(others, dec_of("190.476"), "Helm's fill belongs to Helm");
+
+        // And Helm must not count its own against itself.
+        let own = attributed_shares_other_strategies(&pool, "tok-shared-b55", "HelmStrategy").await;
+        assert_eq!(own, Decimal::ZERO, "a strategy does not exclude itself from its own fill");
+
+        // A ghost row holds no real shares, so it cannot reserve any.
+        record_open_position_with_status(
+            &pool, &TradeScope::shard_only("test"), "sq-1", "GboostStrategy", "tok-shared-b55",
+            "BTC up or down", "YES", dec_of("0.50"), dec_of("50"), true, "pending",
+        ).await;
+        let after_ghost = attributed_shares_other_strategies(&pool, "tok-shared-b55", "MakerStrategy").await;
+        assert_eq!(after_ghost, dec_of("190.476"), "a ghost row reserves nothing");
+    }
+
+    /// [B53] Restart rehydration caps at the attributed size, and only caps.
+    ///
+    /// The lookup searches every shard because the reconciliation path does not
+    /// know which asset owns a token. `None` is the honest answer for a position
+    /// adopted from chain, which has no engine fill to report.
+    #[tokio::test]
+    async fn the_attributed_lookup_reports_only_engine_fills() {
+        let pool = mem_pool().await;
+        record_open_position_with_status(
+            &pool, &TradeScope::shard_only("test"), "sq-1", "HelmStrategy", "tok-b53",
+            "BTC up or down", "YES", dec_of("0.0210"), dec_of("190.476"), false, "pending",
+        ).await;
+        set_open_position_attribution(
+            &pool, "HelmStrategy", "tok-b53", dec_of("190.476"), dec_of("69.751"), dec_of("0.27"),
+        ).await;
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT shares, baseline_shares FROM open_positions
+              WHERE strategy = 'HelmStrategy' AND token_id = 'tok-b53' AND engine_attributed = 1"
+        ).fetch_optional(&pool).await.unwrap();
+        let (sh, base) = row.expect("an engine row must be found");
+        assert_eq!(sh.parse::<Decimal>().unwrap(), dec_of("190.476"));
+        assert_eq!(base.unwrap().parse::<Decimal>().unwrap(), dec_of("69.751"));
+
+        // A chain-adopted row must report nothing, so rehydration falls back to
+        // the wallet — which is the case that function exists for.
+        sqlx::query(
+            "INSERT INTO open_positions (ts, session_id, strategy, token_id, market, side, entry_price, shares, engine_attributed)
+             VALUES ('2026-10-04T00:00:00Z','s1','MakerStrategy','tok-b53-adopted','BTC hourly','YES','0.40','9', 0)"
+        ).execute(&pool).await.unwrap();
+        let adopted: Option<(String,)> = sqlx::query_as(
+            "SELECT shares FROM open_positions
+              WHERE strategy = 'MakerStrategy' AND token_id = 'tok-b53-adopted' AND engine_attributed = 1"
+        ).fetch_optional(&pool).await.unwrap();
+        assert!(adopted.is_none(), "an adopted row has no engine attribution to report");
+    }
+
     /// An engine row carries the attributed fill, not the requested size.
     ///
     /// This is the foundation the whole [B49] fix stands on. Before it, the row

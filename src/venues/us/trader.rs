@@ -2251,6 +2251,12 @@ async fn dispatch_signal(
         // its historical bid-based take-profit, which is what this venue did
         // before the signal existed. `MakerStrategy` re-emits it every tick, so
         // there is nothing to queue or replay if this venue later implements it.
+        //
+        // Helm emits its take-profit through this same signal, so on this venue
+        // the Helm take-profit is a FAK at the bid once the bid reaches the
+        // target, and that leg is charged. `venues::helm_take_profit_leg()` says
+        // so to the fee verdict; implementing the resting exit here means
+        // flipping that arm to `Resting` in the same change.
         StrategySignal::MakerRestingExit { .. } => false,
         StrategySignal::Exit { params, reason, exit_pair } => {
             // An exit that didn't fill re-signals on the very next tick (the stop
@@ -2612,18 +2618,28 @@ async fn sync_dashboard(
     for p in &positions {
         let sym = p.market.as_str();
         live_ids.insert(sym.to_string());
+        // Both arms adopt a WALLET-sized holding, so both write
+        // `engine_attributed = 0`. `record_open_position` stamps the flag as 1,
+        // which claims the share count came from the engine's own fill; a row
+        // written here with that stamp would be believed over the wallet by any
+        // corrector that later runs on this venue, and the flag's one job is that
+        // it cannot be forged by a wallet reading. Today the US loop has no
+        // corrector and its settlement passes size zero, so nothing read the
+        // false stamp; the fix is so that stays true when one lands.
         match owners.get(sym) {
             // The viper's own entry row already exists — the venue confirming the
-            // holding is what promotes it out of `pending`.
+            // holding is what promotes it out of `pending`. The insert is a no-op
+            // for it; it only writes when the viper's row is missing, and then
+            // the size is the wallet's, not the fill's.
             Some((strategy, market_name)) => {
-                db::record_open_position(
-                    pool, &adopt_scope, squadron_id, strategy, sym, market_name, side_label(sym), p.avg_price, p.shares, false,
+                db::record_adopted_position(
+                    pool, &adopt_scope, squadron_id, strategy, sym, market_name, side_label(sym), p.avg_price, p.shares,
                 ).await;
                 db::confirm_position_status(pool, strategy, sym).await;
             }
             None => {
-                db::record_open_position(
-                    pool, &adopt_scope, squadron_id, "ChainAdopted", sym, sym, side_label(sym), p.avg_price, p.shares, false,
+                db::record_adopted_position(
+                    pool, &adopt_scope, squadron_id, "ChainAdopted", sym, sym, side_label(sym), p.avg_price, p.shares,
                 ).await;
             }
         }

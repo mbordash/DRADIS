@@ -766,10 +766,53 @@ pub async fn reconcile_orphaned_positions(
         };
 
         if let Some(strategy_name) = adopted_strategy {
+            // Seed from what the engine attributed, not from the wallet.
+            //
+            // `actual_shares` is a raw `balance_allowance` reading: the whole
+            // wallet's holding of this token, with no notion of which strategy
+            // bought what. Seeding a position with it hands the strategy shares it
+            // never bought, and because an exit sells the in-memory size, a stop
+            // after a restart would liquidate them. This was the last surviving
+            // path to the 2026-10-03 Helm loss: the database side of that fix
+            // cannot reach here, because this runs before any row is consulted.
+            //
+            // Capped, never raised: if the wallet holds LESS than the row claims,
+            // something was sold or settled while the engine was down and the
+            // wallet is the truth. A position with no engine-attributed row was
+            // adopted from chain and has nothing better than the wallet figure,
+            // which is the case this whole function was written for.
+            let seeded_shares = match crate::helpers::db::attributed_shares_for_token(
+                &strategy_name, &token_id.to_string(),
+            ).await {
+                Some((attributed, baseline)) if actual_shares > attributed => {
+                    warn!(
+                        " RECONCILE: wallet holds {:.4} of token {} but only {:.4} is attributed to {} \
+                         (baseline at entry {:.4}) — seeding the attributed size. The extra {:.4} share(s) \
+                         are not this strategy's and an exit must not sell them.",
+                        actual_shares, token_id, attributed, strategy_name, baseline,
+                        actual_shares - attributed,
+                    );
+                    attributed
+                }
+                Some((attributed, _)) => {
+                    // Wallet at or below the attribution: a sale or settlement
+                    // happened while the engine was down.
+                    if attributed > actual_shares {
+                        warn!(
+                            " RECONCILE: token {} attributed {:.4} to {} but the wallet holds {:.4} — \
+                             seeding the wallet, which means shares left while the engine was down.",
+                            token_id, attributed, strategy_name, actual_shares,
+                        );
+                    }
+                    actual_shares
+                }
+                None => actual_shares,
+            };
+
             let mut pos_map = positions.lock().await;
 
             pos_map.insert(PositionKey::new(squadron_id, strategy_name.clone(), market.clone()), Position {
-                shares: actual_shares,
+                shares: seeded_shares,
                 avg_entry,
                 opened_at: Utc::now() - chrono::Duration::seconds(crate::config::MIN_HOLD_SECS_BEFORE_STOP_LOSS),
                 close_time: market_close_time,
