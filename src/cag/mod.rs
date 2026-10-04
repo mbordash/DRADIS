@@ -378,6 +378,15 @@ impl Cag {
             maker_market_name: None,
             deployed_at:       Utc::now(),
             market_class:      market_type.to_string(),
+            // The raptor-health lookup key for the Control Tower, and only that.
+            //
+            // Not where DB rows get their underlying — that is the `TradeScope`
+            // in `patrol_impl`, which is where the `underlying: 'helm'` defect
+            // actually lived and is now fixed. Kept as the class so a squadron's
+            // detail view keeps looking up the health it has always looked up;
+            // deriving a crypto underlying here would point a politics or sports
+            // squadron at a chain's raptor health, which `api/server.rs` refuses
+            // on purpose.
             underlying:        market_type.to_lowercase(),
             raptors:           raptors.to_vec(),
             vipers:            vipers.to_vec(),

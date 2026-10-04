@@ -323,11 +323,31 @@ impl Squadron {
         // to "what kind of market is this?", which the sports board cannot be
         // (its lines expire six hours after kick-off).
         let market_class_for_ctx = market_class.clone();
+        // The shard key and the UNDERLYING are different questions.
+        //
+        // `asset_lc` is the shard — the storage location, which `db::pool_for`
+        // and `alias_pool("helm", "btc")` key on, and which must stay as it is.
+        // The fourth argument is the market's underlying instrument, and filing
+        // the shard key there recorded `underlying: 'helm'` on every row a Helm
+        // squadron wrote: the first live Helm trade, 2026-10-03, was a Bitcoin
+        // market with no Bitcoin in its record and invisible to any analysis
+        // grouped by underlying.
+        //
+        // Only a Helm squadron is corrected, because only its asset is not an
+        // underlying. `None` where the market names no instrument, which is what
+        // the nullable column is for — "will the Chiefs win" has no underlying
+        // and `'helm'` was never one either.
+        let scope_underlying = if self.asset.is_helm() {
+            crate::squadron::underlying_from_market_name(&self.market.market_name)
+                .map(str::to_string)
+        } else {
+            Some(asset_lc.clone())
+        };
         let mut scope = TradeScope::new(
             asset_lc.clone(),
             crate::venues::intl::INTL_VENUE,
             Some(market_class.clone()),
-            Some(asset_lc.clone()),
+            scope_underlying,
         );
 
         // Notification credentials

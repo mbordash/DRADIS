@@ -134,6 +134,7 @@ pub async fn sync_position_balance(
         };
 
         let actual_shares = (raw_shares - baseline_shares).max(dec!(0));
+
         let mut pos_map = positions.lock().await;
 
         if let Some(pos) = pos_map.get_mut(&key) {
@@ -149,7 +150,21 @@ pub async fn sync_position_balance(
                     continue;
                 }
 
-                info!("⚖️ Position Synced [{}]: Token {} updated to actual: {}", strategy_name, token_id, actual_shares);
+                // All three figures, on the line that fires once on success
+                // rather than on every 3-second poll.
+                //
+                // The arithmetic between them is where a position silently
+                // changes size, and none of it was recorded: on 2026-10-03 the
+                // first live Helm trade ordered 190.476 shares and ended up
+                // settled on 260.227 at a blended price, and the mechanism could
+                // not be reconstructed afterwards. `attributed` is what this
+                // function books; a `chain` far above `baseline + attributed`
+                // means the wallet held shares this trade did not buy.
+                info!(
+                    "⚖️ Position Synced [{}]: Token {} updated to actual: {} \
+                     (chain={} baseline={})",
+                    strategy_name, token_id, actual_shares, raw_shares, baseline_shares,
+                );
                 // The entry fee was booked against the shares we *asked* for, but
                 // the venue charges it on what actually filled — and a marketable
                 // FAK routinely over-fills (2026-08-13 trade 353: 16.04 requested,

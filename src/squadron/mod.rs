@@ -186,6 +186,65 @@ pub(crate) fn classification_category<'a>(
 /// operator's market with every one of them.
 #[cfg(test)]
 mod classification_category_tests {
+    /// A market's underlying is not its squadron's asset.
+    ///
+    /// A Helm squadron's asset is `helm`, so every row it filed recorded
+    /// `underlying: 'helm'`. The first live Helm trade, 2026-10-03, was a Bitcoin
+    /// market filed with no Bitcoin in its record.
+    #[test]
+    fn a_market_name_yields_its_underlying_or_nothing() {
+        use super::underlying_from_market_name as u;
+        // The market the first live Helm trade was taken on.
+        assert_eq!(u("Bitcoin Up or Down on October 3?"), Some("btc"));
+        assert_eq!(u("BTC Up or Down - October 2, 4:00PM-8:00PM ET"), Some("btc"));
+        assert_eq!(u("Ethereum above $4,000?"), Some("eth"));
+        assert_eq!(u("Will SOL close higher?"), Some("sol"));
+        assert_eq!(u("BTC/USDT noon candle"), Some("btc"), "punctuation must not hide a ticker");
+
+        // `None` is the right answer, not a gap.
+        assert_eq!(u("Will the Chiefs win?"), None);
+        assert_eq!(u("Who takes the Senate?"), None);
+        assert_eq!(u(""), None);
+    }
+
+    /// Substring matching labelled ordinary words as crypto underlyings.
+    ///
+    /// The first version of this helper used plain `contains`, so a politics or
+    /// sports squadron was given a crypto underlying and shown that chain's
+    /// raptor health: "Netherlands" and "Ethiopia" both read as Ethereum, and
+    /// "resolved", "solar" and "console" as Solana. `api/server.rs` is explicit
+    /// that a non-crypto squadron must not derive raptors from a crypto
+    /// underlying, so this was a regression, not a cosmetic slip.
+    #[test]
+    fn ordinary_words_are_not_underlyings() {
+        use super::underlying_from_market_name as u;
+        for name in [
+            "Will the Netherlands win?",
+            "Ethiopia election 2026",
+            "Will the Senate bill be resolved?",
+            "Solar power mandate passes?",
+            "Will the console launch slip?",
+            "Seth Rogen hosts?",
+            "Absolute majority?",
+            "Methodist conference vote",
+        ] {
+            assert_eq!(u(name), None, "{name} is not a crypto market");
+        }
+    }
+
+    /// A market naming two underlyings has no single one.
+    ///
+    /// The old helper returned whichever it happened to test first, so
+    /// "Bitcoin beat Solana?" came back as Solana purely from check order — and
+    /// the original test pinned "Ethereum or Bitcoin" to eth, which concealed
+    /// exactly that. Ambiguity is `None`.
+    #[test]
+    fn two_underlyings_in_one_question_is_ambiguous() {
+        use super::underlying_from_market_name as u;
+        assert_eq!(u("Will Bitcoin beat Solana?"), None);
+        assert_eq!(u("Ethereum or Bitcoin first to $100k?"), None);
+    }
+
     use super::{classification_category, CryptoAsset};
 
     fn custom(s: &str) -> CryptoAsset { CryptoAsset::Custom(s.to_string()) }
@@ -229,6 +288,70 @@ mod classification_category_tests {
         assert!(!custom("us").is_helm());
         assert!(!CryptoAsset::Btc.is_helm());
     }
+}
+
+/// The crypto underlying a market is about, from its question, or `None`.
+///
+/// Needed because a squadron's ASSET is not always the market's underlying. A
+/// Helm squadron's asset is `helm`, so every row it filed recorded
+/// `underlying: 'helm'` — the first live Helm trade was a Bitcoin market with no
+/// Bitcoin in its record, invisible to any analysis grouped by underlying.
+///
+/// `None` is a first-class answer: "will the Chiefs win" has no underlying
+/// instrument, and `underlying` is nullable precisely so nothing has to invent
+/// one.
+///
+/// Matching is on WHOLE WORDS, and the first version of this was not. Plain
+/// substring matching read "N**eth**erlands" and "**Eth**iopia" as Ethereum, and
+/// "re**sol**ved", "**sol**ar" and "con**sol**e" as Solana — so a politics
+/// squadron would have been labelled a crypto underlying and shown that chain's
+/// raptor health. The ticker aliases are also checked only in upper case, because
+/// a bare lowercase "sol" or "eth" inside ordinary prose is far more often a
+/// coincidence than a ticker.
+pub fn underlying_from_market_name(market_name: &str) -> Option<&'static str> {
+    // Split on anything that is not a letter or digit, so "BTC/USDT" and
+    // "(Bitcoin)" both tokenize.
+    let words: Vec<&str> = market_name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let has_word = |want: &str| {
+        words.iter().any(|w| w.eq_ignore_ascii_case(want))
+    };
+    let has_ticker = |want: &str| {
+        // Case-sensitive: "SOL" is a ticker, "sol" usually is not.
+        words.iter().any(|w| *w == want)
+    };
+
+    // Full names first, and each checked across ALL candidates before any
+    // ticker, so "Bitcoin beat Solana?" cannot resolve to the one that happens
+    // to be tested first. A market naming two underlyings has no single one, so
+    // it is `None` rather than a coin flip.
+    let named: Vec<&'static str> = [
+        ("ethereum", "eth"),
+        ("solana", "sol"),
+        ("bitcoin", "btc"),
+    ]
+    .iter()
+    .filter(|(name, _)| has_word(name))
+    .map(|(_, slug)| *slug)
+    .collect();
+    if named.len() == 1 {
+        return Some(named[0]);
+    }
+    if named.len() > 1 {
+        return None;
+    }
+
+    let tickers: Vec<&'static str> = [("ETH", "eth"), ("SOL", "sol"), ("BTC", "btc")]
+        .iter()
+        .filter(|(t, _)| has_ticker(t))
+        .map(|(_, slug)| *slug)
+        .collect();
+    if tickers.len() == 1 {
+        return Some(tickers[0]);
+    }
+    None
 }
 
 impl CryptoAsset {
