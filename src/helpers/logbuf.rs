@@ -97,9 +97,78 @@ impl Write for TeeWriter {
     }
 }
 
+/// Where the durable copy of the log goes, once resolved.
+///
+/// `None` until the first write, then either an open file or a decision not to
+/// keep one. Resolved once rather than per event, because this runs on every
+/// log line.
+static LOG_FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+
+/// The largest a single log file may grow before it is replaced.
+///
+/// A new file starts when this is exceeded, and exactly one previous generation
+/// is kept alongside it (`dradis.log.1`), so the footprint is bounded at roughly
+/// twice this figure. A t3.medium accumulates a few megabytes a day at
+/// `RUST_LOG=info`, so this holds weeks rather than hours.
+const LOG_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Directory for the durable log, matching the bind mount in the AMI's compose
+/// file (`./logs:/app/logs`). Overridable for a local run or a test.
+fn log_dir() -> std::path::PathBuf {
+    std::env::var("DRADIS_LOG_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/app/logs"))
+}
+
+/// Open the durable log, rotating first if the current one is already full.
+///
+/// Returns `None` when the directory does not exist, which is the normal case
+/// for a local `cargo run` outside the container: the engine then behaves
+/// exactly as it did before this existed.
+fn open_log_file() -> Option<Mutex<std::fs::File>> {
+    let dir = log_dir();
+    if !dir.is_dir() {
+        return None;
+    }
+    let path = dir.join("dradis.log");
+    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) >= LOG_FILE_MAX_BYTES {
+        // One generation back. A longer history is not worth the disk on an
+        // instance whose whole record of what it traded is the SQLite file
+        // beside it.
+        let _ = std::fs::rename(&path, dir.join("dradis.log.1"));
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()
+        .map(Mutex::new)
+}
+
 impl Drop for TeeWriter {
     fn drop(&mut self) {
         let _ = io::stdout().write_all(&self.buf);
+
+        // A durable copy, because stdout is not one.
+        //
+        // The engine's log lived only in the container's stdout, so every
+        // `docker compose up` destroyed it. That is not a theoretical loss: on
+        // 2026-10-03 a deploy erased the entry trace for a live Helm position
+        // whose share count was wrong, and the mechanism had to be found by
+        // reading code instead; and the Momentum break-even gate recorded
+        // verdicts from 2026-09-30 onward that no longer exist. The SQLite
+        // files in this same directory already survive a redeploy — the log is
+        // the one piece of evidence that did not.
+        //
+        // ANSI escapes are stripped on the way in: the ring strips them for the
+        // Console, and a file full of colour codes is worse than useless to
+        // `grep`.
+        if let Some(file) = LOG_FILE.get_or_init(open_log_file).as_ref() {
+            if let Ok(mut f) = file.lock() {
+                let _ = f.write_all(strip_ansi(&String::from_utf8_lossy(&self.buf)).as_bytes());
+            }
+        }
+
         for line in String::from_utf8_lossy(&self.buf).lines() {
             push_line(line);
         }
@@ -120,6 +189,75 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TeeMakeWriter {
 
 #[cfg(test)]
 mod tests {
+
+    /// The durable log is opened only where a directory exists for it.
+    ///
+    /// A local `cargo run` has no `/app/logs`, and the engine must behave
+    /// exactly as it did before the file sink existed rather than failing or
+    /// creating stray directories.
+    #[test]
+    fn a_missing_log_directory_yields_no_file() {
+        let missing = std::env::temp_dir().join("dradis-logbuf-does-not-exist-xyz");
+        let _ = std::fs::remove_dir_all(&missing);
+        // SAFETY: single-threaded test, and the var is read only by `log_dir`.
+        unsafe { std::env::set_var("DRADIS_LOG_DIR", &missing); }
+        assert!(super::open_log_file().is_none(), "no directory means no file, not a panic");
+        assert!(!missing.exists(), "and nothing is created behind the operator's back");
+        unsafe { std::env::remove_var("DRADIS_LOG_DIR"); }
+    }
+
+    /// A full log is rotated, keeping exactly one generation.
+    ///
+    /// Unbounded growth is how a long-lived instance fills its disk; discarding
+    /// everything is how the 2026-10-03 deploy destroyed the evidence this sink
+    /// exists to keep. One generation back bounds the footprint at roughly twice
+    /// the limit while holding weeks of history at `info`.
+    #[test]
+    fn a_full_log_rotates_and_keeps_one_generation() {
+        let dir = std::env::temp_dir().join(format!("dradis-logbuf-rot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("dradis.log");
+        let prev = dir.join("dradis.log.1");
+
+        // A log already past the limit, and an older generation to be replaced.
+        std::fs::write(&prev, b"older generation").unwrap();
+        std::fs::write(&live, vec![b'x'; (super::LOG_FILE_MAX_BYTES + 1) as usize]).unwrap();
+
+        unsafe { std::env::set_var("DRADIS_LOG_DIR", &dir); }
+        let opened = super::open_log_file();
+        assert!(opened.is_some(), "a writable directory must yield a file");
+        assert_eq!(
+            std::fs::metadata(&live).unwrap().len(), 0,
+            "the live log restarts empty after rotation",
+        );
+        assert_eq!(
+            std::fs::metadata(&prev).unwrap().len(), super::LOG_FILE_MAX_BYTES + 1,
+            "the full log becomes the kept generation, replacing the older one",
+        );
+        unsafe { std::env::remove_var("DRADIS_LOG_DIR"); }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A log below the limit is appended to, not rotated.
+    ///
+    /// Rotating on every open would discard the log on each restart, which is
+    /// the failure this sink is meant to end.
+    #[test]
+    fn a_short_log_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("dradis-logbuf-app-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("dradis.log"), b"from the previous process\n").unwrap();
+
+        unsafe { std::env::set_var("DRADIS_LOG_DIR", &dir); }
+        assert!(super::open_log_file().is_some());
+        let kept = std::fs::read_to_string(dir.join("dradis.log")).unwrap();
+        assert!(kept.contains("previous process"), "a restart must not truncate the log");
+        assert!(!dir.join("dradis.log.1").exists(), "and must not rotate a short log");
+        unsafe { std::env::remove_var("DRADIS_LOG_DIR"); }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use super::*;
 
     #[test]

@@ -63,6 +63,21 @@ services:
       nofile:
         soft: 65536
         hard: 65536
+    # Docker's json-file driver has NO size limit by default, and there is no
+    # /etc/docker/daemon.json on the AMI to supply one, so the container log
+    # grows until the disk does. A few megabytes a day at RUST_LOG=info is
+    # survivable for months and not for years.
+    #
+    # This bounds the stream Docker keeps; it is not where the durable log
+    # lives. A container log dies with its container, so every redeploy
+    # discarded it — see `helpers::logbuf`, which now also writes
+    # logs/dradis.log into the bind mount beside the SQLite files, where a
+    # redeploy cannot reach it.
+    logging:
+      driver: json-file
+      options:
+        max-size: "32m"
+        max-file: "3"
     networks: [dradis-net]
 
   control-tower:
