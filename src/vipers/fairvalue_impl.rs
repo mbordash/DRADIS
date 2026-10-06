@@ -320,6 +320,100 @@ impl FairValueGlobals {
 /// Per-asset state, created on first sight of an asset and never dropped.
 /// Leaked deliberately so callers keep the `&'static` borrow the old global
 /// gave them — there are at most a handful of assets per process.
+/// Weekday Eastern event times from the `fairvalue_event_times_et` knob.
+///
+/// "09:30" or "09:30,14:00". A malformed entry is skipped rather than failing
+/// the viper: a typo in an operator knob should cost one event, not trading.
+pub(crate) fn parse_event_times_et(s: &str) -> Vec<(u32, u32)> {
+    s.split(',')
+        .filter_map(|part| {
+            let (h, m) = part.trim().split_once(':')?;
+            let (h, m) = (h.trim().parse::<u32>().ok()?, m.trim().parse::<u32>().ok()?);
+            (h < 24 && m < 60).then_some((h, m))
+        })
+        .collect()
+}
+
+/// Every scheduled weekday event in `(from, to]`, as UTC instants.
+///
+/// The one place weekdays and daylight saving are decided, so the "event
+/// ahead" and "event just passed" questions cannot disagree. Evaluated in
+/// America/New_York so the event moves with the clock it is scheduled on.
+/// Weekends never match: the event this exists for is the US cash open.
+fn weekday_events_between(from: DateTime<Utc>, to: DateTime<Utc>, events: &[(u32, u32)]) -> Vec<DateTime<Utc>> {
+    use chrono::{Datelike, TimeZone, Weekday};
+    use chrono_tz::America::New_York as Et;
+    let mut out = Vec::new();
+    if to <= from || events.is_empty() {
+        return out;
+    }
+    let mut day = from.with_timezone(&Et).date_naive();
+    let last = to.with_timezone(&Et).date_naive();
+    // Bounded: hourly and daily markets span at most a couple of dates.
+    for _ in 0..8 {
+        if day > last {
+            break;
+        }
+        if !matches!(day.weekday(), Weekday::Sat | Weekday::Sun) {
+            for &(h, m) in events {
+                let at = day
+                    .and_hms_opt(h, m, 0)
+                    .and_then(|naive| Et.from_local_datetime(&naive).earliest())
+                    .map(|t| t.with_timezone(&Utc));
+                if let Some(t) = at {
+                    if t > from && t <= to {
+                        out.push(t);
+                    }
+                }
+            }
+        }
+        match day.succ_opt() {
+            Some(next) => day = next,
+            None => break,
+        }
+    }
+    out
+}
+
+/// Whether a scheduled weekday event falls inside `(now, close]`.
+///
+/// Strictly after `now`; an event at or before `now` is handled by
+/// [`post_event_multiplier`] instead. Inclusive of `close`, because a market
+/// that settles at the event still carries its risk.
+pub(crate) fn event_in_horizon(now: DateTime<Utc>, close: DateTime<Utc>, events: &[(u32, u32)]) -> bool {
+    !weekday_events_between(now, close, events).is_empty()
+}
+
+/// The σ multiplier still owed after an event, while the trailing window
+/// catches up with it.
+///
+/// FairValue's σ is measured over a trailing window. At the event none of
+/// that window has seen it; a window later all of it has. If a fraction `f`
+/// of the window is post-event and the event runs at `m` times the prior
+/// volatility, the trailing estimate reads `sqrt(1 - f + f*m^2)` (in units of
+/// the prior σ) while what lies ahead is about `m`. The multiplier that closes
+/// the gap is therefore `m / sqrt(1 - f + f*m^2)`: the full `m` at the event,
+/// falling smoothly to 1 as the window fills.
+///
+/// This is not a refinement. Half the real 9AM entries came after 09:30
+/// (09:30 to 09:35), and they carried $2.83 of the hour's $3.58 loss. Treating
+/// the open as finished the moment it passed would have left most of the loss
+/// in place, because at 09:33 the trailing hour is still 95% pre-open.
+pub(crate) fn post_event_multiplier(m: f64, secs_since_event: f64, window_secs: f64) -> f64 {
+    if !(m > 1.0) || !(window_secs > 0.0) {
+        return 1.0;
+    }
+    let f = (secs_since_event / window_secs).clamp(0.0, 1.0);
+    m / (1.0 - f + f * m * m).sqrt()
+}
+
+/// The most recent scheduled event in `(now - lookback, now]`, if any.
+pub(crate) fn last_event_within(now: DateTime<Utc>, lookback_secs: i64, events: &[(u32, u32)]) -> Option<DateTime<Utc>> {
+    weekday_events_between(now - chrono::Duration::seconds(lookback_secs), now, events)
+        .into_iter()
+        .max()
+}
+
 fn globals(asset: &str) -> &'static FairValueGlobals {
     static G: OnceLock<StdMutex<HashMap<String, &'static FairValueGlobals>>> = OnceLock::new();
     let map = G.get_or_init(|| StdMutex::new(HashMap::new()));
@@ -451,11 +545,66 @@ impl FairValueStrategyImpl {
         floor: f64,
         secs_left: f64,
     ) -> Option<(f64, f64)> {
+        Self::conservative_side_fairs_ev(spot, strike, sigma_realized, floor, secs_left, 1.0)
+    }
+
+    /// [`conservative_side_fairs`](Self::conservative_side_fairs), also priced
+    /// against a scheduled volatility event inside the horizon.
+    ///
+    /// `event_mult` above 1.0 adds a third σ, the floored σ scaled up, and keeps
+    /// the lower value per side exactly as the floor does. That is the point:
+    /// a larger σ pulls the favorite toward 0.5 and pushes the longshot away
+    /// from it, so applying it flat would manufacture longshot edge at the very
+    /// hour the market is hardest to read. Taking the minimum means the event
+    /// can only lower a side's fair value, so it can only remove an entry.
+    ///
+    /// 2026-10-06 9AM ET, real money: NO bought at $0.73 on fair 0.846 at
+    /// σ 4.38e-5; the hour then realized 8.15e-5, at which fair was 0.708,
+    /// below the ask. All ten real 9AM entries had negative edge at the σ the
+    /// hour actually produced. `event_mult` of 1.0 is today's pricing exactly.
+    fn conservative_side_fairs_ev(
+        spot: f64,
+        strike: f64,
+        sigma_realized: f64,
+        floor: f64,
+        secs_left: f64,
+        event_mult: f64,
+    ) -> Option<(f64, f64)> {
         let raw = sigma_realized.max(config::FAIRVALUE_ABSOLUTE_MIN_SIGMA_PER_SQRT_SEC);
         let floored = sigma_realized.max(floor);
         let yes_raw = fair_yes_probability(spot, strike, raw, secs_left)?;
         let yes_floored = fair_yes_probability(spot, strike, floored, secs_left)?;
-        Some((yes_raw.min(yes_floored), (1.0 - yes_raw).min(1.0 - yes_floored)))
+        let mut fair_yes = yes_raw.min(yes_floored);
+        let mut fair_no = (1.0 - yes_raw).min(1.0 - yes_floored);
+        if event_mult > 1.0 {
+            let yes_event = fair_yes_probability(spot, strike, floored * event_mult, secs_left)?;
+            fair_yes = fair_yes.min(yes_event);
+            fair_no = fair_no.min(1.0 - yes_event);
+        }
+        Some((fair_yes, fair_no))
+    }
+
+    /// The σ multiplier for a position that closes at `close`, from the knobs.
+    ///
+    /// 1.0 unless a configured event falls inside `(now, close]`. Values at or
+    /// below 1.0 disable it: the knob exists to inflate σ ahead of an event the
+    /// trailing window cannot see, never to deflate it.
+    fn event_sigma_mult(dc: &crate::helpers::dynamic_config::DynamicConfig, now: DateTime<Utc>, close: Option<DateTime<Utc>>) -> f64 {
+        let mult = dc.fairvalue_event_sigma_multiplier.to_f64().unwrap_or(1.0);
+        if !(mult > 1.0) {
+            return 1.0;
+        }
+        let Some(close) = close else { return 1.0 };
+        let events = parse_event_times_et(&dc.fairvalue_event_times_et);
+        if event_in_horizon(now, close, &events) {
+            return mult;
+        }
+        // The event has passed but the trailing window has not caught up.
+        let window = config::FAIRVALUE_VOL_WINDOW_SECS as i64;
+        match last_event_within(now, window, &events) {
+            Some(at) => post_event_multiplier(mult, (now - at).num_seconds() as f64, window as f64),
+            None => 1.0,
+        }
     }
 
     /// Edge of buying a side at `ask` against the side's fair value, net of
@@ -1143,6 +1292,12 @@ impl FairValueStrategyImpl {
         token_is_yes: bool,
         min_sigma_per_sqrt_sec: f64,
         sigma_floor_horizon_secs: i64,
+        // From `event_sigma_mult` at the moment of the call. Passed in rather
+        // than read from the clock here so tests stay deterministic. It is NOT
+        // the multiplier the entry saw: it decays as the trailing window absorbs
+        // the event, so a position's exit rules see σ as it stands now. 1.0 is
+        // today's pricing.
+        event_mult: f64,
     ) -> Option<f64> {
         let strike = market.strike_price?.to_f64()?;
         let spot = snapshot.oracle_price.to_f64()?;
@@ -1167,8 +1322,9 @@ impl FairValueStrategyImpl {
         drop(samples);
         let sigma_realized = sigma_per_sqrt_sec(&prices, span_secs, config::FAIRVALUE_MIN_VOL_SAMPLES)?;
         let floor = Self::sigma_floor(min_sigma_per_sqrt_sec, sigma_floor_horizon_secs, secs_left);
-        let (fair_yes, fair_no) =
-            Self::conservative_side_fairs(spot, strike, sigma_realized, floor, secs_left as f64)?;
+        let (fair_yes, fair_no) = Self::conservative_side_fairs_ev(
+            spot, strike, sigma_realized, floor, secs_left as f64, event_mult,
+        )?;
         Some(if token_is_yes { fair_yes } else { fair_no })
     }
 }
@@ -1178,7 +1334,7 @@ impl FairValueStrategyImpl {
 /// the sports board once a side has been chosen, so it is the only thing the
 /// shared gate path is parameterized on.
 pub(crate) enum EntryLog {
-    Crypto { fair_yes: f64, d_sigma: f64, sigma: f64, sigma_realized: f64, strike: f64, secs_left: i64 },
+    Crypto { fair_yes: f64, d_sigma: f64, sigma: f64, sigma_realized: f64, strike: f64, secs_left: i64, event_mult: f64 },
     Sports { league: String, outcome_label: String, num_books: i64, dispersion: Option<f64>, line_age_secs: i64, secs_to_start: i64 },
 }
 
@@ -1434,16 +1590,17 @@ impl FairValueStrategyImpl {
             if due {
                 *last = Some(Instant::now());
                 match &log {
-                    EntryLog::Crypto { fair_yes, d_sigma, sigma, sigma_realized, strike, secs_left } => {
+                    EntryLog::Crypto { fair_yes, d_sigma, sigma, sigma_realized, strike, secs_left, event_mult } => {
                         tracing::info!(
-                            " FairValue {} entry: fair={:.3} ask=${:.2} edge={:+.3} (req {:.3}) | d={:+.2}σ T={}s K=${:.2} | shares={:.2}",
-                            side, entry_fair, ask, edge, req_edge, d_sigma, secs_left, strike, shares,
+                            " FairValue {} entry: fair={:.3} ask=${:.2} edge={:+.3} (req {:.3}) | d={:+.2}σ T={}s K=${:.2} event_σ×{:.2} | shares={:.2}",
+                            side, entry_fair, ask, edge, req_edge, d_sigma, secs_left, strike, event_mult, shares,
                         );
                         crate::helpers::metrics::stash_entry_signals_json(token_id.as_str(), serde_json::json!({
                             "viper": "FairValue", "model": "lognormal", "side": side,
                             "fair_yes": fair_yes, "fair_side": entry_fair,
                             "d_sigma": d_sigma, "sigma_per_sqrt_sec": sigma,
                             "sigma_realized_per_sqrt_sec": sigma_realized,
+                            "event_sigma_mult": event_mult,
                             "strike": strike, "secs_left": secs_left,
                             "ask": ask.to_string(), "edge": edge.to_string(),
                             "required_edge": req_edge.to_string(),
@@ -1600,8 +1757,12 @@ impl Strategy for FairValueStrategyImpl {
             Some(p) => p,
             None => { idle("fair value not computable"); return Ok(StrategySignal::NoSignal) },
         };
+        // A scheduled event inside the horizon (the 09:30 ET open, by default)
+        // is volatility the trailing window has not seen yet. Priced as an
+        // extra σ per side, keeping the lower fair, so it only removes entries.
+        let event_mult = Self::event_sigma_mult(dc, Utc::now(), market.market_close_time);
         let (fair_yes_side, fair_no_side) =
-            match Self::conservative_side_fairs(spot, strike, sigma_realized, floor, secs_left as f64) {
+            match Self::conservative_side_fairs_ev(spot, strike, sigma_realized, floor, secs_left as f64, event_mult) {
                 Some(f) => f,
                 None => { idle("fair value not computable"); return Ok(StrategySignal::NoSignal) },
             };
@@ -1653,8 +1814,8 @@ impl Strategy for FairValueStrategyImpl {
             if due {
                 *last = Some(Instant::now());
                 tracing::info!(
-                    " FairValue: fair(YES)={:.3} (d={:+.2}σ, σ/√s={:.2e} realized {:.2e}, T={}s, K=${:.2}) | yes_ask=${:.2} fair={:.3} edge={:+.3} | no_ask=${:.2} fair={:.3} edge={:+.3} | req={:.3} | noise{}={}{}",
-                    fair_yes, d_sigma, sigma, sigma_realized, secs_left, strike,
+                    " FairValue: fair(YES)={:.3} (d={:+.2}σ, σ/√s={:.2e} realized {:.2e}, event_σ×{:.2}, T={}s, K=${:.2}) | yes_ask=${:.2} fair={:.3} edge={:+.3} | no_ask=${:.2} fair={:.3} edge={:+.3} | req={:.3} | noise{}={}{}",
+                    fair_yes, d_sigma, sigma, sigma_realized, event_mult, secs_left, strike,
                     snap.yes_ask, fair_yes_side, yes_edge, snap.no_ask, fair_no_side, no_edge, req_edge,
                     config::FAIRVALUE_EDGE_NOISE_HORIZON_SECS,
                     fair_noise.map_or_else(|| "warmup".to_string(), |n| format!("{:.3}", n)),
@@ -1714,7 +1875,7 @@ impl Strategy for FairValueStrategyImpl {
         let entry_fair = if want_yes { fair_yes_side } else { fair_no_side };
         self.finalize_entry(
             ctx, market, snap, want_yes, edge, req_edge, ask, token_id, fee_bps, entry_fair,
-            EntryLog::Crypto { fair_yes, d_sigma, sigma, sigma_realized, strike, secs_left },
+            EntryLog::Crypto { fair_yes, d_sigma, sigma, sigma_realized, strike, secs_left, event_mult },
         ).await
     }
 
@@ -1801,6 +1962,7 @@ impl Strategy for FairValueStrategyImpl {
                 None => self.fair_prob_for_side(
                     &ctx.crypto_filter, market, snap, token_is_yes,
                     Self::min_sigma(dc), dc.fairvalue_sigma_floor_horizon_secs,
+                    Self::event_sigma_mult(dc, Utc::now(), market.market_close_time),
                 ),
             };
 
@@ -3757,7 +3919,7 @@ mod entry_book_tests {
 
         let strat = FairValueStrategyImpl::default();
         let fair = |yes: bool, floor: f64| strat
-            .fair_prob_for_side(asset, &c.market, &c.snapshot, yes, floor, 0)
+            .fair_prob_for_side(asset, &c.market, &c.snapshot, yes, floor, 0, 1.0)
             .expect("the seeded sampler must let the model price");
         for floor in [5.0e-5, 3.5e-5] {
             let yes = fair(true, floor);
@@ -3788,7 +3950,7 @@ mod entry_book_tests {
 
         let strat = FairValueStrategyImpl::default();
         let fair = |yes: bool| strat
-            .fair_prob_for_side(asset, &c.market, &c.snapshot, yes, 3.5e-5, 600)
+            .fair_prob_for_side(asset, &c.market, &c.snapshot, yes, 3.5e-5, 600, 1.0)
             .expect("the seeded sampler must let the model price");
         let no = fair(false);
         assert!((no - 0.136).abs() < 0.005, "fair(NO)={no}: the floor priced it 0.300");
@@ -4015,7 +4177,7 @@ mod entry_book_tests {
         let strat = FairValueStrategyImpl::default();
         let key = PositionKey::new(c.squadron_id.clone(), "FairValueStrategy", c.market.yes_token.clone());
         let fair_yes = |c: &StrategyContext| strat
-            .fair_prob_for_side(asset, &c.market, &c.snapshot, true, 4.2e-5, 0)
+            .fair_prob_for_side(asset, &c.market, &c.snapshot, true, 4.2e-5, 0, 1.0)
             .expect("the seeded sampler must let the model price");
 
         // Fair clears the line: the resting ask is raised to $0.99.
@@ -4085,7 +4247,7 @@ mod entry_book_tests {
 
         let strat = FairValueStrategyImpl::default();
         let fair_no = strat
-            .fair_prob_for_side(asset, &c.market, &c.snapshot, false, config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC, 0)
+            .fair_prob_for_side(asset, &c.market, &c.snapshot, false, config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC, 0, 1.0)
             .expect("the seeded sampler must let the model price");
         assert!((0.80..0.90).contains(&fair_no), "fair(NO)={fair_no} should sit near the logged 0.846");
 
@@ -4154,7 +4316,7 @@ mod entry_book_tests {
 
         let strat = FairValueStrategyImpl::default();
         let fair_no = strat
-            .fair_prob_for_side(asset, &c.market, &c.snapshot, false, config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC, 0)
+            .fair_prob_for_side(asset, &c.market, &c.snapshot, false, config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC, 0, 1.0)
             .expect("the seeded sampler must let the model price");
         assert!(fair_no < 0.76, "fair(NO)={fair_no} must sit below the fee-net bid for the EV exit");
 
@@ -4198,7 +4360,7 @@ mod entry_book_tests {
         c2.crypto_filter = asset2.to_string();
         c2.dynamic_config = c.dynamic_config.clone();
         let fair_no = strat
-            .fair_prob_for_side(asset2, &c2.market, &c2.snapshot, false, config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC, 0)
+            .fair_prob_for_side(asset2, &c2.market, &c2.snapshot, false, config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC, 0, 1.0)
             .expect("the seeded sampler must let the model price");
         assert!(fair_no > 0.60 - 0.02, "fair(NO)={fair_no}: the EV test must NOT be what fires here");
         c2.positions.lock().await.insert(
@@ -4793,7 +4955,7 @@ mod entry_book_tests {
 
         let strat = FairValueStrategyImpl::default();
         let fair_no = strat
-            .fair_prob_for_side(asset, &c.market, &c.snapshot, false, config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC, 0)
+            .fair_prob_for_side(asset, &c.market, &c.snapshot, false, config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC, 0, 1.0)
             .expect("the seeded sampler must let the model price");
         assert!(
             fair_no >= config::FAIRVALUE_SETTLE_HOLD_MIN_PROB,
@@ -4971,3 +5133,253 @@ mod sports_consensus_tests {
     }
 }
 
+
+#[cfg(test)]
+mod event_sigma_tests {
+    use super::{event_in_horizon, parse_event_times_et, FairValueStrategyImpl as Fv};
+    use chrono::{DateTime, TimeZone, Utc};
+    use chrono_tz::America::New_York as Et;
+    use rust_decimal::prelude::FromPrimitive;
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
+
+    fn et(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
+        Et.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap().with_timezone(&Utc)
+    }
+
+    /// The 2026-10-06 9AM ET trade, replayed. Real money, −$0.76.
+    ///
+    /// NO bought at $0.73: strike $86,214, d = −1.02σ at σ 4.378e-5, 2,441s
+    /// left, required edge 0.093. At today's pricing the edge was 0.0932 and the
+    /// entry cleared by a hair. The hour then realized σ 8.15e-5. At 1.5x the
+    /// edge is negative, so the trade is refused outright rather than narrowly.
+    #[test]
+    fn the_oct_6_entry_is_refused_with_the_event_multiplier() {
+        let (strike, sigma, t) = (86214.0_f64, 4.378005091909438e-5_f64, 2441.0_f64);
+        let spot = strike * (-1.02_f64 * sigma * t.sqrt()).exp();
+        let req = dec!(0.093);
+        let edge_at = |mult: f64| {
+            let (_, no) = Fv::conservative_side_fairs_ev(spot, strike, sigma, 4.2e-5, t, mult).unwrap();
+            Fv::side_edge(Decimal::from_f64(no).unwrap(), dec!(0.73))
+        };
+        assert!(edge_at(1.0) >= req, "today's pricing took this trade: edge {}", edge_at(1.0));
+        assert!(edge_at(1.5) < req, "the event multiplier must refuse it: edge {}", edge_at(1.5));
+        assert!(edge_at(1.5) < Decimal::ZERO, "and not narrowly: the edge is gone entirely");
+    }
+
+    /// Every real 9AM ET FairValue entry, replayed from production inputs.
+    ///
+    /// Ten trades, 2026-09-16 to 2026-10-06, −$3.58 net. Each row is the
+    /// entry's own logged strike, d, σ, horizon, ask and required edge, and the
+    /// seconds from the 09:30 open (negative = before it). Two things are pinned:
+    ///
+    /// - The replay at multiplier 1.0 reproduces the edge production logged, to
+    ///   within 0.002, so this is the model that traded, not a reconstruction
+    ///   of one.
+    /// - At the multiplier the knob now produces at each entry's moment, every
+    ///   one is refused. Five came AFTER 09:30 (09:30:03 to 09:35:06) and carried
+    ///   $2.83 of the loss; treating the open as finished once it passed priced
+    ///   all five at 1.0 and let them through.
+    #[test]
+    fn every_real_9am_entry_is_refused() {
+        use super::post_event_multiplier;
+        let rows: &[(&str, &str, f64, f64, f64, f64, f64, &str, &str, &str, i64)] = &[
+        ("2026-09-16", "NO", 75967.98, -1.3832481497268825, 6.313939637979894e-05, 6.313939637979894e-05, 1616.0, "0.81", "0.0738666666666666666666666667", "0.09012707992884098304800", 189),
+        ("2026-09-17", "NO", 76736.59, -1.3210673739839396, 6.393917101966764e-05, 6.393917101966764e-05, 1691.0, "0.78", "0.0763666666666666666666666667", "0.10831797804747507160200", 113),
+        ("2026-09-18", "YES", 78043.12, 0.9242592904995711, 4.2637694395202145e-05, 4.2637694395202145e-05, 1837.0, "0.65", "0.080818039792", "0.14542464880250336397312", -33),
+        ("2026-09-21", "NO", 85323.0, -1.271042773036409, 9.04422491546886e-05, 9.04422491546886e-05, 1702.0, "0.79", "0.0767333333333333333333333333", "0.0901264764811115407607", 103),
+        ("2026-09-22", "NO", 86024.01, -1.1515124924656879, 6.866445972401373e-05, 6.866445972401373e-05, 1801.0, "0.76", "0.080022219136", "0.0948275263196202497472", 3),
+        ("2026-09-24", "YES", 83604.26, 1.0611760009758933, 5.476188558506805e-05, 5.476188558506805e-05, 2428.0, "0.74", "0.092913340744", "0.0935833315055540724367", -624),
+        ("2026-09-25", "NO", 84471.79, -1.6126983818977039, 7.942385597448673e-05, 7.942385597448673e-05, 1498.0, "0.86", "0.0699333333333333333333333333", "0.0746282733124897635727", 306),
+        ("2026-10-01", "NO", 83736.02, -1.2454346376423728, 5.645216357520584e-05, 5.645216357520584e-05, 1956.0, "0.76", "0.083394644112", "0.1140856420451613609788", -152),
+        ("2026-10-05", "YES", 85904.0, 1.0751934902284057, 4.2e-05, 3.973325575310889e-05, 3002.0, "0.72", "0.103313976680", "0.1162583380195992087772", -1197),
+        ("2026-10-06", "NO", 86214.0, -1.0199870240429811, 4.378005091909438e-05, 4.378005091909438e-05, 2441.0, "0.73", "0.093161747040", "0.0932222231140317512007", -637),
+        ];
+        // These are Polymarket International trades, so they are priced at the
+        // intl taker rate on every build: a US build's 0.06 would describe fees
+        // these trades never paid. Where the build's own rate is the same 0.07
+        // (intl, Kalshi), the explicit formula is checked against `side_edge`
+        // so the two cannot drift apart.
+        let intl_rate = dec!(0.07);
+        let fee = |p: Decimal| intl_rate * p * (Decimal::ONE - p);
+        for &(day, side, strike, d, sigma, realized, t, ask, req, logged, since) in rows {
+            let spot = strike * (d * sigma * t.sqrt()).exp();
+            let ask_d = Decimal::from_str_exact(ask).unwrap();
+            let edge = |m: f64| {
+                let (y, n) = Fv::conservative_side_fairs_ev(spot, strike, realized, sigma, t, m).unwrap();
+                let fair = Decimal::from_f64(if side == "YES" { y } else { n }).unwrap();
+                let explicit = fair - ask_d - fee(ask_d) - fee(fair);
+                if crate::venues::taker_fee_rate() == intl_rate {
+                    assert_eq!(explicit, Fv::side_edge(fair, ask_d), "{day}: explicit fee formula drifted from side_edge");
+                }
+                explicit
+            };
+            let req = Decimal::from_str_exact(req).unwrap();
+            let logged = Decimal::from_str_exact(logged).unwrap();
+            assert!((edge(1.0) - logged).abs() < dec!(0.002),
+                "{day}: replay {} does not reproduce the logged edge {logged}", edge(1.0));
+            assert!(edge(1.0) >= req, "{day}: today's pricing took this trade");
+            let mult = if since < 0 { 1.5 } else { post_event_multiplier(1.5, since as f64, 3600.0) };
+            assert!(edge(mult) < req, "{day} ({since}s from the open): still enters at x{mult:.3}, edge {}", edge(mult));
+        }
+    }
+
+    /// A multiplier of 1.0 is today's pricing exactly, so shipping the knob
+    /// at 1.0 changes nothing.
+    #[test]
+    fn a_multiplier_of_one_is_todays_pricing() {
+        let (spot, strike, t) = (86024.0, 86214.0, 2441.0);
+        for (sigma, floor) in [(4.378e-5, 4.2e-5), (2.4e-5, 5.0e-5), (9.0e-5, 4.2e-5)] {
+            assert_eq!(
+                Fv::conservative_side_fairs_ev(spot, strike, sigma, floor, t, 1.0),
+                Fv::conservative_side_fairs(spot, strike, sigma, floor, t),
+            );
+        }
+    }
+
+    /// The multiplier can only lower a side's fair value, never raise it.
+    ///
+    /// A larger σ pushes a longshot's value UP toward 0.5. Applied flat, that
+    /// would manufacture longshot edge at the hardest hour of the day, the
+    /// exact failure the vol floor's per-side minimum was written to stop
+    /// (2026-09-10 and 09-12, −$3.06 on two longshots). Both sides, both
+    /// directions of the strike.
+    #[test]
+    fn the_multiplier_never_raises_a_fair_value() {
+        let strike = 86214.0;
+        for spot in [85600.0, 86000.0, 86214.0, 86400.0, 86800.0] {
+            for mult in [1.25, 1.5, 2.0, 3.0] {
+                let (y1, n1) = Fv::conservative_side_fairs_ev(spot, strike, 4.4e-5, 4.2e-5, 2400.0, 1.0).unwrap();
+                let (ym, nm) = Fv::conservative_side_fairs_ev(spot, strike, 4.4e-5, 4.2e-5, 2400.0, mult).unwrap();
+                assert!(ym <= y1 + 1e-12, "YES rose at spot {spot} mult {mult}: {y1} -> {ym}");
+                assert!(nm <= n1 + 1e-12, "NO rose at spot {spot} mult {mult}: {n1} -> {nm}");
+            }
+        }
+    }
+
+    /// The post-event multiplier is the full value at the event and decays to
+    /// 1 as the trailing window fills with post-event data.
+    #[test]
+    fn the_post_event_multiplier_decays_as_the_window_fills() {
+        use super::post_event_multiplier as pem;
+        assert!((pem(1.5, 0.0, 3600.0) - 1.5).abs() < 1e-12, "at the event: the full multiplier");
+        assert!((pem(1.5, 3600.0, 3600.0) - 1.0).abs() < 1e-12, "a window later: nothing owed");
+        assert!((pem(1.5, 99999.0, 3600.0) - 1.0).abs() < 1e-12, "and never below 1");
+        // 09:33, 5% of the hour post-open: still almost the whole adjustment.
+        assert!(pem(1.5, 180.0, 3600.0) > 1.45);
+        let mut prev = f64::INFINITY;
+        for secs in (0..=3600).step_by(60) {
+            let m = pem(1.5, secs as f64, 3600.0);
+            assert!(m <= prev + 1e-12, "monotone non-increasing at {secs}s");
+            assert!((1.0..=1.5).contains(&m));
+            prev = m;
+        }
+        assert_eq!(pem(1.0, 0.0, 3600.0), 1.0, "a disabled multiplier stays disabled");
+        assert_eq!(pem(0.5, 0.0, 3600.0), 1.0, "and cannot deflate");
+    }
+
+    /// The knob carries the open through the rest of the 9AM market.
+    #[test]
+    fn the_open_still_counts_after_it_has_passed() {
+        let mut dc = crate::helpers::dynamic_config::DynamicConfig::default();
+        dc.fairvalue_event_sigma_multiplier = dec!(1.5);
+        let close = et(2026, 10, 6, 10, 0);
+        let at = |h: u32, m: u32| Fv::event_sigma_mult(&dc, et(2026, 10, 6, h, m), Some(close));
+        assert_eq!(at(9, 19), 1.5, "before the open: the full multiplier");
+        assert!(at(9, 33) > 1.45, "three minutes after: nearly all of it (was 1.0 before this fix)");
+        // 09:55: 25 of 60 minutes post-open, f = 0.417, so 1.5 / sqrt(1.521) = 1.216.
+        assert!((at(9, 55) - 1.216).abs() < 0.001, "late in the hour the window is still mostly pre-open: {}", at(9, 55));
+        // The 10AM market at 10:40: 70 minutes after the open, window full.
+        assert_eq!(Fv::event_sigma_mult(&dc, et(2026, 10, 6, 10, 40), Some(et(2026, 10, 6, 11, 0))), 1.0);
+    }
+
+    /// The 9AM market at the typical entry time contains the 09:30 open.
+    #[test]
+    fn the_open_is_inside_a_9am_position() {
+        let ev = parse_event_times_et("09:30");
+        // Tuesday 2026-10-06, entered 09:19, closes 10:00 ET.
+        assert!(event_in_horizon(et(2026, 10, 6, 9, 19), et(2026, 10, 6, 10, 0), &ev));
+    }
+
+    /// `event_in_horizon` is about events AHEAD. A just-passed event is not in
+    /// the horizon; the multiplier it is still owed comes from
+    /// `post_event_multiplier` instead.
+    #[test]
+    fn an_event_that_has_happened_does_not_count() {
+        let ev = parse_event_times_et("09:30");
+        assert!(!event_in_horizon(et(2026, 10, 6, 9, 40), et(2026, 10, 6, 10, 0), &ev));
+        assert!(!event_in_horizon(et(2026, 10, 6, 9, 30), et(2026, 10, 6, 10, 0), &ev),
+            "exactly at the event is no longer ahead of it");
+    }
+
+    /// A market that closes before the event never sees it.
+    #[test]
+    fn a_market_closing_before_the_event_is_untouched() {
+        let ev = parse_event_times_et("09:30");
+        assert!(!event_in_horizon(et(2026, 10, 6, 8, 19), et(2026, 10, 6, 9, 0), &ev));
+        // Closing exactly at the event still carries its risk.
+        assert!(event_in_horizon(et(2026, 10, 6, 9, 0), et(2026, 10, 6, 9, 30), &ev));
+    }
+
+    /// There is no US cash open on a weekend.
+    #[test]
+    fn weekends_never_match() {
+        let ev = parse_event_times_et("09:30");
+        // Saturday 2026-10-03 and Sunday 2026-10-04.
+        assert!(!event_in_horizon(et(2026, 10, 3, 9, 19), et(2026, 10, 3, 10, 0), &ev));
+        assert!(!event_in_horizon(et(2026, 10, 4, 9, 19), et(2026, 10, 4, 10, 0), &ev));
+    }
+
+    /// The event moves with Eastern time across daylight saving.
+    ///
+    /// 09:30 ET is 13:30 UTC in October and 14:30 UTC in December. A fixed UTC
+    /// offset would put the multiplier on the wrong hour for half the year.
+    #[test]
+    fn the_event_follows_daylight_saving() {
+        let ev = parse_event_times_et("09:30");
+        let dec_entry = Utc.with_ymd_and_hms(2026, 12, 8, 14, 19, 0).unwrap();
+        let dec_close = Utc.with_ymd_and_hms(2026, 12, 8, 15, 0, 0).unwrap();
+        assert!(event_in_horizon(dec_entry, dec_close, &ev), "Tuesday 09:19 to 10:00 EST");
+        let wrong = Utc.with_ymd_and_hms(2026, 12, 8, 13, 19, 0).unwrap();
+        let wrong_close = Utc.with_ymd_and_hms(2026, 12, 8, 14, 0, 0).unwrap();
+        assert!(!event_in_horizon(wrong, wrong_close, &ev), "08:19 to 09:00 EST is before the open");
+    }
+
+    /// A daily market spanning the event's day still sees it.
+    #[test]
+    fn a_long_horizon_sees_an_event_hours_away() {
+        let ev = parse_event_times_et("09:30");
+        // Monday 22:00 ET to Tuesday 12:00 ET.
+        assert!(event_in_horizon(et(2026, 10, 5, 22, 0), et(2026, 10, 6, 12, 0), &ev));
+        // Friday 22:00 ET to Saturday 12:00 ET: the next open is Monday.
+        assert!(!event_in_horizon(et(2026, 10, 2, 22, 0), et(2026, 10, 3, 12, 0), &ev));
+    }
+
+    /// The knob is operator-typed, so a typo costs one event, not trading.
+    #[test]
+    fn event_times_parse_leniently() {
+        assert_eq!(parse_event_times_et("09:30"), vec![(9, 30)]);
+        assert_eq!(parse_event_times_et(" 09:30 , 14:00 "), vec![(9, 30), (14, 0)]);
+        assert_eq!(parse_event_times_et("09:30,banana,25:00,14:61,14:00"), vec![(9, 30), (14, 0)]);
+        assert!(parse_event_times_et("").is_empty());
+        assert!(!event_in_horizon(et(2026, 10, 6, 9, 19), et(2026, 10, 6, 10, 0), &[]),
+            "no events configured means no adjustment");
+    }
+
+    /// Values at or below 1.0 disable the knob; it exists only to inflate σ.
+    #[test]
+    fn the_knob_cannot_deflate_volatility() {
+        let mut dc = crate::helpers::dynamic_config::DynamicConfig::default();
+        let (now, close) = (et(2026, 10, 6, 9, 19), et(2026, 10, 6, 10, 0));
+        dc.fairvalue_event_sigma_multiplier = dec!(1.5);
+        assert_eq!(Fv::event_sigma_mult(&dc, now, Some(close)), 1.5);
+        dc.fairvalue_event_sigma_multiplier = dec!(0.5);
+        assert_eq!(Fv::event_sigma_mult(&dc, now, Some(close)), 1.0);
+        dc.fairvalue_event_sigma_multiplier = dec!(1.0);
+        assert_eq!(Fv::event_sigma_mult(&dc, now, Some(close)), 1.0);
+        dc.fairvalue_event_sigma_multiplier = dec!(1.5);
+        assert_eq!(Fv::event_sigma_mult(&dc, now, None), 1.0, "no close time, no adjustment");
+        assert_eq!(Fv::event_sigma_mult(&dc, et(2026, 10, 6, 13, 19), Some(et(2026, 10, 6, 14, 0))), 1.0,
+            "an afternoon market is untouched");
+    }
+}

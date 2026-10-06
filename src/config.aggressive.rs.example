@@ -1344,6 +1344,25 @@ pub const FAIRVALUE_EDGE_HORIZON_CAP: Decimal = dec!(0.20);
 // Floor on sigma per sqrt-second — a quiet sampling hour must not collapse the model.
 // Default for the fairvalue_min_sigma_per_sqrt_sec runtime knob (Control Tower: FairValue, Vol Floor).
 pub const FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC: f64 = 3.5e-5;
+/// Multiplier on FairValue's realized σ when a position's horizon contains a
+/// scheduled volatility event (`FAIRVALUE_EVENT_TIMES_ET`).
+///
+/// FairValue estimates σ from the trailing hour, which cannot see an event that
+/// has not happened yet. The 09:30 ET US cash open lands inside the 9AM market,
+/// and across every hourly window from 2026-07-01 to 2026-10-06 the forward σ
+/// for that hour ran a median 1.49x the trailing estimate (1.48x in the trading
+/// period, 1.49x on 69 days before FairValue placed a trade); no other hour
+/// exceeded 1.14x. The understated σ made fair values too extreme at exactly
+/// that hour: all ten real 9AM entries had negative edge at the σ realized, and
+/// the hour carried most of the viper's lifetime loss.
+///
+/// Applied as an extra σ per side, keeping the lower fair value, so it can only
+/// remove an entry, never create one. Default for the
+/// fairvalue_event_sigma_multiplier runtime knob. 1.0 disables.
+pub const FAIRVALUE_EVENT_SIGMA_MULTIPLIER: Decimal = dec!(1.5);
+/// Weekday ET times of scheduled volatility events, "HH:MM" comma-separated.
+/// Default for the fairvalue_event_times_et runtime knob.
+pub const FAIRVALUE_EVENT_TIMES_ET: &str = "09:30";
 /// Horizon at or below which the sigma floor does not bind (ramps to full at 2x).
 /// Defaults to the vol window: trust the measurement as far out as we measured.
 pub const FAIRVALUE_SIGMA_FLOOR_HORIZON_SECS: i64 = 600;

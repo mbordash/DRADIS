@@ -848,6 +848,20 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              half of what the book implied and FairValue lost $3.79 over 15 trades. Values below the absolute \
              backstop (1.0e-5) are raised to it.")
             .range(0.00001, 0.0002).step(0.000005));
+        v.push(F::new(g, e, "fairvalue_event_sigma_multiplier", "Event Vol Multiplier", "decimal", true,
+            "Multiplies the realized-vol input when a position's horizon contains a scheduled volatility event \
+             (Event Times). Realized vol is measured over the trailing hour, so it cannot see the 09:30 ET US \
+             open coming: across every 9AM ET window from July to October 2026, the vol that followed ran a \
+             median 1.49x what the trailing hour said, and no other hour exceeded 1.14x. All ten real 9AM \
+             entries had negative edge at the vol that actually happened. The adjusted value is applied per \
+             side and the lower fair value kept, so this can only REMOVE an entry, never create one. 1.0 \
+             turns it off.")
+            .range(1.0, 3.0).step(0.05));
+        v.push(F::new(g, e, "fairvalue_event_times_et", "Event Times (ET)", "string", true,
+            "Weekday Eastern times of scheduled volatility events, \"HH:MM\" comma-separated, e.g. \"09:30\" \
+             for the US cash open or \"09:30,14:00\" to add an FOMC release. A position whose remaining life \
+             contains one of these has its vol input raised by Event Vol Multiplier. Weekends never match. \
+             Malformed entries are ignored."));
         v.push(F::new(g, e, "fairvalue_edge_noise_multiple", "Edge vs Noise", "decimal", true,
             "Multiple of the model's own recent fair-value noise the edge must clear, on top of Base Edge. \
              Noise is the std-dev of successive fair-value moves over the last 15 min, rescaled to a 2-minute \

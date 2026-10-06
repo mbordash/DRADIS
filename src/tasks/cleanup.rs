@@ -992,7 +992,21 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
                         "DOWN" => "NO",
                         _      => raw_outcome.as_str(),
                     };
-                    if db::adopt_chain_position(&pool, token_str, &pos.title, side, pos.avg_price, pos.size, Some(pos.cur_price)).await {
+                    // Never re-adopt a token the engine just closed. The Data API
+                    // lags the book, so for a few seconds after a sale it still
+                    // lists the pre-sale holding; adopting that creates a ghost
+                    // the sweep then books as a second exit (2026-10-06, trade
+                    // 156). The wallet's true balance is re-read next pass.
+                    if !db::adoption_allowed(
+                        db::recently_exited_at(token_str),
+                        std::time::Instant::now(),
+                        std::time::Duration::from_secs(db::CHAIN_ADOPT_EXIT_GRACE_SECS),
+                    ) {
+                        info!(" Chain-sync [{}]: NOT re-adopting token {} | {} shares — the engine closed it within {}s, \
+                               so this is the Data API's pre-sale balance, not a position",
+                            asset.to_uppercase(), &token_str[..token_str.len().min(20)], pos.size,
+                            db::CHAIN_ADOPT_EXIT_GRACE_SECS);
+                    } else if db::adopt_chain_position(&pool, token_str, &pos.title, side, pos.avg_price, pos.size, Some(pos.cur_price)).await {
                         total_adopted += 1;
                         info!(" Chain-sync [{}]: re-adopted on-chain position — token {} | {} shares @ ${:.4} cur=${:.4} | \"{}\"",
                             asset.to_uppercase(),

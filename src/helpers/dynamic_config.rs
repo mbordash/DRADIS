@@ -209,6 +209,8 @@ fn default_fairvalue_stop_loss()           -> Decimal { config::FAIRVALUE_STOP_L
 fn default_fairvalue_reversal_decay()      -> Decimal { config::FAIRVALUE_MODEL_REVERSAL_DECAY_PCT    }
 fn default_fairvalue_sigma_floor_horizon() -> i64     { config::FAIRVALUE_SIGMA_FLOOR_HORIZON_SECS    }
 fn default_fairvalue_min_sigma()           -> Decimal { decimal_from_f64(config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC) }
+fn default_fairvalue_event_sigma_multiplier() -> Decimal { config::FAIRVALUE_EVENT_SIGMA_MULTIPLIER }
+fn default_fairvalue_event_times_et()        -> String  { config::FAIRVALUE_EVENT_TIMES_ET.to_string() }
 fn default_fairvalue_post_exit_cooldown()  -> i64     { config::FAIRVALUE_POST_EXIT_COOLDOWN_SECS     }
 fn default_fairvalue_max_stop_losses()     -> u32     { config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET  }
 fn default_fairvalue_edge_noise_multiple() -> Decimal { config::FAIRVALUE_EDGE_NOISE_MULTIPLE         }
@@ -1021,6 +1023,15 @@ pub struct DynamicConfig {
     /// constants. Values below the absolute backstop are raised to it.
     #[serde(default = "default_fairvalue_min_sigma")]
     pub fairvalue_min_sigma_per_sqrt_sec: Decimal,
+    /// Multiplier on realized σ when the position's horizon contains a scheduled
+    /// volatility event (`fairvalue_event_times_et`). Trailing σ cannot see an
+    /// event that has not happened; at the 09:30 ET open it ran a median 1.49x
+    /// low. Can only lower a fair value, so it only removes entries. 1.0 disables.
+    #[serde(default = "default_fairvalue_event_sigma_multiplier")]
+    pub fairvalue_event_sigma_multiplier: Decimal,
+    /// Weekday ET times of scheduled volatility events, "HH:MM" comma-separated.
+    #[serde(default = "default_fairvalue_event_times_et")]
+    pub fairvalue_event_times_et: String,
     /// Seconds a token is locked out after any FairValue exit. Re-entries into a
     /// market the viper has just left were 0-for-4 in prod (2026-08-13/14).
     #[serde(default = "default_fairvalue_post_exit_cooldown")]
@@ -1560,6 +1571,8 @@ impl Default for DynamicConfig {
             fairvalue_stop_veto_max_model_decay_pct: config::FAIRVALUE_STOP_VETO_MAX_MODEL_DECAY_PCT,
             fairvalue_sigma_floor_horizon_secs: config::FAIRVALUE_SIGMA_FLOOR_HORIZON_SECS,
             fairvalue_min_sigma_per_sqrt_sec: decimal_from_f64(config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC),
+            fairvalue_event_sigma_multiplier: config::FAIRVALUE_EVENT_SIGMA_MULTIPLIER,
+            fairvalue_event_times_et: config::FAIRVALUE_EVENT_TIMES_ET.to_string(),
             fairvalue_post_exit_cooldown_secs: config::FAIRVALUE_POST_EXIT_COOLDOWN_SECS,
             fairvalue_max_stop_losses_per_market: config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET,
             fairvalue_edge_noise_multiple:    config::FAIRVALUE_EDGE_NOISE_MULTIPLE,

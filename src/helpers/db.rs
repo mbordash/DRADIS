@@ -3941,11 +3941,59 @@ pub async fn close_ghost_open_position(pool: &SqlitePool, token_id: &str) {
 
 /// Remove a row from `open_positions` when a position is closed (any exit reason).
 /// Keyed by (strategy, token_id) — unique across all sessions.
+/// How long after an engine exit chain-sync may not re-adopt the token.
+///
+/// The Data API indexes fills seconds behind the order book, so for a short
+/// while after a sale it still lists the full holding. 600 seconds covers that
+/// lag plus a full drift tick. A correctness bound against venue lag, not a
+/// strategy setting.
+pub const CHAIN_ADOPT_EXIT_GRACE_SECS: u64 = 600;
+
+/// Tokens the engine closed, and when. Process-local on purpose: it guards a
+/// race measured in seconds, and a restart clears the in-memory positions this
+/// protects anyway.
+fn recent_exits() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static REG: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn note_recent_exit(token_id: &str) {
+    if let Ok(mut reg) = recent_exits().lock() {
+        let grace = std::time::Duration::from_secs(CHAIN_ADOPT_EXIT_GRACE_SECS);
+        reg.retain(|_, at| at.elapsed() < grace);
+        reg.insert(token_id.to_string(), std::time::Instant::now());
+    }
+}
+
+/// When the engine last closed this token, if within the grace window.
+pub fn recently_exited_at(token_id: &str) -> Option<std::time::Instant> {
+    recent_exits().lock().ok()?.get(token_id).copied()
+}
+
+/// Whether chain-sync may adopt a token, given when the engine last exited it.
+///
+/// No for `grace` after an exit. On 2026-10-06 a FairValue stop sold its
+/// position and five seconds later chain-sync re-adopted it from a Data API
+/// still listing the pre-sale balance; the sweep then booked that ghost as a
+/// second exit. Refusing the adoption stops the ghost from existing, which is
+/// the root of the race; `recent_exit_covers` is the second line, for any path
+/// that creates the row anyway.
+pub fn adoption_allowed(exited_at: Option<std::time::Instant>, now: std::time::Instant, grace: std::time::Duration) -> bool {
+    match exited_at {
+        Some(at) => now.saturating_duration_since(at) >= grace,
+        None => true,
+    }
+}
+
 pub async fn close_open_position(
     pool: &SqlitePool,
     strategy: &str,
     token_id: &str,
 ) {
+    // Every engine exit funnels through here, so this is where the tombstone
+    // that keeps chain-sync from re-adopting a just-sold token is written.
+    note_recent_exit(token_id);
     if let Err(e) = sqlx::query(
         "DELETE FROM open_positions WHERE strategy = ? AND token_id = ?"
     )
@@ -3989,6 +4037,62 @@ pub async fn purge_all_live_open_positions(pool: &SqlitePool) -> usize {
 /// arbitrage case where a resolved YES+NO pair is booked as a single YES-side
 /// settlement row: the NO leg shares equal the pair size, so it still matches and is
 /// correctly NOT re-booked. If a match exists we must NOT fabricate a second row.
+/// How far back a just-made exit can cover a later reconcile booking.
+///
+/// Long enough to span the Data API's indexing lag, a 60-second drift tick and
+/// the 300-second cleanup loop, which is the whole chain that produced the
+/// 2026-10-06 phantom. Short enough that a separate later position on the same
+/// market is not mistaken for the earlier one. A correctness bound against
+/// venue lag, not a strategy setting.
+const RECENT_EXIT_COVER_SECS: i64 = 900;
+
+/// Whether a real exit this strategy just booked already accounts for `qty`.
+///
+/// `market_has_matching_trade` matches sizes to 0.001, which an exact match
+/// needs. An engine exit is not exact: it sells a two-decimal order size and
+/// leaves sub-minimum dust in the wallet, so the size a later sweep preserves
+/// (the full holding) differs from the size the exit booked by that dust. On
+/// 2026-10-06 the stop booked 5.06 and the sweep found 5.0684 to book; 0.0084
+/// exceeded the tolerance and the same sale was booked twice.
+///
+/// Scoped to the same strategy, market and side, within
+/// `RECENT_EXIT_COVER_SECS`, and to a residue of under one hundredth of a share
+/// ABOVE the booked size. That is the exact mechanism: buys produce four-decimal
+/// share counts and sells floor to two decimals, so the residue is always below
+/// 0.01, and the re-adopted ghost carries the pre-sale holding, so it is never
+/// smaller than what was sold.
+///
+/// The tolerance must not be wider. A first version used `MIN_ORDER_SHARES`
+/// (1.0) on the theory that anything larger would have been sold, which is
+/// false: the venue minimum is 5 shares and FairValue holds a smaller
+/// remainder to settlement. A stop that sold 3.00 of 5.06 leaves 2.06 held; if
+/// the operator then sells that by hand, |3.00 - 2.06| = 0.94 would have read
+/// as dust and a real sale would have left the ledger. The 2026-09-13 case is
+/// untouched by design: there the engine had booked nothing to cover it.
+pub async fn recent_exit_covers(pool: &SqlitePool, strategy: &str, market: &str, side: &str, qty: Decimal) -> bool {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT shares FROM trades
+          WHERE strategy = ? AND market = ? AND side = ? AND ghost = 0
+            AND julianday(replace(substr(ts, 1, 19), 'T', ' ')) >= julianday('now', ?)"
+    )
+    .bind(strategy).bind(market).bind(side)
+    .bind(format!("-{RECENT_EXIT_COVER_SECS} seconds"))
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    rows.iter().any(|s| {
+        s.parse::<Decimal>()
+            .map(|booked| {
+                let residue = qty - booked;
+                residue >= Decimal::ZERO && residue < EXIT_DUST_SHARES
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// The most an engine exit leaves behind: sells floor to two decimals.
+const EXIT_DUST_SHARES: Decimal = Decimal::from_parts(1, 0, 0, false, 2); // 0.01
+
 pub async fn market_has_matching_trade(pool: &SqlitePool, market: &str, shares: Decimal) -> bool {
     let share_dust = Decimal::new(1, 3); // 0.001
     let rows: Vec<String> = sqlx::query_scalar("SELECT shares FROM trades WHERE market = ?")
@@ -4561,6 +4665,15 @@ pub async fn purge_stale_open_positions(
             if entry > Decimal::ZERO && qty > Decimal::ZERO {
                 if market_has_matching_trade(pool, &market, qty).await {
                     // Already booked (strategy close or settlement) — don't double-count.
+                } else if recent_exit_covers(pool, &strategy, &market, &side, qty).await {
+                    // The exit this strategy just made already booked this sale;
+                    // the size differs only by the dust the exit left behind.
+                    warn!(
+                        "🧾 Ledger reconcile: NOT booking {} {} {} | {} sh — a {} exit on this market \
+                         and side within {}s already booked it (the difference is exit dust). This is a \
+                         re-adopted row from a lagging Data API, not a second sale.",
+                        strategy, market, side, qty, strategy, RECENT_EXIT_COVER_SECS,
+                    );
                 } else {
                     // Position is a long outcome token: P&L = (exit − entry) × shares
                     // for either YES or NO side (both were bought at `entry`).
@@ -6640,6 +6753,139 @@ mod reconcile_tests {
         ).fetch_one(&pool).await.unwrap();
         assert_eq!(settled, None, "a sale-sized remainder is not a settled transition");
         assert!((fee_now.unwrap().parse::<f64>().unwrap() - 0.10).abs() < 1e-9);
+    }
+
+    /// A remainder sold by hand is a real sale, even right after a partial exit.
+    ///
+    /// A stop that sells 3.00 of 5.06 leaves 2.06, below the venue's 5-share
+    /// minimum, which FairValue holds rather than sells. If the operator sells
+    /// it by hand minutes later, the sweep must book it. A first version of the
+    /// dust tolerance (1.0 share) would have read |3.00 - 2.06| = 0.94 as exit
+    /// dust and dropped the sale from the ledger.
+    #[tokio::test]
+    async fn a_hand_sold_remainder_after_a_partial_exit_is_still_booked() {
+        let pool = mem_pool().await;
+        let (tok, mkt) = ("tok-remainder", "Bitcoin Up or Down - October 7, 2PM ET");
+        sqlx::query(
+            "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, session_id, fees, ghost)
+             VALUES (?, 'FairValueStrategy', ?, 'YES', '0.70', '0.61', '3.00', '-0.30',
+                     'FairValueSL: partial', ?, '0.05', 0)"
+        )
+        .bind(Utc::now().to_rfc3339()).bind(mkt).bind(current_session_id())
+        .execute(&pool).await.unwrap();
+        insert_open(&pool, "FairValueStrategy", tok, mkt, "YES", "0.70", "2.06", Some("0.64"), "confirmed").await;
+
+        assert!(!recent_exit_covers(&pool, "FairValueStrategy", mkt, "YES", dec_of("2.06")).await,
+            "2.06 held after a 3.00 exit is a position, not dust");
+        purge_stale_open_positions(&pool, &HashSet::new(), &HashMap::new(), &HashSet::new()).await;
+        let booked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM trades WHERE reason LIKE 'ChainReconcile%'"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(booked, 1, "the hand sale of the remainder must be booked");
+    }
+
+    /// The tolerance covers exactly the floor-to-two-decimals residue.
+    #[tokio::test]
+    async fn exit_dust_is_under_a_hundredth_of_a_share_above_the_sale() {
+        let pool = mem_pool().await;
+        let mkt = "Bitcoin Up or Down - October 7, 3PM ET";
+        sqlx::query(
+            "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, session_id, fees, ghost)
+             VALUES (?, 'FairValueStrategy', ?, 'NO', '0.73', '0.61', '5.06', '-0.76', 'FairValueSL', ?, '0.15', 0)"
+        )
+        .bind(Utc::now().to_rfc3339()).bind(mkt).bind(current_session_id())
+        .execute(&pool).await.unwrap();
+        let covers = |q: &'static str| { let pool = pool.clone(); async move {
+            recent_exit_covers(&pool, "FairValueStrategy", mkt, "NO", dec_of(q)).await } };
+        assert!(covers("5.0684").await, "the 2026-10-06 ghost: 0.0084 above the sale");
+        assert!(covers("5.06").await, "an exact match");
+        assert!(!covers("5.07").await, "0.01 above is no longer floor residue");
+        assert!(!covers("5.05").await, "a ghost is never SMALLER than the sale");
+        assert!(!covers("4.06").await, "a separate smaller position");
+        // Other strategies and sides never cover.
+        assert!(!recent_exit_covers(&pool, "GboostStrategy", mkt, "NO", dec_of("5.0684")).await);
+        assert!(!recent_exit_covers(&pool, "FairValueStrategy", mkt, "YES", dec_of("5.0684")).await);
+    }
+
+    /// Chain-sync may not re-adopt a token inside the grace window after an exit.
+    #[test]
+    fn adoption_waits_out_the_grace_window_after_an_exit() {
+        use std::time::{Duration, Instant};
+        let grace = Duration::from_secs(CHAIN_ADOPT_EXIT_GRACE_SECS);
+        let exited = Instant::now();
+        assert!(!adoption_allowed(Some(exited), exited, grace), "the moment of the exit");
+        assert!(!adoption_allowed(Some(exited), exited + Duration::from_secs(5), grace),
+            "five seconds later, which is when 2026-10-06 re-adopted");
+        assert!(!adoption_allowed(Some(exited), exited + grace - Duration::from_secs(1), grace));
+        assert!(adoption_allowed(Some(exited), exited + grace + Duration::from_secs(1), grace),
+            "after the window a real orphan must still be adopted");
+        assert!(adoption_allowed(None, exited, grace), "a token never exited adopts normally");
+    }
+
+    /// `close_open_position` writes the tombstone. Every sale path funnels
+    /// through it (verified by review across intl, US, Kalshi and the API).
+    #[tokio::test]
+    async fn the_exit_funnel_leaves_a_tombstone() {
+        let pool = mem_pool().await;
+        let tok = "tok-tombstone-unique-7f3a";
+        assert!(recently_exited_at(tok).is_none());
+        record_open_position(&pool, &TradeScope::shard_only("test"), "btc-open", "FairValueStrategy", tok,
+            "mkt", "NO", dec_of("0.73"), dec_of("5.06"), false).await;
+        close_open_position(&pool, "FairValueStrategy", tok).await;
+        assert!(recently_exited_at(tok).is_some(), "close_open_position must record the exit");
+        assert!(!adoption_allowed(recently_exited_at(tok), std::time::Instant::now(),
+            std::time::Duration::from_secs(CHAIN_ADOPT_EXIT_GRACE_SECS)),
+            "and that exit must block re-adoption");
+    }
+
+    /// 2026-10-06 9AM ET, replayed: a position the engine had already sold and
+    /// booked was re-adopted from a lagging Data API and booked a second time.
+    ///
+    /// The stop sold 5.06 of 5.0684 shares at $0.61 and recorded trade 155.
+    /// Five seconds later chain-sync still saw 5.0684 shares (indexer lag), found
+    /// no row, and re-adopted it. The drift corrector then read the true balance
+    /// of 0.0084 and preserved 5.0684 as the size to book, and the sweep booked
+    /// that at a two-minute-stale Gamma mark of $0.725 as trade 156. The dedup
+    /// guard missed it because the 0.0084 dust exceeds its 0.001 tolerance.
+    ///
+    /// One position, two exits. Here the phantom was −$0.025 only because the
+    /// stale mark sat near the entry; on a 190-share position it is dollars.
+    #[tokio::test]
+    async fn a_position_already_booked_is_not_booked_again_after_re_adoption() {
+        let pool = mem_pool().await;
+        let (tok, mkt) = ("tok-oct6", "Bitcoin Up or Down - October 6, 9AM ET");
+        sqlx::query(
+            "INSERT INTO entries (ts, strategy, token_id, market, side, entry_price, shares, session_id)
+             VALUES (?, 'FairValueStrategy', ?, ?, 'NO', '0.7299', '5.0684', ?)"
+        )
+        .bind(Utc::now().to_rfc3339()).bind(tok).bind(mkt).bind(current_session_id())
+        .execute(&pool).await.unwrap();
+        // The stop's own booking, trade 155.
+        sqlx::query(
+            "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, session_id, fees, ghost)
+             VALUES (?, 'FairValueStrategy', ?, 'NO', '0.73', '0.61', '5.06', '-0.7613',
+                     'FairValueSL: bid=$0.6100, loss=-16.43%', ?, '0.1541', 0)"
+        )
+        .bind(Utc::now().to_rfc3339()).bind(mkt).bind(current_session_id())
+        .execute(&pool).await.unwrap();
+
+        // Re-adoption from the lagging Data API, then the drift corrector.
+        assert!(adopt_chain_position(&pool, tok, mkt, "NO", dec_of("0.7299"), dec_of("5.0684"), Some(dec_of("0.62"))).await);
+        update_position_from_chain(&pool, tok, dec_of("0.0084"), dec_of("0.7299"), None).await;
+        sqlx::query("UPDATE open_positions SET current_price = '0.725' WHERE token_id = ?")
+            .bind(tok).execute(&pool).await.unwrap();
+
+        purge_stale_open_positions(&pool, &HashSet::new(), &HashMap::new(), &HashSet::new()).await;
+
+        let phantoms: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM trades WHERE reason LIKE 'ChainReconcile%'"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(phantoms, 0, "the sale was already booked as trade 155; booking it again invents a trade");
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades").fetch_one(&pool).await.unwrap();
+        assert_eq!(total, 1, "exactly the one real exit");
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions WHERE token_id = ?")
+            .bind(tok).fetch_one(&pool).await.unwrap();
+        assert_eq!(left, 0, "the re-adopted ghost row must still be cleared, just not booked");
     }
 
     /// The row the 2026-09-13 sweep actually found: 0.0028 shares of dust with
