@@ -102,6 +102,35 @@ pub fn u256_from_market_id(market: &MarketId) -> Result<U256> {
         .with_context(|| format!("intl: invalid MarketId (not decimal U256): {market}"))
 }
 
+/// Shares the exchange reports as matched immediately, in the order's own
+/// orientation: a SELL gives up `making` shares, a BUY receives `taking`. Zero
+/// when nothing matched (a resting order, or a FAK that found no liquidity).
+fn matched_shares(side: Side, making: Decimal, taking: Decimal) -> Decimal {
+    if making > Decimal::ZERO && taking > Decimal::ZERO {
+        match side {
+            Side::Sell => making,
+            Side::Buy  => taking,
+        }
+    } else {
+        Decimal::ZERO
+    }
+}
+
+/// The size to report as filled: what the exchange matched, when it matched.
+///
+/// It used to echo the requested quantity, which is not what trades. A BUY is
+/// signed for whole shares, so a request of 6.3796 buys 6; and a marketable BUY
+/// spends a fixed amount of USDC, so a better fill price buys MORE than asked
+/// (2026-10-06: 5.0 requested, 5.0684 received). Callers book this figure, so
+/// the lifecycle's naked-leg flatten booked the requested size of a sale.
+///
+/// When nothing matched immediately the requested size is kept, unchanged from
+/// before: a resting order has not filled yet and reports what it was placed
+/// for, and callers that care treat that case through their own fallbacks.
+fn reported_filled(matched: Decimal, requested: Decimal) -> Decimal {
+    if matched > Decimal::ZERO { matched } else { requested }
+}
+
 /// Polymarket's taker fee for a matched order, in USDC.
 ///
 ///   fee = rate · p · (1 − p) · shares
@@ -320,20 +349,13 @@ impl Execution for IntlClobVenue {
         // lifecycle when it does fill. The exchange charges this out of
         // collateral and reports it nowhere, so leaving it at zero here made
         // every lifecycle-adopted position carry a free entry (see `taker_fee`).
-        let matched_shares = if making_amount > dec!(0) && taking_amount > dec!(0) {
-            match intent.side {
-                Side::Sell => making_amount,
-                Side::Buy  => taking_amount,
-            }
-        } else {
-            Decimal::ZERO
-        };
+        let matched_shares = matched_shares(intent.side, making_amount, taking_amount);
         let fee = taker_fee(live_taker_fee_rate(), fill_price, matched_shares);
 
         Ok(Fill {
             order_id: OrderId(order_id),
             market: intent.market,
-            filled: intent.quantity,
+            filled: reported_filled(matched_shares, intent.quantity),
             price: fill_price, fee
         })
     }
@@ -622,5 +644,48 @@ mod tests {
         // Peaks at the coin flip, collapses toward either tail.
         assert!(taker_fee(rate, dec!(0.50), dec!(10)) > taker_fee(rate, dec!(0.10), dec!(10)));
         assert!(taker_fee(rate, dec!(0.50), dec!(10)) > taker_fee(rate, dec!(0.90), dec!(10)));
+    }
+}
+
+#[cfg(test)]
+mod reported_fill_tests {
+    use super::{matched_shares, reported_filled};
+    use crate::venues::core::Side;
+    use rust_decimal_macros::dec;
+
+    /// 2026-10-06: a BUY requested at 5.0 shares received 5.0684, because a
+    /// marketable buy spends fixed USDC and the price improved. Report the
+    /// shares received, not the shares asked for.
+    #[test]
+    fn a_price_improved_buy_reports_the_shares_received() {
+        // BUY orientation: making = USDC paid, taking = shares received.
+        let m = matched_shares(Side::Buy, dec!(3.65), dec!(5.0684));
+        assert_eq!(m, dec!(5.0684));
+        assert_eq!(reported_filled(m, dec!(5.0)), dec!(5.0684));
+    }
+
+    /// A request of 6.3796 is signed for whole shares, so 6 trade.
+    #[test]
+    fn a_whole_share_buy_reports_six_not_the_fraction_requested() {
+        let m = matched_shares(Side::Buy, dec!(3.42), dec!(6));
+        assert_eq!(reported_filled(m, dec!(6.3796)), dec!(6));
+    }
+
+    /// SELL orientation: making = shares given up. A stop that sold 5.06 of a
+    /// 5.0684 holding (sells floor to two decimals) reports 5.06.
+    #[test]
+    fn a_sell_reports_the_shares_given_up() {
+        let m = matched_shares(Side::Sell, dec!(5.06), dec!(3.0866));
+        assert_eq!(reported_filled(m, dec!(5.0684)), dec!(5.06));
+    }
+
+    /// Nothing matched: the requested size is kept, exactly as before, so a
+    /// resting order and callers' own fallbacks behave unchanged.
+    #[test]
+    fn an_unmatched_order_keeps_the_requested_size() {
+        let m = matched_shares(Side::Buy, dec!(0), dec!(0));
+        assert_eq!(m, dec!(0));
+        assert_eq!(reported_filled(m, dec!(5.0)), dec!(5.0));
+        assert_eq!(matched_shares(Side::Sell, dec!(5), dec!(0)), dec!(0), "half a pair is not a match");
     }
 }

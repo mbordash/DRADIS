@@ -147,7 +147,7 @@ fn side_reject_reason(
         // `maker_edge`. Nine live fills at the 4-tick default netted 1–2 ticks
         // per win against ≥2.7 ticks per forced exit.
         let nets = maker_edge::win_ticks(spread, dec!(1), dc.maker_resting_exit_ask_improvement_ticks);
-        let fee_ticks = maker_edge::exit_fee_ticks(crate::venues::taker_fee_rate(), bid_price);
+        let fee_ticks = maker_edge::exit_fee_ticks(fee_rate, bid_price);
         return Some(("spread", format!(
             "spread {:.3} < min {:.3} (nets {:.0} tick(s) if lifted; a forced exit pays \u{2248}{:.1} ticks of fee on top of the move)",
             spread, dc.maker_min_spread, nets, fee_ticks
@@ -1059,7 +1059,7 @@ impl Strategy for MakerStrategyImpl {
                     snapshot.yes_has_ask(), yes_book_ok, taker_flow_blocks_yes, yes_toxic_cooldown,
                     yes_spread, yes_bid_price,
                     snapshot.yes_ask, no_bid, velocity_bias_strong_negative,
-                    crate::venues::fee_rate_from_ceiling_bps(market.yes_fee_bps), dc,
+                    crate::venues::charged_fee_rate(market.yes_fee_bps), dc,
                 ).unwrap_or(("unknown", "unknown".to_string())),
             };
             let (no_key, no_detail) = match no_streak {
@@ -1068,7 +1068,7 @@ impl Strategy for MakerStrategyImpl {
                     snapshot.no_has_ask(), no_book_ok, taker_flow_blocks_no, no_toxic_cooldown,
                     no_spread, no_bid_price,
                     snapshot.no_ask, yes_bid, velocity_bias_strong_positive,
-                    crate::venues::fee_rate_from_ceiling_bps(market.no_fee_bps), dc,
+                    crate::venues::charged_fee_rate(market.no_fee_bps), dc,
                 ).unwrap_or(("unknown", "unknown".to_string())),
             };
             // Displayed as one line, counted per leg: the advisor's refusal
@@ -2578,5 +2578,44 @@ mod sports_dispersion_tests {
         assert!(sports_widest_credible_dispersion(&none_recorded, 300, 5, Utc::now()).is_none());
         let empty = SportsMarketLine { yes: None, no: None };
         assert!(sports_widest_credible_dispersion(&empty, 300, 5, Utc::now()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod charged_fee_rate_tests {
+    use crate::venues::charged_fee_rate;
+    use rust_decimal_macros::dec;
+
+    /// The crypto path's stored 1000 bps is the CLOB's authorization ceiling,
+    /// not a rate. Converted naively it reads 0.40; the venue charges its own
+    /// taker coefficient.
+    #[test]
+    fn the_crypto_authorization_ceiling_resolves_to_the_venue_rate() {
+        assert_eq!(charged_fee_rate(1000), crate::venues::taker_fee_rate());
+        assert!(charged_fee_rate(1000) < dec!(0.40), "never the naive 0.40");
+    }
+
+    /// The event path's published rates are already charged rates, and below
+    /// every venue's coefficient, so they pass through unchanged.
+    #[test]
+    fn published_event_rates_pass_through() {
+        assert_eq!(charged_fee_rate(125), dec!(0.05), "sports");
+        assert_eq!(charged_fee_rate(100), dec!(0.04), "politics");
+        assert_eq!(charged_fee_rate(0), dec!(0), "a published zero is free");
+    }
+
+    /// The 2026-10-07 BTC daily refusals, in the numbers that exposed this.
+    ///
+    /// A 1c book at a $0.12 bid was logged "below fee floor 0.0422 — unquotable
+    /// at any min_spread". 0.0422 is 0.40 x 0.12 x 0.88. At the rate actually
+    /// charged the one-leg floor is well under a cent, so the book is refused
+    /// by `maker_min_spread`, not by fees, and the message must say so.
+    #[test]
+    fn a_one_cent_btc_book_is_not_unquotable_at_any_min_spread() {
+        let bid = dec!(0.12);
+        let floor = crate::venues::taker_leg_fee_pct_at(bid, charged_fee_rate(1000)) * bid;
+        assert!(floor < dec!(0.01), "the true floor {floor} is under a 1c spread");
+        let naive = crate::venues::taker_leg_fee_pct_at(bid, dec!(0.40)) * bid;
+        assert!((naive - dec!(0.0422)).abs() < dec!(0.0001), "the logged figure was the naive one: {naive}");
     }
 }

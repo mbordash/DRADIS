@@ -227,8 +227,12 @@ impl Strategy for BasisStrategyImpl {
         // Without this, a $15 order at 1000 bps adds ~$0.67 in fees, pushing the required total
         // above the available pUSD balance and causing a 400 "not enough balance" rejection.
         let trade_size = crate::vipers::basis_impl::basis_trade_size(skew.abs(), dc.basis_min_trade_size_usdc, dc.basis_max_trade_size_usdc, dc.basis_entry_skew_threshold);
-        let no_fee_headroom  = dec!(1) + Decimal::from(market.no_fee_bps)  / dec!(10000);
-        let yes_fee_headroom = dec!(1) + Decimal::from(market.yes_fee_bps) / dec!(10000);
+        // At the fee the venue actually charges at each side's ask, not the raw
+        // field: on the crypto path that is the CLOB's 1000-bps authorization
+        // ceiling, which read as a flat 10% and sized every crypto entry several
+        // percent under `trade_size` (see `venues::taker_fee_headroom`).
+        let no_fee_headroom  = crate::venues::taker_fee_headroom(snap.no_ask,  market.no_fee_bps);
+        let yes_fee_headroom = crate::venues::taker_fee_headroom(snap.yes_ask, market.yes_fee_bps);
 
         // ── Balance Gate ─────────────────────────────────────────────────────
         // If the wallet can't cover even the minimum trade + fee, skip entirely.

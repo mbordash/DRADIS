@@ -3641,6 +3641,13 @@ async fn insert_open_position(
     status: &str,
     engine_attributed: bool,
 ) {
+    // A row written straight in as `confirmed` (an immediate fill, or a holding
+    // the venue reported) is a confirmation the Data API may not have indexed
+    // yet, exactly like a later `confirm_position_status`. Noted even when the
+    // `WHERE NOT EXISTS` below skips the write: the fill is fresh either way.
+    if status == "confirmed" && !ghost_mode {
+        note_confirmation(token_id);
+    }
     let ts = Utc::now().to_rfc3339();
     let sid = current_session_id();
     let venue = resolved_venue(scope);
@@ -3865,6 +3872,8 @@ pub async fn confirm_position_status(
     strategy: &str,
     token_id: &str,
 ) {
+    // The sweep must not book this row before the Data API has indexed it.
+    note_confirmation(token_id);
     if let Err(e) = sqlx::query(
         "UPDATE open_positions SET status = 'confirmed' WHERE strategy = ? AND token_id = ?"
     )
@@ -3963,6 +3972,69 @@ fn note_recent_exit(token_id: &str) {
         let grace = std::time::Duration::from_secs(CHAIN_ADOPT_EXIT_GRACE_SECS);
         reg.retain(|_, at| at.elapsed() < grace);
         reg.insert(token_id.to_string(), std::time::Instant::now());
+    }
+}
+
+/// How long after a fill is confirmed the sweep may not book its row as an
+/// off-strategy exit.
+///
+/// The engine confirms a fill from the CLOB balance, which is immediate; the
+/// sweep decides a position is gone from the Data API, which indexes fills
+/// seconds to minutes behind. A row confirmed moments ago and not yet in the
+/// Data API's list is a fill the indexer has not seen, not a position someone
+/// sold. Covers that lag plus one 300-second cleanup pass. A correctness bound
+/// against venue lag, not a strategy setting.
+pub const CONFIRMED_ROW_SWEEP_GRACE_SECS: u64 = 600;
+
+/// Tokens whose rows were confirmed, and when. Process-local for the same
+/// reason as `recent_exits`: it guards a race measured in seconds.
+fn recent_confirmations() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static REG: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn note_confirmation(token_id: &str) {
+    if let Ok(mut reg) = recent_confirmations().lock() {
+        let grace = std::time::Duration::from_secs(CONFIRMED_ROW_SWEEP_GRACE_SECS);
+        reg.retain(|_, at| at.elapsed() < grace);
+        reg.insert(token_id.to_string(), std::time::Instant::now());
+    }
+}
+
+/// When this token's row was last confirmed, if the registry still holds it.
+pub fn recently_confirmed_at(token_id: &str) -> Option<std::time::Instant> {
+    recent_confirmations().lock().ok()?.get(token_id).copied()
+}
+
+/// Test-only: treat a token's confirmation as long past.
+///
+/// For tests whose subject is what a sweep BOOKS for an established position
+/// that left the wallet, not how fresh the fill is. Without it, a position a
+/// test has just written looks like a fill the indexer has not seen yet, and
+/// the sweep correctly waits instead of booking.
+#[cfg(test)]
+pub(crate) fn forget_confirmation(token_id: &str) {
+    if let Ok(mut reg) = recent_confirmations().lock() {
+        reg.remove(token_id);
+    }
+}
+
+/// Whether the sweep must leave a confirmed row alone this pass.
+///
+/// Yes for `grace` after confirmation. A race the 2026-09-17 post-mortem
+/// exposed, NOT the cause of 2026-09-17: that incident was title routing (a
+/// tennis token the sweep could not assign to any asset, fixed in `98efbc1`; see
+/// `sync_open_positions_with_chain`). This is the neighbouring hole. `live_ids`
+/// come only from the Data API, which indexes fills seconds behind the CLOB
+/// balance that confirms them (seconds of lag observed on 2026-10-06, trade
+/// 156), so a confirmed row the indexer has not seen reads exactly like a
+/// position someone sold. No instance of this race has been logged. A row the
+/// indexer has not caught up with is waited on, never booked.
+pub fn confirmed_row_protected(confirmed_at: Option<std::time::Instant>, now: std::time::Instant, grace: std::time::Duration) -> bool {
+    match confirmed_at {
+        Some(at) => now.saturating_duration_since(at) < grace,
+        None => false,
     }
 }
 
@@ -4639,6 +4711,22 @@ pub async fn purge_stale_open_positions(
                 purged += 1;
             note_position_released(&token_id);
             }
+            continue;
+        }
+
+        // A confirmed row the Data API has not indexed yet is a fresh fill, not
+        // a position someone sold. Wait for the indexer rather than book it as
+        // an off-strategy exit and drop shares no viper would then manage.
+        if !is_pending && confirmed_row_protected(
+            recently_confirmed_at(&token_id),
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(CONFIRMED_ROW_SWEEP_GRACE_SECS),
+        ) {
+            info!(
+                "🧾 Ledger reconcile: waiting on {} {} | {} sh — confirmed within {}s and not yet \
+                 indexed by the Data API; not booking it as an off-strategy exit",
+                strategy, market, shares, CONFIRMED_ROW_SWEEP_GRACE_SECS,
+            );
             continue;
         }
 
@@ -6807,6 +6895,84 @@ mod reconcile_tests {
         assert!(!recent_exit_covers(&pool, "FairValueStrategy", mkt, "YES", dec_of("5.0684")).await);
     }
 
+    /// The sweep waits on a freshly confirmed row instead of booking it.
+    #[test]
+    fn a_confirmed_row_is_protected_only_inside_the_grace() {
+        use std::time::{Duration, Instant};
+        let grace = Duration::from_secs(CONFIRMED_ROW_SWEEP_GRACE_SECS);
+        let at = Instant::now();
+        assert!(confirmed_row_protected(Some(at), at, grace), "the moment it is confirmed");
+        assert!(confirmed_row_protected(Some(at), at + Duration::from_secs(300), grace),
+            "a full cleanup pass later, still inside the grace");
+        assert!(!confirmed_row_protected(Some(at), at + grace + Duration::from_secs(1), grace),
+            "after the grace a genuine outside sale must still be booked");
+        assert!(!confirmed_row_protected(None, at, grace), "a row nobody confirmed recently is not protected");
+    }
+
+    /// An immediate fill the Data API has not indexed yet.
+    ///
+    /// The fill is confirmed from the CLOB balance; if the next sweep runs before
+    /// the Data API lists the token, the row would be booked as "closed
+    /// off-strategy" at the mark and the shares dropped from management. The row
+    /// must survive the pass and nothing may be booked. (The market name is the
+    /// 2026-09-17 tennis match for realism only; that incident's cause was title
+    /// routing, not this race.)
+    #[tokio::test]
+    async fn a_fresh_fill_the_indexer_has_not_seen_is_not_booked_as_sold() {
+        let pool = mem_pool().await;
+        let tok = "tok-fresh-fill-0917-unique";
+        record_open_position(&pool, &TradeScope::shard_only("test"), "sports-open", "MakerStrategy", tok,
+            "Valencia: Guiomar Maristany vs Marina Bassols Ribera", "YES", dec_of("0.47"), dec_of("17.02"), false).await;
+        sqlx::query("UPDATE open_positions SET current_price = '0.56' WHERE token_id = ?")
+            .bind(tok).execute(&pool).await.unwrap();
+
+        purge_stale_open_positions(&pool, &HashSet::new(), &HashMap::new(), &HashSet::new()).await;
+
+        let booked: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE reason LIKE 'ChainReconcile%'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(booked, 0, "a fill the indexer has not seen is not a sale");
+        let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions WHERE token_id = ?")
+            .bind(tok).fetch_one(&pool).await.unwrap();
+        assert_eq!(kept, 1, "and the position stays under management");
+    }
+
+    /// A resting quote confirmed later is protected too.
+    ///
+    /// Maker's row is written when the quote is placed and confirmed only when
+    /// it fills, possibly hours later, so the row's own timestamp says nothing
+    /// about how fresh the fill is. The confirmation is what counts.
+    #[tokio::test]
+    async fn a_resting_quote_confirmed_late_is_protected_from_its_confirmation() {
+        let pool = mem_pool().await;
+        let tok = "tok-late-confirm-unique";
+        sqlx::query(
+            "INSERT INTO open_positions (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted, status, current_price)
+             VALUES ('2026-10-07T08:00:00+00:00', 's1', 'MakerStrategy', ?, 'Some event', 'YES', '0.31', '25', 0, 0, 'pending', '0.35')"
+        ).bind(tok).execute(&pool).await.unwrap();
+        confirm_position_status(&pool, "MakerStrategy", tok).await;
+
+        purge_stale_open_positions(&pool, &HashSet::new(), &HashMap::new(), &HashSet::new()).await;
+
+        let booked: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE reason LIKE 'ChainReconcile%'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(booked, 0, "hours-old quote, seconds-old fill: still a fresh fill");
+    }
+
+    /// Without a recent confirmation, a vanished confirmed row is still booked.
+    ///
+    /// The guard must not swallow genuine outside sales: those are exactly
+    /// what the off-strategy booking exists to record.
+    #[tokio::test]
+    async fn an_old_confirmed_row_that_vanished_is_still_booked() {
+        let pool = mem_pool().await;
+        insert_open(&pool, "MakerStrategy", "tok-old-confirmed-unique", "Some event", "YES",
+                    "0.31", "25", Some("0.35"), "confirmed").await;
+        purge_stale_open_positions(&pool, &HashSet::new(), &HashMap::new(), &HashSet::new()).await;
+        let booked: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE reason LIKE 'ChainReconcile%'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(booked, 1, "an outside sale of an established position is still recorded");
+    }
+
     /// Chain-sync may not re-adopt a token inside the grace window after an exit.
     #[test]
     fn adoption_waits_out_the_grace_window_after_an_exit() {
@@ -6974,6 +7140,12 @@ mod reconcile_tests {
         record_open_position(&pool, &scope, "btc-open", "GboostStrategy", "tok-sold",
             "Bitcoin Up or Down - September 13, 8AM ET", "NO", dec_of("0.4899"), dec_of("7.142858"), false).await;
         sqlx::query("UPDATE open_positions SET status = 'confirmed', current_price = '0.60' WHERE token_id = 'tok-sold'").execute(&pool).await.unwrap();
+        // An established position, not a fill seconds old: a fresh confirmation
+        // is waited on rather than booked (see `confirmed_row_protected`), and
+        // this test is about what the booking carries, not about timing. The
+        // fresh-fill case is covered by
+        // `a_fresh_fill_the_indexer_has_not_seen_is_not_booked_as_sold`.
+        forget_confirmation("tok-sold");
         assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &HashMap::new(), &HashSet::new()).await, 1);
 
         let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(

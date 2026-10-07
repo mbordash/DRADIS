@@ -1469,7 +1469,10 @@ impl FairValueStrategyImpl {
         };
 
         // ── Size: the trade size, raised to the venue's minimum order ────────
-        let fee_headroom = dec!(1) + Decimal::from(fee_bps) / dec!(10000);
+        // At the fee the venue actually charges at this ask (see
+        // `venues::taker_fee_headroom`). The raw field read the crypto path's
+        // 1000-bps authorization ceiling as a flat 10%.
+        let fee_headroom = crate::venues::taker_fee_headroom(ask, u32::from(fee_bps));
         let shares = match Self::entry_shares(
             dc.fairvalue_trade_size_usdc,
             fee_headroom,

@@ -172,6 +172,46 @@ pub fn fee_rate_from_ceiling_bps(fee_bps: u32) -> Decimal {
 /// The sibling of [`exit_only_fee_pct`] for callers holding a market's own rate
 /// rather than the venue-wide one. Same quadratic, same evaluation at the entry
 /// price; only the coefficient differs.
+/// The fee rate a market actually charges, from its stored `*_fee_bps` field.
+///
+/// The field carries two different units depending on how the market arrived.
+/// The event path (`cag::adama`) stores the market's published rate in the
+/// ceiling convention: 125 for sports (0.05), 100 for politics (0.04). The
+/// crypto hourly and daily path (`cag::run`) stores what the CLOB's
+/// `fee-rate-bps` endpoint returns, 1000, which is the ceiling an order
+/// AUTHORIZES and not a charged rate (`venues::intl::taker_fee`). Converted the
+/// same way, 1000 reads as 0.40 rather than the 0.07 actually charged.
+///
+/// No market charges more than the venue's own taker coefficient, so a
+/// converted rate above it can only be that authorization ceiling, and the
+/// venue rate is the honest answer. Callers: Maker's refusal message (which
+/// told the operator a 1c BTC book was "unquotable at any min_spread" when its
+/// real one-leg floor at $0.12 is 0.74c), and the entry-size fee reserve of
+/// FairValue and Basis via [`taker_fee_headroom`]. Arbitrage still reads the
+/// raw field, in a branch its own comment documents as unreachable.
+///
+/// The cap is the live `intl_taker_fee_rate` knob, so an operator who sets it
+/// below a market's published rate (0.05 sports, 0.04 politics) would see that
+/// market's label clipped to the knob. Label only; no quote depends on it.
+pub fn charged_fee_rate(fee_bps: u32) -> Decimal {
+    crate::venues::fee_rate_from_ceiling_bps(fee_bps).min(taker_fee_rate())
+}
+
+/// The multiplier a taker BUY at `ask` must reserve for its fee, so that
+/// `shares * ask * headroom` covers the order and the fee charged on it.
+///
+/// The venue charges `rate * p * (1 - p)` per share, so as a share of the money
+/// spent the fee is `rate * (1 - p)`: about 3.5% at $0.50, 5.6% at $0.20, and
+/// only 1.75% at $0.75. FairValue and Basis previously reserved
+/// `1 + fee_bps / 10000`, which on the crypto path read the CLOB's 1000-bps
+/// authorization ceiling as a flat 10% and sized every crypto entry several
+/// percent below the configured trade size. A flat 1.75% would have been the
+/// opposite error, under-reserving every contract below $0.75 and reopening the
+/// "not enough balance" rejections the reserve exists to prevent.
+pub fn taker_fee_headroom(ask: Decimal, fee_bps: u32) -> Decimal {
+    Decimal::ONE + taker_leg_fee_pct_at(ask, charged_fee_rate(fee_bps))
+}
+
 pub fn taker_leg_fee_pct_at(entry_price: Decimal, rate: Decimal) -> Decimal {
     if entry_price <= Decimal::ZERO || entry_price >= Decimal::ONE { return Decimal::ZERO; }
     if rate <= Decimal::ZERO { return Decimal::ZERO; }
@@ -629,3 +669,60 @@ mod startup_sweep_gate_tests {
     }
 }
 
+
+#[cfg(test)]
+mod taker_fee_headroom_tests {
+    use super::{taker_fee_headroom, taker_fee_rate};
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
+
+    /// The reserve is the fee as a share of spend: `rate * (1 - ask)`.
+    #[test]
+    fn the_reserve_is_the_fee_share_of_spend_at_this_ask() {
+        assert_eq!(taker_fee_headroom(dec!(0.50), 1000), Decimal::ONE + taker_fee_rate() * dec!(0.50),
+            "crypto: the venue's own rate, not the 1000-bps ceiling");
+        assert_eq!(taker_fee_headroom(dec!(0.50), 125), dec!(1.025), "sports 0.05 at $0.50");
+        assert_eq!(taker_fee_headroom(dec!(0.50), 100), dec!(1.02),  "politics 0.04 at $0.50");
+        assert_eq!(taker_fee_headroom(dec!(0.50), 0), Decimal::ONE,  "a free market reserves nothing");
+        assert_eq!(taker_fee_headroom(Decimal::ZERO, 1000), Decimal::ONE, "no usable ask, no reserve");
+        assert_eq!(taker_fee_headroom(Decimal::ONE, 1000), Decimal::ONE);
+    }
+
+    /// The property the reserve exists for: order plus the fee actually
+    /// charged never exceeds the trade size, at any price. Basis documents the
+    /// failure if it does: a "not enough balance" rejection from the venue.
+    #[test]
+    fn order_plus_charged_fee_never_exceeds_the_trade_size() {
+        let trade = dec!(4);
+        for bps in [1000u32, 125, 100] {
+            let rate = super::charged_fee_rate(bps);
+            for cents in 2..=98 {
+                let ask = Decimal::new(cents, 2);
+                let shares = trade / taker_fee_headroom(ask, bps) / ask;
+                let cost = shares * ask + rate * ask * (Decimal::ONE - ask) * shares;
+                assert!(cost <= trade + dec!(0.0000001), "bps {bps} ask {ask}: cost {cost} > {trade}");
+            }
+        }
+    }
+
+    /// Both alternatives were wrong, in opposite directions.
+    ///
+    /// The old reserve read the crypto path's 1000 bps as a flat 10%, spending
+    /// several percent less than the configured size. A flat 1.75% (the 175-bps
+    /// ceiling of the real coefficient) is the fee share only at $0.75, so it
+    /// under-reserves every cheaper contract and the order plus its fee would
+    /// exceed the trade size.
+    #[test]
+    fn neither_a_flat_ten_percent_nor_a_flat_one_point_seven_five_is_right() {
+        let (trade, ask) = (dec!(4), dec!(0.65));
+        let old = trade / dec!(1.10) / ask;
+        let new = trade / taker_fee_headroom(ask, 1000) / ask;
+        assert!(new > old, "the real fee sizes up from the old flat 10%");
+
+        let cheap = dec!(0.20);
+        let rate = super::charged_fee_rate(1000);
+        let flat = trade / dec!(1.0175) / cheap;
+        let cost_flat = flat * cheap + rate * cheap * (Decimal::ONE - cheap) * flat;
+        assert!(cost_flat > trade, "a flat 1.75% overspends at $0.20: {cost_flat}");
+    }
+}
