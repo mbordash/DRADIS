@@ -427,32 +427,72 @@ async fn stream_alpaca_iex(
     let auth = format!(r#"{{"action":"auth","key":"{key}","secret":"{secret}"}}"#);
     ws.send(Message::Text(auth.into())).await.map_err(|e| format!("auth send failed: {e}"))?;
 
-    let mut subscribed = false;
     // Subscribe to all symbols: BTC ETFs (Tide) + TradFi (Horizon)
     let tickers: Vec<&str> = all_tickers();
+    consume_feed(&mut ws, Duration::from_secs(ALPACA_IDLE_SECS), quotes, vol_windows, &tickers).await
+}
 
+/// How long the feed may go without a frame before a keepalive ping is sent,
+/// and then how long that ping may go unanswered before the connection is
+/// treated as dead.
+const ALPACA_IDLE_SECS: u64 = 120;
+
+/// Consume an authenticated feed until it closes, errors, or stops answering.
+///
+/// Silence alone is not death: off-hours, and on market holidays (which
+/// `is_us_market_open` does not know about), IEX legitimately sends nothing for
+/// hours. So silence is answered with a WebSocket ping, and only a ping that
+/// goes unanswered for another `idle` ends the connection. A live server pongs
+/// whatever the market is doing; a dead connection never does.
+///
+/// The previous loop only waited. On 2026-10-07 the shared feed authenticated
+/// at 23:02 the night before, then died without a close frame; with nothing
+/// sent and nothing received the read simply timed out every 120 seconds for
+/// fourteen hours, Tide sat empty and Horizon reported the market closed
+/// through the US session, and no line was ever logged. Returning `Err` here is
+/// what lets `run_equity_feed` log the drop and reconnect.
+async fn consume_feed<T>(
+    ws: &mut tokio_tungstenite::WebSocketStream<T>,
+    idle: Duration,
+    quotes: &QuoteMap,
+    vol_windows: &mut HashMap<&'static str, VecDeque<(Instant, Decimal)>>,
+    tickers: &[&str],
+) -> Result<(), String>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut subscribed = false;
+    let mut awaiting_pong = false;
     loop {
-        // Generous read timeout: off-hours the feed is legitimately silent, so a
-        // timeout just re-polls (keeping pings flowing) rather than reconnecting.
-        match tokio_timeout(Duration::from_secs(120), ws.next()).await {
+        match tokio_timeout(idle, ws.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => {
-                handle_alpaca_payload(
-                    &text, quotes, vol_windows, &mut ws, &mut subscribed, &tickers,
-                ).await?;
+                awaiting_pong = false;
+                handle_alpaca_payload(&text, quotes, vol_windows, ws, &mut subscribed, tickers).await?;
             }
             // Alpaca's default is JSON text; tolerate binary by attempting UTF-8.
             Ok(Some(Ok(Message::Binary(bin)))) => {
+                awaiting_pong = false;
                 if let Ok(text) = String::from_utf8(bin.to_vec()) {
-                    handle_alpaca_payload(
-                        &text, quotes, vol_windows, &mut ws, &mut subscribed, &tickers,
-                    ).await?;
+                    handle_alpaca_payload(&text, quotes, vol_windows, ws, &mut subscribed, tickers).await?;
                 }
             }
-            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {} // keepalive
+            // Any frame from the server proves the connection is alive.
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => awaiting_pong = false,
             Ok(Some(Ok(Message::Close(_)))) | Ok(None) => return Ok(()),
             Ok(Some(Ok(_))) => {} // frame types we don't care about
             Ok(Some(Err(e))) => return Err(format!("ws error: {e}")),
-            Err(_) => {} // 120s idle — normal off-hours; keep the socket open
+            Err(_) if awaiting_pong => {
+                return Err(format!(
+                    "no reply to a keepalive ping within {}s — the connection is dead",
+                    idle.as_secs(),
+                ));
+            }
+            Err(_) => {
+                ws.send(Message::Ping(Vec::<u8>::new().into()))
+                    .await
+                    .map_err(|e| format!("keepalive ping failed: {e}"))?;
+                awaiting_pong = true;
+            }
         }
     }
 }
@@ -550,4 +590,82 @@ fn json_decimal(v: &serde_json::Value) -> Option<Decimal> {
         return Decimal::from_f64(f);
     }
     v.as_str().and_then(|s| Decimal::from_str(s).ok())
+}
+
+#[cfg(test)]
+mod feed_liveness_tests {
+    //! Against a real WebSocket server on localhost, with the idle window cut
+    //! to milliseconds: the behavior under test is the network's, not a mock's.
+    use super::{consume_feed, QuoteMap};
+    use futures::{SinkExt, StreamExt};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::time::{timeout, Duration};
+    use tokio_tungstenite::{accept_async, connect_async, tungstenite::protocol::Message};
+
+    const IDLE: Duration = Duration::from_millis(200);
+
+    fn empty_quotes() -> QuoteMap { Arc::new(tokio::sync::Mutex::new(HashMap::new())) }
+
+    /// A peer that stops answering is declared dead, so the caller reconnects.
+    ///
+    /// The 2026-10-07 failure: the feed died without a close frame and the old
+    /// loop waited on it for fourteen hours. The server here completes the
+    /// handshake and then never reads again, so a ping can never be answered.
+    #[tokio::test]
+    async fn a_peer_that_stops_answering_is_declared_dead() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let held = accept_async(tcp).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await; // hung: never polls
+            drop(held);
+        });
+        let (mut ws, _) = connect_async(format!("ws://{addr}")).await.unwrap();
+        let mut vol = HashMap::new();
+        let outcome = timeout(Duration::from_secs(3), consume_feed(&mut ws, IDLE, &empty_quotes(), &mut vol, &[])).await;
+        server.abort();
+        let err = outcome.expect("must not wait forever").expect_err("a hung peer is not a healthy connection");
+        assert!(err.contains("keepalive ping"), "{err}");
+    }
+
+    /// A quiet but healthy peer is NOT declared dead.
+    ///
+    /// Off-hours and on market holidays IEX legitimately sends nothing. This
+    /// server sends nothing either, but keeps reading, so the WebSocket layer
+    /// answers each ping. The feed must still be running when the test stops it.
+    #[tokio::test]
+    async fn a_quiet_but_live_peer_is_kept() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(tcp).await.unwrap();
+            while let Some(Ok(_)) = ws.next().await {} // reading answers pings
+        });
+        let (mut ws, _) = connect_async(format!("ws://{addr}")).await.unwrap();
+        let mut vol = HashMap::new();
+        let outcome = timeout(Duration::from_millis(1500), consume_feed(&mut ws, IDLE, &empty_quotes(), &mut vol, &[])).await;
+        server.abort();
+        assert!(outcome.is_err(), "still consuming after 7 idle windows, as it should be: {outcome:?}");
+    }
+
+    /// A clean close ends the feed normally, as before.
+    #[tokio::test]
+    async fn a_clean_close_ends_normally() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(tcp).await.unwrap();
+            let _ = ws.send(Message::Close(None)).await;
+            while let Some(Ok(_)) = ws.next().await {}
+        });
+        let (mut ws, _) = connect_async(format!("ws://{addr}")).await.unwrap();
+        let mut vol = HashMap::new();
+        let outcome = timeout(Duration::from_secs(3), consume_feed(&mut ws, IDLE, &empty_quotes(), &mut vol, &[])).await;
+        assert_eq!(outcome.expect("must end"), Ok(()));
+    }
 }
