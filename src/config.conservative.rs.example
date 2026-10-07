@@ -317,13 +317,18 @@ pub const MOMENTUM_MAX_FEE_TO_TARGET_RATIO: Decimal = dec!(0.40);
 /// 2026-09-29 overnight: one lift at $0.75 and one stop at $0.58 from two $0.65
 /// entries made +$0.21 gross and -$0.13 net.
 ///
-/// Observe-first, like MAKER_HORIZON_GATE_ENFORCE: with ENFORCE false the verdict
-/// is computed and recorded on every entry (log line and Viper Backtrace) and on
-/// every held spike, and nothing is refused. 0.50 is "the plan must be profitable
-/// at a coin flip"; enforcing it at the current 15%/10% plan refuses the whole
-/// $0.58-$0.69 band, so the cap and the plan are a decision to make together.
+/// ENFORCED since 2026-10-07. It ran observe-first from 2026-09-30, recording a
+/// verdict on every entry and held spike while refusing nothing. Its first live
+/// verdict was the 2026-10-07 12PM ET entry: NO at $0.58, break-even win rate
+/// 58.9% against the 50% cap, "would veto (observe)". The trade was taken and
+/// stopped out at -17.8% (-$1.20), taking Momentum's real record to 1 win in 8,
+/// -$7.89. 0.50 is "the plan must be profitable at a coin flip".
+///
+/// The cap and the take-profit are one decision: at a 15% target no reachable
+/// entry clears it, so enforcing it alone stops Momentum entirely. See
+/// MOMENTUM_TARGET_PROFIT_PERCENT for the target each profile pairs it with.
 pub const MOMENTUM_MAX_BREAK_EVEN_WIN_RATE: Decimal = dec!(0.50);
-pub const MOMENTUM_BREAK_EVEN_GATE_ENFORCE: bool = false;
+pub const MOMENTUM_BREAK_EVEN_GATE_ENFORCE: bool = true;
 
 /// How long the oracle must read reversed, continuously, before the Momentum
 /// reversal exit fires. `velocity` is a 5s window (MOMENTUM_WINDOW_SECS), so one
@@ -1533,7 +1538,7 @@ pub const FAIRVALUE_MAX_SNAPSHOT_AGE_SECS: i64 = 900; // daily book is quiet; FA
 pub const FAIRVALUE_POST_EXIT_COOLDOWN_SECS: i64 = 1200;
 /// Record a counterfactual for every position the percentage stop closes.
 ///
-/// Observe-first, like MOMENTUM_BREAK_EVEN_GATE_ENFORCE: the live stop keeps
+/// Observe-only: the live stop keeps
 /// firing exactly as before; this only opens a row when a stop FILL is booked
 /// and follows the market to the venue's resolution, recording what holding
 /// those shares would have returned (pure hold, and hold with the catastrophic
