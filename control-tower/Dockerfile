@@ -60,6 +60,12 @@ COPY --from=builder --chown=nextjs:nodejs /app/public/                     ./pub
 USER nextjs
 EXPOSE 3002
 
+# The entry point is a thin wrapper around Next's generated server.js. Next
+# exposes no setting for Node's requestTimeout, whose 300-second default ended
+# a 247 MB backup restore with "HTTP 408" on 2026-10-06; ct-server.js raises it
+# and then starts server.js unchanged.
+COPY --chown=nextjs:nodejs ct-server.js ./ct-server.js
+
 # DRADIS_API_URL is injected at runtime:
 #   docker run -e DRADIS_API_URL=http://dradis-btc:9000 ...
-CMD ["node", "server.js"]
+CMD ["node", "ct-server.js"]
