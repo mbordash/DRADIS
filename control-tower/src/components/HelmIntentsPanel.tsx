@@ -36,7 +36,7 @@ import { useCallback, useState } from 'react';
 import useSWR from 'swr';
 import type { HelmIntent } from '@/lib/types';
 import {
-  acknowledgeHelmIntent, cancelHelmIntent, getHelmSummary, HelmApiError, listHelmIntents, scoreHelmCritique,
+  acknowledgeHelmIntent, cancelHelmIntent, getHelmSummary, getVipersStatus, HelmApiError, listHelmIntents, scoreHelmCritique,
 } from '@/lib/api';
 
 const STATUS_COLOR: Record<string, string> = {
@@ -55,7 +55,11 @@ const IN_FLIGHT = new Set(['working', 'filled', 'partial']);
 /** Nothing more will happen to it. Matches `IntentStatus::is_terminal` in Rust. */
 const isTerminal = (status: string) => status === 'closed' || status === 'superseded';
 
-function IntentRow({ intent, showSquadron, onChanged }: { intent: HelmIntent; showSquadron: boolean; onChanged: () => void }) {
+function IntentRow({ intent, showSquadron, onChanged, engineReason }: {
+  intent: HelmIntent; showSquadron: boolean; onChanged: () => void;
+  /** The Helm viper's current reason for not entering, from the status feed. */
+  engineReason?: string | null;
+}) {
   const [read, setRead] = useState(false);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
@@ -95,6 +99,12 @@ function IntentRow({ intent, showSquadron, onChanged }: { intent: HelmIntent; sh
       <p className="text-xs font-mono text-gray-300 whitespace-pre-wrap">{intent.first.thesis}</p>
       <p className="text-[11px] font-mono text-gray-500">Wrong if: {intent.first.falsification}</p>
       {intent.status_detail && <p className="text-[11px] font-mono text-gray-500">{intent.status_detail}</p>}
+      {/* An acknowledged intent that has not entered is waiting on the engine's
+          gates. Until 2026-10-08 the reason was a log line: a live operator with
+          Live Orders off saw an intent that never entered and nothing saying why. */}
+      {intent.status === 'acknowledged' && engineReason && (
+        <p className="text-[11px] font-mono text-amber-200">Engine, not entering: {engineReason}</p>
+      )}
       {intent.fee_verdict && <p className="text-[11px] font-mono text-amber-200">Fee: {intent.fee_verdict}</p>}
       <div className="rounded border border-indigo-500/20 bg-indigo-500/5 px-2 py-1.5">
         <p className="text-[10px] font-mono uppercase tracking-wide text-indigo-300">Critique</p>
@@ -228,6 +238,14 @@ export default function HelmIntentsPanel({
     { refreshInterval: open ? 3_000 : 30_000 },
   );
   const { data: summary, mutate: mutateSummary } = useSWR('helm-summary', getHelmSummary, { refreshInterval: open ? 10_000 : 60_000 });
+  // Every Helm squadron reports under the one "helm" asset key, so one row
+  // carries the reason the viper is holding, instance-wide.
+  const { data: helmStatus } = useSWR(
+    ['vipers-status', 'helm'],
+    () => getVipersStatus('helm'),
+    { refreshInterval: open ? 10_000 : 60_000, revalidateOnFocus: false },
+  );
+  const engineReason = helmStatus?.find((r) => r.strategy === 'HelmStrategy')?.last_reason ?? null;
   const refresh = useCallback(() => { mutate(); mutateSummary(); }, [mutate, mutateSummary]);
 
   // Same definition of terminal as `IntentRow` uses.
@@ -250,7 +268,7 @@ export default function HelmIntentsPanel({
         {shown && shown.length === 0 && (
           <p className="text-xs font-mono text-gray-500">{emptyText ?? 'Nothing here yet.'}</p>
         )}
-        {shown?.map((i) => <IntentRow key={i.id} intent={i} showSquadron={!squadronId} onChanged={refresh} />)}
+        {shown?.map((i) => <IntentRow key={i.id} intent={i} showSquadron={!squadronId} onChanged={refresh} engineReason={engineReason} />)}
       </div>
     );
   }
@@ -297,7 +315,7 @@ export default function HelmIntentsPanel({
             : 'No Helm intents yet. "Take the Helm" above creates one.')}
         </p>
       )}
-      {open && shown?.map((i) => <IntentRow key={i.id} intent={i} showSquadron={!squadronId} onChanged={refresh} />)}
+      {open && shown?.map((i) => <IntentRow key={i.id} intent={i} showSquadron={!squadronId} onChanged={refresh} engineReason={engineReason} />)}
     </div>
   );
 }

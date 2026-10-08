@@ -16,6 +16,7 @@
 
 use anyhow::Result;
 use reqwest;
+use rust_decimal::Decimal;
 use serde::Serialize;
 use tracing::{error, info};
 use crate::config;
@@ -26,6 +27,177 @@ use sha1::Sha1;
 type HmacSha1 = Hmac<Sha1>;
 
 // ── Telegram ────────────────────────────────────────────────────────────────
+
+// ── Trade alerts ─────────────────────────────────────────────────────────────
+//
+// One line per fill, written for an operator reading it on a phone. The exit
+// line used to carry the bid, the reason and the session total and nothing
+// else: not which side was held, not what the trade itself made. A customer
+// cannot tell a $0.60 win from a $1.10 loss until they open the Control Tower,
+// which is the opposite of what an alert is for.
+
+/// Everything the exit line says, gathered where the patrol settles the fill.
+pub struct ExitAlert<'a> {
+    pub strategy: &'a str,
+    pub market: &'a str,
+    /// "YES" or "NO".
+    pub side: &'a str,
+    /// Shares the venue actually sold. Zero is a killed FAK, not an exit.
+    pub filled: Decimal,
+    /// Shares the exit asked for (filled + whatever stays under management).
+    pub requested: Decimal,
+    pub entry_price: Decimal,
+    pub exit_price: Decimal,
+    /// Realized P&L of this trade after both fees.
+    pub trade_pnl: Decimal,
+    pub fees: Decimal,
+    pub reason: &'a str,
+    pub session_pnl: Decimal,
+    /// Simulated fill: say so on the line, or a ghost run reads like real money.
+    pub ghost: bool,
+    /// A paired exit (TimeDecay, Arbitrage) sells the other leg in the same
+    /// breath and books its P&L to the session too. `(pnl, fees)` of that leg,
+    /// when it filled, so the line reports the pair and not one side of it.
+    pub paired_leg: Option<(Decimal, Decimal)>,
+}
+
+/// What the ledger books is not always what the venue matched. A fill under
+/// the venue minimum is not booked (no row, no session credit) and a remainder
+/// under it is dropped rather than retained, so the alert reports booked
+/// shares: `(filled, requested)` as the ledger sees them, with a sub-minimum
+/// fill reading as no fill at all.
+pub fn booked_exit_sizes(matched: Decimal, remainder: Decimal, min_shares: Decimal) -> (Decimal, Decimal) {
+    if matched < min_shares {
+        return (Decimal::ZERO, matched + remainder);
+    }
+    let kept = if remainder >= min_shares { remainder } else { Decimal::ZERO };
+    (matched, matched + kept)
+}
+
+fn signed_dollars(x: Decimal) -> String {
+    if x.is_sign_negative() { format!("-${:.4}", -x) } else { format!("+${:.4}", x) }
+}
+
+fn ghost_tag(ghost: bool) -> &'static str {
+    if ghost { " | GHOST" } else { "" }
+}
+
+/// `🟢 ENTRY [Maker] <market> | YES 7.6 sh @ $0.6500`
+pub fn entry_alert(strategy: &str, market: &str, side: &str, price: Decimal, shares: Decimal, ghost: bool) -> String {
+    format!("🟢 ENTRY [{}] {} | {} {:.1} sh @ ${:.4}{}", strategy, market, side, shares, price, ghost_tag(ghost))
+}
+
+/// A filled exit names the side, the size, the round trip and the trade's own
+/// P&L before the session total. A killed exit says so instead of reading as a
+/// sale: `⚠️ EXIT NOT FILLED` with the bid it was sent at and the position kept.
+pub fn exit_alert(a: &ExitAlert) -> String {
+    if a.filled.is_zero() {
+        return format!(
+            "⚠️ EXIT NOT FILLED [{}] {} | {} {:.1} sh unsold at ${:.4} bid | position retained | {}{}",
+            a.strategy, a.market, a.side, a.requested, a.exit_price, a.reason, ghost_tag(a.ghost),
+        );
+    }
+    let size = if a.filled < a.requested {
+        format!("{:.1} of {:.1} sh", a.filled, a.requested)
+    } else {
+        format!("{:.1} sh", a.filled)
+    };
+    let (trade, legs) = match a.paired_leg {
+        Some((pair_pnl, pair_fees)) => (
+            format!("trade {} both legs (fees ${:.4})", signed_dollars(a.trade_pnl + pair_pnl), a.fees + pair_fees),
+            " + paired leg",
+        ),
+        None => (format!("trade {} (fees ${:.4})", signed_dollars(a.trade_pnl), a.fees), ""),
+    };
+    format!(
+        "🔴 EXIT [{}] {} | {} {} ${:.4} → ${:.4}{} | {} | {} | session {}{}",
+        a.strategy, a.market, a.side, size, a.entry_price, a.exit_price, legs,
+        trade, a.reason, signed_dollars(a.session_pnl), ghost_tag(a.ghost),
+    )
+}
+
+#[cfg(test)]
+mod trade_alert_tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    fn exit() -> ExitAlert<'static> {
+        ExitAlert {
+            strategy: "GboostStrategy", market: "Bitcoin Up or Down - October 8, 7AM ET", side: "NO",
+            filled: dec!(5.24), requested: dec!(5.24), entry_price: dec!(0.76), exit_price: dec!(0.90),
+            trade_pnl: dec!(0.6578), fees: dec!(0.0812), reason: "take-profit", session_pnl: dec!(12.3456), ghost: false,
+            paired_leg: None,
+        }
+    }
+
+    /// TimeDecay trade #5 shape: the alerted leg lost $0.60 on its own while the
+    /// pair netted something else. One leg's figure labeled "trade" misleads;
+    /// the line reports the pair's total and says so.
+    #[test]
+    fn a_paired_exit_reports_both_legs_together() {
+        let mut a = exit(); a.trade_pnl = dec!(-0.5951); a.fees = dec!(0.3751); a.paired_leg = Some((dec!(1.10), dec!(0.20)));
+        let line = exit_alert(&a);
+        assert!(line.contains("$0.7600 → $0.9000 + paired leg | trade +$0.5049 both legs (fees $0.5751) |"), "{line}");
+    }
+
+    /// The ledger books nothing under the venue minimum, so neither does the line.
+    #[test]
+    fn sub_minimum_fills_and_remainders_follow_the_ledger() {
+        let min = dec!(1);
+        assert_eq!(booked_exit_sizes(dec!(0.5), dec!(4.5), min), (dec!(0), dec!(5.0)), "a dust fill is no fill");
+        assert_eq!(booked_exit_sizes(dec!(4.5), dec!(0.5), min), (dec!(4.5), dec!(4.5)), "a dust remainder is dropped, not retained");
+        assert_eq!(booked_exit_sizes(dec!(3), dec!(4.6), min), (dec!(3), dec!(7.6)));
+        assert_eq!(booked_exit_sizes(dec!(5), dec!(0), min), (dec!(5), dec!(5)));
+    }
+
+    /// The side, the round trip and the trade's own P&L are on the line, before
+    /// the session total that used to be the only number.
+    #[test]
+    fn a_filled_exit_names_side_round_trip_and_trade_pnl() {
+        let line = exit_alert(&exit());
+        assert_eq!(
+            line,
+            "🔴 EXIT [GboostStrategy] Bitcoin Up or Down - October 8, 7AM ET | NO 5.2 sh $0.7600 → $0.9000 \
+             | trade +$0.6578 (fees $0.0812) | take-profit | session +$12.3456"
+        );
+    }
+
+    #[test]
+    fn a_loss_carries_its_sign_on_both_figures() {
+        let mut a = exit(); a.trade_pnl = dec!(-1.1892); a.session_pnl = dec!(-0.4); a.exit_price = dec!(0.56); a.reason = "stop";
+        let line = exit_alert(&a);
+        assert!(line.contains("$0.7600 → $0.5600 | trade -$1.1892 (fees $0.0812) | stop | session -$0.4000"), "{line}");
+    }
+
+    /// A FAK the venue killed sold nothing. Calling that an EXIT told the
+    /// operator a position was closed that is still open.
+    #[test]
+    fn a_killed_exit_says_so_and_that_the_position_is_kept() {
+        let mut a = exit(); a.filled = Decimal::ZERO; a.requested = dec!(7.6); a.exit_price = dec!(0.57);
+        let line = exit_alert(&a);
+        assert!(line.starts_with("⚠️ EXIT NOT FILLED [GboostStrategy]"), "{line}");
+        assert!(line.contains("NO 7.6 sh unsold at $0.5700 bid | position retained | take-profit"), "{line}");
+        assert!(!line.contains("trade "), "a killed exit has no trade P&L to report: {line}");
+    }
+
+    #[test]
+    fn a_partial_fill_shows_sold_of_requested() {
+        let mut a = exit(); a.filled = dec!(3); a.requested = dec!(7.6);
+        assert!(exit_alert(&a).contains("| NO 3.0 of 7.6 sh $0.7600"), "{}", exit_alert(&a));
+    }
+
+    /// Simulated fills are tagged, on entry and exit alike.
+    #[test]
+    fn ghost_fills_are_tagged() {
+        let mut a = exit(); a.ghost = true;
+        assert!(exit_alert(&a).ends_with(" | GHOST"));
+        assert!(!exit_alert(&exit()).contains("GHOST"));
+        assert_eq!(
+            entry_alert("MomentumStrategy", "M", "YES", dec!(0.65), dec!(7.6), true),
+            "🟢 ENTRY [MomentumStrategy] M | YES 7.6 sh @ $0.6500 | GHOST"
+        );
+    }
+}
 
 #[derive(Serialize)]
 struct TelegramMessage {

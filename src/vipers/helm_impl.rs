@@ -103,8 +103,8 @@ pub const INTENT_PROPOSED: &str = "intent proposed, awaiting acknowledgement";
 pub const INTENT_WORKING: &str = "intent working: entry on the book, awaiting fill";
 pub const INTENT_HELD: &str = "intent filled: position held under its posture";
 pub const INTENTS_COMPLETE: &str = "all intents terminal, squadron retiring";
-pub const DISABLED: &str = "disabled in config (helm_enabled)";
-pub const LIVE_DISABLED: &str = "live orders disabled (helm_live_enabled)";
+pub const DISABLED: &str = "Helm is switched off: Setup › Helm › Enabled (helm_enabled)";
+pub const LIVE_DISABLED: &str = "live orders off: turn on Setup › Helm › Live Orders (helm_live_enabled)";
 pub const NO_DATABASE: &str = "database unavailable: cannot record the intent going to work";
 
 /// How often the strategy re-reads its squadron's intents. The patrol ticks

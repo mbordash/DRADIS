@@ -85,11 +85,19 @@ pub fn scope_for_group(group: &str) -> Option<ConfigScope> {
         "Sports Lines" => ConfigScope::Squadron,
         "Arbitrage" | "Basis" | "Bookline" | "Convergence" | "FairValue" | "GBoost"
         | "Maker" | "Momentum" | "Time Decay" | "TrendReversal" => ConfigScope::Squadron,
-        // Helm reads its knobs from the squadron snapshot like every viper. A
-        // Helm squadron's row is seeded from the global row at deploy, so the
-        // operator sets these in Setup first; the squadron page can then
-        // override them for that one position.
+        // Helm's posture knobs: read from the squadron snapshot like every
+        // viper, overridable per position on the squadron page.
         "Helm" => ConfigScope::Squadron,
+        // Helm's switches and the open-intent cap describe the INSTANCE: the
+        // kill switch, whether real orders may be placed at all, how many
+        // convictions may be open at once. They are in `GLOBAL_SEMANTICS_KEYS`,
+        // so every squadron row follows the global row and Setup is where they
+        // are set. Before 2026-10-08 they sat in the squadron-scoped group: "Take
+        // the Helm" deploys a new squadron per market, each seeded from a global
+        // row that Setup could not reach, so a live operator had to find the new
+        // squadron's card and arm Live Orders again for every conviction, told
+        // only by a log line that the entry was refused.
+        "Helm Instance" => ConfigScope::Global,
         _ => return None,
     })
 }
@@ -1223,27 +1231,28 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         // Helm: the operator's own position, entered from an acknowledged intent
         // and exited by the posture the intent states. No entry gates of its own
         // beyond these risk controls, which is the point.
+        let hi = "Helm Instance";
+        v.push(F::new(hi, None, "helm_enabled", "Enabled", "bool", false,
+            "Kill switch for the one path that spends on the operator's say-so. Instance-wide: off freezes every \
+             Helm squadron at \"intent acknowledged\", no entry is placed and no intent is touched. Exits on a \
+             position already held keep running — a switch that stranded a position would be worse than one that \
+             did nothing."));
+        v.push(F::new(hi, Some("helm_enabled"), "helm_live_enabled", "Live Orders", "bool", false,
+            "May Helm place real orders? Ships off. Instance-wide: one switch arms every Helm squadron, present \
+             and future. A squadron in Simulation Mode enters and exits on paper regardless; with the instance live \
+             and this off, every Helm entry is refused with \"live orders off\" and the intent waits. Turn it on \
+             deliberately, here, before taking the helm."));
+        v.push(F::new(hi, Some("helm_enabled"), "helm_max_open_intents", "Max Open Intents", "int", false,
+            "Most intents that may be open (not closed or superseded) across every Helm squadron at once. \
+             Enforced when an intent is created. Two is a conviction; ten is a habit.")
+            .min(1.0).step(1.0));
+
         let hm = "Helm";
-        v.push(F::new(hm, None, "helm_enabled", "Enabled", "bool", false,
-            "Kill switch for the one path that spends on the operator's say-so. Off freezes every Helm squadron \
-             at \"intent acknowledged\": no entry is placed and no intent is touched. Exits on a position already \
-             held keep running — a switch that stranded a position would be worse than one that did nothing."));
-        v.push(F::new(hm, Some("helm_enabled"), "helm_live_enabled", "Live Orders", "bool", false,
-            "May Helm place real orders? Ships off. A squadron in Simulation Mode enters and exits on paper \
-             regardless; a live squadron refuses every entry with \"live orders disabled\" until this is on. \
-             Turn it on deliberately, here on this squadron's Helm card: the squadron's row is seeded \
-             from the global row at deploy and the strategy reads the squadron's row each tick. This \
-             switch rendered nowhere at all until the card learned to show boolean knobs, so arming \
-             Helm meant a hand-written PATCH."));
         v.push(F::new(hm, Some("helm_enabled"), "helm_max_exposure_usdc", "Max Exposure", "usd", false,
             "Ceiling on total Helm notional (entry price × shares) across EVERY Helm squadron on this instance. \
              Helm squadrons share one session and one position map, so this is the sum over all of them, and \
              it composes with the wallet's collateral gate, which every entry also passes.")
             .min(0.0).step(1.0).unit("USDC"));
-        v.push(F::new(hm, Some("helm_enabled"), "helm_max_open_intents", "Max Open Intents", "int", false,
-            "Most intents that may be open (not closed or superseded) across every Helm squadron at once. \
-             Enforced when an intent is created. Two is a conviction; ten is a habit.")
-            .min(1.0).step(1.0));
         v.push(F::new(hm, Some("helm_enabled"), "helm_fee_verdict_enforce", "Fee Verdict Blocks", "bool", false,
             "Does a fee-dominated verdict REFUSE the entry, or only record itself? Ships on. Through phase 1 \
              the verdict recorded and nothing acted on it: a time-limit intent entered at $0.1500 and exited \
@@ -1532,20 +1541,54 @@ mod tests {
         assert!(
             card.contains("basicBools"),
             "ViperCard renders no bools, so every `advanced: false` bool in a viper group \
-             is unreachable in the UI — including the switch that arms live Helm orders",
+             is unreachable in the UI (`helm_fee_verdict_enforce`, a safety gate, is one)",
         );
         assert!(
             !card.contains("f.type !== 'bool'") || card.contains("f.type === 'bool'"),
             "bools are filtered out of the card and nothing puts them back",
         );
-        // And the knob that matters is still a non-advanced bool, so it is the
-        // card's job to render it rather than the modal's.
+        // `helm_live_enabled` was the motivating case and has since moved to the
+        // Global-scoped `Helm Instance` group, which Setup renders. It must stay
+        // a non-advanced bool so Setup's panel shows it as a switch rather than
+        // hiding it behind the Advanced editor.
         let live = config_schema()
             .into_iter()
             .find(|f| f.key == "helm_live_enabled")
             .expect("helm_live_enabled is in the schema");
         assert_eq!(live.value_type, "bool");
-        assert!(!live.advanced, "if this becomes advanced, the modal renders it and this test should change");
+        assert_eq!(live.scope, ConfigScope::Global);
+        assert!(!live.advanced, "if this becomes advanced, Setup hides it and this test should change");
+    }
+
+    /// The two registries that make a key instance-wide must agree. A key the
+    /// engine forces to the global value (`GLOBAL_SEMANTICS_KEYS`) rendered on a
+    /// squadron card would offer an edit that is overridden on the next read;
+    /// a Global-scoped switch missing from the registry would be set in Setup
+    /// and never reach a squadron row already deployed. E75 was the second case
+    /// in effect: the Helm switches sat in a squadron group and Setup could not
+    /// arm them.
+    #[test]
+    fn every_global_semantics_key_is_global_scoped() {
+        use crate::helpers::dynamic_config::GLOBAL_SEMANTICS_KEYS;
+        let schema = config_schema();
+        for key in GLOBAL_SEMANTICS_KEYS {
+            let f = schema.iter().find(|f| f.key == *key)
+                .unwrap_or_else(|| panic!("{key} is in GLOBAL_SEMANTICS_KEYS but not in the schema"));
+            assert_eq!(f.scope, ConfigScope::Global, "{key} follows the global row but renders on a squadron card");
+        }
+    }
+
+    /// And the Helm switches specifically: all three in the registry, so a
+    /// Setup change reaches every Helm squadron, present and future.
+    #[test]
+    fn the_helm_instance_switches_follow_the_global_row() {
+        use crate::helpers::dynamic_config::GLOBAL_SEMANTICS_KEYS;
+        for key in ["helm_enabled", "helm_live_enabled", "helm_max_open_intents"] {
+            assert!(GLOBAL_SEMANTICS_KEYS.contains(&key), "{key} is not instance-wide");
+        }
+        let instance: Vec<&str> = config_schema().iter()
+            .filter(|f| f.group == "Helm Instance").map(|f| f.key).collect();
+        assert_eq!(instance, vec!["helm_enabled", "helm_live_enabled", "helm_max_open_intents"]);
     }
 
     #[test]

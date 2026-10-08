@@ -1045,6 +1045,7 @@ export default function DashboardPage() {
           isLoading={llmLoading}
           loadError={!llmRecs && llmError ? (llmError instanceof Error ? llmError.message : String(llmError)) : undefined}
           advisorEnabled={status?.llm_advisor_enabled ?? true}
+          health={status?.llm_advisor}
           pendingCount={pendingLlmCount}
           onGoToActions={() => navigate('ai')}
         />

@@ -1170,6 +1170,9 @@ struct StatusResponse {
     strategy_markets: HashMap<String, String>,
     /// Whether the LLM Advisor is switched on (env override or compile default).
     llm_advisor_enabled: bool,
+    /// What the advisor is doing now: disabled, misconfigured, waiting, ok,
+    /// failing or standing down, with the reason and the times that matter.
+    llm_advisor: crate::helpers::llm_advisor::AdvisorHealth,
     /// RFC-3339 timestamp of the current session start (= process startup).
     session_started_at: String,
     /// Per-asset Binance Raptor connection health.
@@ -1238,6 +1241,7 @@ async fn get_status(State(s): State<ApiState>) -> Response {
     Json(StatusResponse {
         strategy_markets: markets,
         llm_advisor_enabled: crate::helpers::llm_advisor::advisor_enabled_setting(),
+        llm_advisor: crate::helpers::llm_advisor::advisor_health(),
         session_started_at, raptors, dark_market_feeds,
     }).into_response()
 }

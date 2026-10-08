@@ -34,10 +34,10 @@
 //      enters on the next tick and enforces the posture from then on.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { AvailableMarket, HelmIntentDetail, MarketType } from '@/lib/types';
+import type { AvailableMarket, DynamicConfig, HelmIntentDetail, MarketType } from '@/lib/types';
 import {
   acknowledgeHelmIntent, createHelmIntent, deploySquadron, getAvailableMarkets,
-  getDeployments, getHelmIntent, HelmApiError,
+  getConfig, getDeployments, getHelmIntent, HelmApiError,
 } from '@/lib/api';
 import { MarketBrowser } from './DeploySquadronModal';
 
@@ -126,6 +126,23 @@ export default function TakeTheHelmModal({ isOpen, onClose, onDone }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const timers = useRef<number[]>([]);
+
+  // The instance switches this intent will be gated by. Read once per open so
+  // the operator learns BEFORE deploying a squadron that nothing will enter,
+  // not from a log line afterwards.
+  const [cfg, setCfg] = useState<DynamicConfig | null>(null);
+  useEffect(() => {
+    if (!isOpen) return;
+    let cancelled = false;
+    getConfig().then((c) => { if (!cancelled) setCfg(c); }).catch(() => { if (!cancelled) setCfg(null); });
+    return () => { cancelled = true; };
+  }, [isOpen]);
+  const armingProblem: string | null = !cfg ? null
+    : cfg.helm_enabled === false
+      ? 'Helm is switched off (Setup › Helm › Enabled). An intent will be acknowledged but nothing will enter until it is on.'
+    : (!cfg.ghost_mode && cfg.helm_live_enabled === false)
+      ? 'Live Orders are off (Setup › Helm › Live Orders) and this instance is live. The intent will be acknowledged but will not enter until you turn them on.'
+    : null;
 
   const clearTimers = () => {
     for (const t of timers.current) window.clearTimeout(t);
@@ -318,6 +335,11 @@ export default function TakeTheHelmModal({ isOpen, onClose, onDone }: Props) {
         <div className="px-5 py-4 space-y-4 overflow-y-auto">
           {error && (
             <div className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs font-mono text-red-300">{error}</div>
+          )}
+          {armingProblem && (
+            <div className="rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs font-mono text-amber-200">
+              {armingProblem}
+            </div>
           )}
 
           {/* ── Step 1: market ─────────────────────────────────────────────── */}
@@ -526,7 +548,11 @@ export default function TakeTheHelmModal({ isOpen, onClose, onDone }: Props) {
           {step === 'done' && detail && (
             <div className="rounded border border-teal-500/30 bg-teal-500/10 px-3 py-3 text-xs font-mono text-teal-100 space-y-1">
               <p>Intent #{detail.intent.id} acknowledged on {detail.intent.squadron_id}.</p>
-              <p className="text-gray-300">The engine enters on its next tick, subject to its own risk gates (kill switch, live-orders gate, exposure cap, collateral, drawdown). Follow it on the squadron page.</p>
+              <p className="text-gray-300">
+                {armingProblem
+                  ? 'The engine will hold this intent at "acknowledged" until the switch above is on; then it enters on the next tick, subject to the exposure cap, collateral and drawdown.'
+                  : 'The engine enters on its next tick, subject to its own risk gates (exposure cap, collateral, drawdown). Follow it on the squadron page; the Helm intents card there shows why it is holding, if it is.'}
+              </p>
               <button onClick={onClose} className="mt-2 rounded border border-[#1e1e32] px-3 py-1.5 text-xs font-mono text-gray-300 hover:bg-white/[0.03]">Close</button>
             </div>
           )}

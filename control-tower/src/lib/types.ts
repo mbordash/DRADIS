@@ -600,11 +600,32 @@ export interface TelemetrySample {
   vix_velocity:       number;  // UVXY 5s rate-of-change
 }
 
+/**
+ * What the LLM Advisor is doing now, from GET /api/status. Absent on engines
+ * before v1.3.3, which reported only the on/off switch.
+ */
+export interface LlmAdvisorHealth {
+  state: 'starting' | 'disabled' | 'misconfigured' | 'waiting' | 'ok' | 'failing' | 'standing_down';
+  /** The configuration error, the provider's error text, or the stand-down reason. */
+  detail?: string | null;
+  provider?: string | null;
+  model?: string | null;
+  interval_secs: number;
+  last_analysis_at?: string | null;
+  last_error_at?: string | null;
+  /** When a stand-down ends and the provider is called again. */
+  resumes_at?: string | null;
+  /** Configuration is read at startup: a fix to it needs a restart. */
+  restart_required: boolean;
+}
+
 /** Response from GET /api/status — maps strategy key to active market name. */
 export interface StatusResponse {
   strategy_markets: Record<string, string>;
   /** Whether the LLM Advisor is switched on. Absent on older engines. */
   llm_advisor_enabled?: boolean;
+  /** The advisor's current state. Absent on older engines. */
+  llm_advisor?: LlmAdvisorHealth;
   /** RFC-3339 timestamp of the current bot session start (= process startup). */
   session_started_at?: string;
   /** Per-asset Binance Raptor connection health. Key = asset symbol (e.g. "btc"). */
@@ -716,6 +737,13 @@ export interface FieldDef {
 export interface ViperDef {
   name:       string;
   enableKey:  keyof DynamicConfig;
+  /**
+   * Set when `enableKey` is an instance-level switch (one of the engine's
+   * global-semantics keys): the card shows its state and points at the Setup
+   * section named here instead of offering a per-squadron toggle, which the
+   * engine would override to the global value on the next read.
+   */
+  instanceSwitch?: string;
   accentColor: string; // Tailwind color class prefix, e.g. 'indigo'
   description: string;
   /** Lower-snake key used in /api/status strategy_markets map */

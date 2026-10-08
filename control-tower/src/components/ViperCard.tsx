@@ -151,7 +151,8 @@ interface ParamRowProps {
 /// Helm orders, was unreachable: the only way to set it was a PATCH by hand. So
 /// was `helm_fee_verdict_enforce`, a safety gate. The card's own on/off switch is
 /// hardwired to `viper.enableKey`, which is why that one bool had a home and
-/// every other one did not.
+/// every other one did not. (`helm_live_enabled` has since become instance-wide
+/// and renders in Setup › Helm; the fee gate still renders here.)
 function BoolRow({ field, config, onPatch, disabled }: ParamRowProps) {
   const cfgKey = field.key as keyof DynamicConfig;
   const value = config[cfgKey] === true;
@@ -324,8 +325,22 @@ export default function ViperCard({ viper, config, onPatch, market, status }: Pr
           <span className={`inline-block h-2 w-2 rounded-full shrink-0 ${enabled ? accent.dot : 'bg-gray-700'}`} />
           <span className="text-sm font-semibold text-white truncate">{viper.name}</span>
         </div>
-        <Toggle enabled={enabled} onToggle={handleToggle} loading={toggling || DEMO_MODE} />
+        {viper.instanceSwitch ? (
+          <span
+            className={`text-[10px] font-mono border rounded px-1.5 py-0.5 ${enabled ? `${accent.badge} border-transparent` : 'bg-gray-800 text-gray-500 border-gray-700'}`}
+            title={`Instance-wide switch. Set it in Setup › ${viper.instanceSwitch}.`}
+          >
+            {enabled ? 'ON' : 'OFF'} · instance
+          </span>
+        ) : (
+          <Toggle enabled={enabled} onToggle={handleToggle} loading={toggling || DEMO_MODE} />
+        )}
       </div>
+      {viper.instanceSwitch && (
+        <p className="text-[10px] font-mono text-gray-500 -mt-2">
+          Enabled, Live Orders and Max Open Intents apply to every {viper.name} squadron. Set them in Setup › {viper.instanceSwitch}.
+        </p>
+      )}
       {toggleErr && <p className="text-[10px] font-mono text-red-400 -mt-2">{toggleErr}</p>}
 
       {/* Description */}

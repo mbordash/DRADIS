@@ -1271,6 +1271,12 @@ fn build_user_prompt(
         if f.advanced {
             continue;
         }
+        // Instance-level switches are refused at validation whatever the model
+        // proposes (`llm_patch` rejects every `GLOBAL_SEMANTICS_KEYS` proposal),
+        // so offering them only spends the change budget on dead proposals.
+        if crate::helpers::dynamic_config::GLOBAL_SEMANTICS_KEYS.contains(&f.key) {
+            continue;
+        }
         // Skip fields of disabled vipers — proposing into a dormant strategy
         // wastes the 4-change budget (enable flags themselves stay listed).
         if let Some(enable_key) = f.enable_key {
@@ -1648,6 +1654,248 @@ fn advisor_hard_block() -> &'static std::sync::Mutex<Option<(String, u32)>> {
     REG.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+// ── Advisor health, for the Control Tower ────────────────────────────────────
+//
+// Until 2026-10-08 the engine told the dashboard one thing about the advisor:
+// whether the switch was on. Every failure mode after that was a log line on a
+// box the operator may not be able to SSH into. A mistyped key made the loop
+// log once and return, and the card said "awaiting first analysis" for the rest
+// of the instance's life; a billing failure stood the loop down for twelve
+// hours and the card said the same. This record is what the loop is doing now,
+// in words an operator can act on, and the status endpoint serves it.
+
+/// The advisor's current state. `state` is one of `starting`, `disabled`,
+/// `misconfigured`, `waiting`, `ok`, `failing`, `standing_down`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AdvisorHealth {
+    pub state: &'static str,
+    /// The reason, for the states that have one: the configuration error, the
+    /// provider's error text, or the failure the loop is standing down over.
+    pub detail: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub interval_secs: u64,
+    /// RFC-3339, the last analysis that was recorded.
+    pub last_analysis_at: Option<String>,
+    /// RFC-3339, the last provider call that failed.
+    pub last_error_at: Option<String>,
+    /// RFC-3339, when a stand-down ends and the loop calls the provider again.
+    pub resumes_at: Option<String>,
+    /// Configuration is read once at startup, so a fix to it needs a restart.
+    /// A billing or key fix on the provider's side does not.
+    pub restart_required: bool,
+}
+
+/// Provider error text can carry a whole JSON body. The card needs the first
+/// line of it, not the transcript.
+const HEALTH_DETAIL_MAX: usize = 240;
+
+fn health_detail(text: &str) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= HEALTH_DETAIL_MAX {
+        one_line
+    } else {
+        let cut: String = one_line.chars().take(HEALTH_DETAIL_MAX - 1).collect();
+        format!("{cut}…")
+    }
+}
+
+impl AdvisorHealth {
+    fn starting() -> Self {
+        Self {
+            state: "starting", detail: None, provider: None, model: None,
+            interval_secs: config::LLM_ADVISOR_INTERVAL_SECS,
+            last_analysis_at: None, last_error_at: None, resumes_at: None, restart_required: false,
+        }
+    }
+
+    fn disabled(&mut self) {
+        self.state = "disabled";
+        self.detail = Some("ENABLE_LLM_ADVISOR is off".to_string());
+        self.restart_required = true;
+    }
+
+    fn misconfigured(&mut self, why: &str) {
+        self.state = "misconfigured";
+        self.detail = Some(health_detail(why));
+        self.restart_required = true;
+    }
+
+    fn started(&mut self, provider: &str, model: &str, interval_secs: u64) {
+        self.state = "waiting";
+        self.detail = None;
+        self.provider = Some(provider.to_string());
+        self.model = Some(model.to_string());
+        self.interval_secs = interval_secs;
+        self.restart_required = false;
+    }
+
+    /// An analysis landed. A stand-down set earlier in the same cycle (one
+    /// squadron's durable failure, another's success) still governs the next
+    /// cycles, so it is kept; only its reason is refreshed by the next failure.
+    fn analysis_recorded(&mut self, now: chrono::DateTime<chrono::Utc>) {
+        self.last_analysis_at = Some(now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        if self.state == "standing_down" {
+            return;
+        }
+        self.state = "ok";
+        self.detail = None;
+        self.resumes_at = None;
+    }
+
+    /// A failed call. Durable failures (billing, quota, a rejected key) become a
+    /// stand-down with a resume time; transient ones are reported and retried
+    /// next cycle.
+    fn call_failed(&mut self, err: &str, durable: bool, backoff_cycles: u32, now: chrono::DateTime<chrono::Utc>) {
+        self.detail = Some(health_detail(err));
+        self.last_error_at = Some(now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        self.restart_required = false;
+        if durable {
+            self.state = "standing_down";
+            // The block counts `backoff_cycles` skipped ticks after the failing
+            // one; the retry is the tick after those, so one more interval.
+            let resume = now + chrono::Duration::seconds((backoff_cycles as i64 + 1) * (self.interval_secs as i64));
+            self.resumes_at = Some(resume.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        } else {
+            self.state = "failing";
+            self.resumes_at = None;
+        }
+    }
+
+    /// The stand-down expired; the next call decides between `ok` and `failing`.
+    fn backoff_expired(&mut self) {
+        self.state = "waiting";
+        self.resumes_at = None;
+    }
+}
+
+fn advisor_health_cell() -> &'static std::sync::Mutex<AdvisorHealth> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<AdvisorHealth>> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::Mutex::new(AdvisorHealth::starting()))
+}
+
+fn update_health(f: impl FnOnce(&mut AdvisorHealth)) {
+    let mut h = match advisor_health_cell().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    f(&mut h);
+}
+
+/// A snapshot of the advisor's state for `/api/status`.
+pub fn advisor_health() -> AdvisorHealth {
+    match advisor_health_cell().lock() {
+        Ok(g) => g.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+#[cfg(test)]
+mod advisor_health_tests {
+    use super::*;
+
+    fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc)
+    }
+
+    /// The failure that motivated this: a mistyped key used to leave the card
+    /// on "awaiting first analysis" forever. It now says what is wrong and
+    /// that a restart is needed after the fix.
+    #[test]
+    fn a_misconfigured_provider_is_named_and_needs_a_restart() {
+        let mut h = AdvisorHealth::starting();
+        h.misconfigured("LLM_API_KEY is not set for provider 'anthropic'");
+        assert_eq!(h.state, "misconfigured");
+        assert_eq!(h.detail.as_deref(), Some("LLM_API_KEY is not set for provider 'anthropic'"));
+        assert!(h.restart_required);
+    }
+
+    /// A billing failure stands the loop down for twelve cycles. The record
+    /// carries when it resumes and that no restart is needed, which is what the
+    /// log line says and the card never did.
+    #[test]
+    fn a_durable_failure_stands_down_until_a_stated_time_without_a_restart() {
+        let mut h = AdvisorHealth::starting();
+        h.started("anthropic", "claude-sonnet-5", 3600);
+        assert_eq!(h.state, "waiting");
+        h.call_failed("HTTP 400 billing_error: credit balance too low", true, 12, at("2026-10-08T01:40:17Z"));
+        assert_eq!(h.state, "standing_down");
+        // Twelve skipped hourly ticks, then the retry on the thirteenth.
+        assert_eq!(h.resumes_at.as_deref(), Some("2026-10-08T14:40:17Z"));
+        assert_eq!(h.last_error_at.as_deref(), Some("2026-10-08T01:40:17Z"));
+        assert!(!h.restart_required);
+        h.backoff_expired();
+        assert_eq!(h.state, "waiting");
+        assert!(h.resumes_at.is_none());
+        assert!(h.detail.is_some(), "the last error stays readable until the next call settles it");
+    }
+
+    #[test]
+    fn a_transient_failure_is_failing_and_retries_next_cycle() {
+        let mut h = AdvisorHealth::starting();
+        h.started("anthropic", "m", 3600);
+        h.call_failed("connection timed out", false, 12, at("2026-10-08T01:00:00Z"));
+        assert_eq!(h.state, "failing");
+        assert!(h.resumes_at.is_none());
+    }
+
+    /// A recorded analysis clears the error state but keeps the error history.
+    #[test]
+    fn a_recorded_analysis_is_ok_and_keeps_the_history() {
+        let mut h = AdvisorHealth::starting();
+        h.started("anthropic", "m", 3600);
+        h.call_failed("HTTP 500", false, 12, at("2026-10-08T01:00:00Z"));
+        h.analysis_recorded(at("2026-10-08T02:00:00Z"));
+        assert_eq!(h.state, "ok");
+        assert!(h.detail.is_none());
+        assert_eq!(h.last_analysis_at.as_deref(), Some("2026-10-08T02:00:00Z"));
+        assert_eq!(h.last_error_at.as_deref(), Some("2026-10-08T01:00:00Z"));
+    }
+
+    /// Provider errors can carry a JSON body; the detail is one line, bounded.
+    #[test]
+    fn detail_is_one_bounded_line() {
+        let long = format!("HTTP 400 {{\n  \"error\": \"{}\"\n}}", "x".repeat(600));
+        let d = health_detail(&long);
+        assert!(!d.contains('\n'));
+        assert_eq!(d.chars().count(), HEALTH_DETAIL_MAX);
+        assert!(d.ends_with('…'));
+        assert_eq!(health_detail("short  text"), "short text");
+    }
+
+    /// Squadron A fails durably, squadron B succeeds in the same cycle: the
+    /// next twelve cycles are still skipped, so the record stays standing down.
+    #[test]
+    fn a_success_in_the_same_cycle_does_not_clear_a_stand_down() {
+        let mut h = AdvisorHealth::starting();
+        h.started("anthropic", "m", 3600);
+        h.call_failed("HTTP 400 billing_error", true, 12, at("2026-10-08T01:00:00Z"));
+        h.analysis_recorded(at("2026-10-08T01:01:00Z"));
+        assert_eq!(h.state, "standing_down");
+        assert!(h.resumes_at.is_some());
+        assert_eq!(h.last_analysis_at.as_deref(), Some("2026-10-08T01:01:00Z"));
+    }
+
+    /// The default provider is a local Ollama; when its host is down the probe
+    /// fails before any call, and that used to leave the record untouched.
+    #[test]
+    fn an_unreachable_provider_is_failing_not_waiting() {
+        let mut h = AdvisorHealth::starting();
+        h.started("ollama", "llama3.1", 3600);
+        h.call_failed("ollama unreachable at http://ollama:11434: connection refused", false, 12, at("2026-10-08T01:00:00Z"));
+        assert_eq!(h.state, "failing");
+        assert!(h.detail.as_deref().unwrap().contains("unreachable"));
+    }
+
+    #[test]
+    fn disabled_says_which_switch() {
+        let mut h = AdvisorHealth::starting();
+        h.disabled();
+        assert_eq!(h.state, "disabled");
+        assert_eq!(h.detail.as_deref(), Some("ENABLE_LLM_ADVISOR is off"));
+    }
+}
+
 /// True when a provider error is durable rather than transient: billing, quota
 /// and authentication failures do not recover by being retried.
 ///
@@ -1731,6 +1979,7 @@ pub async fn run_llm_advisor_loop(
     let advisor_enabled = advisor_enabled_setting();
     if !advisor_enabled {
         info!("🤖 LLM Advisor: disabled (ENABLE_LLM_ADVISOR=false)");
+        update_health(|h| h.disabled());
         return;
     }
 
@@ -1741,6 +1990,7 @@ pub async fn run_llm_advisor_loop(
         Ok(p) => p,
         Err(e) => {
             error!("🤖 LLM Advisor: provider misconfigured — advisor disabled: {}", e);
+            update_health(|h| h.misconfigured(&e.to_string()));
             return;
         }
     };
@@ -1781,6 +2031,7 @@ pub async fn run_llm_advisor_loop(
         config::LLM_ADVISOR_INTERVAL_SECS,
         db::current_session_id(),
     );
+    update_health(|h| h.started(provider.name(), provider.model(), config::LLM_ADVISOR_INTERVAL_SECS));
 
     // Two HTTP clients with different timeout profiles:
     //
@@ -1839,6 +2090,7 @@ pub async fn run_llm_advisor_loop(
                 }
                 *block = None;
                 info!("🤖 LLM Advisor: provider backoff expired, retrying this cycle");
+                update_health(|h| h.backoff_expired());
             }
         }
 
@@ -2022,6 +2274,10 @@ pub async fn run_llm_advisor_loop(
                 "🤖 LLM Advisor: {} unreachable at {} — skipping cycle ({})",
                 provider.name(), provider.display_url(), e
             );
+            update_health(|h| h.call_failed(
+                &format!("{} unreachable at {}: {}", provider.name(), provider.display_url(), e),
+                false, config::LLM_ADVISOR_HARD_FAIL_BACKOFF_CYCLES, chrono::Utc::now(),
+            ));
             continue;
         }
 
@@ -2257,6 +2513,7 @@ pub async fn run_llm_advisor_loop(
                     current_pnl,
                     &analysis,
                 ).await;
+                update_health(|h| h.analysis_recorded(chrono::Utc::now()));
 
                 // Telegram has a 4096-char limit per message; truncate with notice if needed.
                 // Name the squadron: with a pass per squadron, an unlabeled
@@ -2285,6 +2542,9 @@ pub async fn run_llm_advisor_loop(
                     squadron_id, provider.name(), MAX_RETRIES, provider.model(),
                     provider.display_url(), last_err
                 );
+                update_health(|h| h.call_failed(
+                    &last_err.to_string(), durable, config::LLM_ADVISOR_HARD_FAIL_BACKOFF_CYCLES, chrono::Utc::now(),
+                ));
                 if durable {
                     let mut block = match advisor_hard_block().lock() {
                         Ok(g) => g,

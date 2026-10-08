@@ -584,7 +584,8 @@ mod tests {
             let flipped = serde_json::to_value(&current).expect("serializes")[*key].clone();
             let to = match flipped {
                 serde_json::Value::Bool(b) => serde_json::json!(!b),
-                other => panic!("{key} is {other:?} — extend this test for non-bool fields"),
+                serde_json::Value::Number(n) => serde_json::json!(n.as_u64().expect("an unsigned count") + 1),
+                other => panic!("{key} is {other:?} — extend this test for a field of a new type"),
             };
             let b = propose(key, to);
             assert!(b.accepted.is_empty(), "{key} must never be proposable per squadron");

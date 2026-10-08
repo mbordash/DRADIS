@@ -608,6 +608,7 @@ export const VIPER_DEFS: ViperDef[] = [
   {
     name: 'Helm',
     enableKey: 'helm_enabled',
+    instanceSwitch: 'Helm',
     accentColor: 'teal',
     statusKey: 'helm',
     strategyName: 'HelmStrategy',

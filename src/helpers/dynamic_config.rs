@@ -1725,7 +1725,21 @@ pub fn read_only_mode() -> bool {
 /// divergent row is not persisted in the first place. Adding a field means
 /// adding it here and to the function; `reconciles_every_declared_key` fails if
 /// you miss one.
-pub const GLOBAL_SEMANTICS_KEYS: &[&str] = &["ghost_mode", "book_apply_price_changes"];
+///
+/// Helm's switches joined on 2026-10-08. "Take the Helm" deploys a squadron per
+/// market, seeded from the global row; `helm_live_enabled` lived in the
+/// squadron-scoped group, so Setup could not set it and a live operator had to
+/// arm every new squadron from its own card, told only by a log line that the
+/// entry was refused. The kill switch, the live-orders switch and the
+/// open-intent cap describe the instance, so they follow the global row like
+/// `ghost_mode` does.
+pub const GLOBAL_SEMANTICS_KEYS: &[&str] = &[
+    "ghost_mode",
+    "book_apply_price_changes",
+    "helm_enabled",
+    "helm_live_enabled",
+    "helm_max_open_intents",
+];
 
 /// Force `cfg`'s instance-level fields to agree with `global`.
 ///
@@ -1747,6 +1761,19 @@ pub fn reconcile_global_semantics(
     if cfg.book_apply_price_changes != global.book_apply_price_changes {
         cfg.book_apply_price_changes = global.book_apply_price_changes;
         corrected.push("book_apply_price_changes");
+    }
+    // Helm's instance switches: one answer per box, set in Setup.
+    if cfg.helm_enabled != global.helm_enabled {
+        cfg.helm_enabled = global.helm_enabled;
+        corrected.push("helm_enabled");
+    }
+    if cfg.helm_live_enabled != global.helm_live_enabled {
+        cfg.helm_live_enabled = global.helm_live_enabled;
+        corrected.push("helm_live_enabled");
+    }
+    if cfg.helm_max_open_intents != global.helm_max_open_intents {
+        cfg.helm_max_open_intents = global.helm_max_open_intents;
+        corrected.push("helm_max_open_intents");
     }
     corrected
 }
@@ -1915,6 +1942,31 @@ fn warn_ceiling_clamps(scope: &str, clamps: &[CeilingClamp]) {
             warn!("⚙️  {scope}: stored {} is above this build's ceiling; running at {} until the stored value is lowered in the Control Tower",
                   c, c.ceiling);
         }
+    }
+}
+
+/// Log a squadron row's disagreement with the global row once per
+/// `(squadron, key)` for the life of the process. Same reason as
+/// [`warn_ceiling_clamps`]: two venues read every squadron row every 30s and
+/// nothing rewrites a stale row until a patch lands on it, so an unthrottled
+/// warning repeats forever. The remedy is the global setting (Setup), which
+/// fans out and rewrites every row; the squadron card cannot save these keys.
+fn warn_global_divergence(squadron_id: &str, corrected: &[&'static str]) {
+    if corrected.is_empty() {
+        return;
+    }
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let fresh: Vec<&&str> = corrected.iter()
+        .filter(|k| seen.lock().map(|mut s| s.insert(format!("{squadron_id}:{k}"))).unwrap_or(true))
+        .collect();
+    if !fresh.is_empty() {
+        warn!(
+            "⚠️  Squadron [{}] config disagreed with the global row on {:?} — overridden to match. \
+             These are instance-level settings: change them in Setup, which rewrites every squadron row. \
+             Reported once per key.",
+            squadron_id, fresh,
+        );
     }
 }
 
@@ -2122,14 +2174,7 @@ impl DynamicConfig {
                             None => Self::load_or_default().await,
                         };
                         let corrected = reconcile_global_semantics(&mut cfg, &global);
-                        if !corrected.is_empty() {
-                            warn!(
-                                "⚠️  Squadron [{}] config disagreed with the global row on {:?} — \
-                                 overridden to match. The stored row is stale; re-save it from the \
-                                 Control Tower to clear this.",
-                                squadron_id, corrected,
-                            );
-                        }
+                        warn_global_divergence(squadron_id, &corrected);
 
                         info!("⚙️  Squadron config loaded from DB: {}", squadron_id);
                         return Arc::new(cfg);
@@ -2686,9 +2731,13 @@ mod global_semantics_tests {
             // Flip the declared key so it disagrees with global.
             match &value[*key] {
                 serde_json::Value::Bool(b) => value[*key] = serde_json::Value::Bool(!b),
+                serde_json::Value::Number(n) => {
+                    let bumped = n.as_u64().expect("an unsigned count") + 1;
+                    value[*key] = serde_json::Value::from(bumped);
+                }
                 other => panic!(
                     "{key} is {other:?}, which this test cannot flip — extend the test \
-                     when adding a non-bool global-semantics field"
+                     when adding a global-semantics field of a new type"
                 ),
             }
 
@@ -2729,6 +2778,31 @@ mod global_semantics_tests {
         let corrected = reconcile_global_semantics(&mut squadron, &global);
         assert_eq!(corrected, vec!["ghost_mode"]);
         assert!(squadron.ghost_mode, "squadron stayed live under a ghost global");
+    }
+
+    /// E75, the first customer's trap: "Take the Helm" deploys a squadron per
+    /// market, seeded from a global row Setup could not arm. Now the operator
+    /// turns Live Orders on once, in Setup, and every Helm squadron's row says
+    /// so on its next read, whatever its own row held.
+    #[test]
+    fn a_helm_squadron_follows_the_instance_live_switch_both_ways() {
+        let mut global = DynamicConfig::default();
+        global.helm_live_enabled = true;
+        global.helm_max_open_intents = 4;
+        let mut squadron = DynamicConfig::default();
+        squadron.helm_live_enabled = false;
+        squadron.helm_max_open_intents = 2;
+
+        let corrected = reconcile_global_semantics(&mut squadron, &global);
+        assert_eq!(corrected, vec!["helm_live_enabled", "helm_max_open_intents"]);
+        assert!(squadron.helm_live_enabled, "a new Helm squadron stayed unarmed under an armed instance");
+        assert_eq!(squadron.helm_max_open_intents, 4);
+
+        // And disarming the instance disarms a squadron that was armed by hand.
+        global.helm_live_enabled = false;
+        let corrected = reconcile_global_semantics(&mut squadron, &global);
+        assert_eq!(corrected, vec!["helm_live_enabled"]);
+        assert!(!squadron.helm_live_enabled);
     }
 
     /// Agreement is silent: reconciliation must report nothing when there is

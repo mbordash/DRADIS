@@ -1449,6 +1449,15 @@ const GLOBAL_CONFIG_GROUPS: { group: string; title: string; blurb: string; omit?
     omit: ['ghost_mode'],
   },
   {
+    group: 'Helm Instance',
+    title: 'Helm',
+    blurb: 'The switches for your own convictions. "Take the Helm" deploys a squadron per ' +
+      'market, and every one of them follows these: Enabled is the kill switch, Live Orders ' +
+      'is whether Helm may place real orders at all (off, a live instance refuses every Helm ' +
+      'entry and the intent waits), Max Open Intents caps how many convictions may be open ' +
+      'at once. Exposure and exit posture stay on each squadron\'s Helm card.',
+  },
+  {
     group: 'GBoost Training',
     title: 'GBoost Training',
     blurb: 'The in-engine pipeline that trains, validates and adopts the GBoost plan-B ' +

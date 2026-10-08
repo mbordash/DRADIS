@@ -52,7 +52,7 @@ use crate::orchestrator::{StrategyRegistry, StrategyContext};
 use crate::orchestrator::executor::{execute_strategies_concurrent, aggregate_and_resolve_signals};
 use crate::helpers::{
     balance::*, orders::*,
-    notifications::{send_notification, tweet_trade}, metrics, db,
+    notifications::{self, send_notification, tweet_trade}, metrics, db,
 };
 use crate::squadron::Squadron;
 use crate::state::TradeScope;
@@ -2305,6 +2305,7 @@ impl Squadron {
                                             }
                                         }
                                     let mut paired_pnl = dec!(0);
+                                    let mut paired_leg_booked: Option<(Decimal, Decimal)> = None;
                                     if exit_pair {
                                         let other_tid = if tid == target_yes_token { target_no_token.clone() } else { target_yes_token.clone() };
                                         let other_tid_m = other_tid.clone(); // neutral key (slice 2a)
@@ -2343,6 +2344,7 @@ impl Squadron {
                                             if let Some((p, st)) = settled {
                                                 if st.filled >= config::MIN_ORDER_SHARES {
                                                     paired_pnl = st.pnl;
+                                                    paired_leg_booked = Some((st.pnl, st.fees()));
                                                     *total_pnl.lock().await += st.pnl;
                                                     let sn_pm = sn.clone(); let m_name = params.market_name.clone(); let sid = side_of(&other_tid).to_string(); let scope_pm = scope.clone();
                                                     let (p_avg, fees, px, filled, pn) = (p.avg_entry, st.fees(), st.exit_price, st.filled, st.pnl);
@@ -2423,7 +2425,19 @@ impl Squadron {
                                     }
                                     if reason_lc.contains("expir") { last_expiry_exit_time.insert(sn.clone(), Instant::now()); }
                                     last_trade_time.insert(sn.clone(), Instant::now());
-                                    { let tok = tg_token.clone(); let cid = tg_chat_id.clone(); let msg = format!("🔴 EXIT [{}] {} | bid=${:.4} | reason: {} | Session PnL: ${:.4}", sn, params.market_name, params.price, reason, *total_pnl.lock().await); tokio::spawn(async move { let _ = send_notification(&tok, &cid, &msg).await; }); }
+                                    {
+                                        let session_pnl = *total_pnl.lock().await;
+                                        let (filled, requested) = notifications::booked_exit_sizes(rs_m, remainder_m, config::MIN_ORDER_SHARES);
+                                        let msg = notifications::exit_alert(&notifications::ExitAlert {
+                                            strategy: &sn, market: &params.market_name, side: side_of(&tid_m),
+                                            filled, requested,
+                                            entry_price: re_m, exit_price: exit_fill_price.unwrap_or(params.price),
+                                            trade_pnl: pnl_m, fees: fees_m, reason: &reason, session_pnl, ghost: ghosting,
+                                            paired_leg: paired_leg_booked,
+                                        });
+                                        let tok = tg_token.clone(); let cid = tg_chat_id.clone();
+                                        tokio::spawn(async move { let _ = send_notification(&tok, &cid, &msg).await; });
+                                    }
                                     { let session_pnl = *total_pnl.lock().await; tweet_trade(tw_api_key.clone(), tw_api_secret.clone(), tw_access_token.clone(), tw_access_token_secret.clone(), sn.clone(), params.market_name.clone(), re_m, params.price, reason.clone(), pnl_m + paired_pnl, session_pnl); }
                                 }
                             }
@@ -3074,7 +3088,7 @@ impl Squadron {
                                         });
                                     }
                                     last_trade_time.insert(sn.clone(), Instant::now());
-                                    { let tok = tg_token.clone(); let cid = tg_chat_id.clone(); let msg = format!("🟢 ENTRY [{}] {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares); tokio::spawn(async move { let _ = send_notification(&tok, &cid, &msg).await; }); }
+                                    { let tok = tg_token.clone(); let cid = tg_chat_id.clone(); let msg = notifications::entry_alert(&sn, &params.market_name, side_of(&token_m), params.price, params.shares, ghosting); tokio::spawn(async move { let _ = send_notification(&tok, &cid, &msg).await; }); }
                                 }
                             }
 

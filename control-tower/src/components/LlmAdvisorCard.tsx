@@ -26,7 +26,7 @@
  */
 
 import { useState } from 'react';
-import type { LlmRecommendationRow } from '@/lib/types';
+import type { LlmAdvisorHealth, LlmRecommendationRow } from '@/lib/types';
 
 interface Props {
   recommendations: LlmRecommendationRow[];
@@ -34,6 +34,12 @@ interface Props {
   /** Set when the recommendations request failed; not the same as "none yet". */
   loadError?: string;
   advisorEnabled: boolean;
+  /**
+   * What the advisor is doing now. Until v1.3.3 the card knew only the on/off
+   * switch, so a mistyped key or a billing failure read as "awaiting first
+   * analysis" for the life of the instance. Absent on older engines.
+   */
+  health?: LlmAdvisorHealth;
   /** Count of AI config proposals awaiting approval (status 'proposed'). */
   pendingCount?: number;
   /** Navigate to the AI Actions view (approval queue + audit trail). */
@@ -53,8 +59,43 @@ function fmtTs(iso: string): string {
   }
 }
 
+/** The badge and the one-line explanation for each advisor state. */
+function describeHealth(h: LlmAdvisorHealth): { badge: string; tone: string; text: string } | null {
+  const every = h.interval_secs >= 3600
+    ? `every ${Math.round(h.interval_secs / 3600)} h`
+    : `every ${Math.max(1, Math.round(h.interval_secs / 60))} min`;
+  const red   = 'bg-red-500/10 text-red-400 border-red-500/20';
+  const amber = 'bg-amber-500/10 text-amber-400 border-amber-500/20';
+  const grey  = 'bg-gray-800 text-gray-500 border-gray-700';
+  switch (h.state) {
+    case 'disabled':
+      return { badge: 'DISABLED', tone: grey, text: 'switched off in Setup › LLM Advisor' };
+    case 'misconfigured':
+      return {
+        badge: 'MISCONFIGURED', tone: red,
+        text: `${h.detail ?? 'provider settings are invalid'} · fix in Setup › LLM Advisor, then restart the engine`,
+      };
+    case 'standing_down':
+      return {
+        badge: 'STANDING DOWN', tone: amber,
+        text: `provider refused the call: ${h.detail ?? 'see the engine log'} · retries ${h.resumes_at ? fmtTs(h.resumes_at) : 'later'} · fix billing or the key, no restart needed`,
+      };
+    case 'failing':
+      return {
+        badge: 'FAILING', tone: red,
+        text: `last call failed${h.last_error_at ? ` ${fmtTs(h.last_error_at)}` : ''}: ${h.detail ?? 'see the engine log'} · retries ${every}`,
+      };
+    case 'waiting':
+      return { badge: '', tone: '', text: `awaiting first analysis · runs ${every}${h.model ? ` on ${h.model}` : ''}` };
+    case 'starting':
+      return { badge: '', tone: '', text: 'starting' };
+    default:
+      return null;
+  }
+}
+
 export default function LlmAdvisorCard({
-  recommendations, isLoading, loadError, advisorEnabled,
+  recommendations, isLoading, loadError, advisorEnabled, health,
   pendingCount = 0, onGoToActions,
 }: Props) {
   const [expanded, setExpanded] = useState(false);
@@ -63,6 +104,7 @@ export default function LlmAdvisorCard({
   const total = recommendations.length;
   const safeIdx = total > 0 ? Math.min(idx, total - 1) : 0;
   const rec = total > 0 ? recommendations[safeIdx] : null;
+  const described = health ? describeHealth(health) : null;
 
   return (
     <section>
@@ -72,11 +114,15 @@ export default function LlmAdvisorCard({
           <span className="label-muted">LLM Advisor</span>
           <span className="text-xs font-mono text-gray-600">🤖</span>
 
-          {!advisorEnabled && (
+          {described?.badge ? (
+            <span className={`text-[10px] font-mono border rounded px-1.5 py-0.5 ${described.tone}`} title={described.text}>
+              {described.badge}
+            </span>
+          ) : (!health && !advisorEnabled && (
             <span className="text-[10px] font-mono bg-gray-800 text-gray-500 border border-gray-700 rounded px-1.5 py-0.5">
               DISABLED
             </span>
-          )}
+          ))}
 
           {isLoading ? (
             <span className="text-xs font-mono text-gray-600">Loading…</span>
@@ -104,7 +150,7 @@ export default function LlmAdvisorCard({
             </>
           ) : (
             <span className="text-xs font-mono text-gray-600">
-              {advisorEnabled ? 'awaiting first analysis' : 'disabled (ENABLE_LLM_ADVISOR)'}
+              {described?.text ?? (advisorEnabled ? 'awaiting first analysis' : 'disabled (ENABLE_LLM_ADVISOR)')}
             </span>
           )}
 
@@ -139,6 +185,12 @@ export default function LlmAdvisorCard({
             )}
           </span>
         </div>
+
+        {/* A problem state stays readable when the strip is showing an older
+            analysis: the badge alone says that something is wrong, this says what. */}
+        {rec && described && ['misconfigured', 'failing', 'standing_down'].includes(health?.state ?? '') && (
+          <div className="mt-2 text-xs font-mono text-gray-500">{described.text}</div>
+        )}
 
         {/* Expanded prose */}
         {expanded && rec && (
