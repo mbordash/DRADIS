@@ -319,6 +319,24 @@ struct KlineDay {
     bars: Vec<[f64; 5]>,
 }
 
+/// Every 1-minute close in an asset's kline store, keyed by bar open time.
+///
+/// FairValue borrows this to fit its hour-of-day σ profile
+/// (`helpers::sigma_profile`). The store belongs to this pipeline and is kept
+/// current by its catch-up fetch, so the dependency is real and one-way: the
+/// profile reads what the trainer already downloads.
+pub fn read_kline_closes(dir: &DataDir) -> HashMap<i64, f64> {
+    let mut out = HashMap::new();
+    if let Ok(entries) = std::fs::read_dir(dir.klines()) {
+        for e in entries.flatten() {
+            if let Ok(day) = read_json::<KlineDay>(&e.path()) {
+                for b in bars_from_day(&day) { out.insert(b.open_s, b.close); }
+            }
+        }
+    }
+    out
+}
+
 fn bars_from_day(d: &KlineDay) -> impl Iterator<Item = Bar> + '_ {
     d.bars.iter().map(|b| Bar { open_s: b[0] as i64, open: b[1], high: b[2], low: b[3], close: b[4] })
 }

@@ -1368,6 +1368,23 @@ pub const FAIRVALUE_EVENT_SIGMA_MULTIPLIER: Decimal = dec!(1.5);
 /// Weekday ET times of scheduled volatility events, "HH:MM" comma-separated.
 /// Default for the fairvalue_event_times_et runtime knob.
 pub const FAIRVALUE_EVENT_TIMES_ET: &str = "09:30";
+/// Whether FairValue scales its realized σ by the hour-of-day profile
+/// (`helpers::sigma_profile`) on hourly markets. The profile generalizes the
+/// 9:30 ET event multiplier: measured over 3,501 weekday hours, the coming
+/// hour's volatility over the trailing hour's runs 1.33x at 9 ET, 1.22x at 8 ET,
+/// 1.24x at 20 ET (00:00 UTC, the daily close and funding) and 0.83x to 0.89x
+/// through the afternoon, and the trailing window is the only σ the viper has.
+/// Applied as a third σ per side keeping the lower fair value, so it only ever
+/// refuses an entry. Default for the fairvalue_sigma_profile_enabled knob.
+pub const FAIRVALUE_SIGMA_PROFILE_ENABLED: bool = true;
+/// Fewest weekday observations a profile cell needs before it is read; a thinner
+/// cell falls back to the point-event rule. Default for
+/// fairvalue_sigma_profile_min_cell_n.
+pub const FAIRVALUE_SIGMA_PROFILE_MIN_CELL_N: i64 = 15;
+/// Days of 1-minute closes the profile is fitted on. Matches the GBoost training
+/// window the kline store is kept for. Default for
+/// fairvalue_sigma_profile_lookback_days.
+pub const FAIRVALUE_SIGMA_PROFILE_LOOKBACK_DAYS: i64 = 120;
 /// Horizon at or below which the sigma floor does not bind (ramps to full at 2x).
 /// Defaults to the vol window: trust the measurement as far out as we measured.
 pub const FAIRVALUE_SIGMA_FLOOR_HORIZON_SECS: i64 = 600;

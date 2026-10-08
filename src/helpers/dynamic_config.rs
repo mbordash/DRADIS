@@ -211,6 +211,9 @@ fn default_fairvalue_sigma_floor_horizon() -> i64     { config::FAIRVALUE_SIGMA_
 fn default_fairvalue_min_sigma()           -> Decimal { decimal_from_f64(config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC) }
 fn default_fairvalue_event_sigma_multiplier() -> Decimal { config::FAIRVALUE_EVENT_SIGMA_MULTIPLIER }
 fn default_fairvalue_event_times_et()        -> String  { config::FAIRVALUE_EVENT_TIMES_ET.to_string() }
+fn default_fairvalue_sigma_profile_enabled() -> bool    { config::FAIRVALUE_SIGMA_PROFILE_ENABLED }
+fn default_fairvalue_sigma_profile_min_cell_n() -> i64  { config::FAIRVALUE_SIGMA_PROFILE_MIN_CELL_N }
+fn default_fairvalue_sigma_profile_lookback_days() -> i64 { config::FAIRVALUE_SIGMA_PROFILE_LOOKBACK_DAYS }
 fn default_fairvalue_post_exit_cooldown()  -> i64     { config::FAIRVALUE_POST_EXIT_COOLDOWN_SECS     }
 fn default_fairvalue_max_stop_losses()     -> u32     { config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET  }
 fn default_fairvalue_edge_noise_multiple() -> Decimal { config::FAIRVALUE_EDGE_NOISE_MULTIPLE         }
@@ -1032,6 +1035,16 @@ pub struct DynamicConfig {
     /// Weekday ET times of scheduled volatility events, "HH:MM" comma-separated.
     #[serde(default = "default_fairvalue_event_times_et")]
     pub fairvalue_event_times_et: String,
+    /// Scale realized σ by the hour-of-day profile on hourly markets. Supersedes
+    /// the point event where the profile has a cell; falls back to it otherwise.
+    #[serde(default = "default_fairvalue_sigma_profile_enabled")]
+    pub fairvalue_sigma_profile_enabled: bool,
+    /// Fewest weekday observations a profile cell needs before it is trusted.
+    #[serde(default = "default_fairvalue_sigma_profile_min_cell_n")]
+    pub fairvalue_sigma_profile_min_cell_n: i64,
+    /// Days of 1-minute closes the profile is fitted on.
+    #[serde(default = "default_fairvalue_sigma_profile_lookback_days")]
+    pub fairvalue_sigma_profile_lookback_days: i64,
     /// Seconds a token is locked out after any FairValue exit. Re-entries into a
     /// market the viper has just left were 0-for-4 in prod (2026-08-13/14).
     #[serde(default = "default_fairvalue_post_exit_cooldown")]
@@ -1573,6 +1586,9 @@ impl Default for DynamicConfig {
             fairvalue_min_sigma_per_sqrt_sec: decimal_from_f64(config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC),
             fairvalue_event_sigma_multiplier: config::FAIRVALUE_EVENT_SIGMA_MULTIPLIER,
             fairvalue_event_times_et: config::FAIRVALUE_EVENT_TIMES_ET.to_string(),
+            fairvalue_sigma_profile_enabled: config::FAIRVALUE_SIGMA_PROFILE_ENABLED,
+            fairvalue_sigma_profile_min_cell_n: config::FAIRVALUE_SIGMA_PROFILE_MIN_CELL_N,
+            fairvalue_sigma_profile_lookback_days: config::FAIRVALUE_SIGMA_PROFILE_LOOKBACK_DAYS,
             fairvalue_post_exit_cooldown_secs: config::FAIRVALUE_POST_EXIT_COOLDOWN_SECS,
             fairvalue_max_stop_losses_per_market: config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET,
             fairvalue_edge_noise_multiple:    config::FAIRVALUE_EDGE_NOISE_MULTIPLE,

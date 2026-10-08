@@ -104,7 +104,7 @@ use rust_decimal_macros::dec;
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex as StdMutex, OnceLock};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::orchestrator::{Strategy, StrategyContext};
@@ -135,6 +135,11 @@ struct FairValueGlobals {
     /// Self-sampled oracle price history: (sample time, price). One sample per
     /// FAIRVALUE_VOL_SAMPLE_SECS, pruned past FAIRVALUE_VOL_WINDOW_SECS.
     vol_samples: StdMutex<VecDeque<(Instant, f64)>>,
+    /// The hour-of-day σ profile (`helpers::sigma_profile`), rebuilt from the
+    /// kline store about once a day on a blocking thread. `None` until the first
+    /// build lands; the multiplier falls back to the point-event rule meanwhile.
+    sigma_profile: StdMutex<Option<std::sync::Arc<crate::helpers::sigma_profile::SigmaProfile>>>,
+    sigma_profile_building: AtomicBool,
     /// Entry-edge persistence streak: (condition_id, is_yes, first_seen, last_seen).
     signal_streak: StdMutex<Option<(String, bool, Instant, Instant)>>,
     /// Per-token post-exit re-entry cooldowns (armed when an Exit is emitted).
@@ -309,6 +314,8 @@ impl FairValueGlobals {
             fair_history:     StdMutex::new(HashMap::new()),
             sl_counted:       StdMutex::new(HashMap::new()),
             veto_withdrawn:   StdMutex::new(HashMap::new()),
+            sigma_profile:    StdMutex::new(None),
+            sigma_profile_building: AtomicBool::new(false),
             settle_hold_latched: StdMutex::new(HashMap::new()),
             sports_opened: StdMutex::new(std::collections::HashSet::new()),
             obi_clear_since:  StdMutex::new(HashMap::new()),
@@ -589,12 +596,29 @@ impl FairValueStrategyImpl {
     /// 1.0 unless a configured event falls inside `(now, close]`. Values at or
     /// below 1.0 disable it: the knob exists to inflate σ ahead of an event the
     /// trailing window cannot see, never to deflate it.
-    fn event_sigma_mult(dc: &crate::helpers::dynamic_config::DynamicConfig, now: DateTime<Utc>, close: Option<DateTime<Utc>>) -> f64 {
+    fn event_sigma_mult(asset: &str, dc: &crate::helpers::dynamic_config::DynamicConfig, now: DateTime<Utc>, close: Option<DateTime<Utc>>) -> f64 {
+        let Some(close) = close else { return 1.0 };
+        // The hour-of-day profile, where it has a trustworthy cell, on an hourly
+        // horizon. Its cells are forward-over-remaining-HOUR ratios, which is
+        // the right quantity only for a market that closes at the top of the
+        // hour; a daily market keeps the point-event rule below. Clamped at 1.0:
+        // a calm-hour cell below 1 would RAISE a favorite's fair value, which is
+        // admitting trades on a model reading and a separate decision from this
+        // one. The clamp keeps the invariant that this multiplier only removes.
+        if dc.fairvalue_sigma_profile_enabled {
+            let horizon = (close - now).num_seconds();
+            if horizon > 0 && horizon <= 3660 {
+                if let Some(profile) = Self::sigma_profile(asset) {
+                    if let Some(f) = profile.factor(now, dc.fairvalue_sigma_profile_min_cell_n.max(1) as usize) {
+                        return f.max(1.0);
+                    }
+                }
+            }
+        }
         let mult = dc.fairvalue_event_sigma_multiplier.to_f64().unwrap_or(1.0);
         if !(mult > 1.0) {
             return 1.0;
         }
-        let Some(close) = close else { return 1.0 };
         let events = parse_event_times_et(&dc.fairvalue_event_times_et);
         if event_in_horizon(now, close, &events) {
             return mult;
@@ -604,6 +628,62 @@ impl FairValueStrategyImpl {
         match last_event_within(now, window, &events) {
             Some(at) => post_event_multiplier(mult, (now - at).num_seconds() as f64, window as f64),
             None => 1.0,
+        }
+    }
+
+    /// The cached hour-of-day σ profile for an asset, if one has been built.
+    fn sigma_profile(asset: &str) -> Option<std::sync::Arc<crate::helpers::sigma_profile::SigmaProfile>> {
+        globals(asset).sigma_profile.lock().ok()?.clone()
+    }
+
+    /// Rebuild the profile when it is missing or a day old, off the tick.
+    ///
+    /// Reads the GBoost pipeline's kline store for the asset
+    /// (`logs/gboost_planb/<asset>/klines`), fits on a blocking thread, and
+    /// swaps the result in. An asset with no store (anything but BTC today)
+    /// builds an empty profile, whose `factor` is always `None`, so the
+    /// multiplier falls back to the point-event rule exactly as before. Called
+    /// once per entry evaluation; the common path is one lock and one compare.
+    fn ensure_sigma_profile(asset: &str, dc: &crate::helpers::dynamic_config::DynamicConfig) {
+        const REFRESH_SECS: i64 = 24 * 3600;
+        if !dc.fairvalue_sigma_profile_enabled {
+            return;
+        }
+        let g = globals(asset);
+        let fresh = g.sigma_profile.lock().ok()
+            .and_then(|p| p.as_ref().map(|p| (Utc::now() - p.built_at).num_seconds() < REFRESH_SECS))
+            .unwrap_or(false);
+        if fresh || g.sigma_profile_building.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Tests and tools may evaluate outside a runtime; do nothing rather than panic.
+        if tokio::runtime::Handle::try_current().is_err() {
+            g.sigma_profile_building.store(false, Ordering::Release);
+            return;
+        }
+        let asset_owned = asset.to_string();
+        let lookback = dc.fairvalue_sigma_profile_lookback_days.max(1);
+        tokio::task::spawn_blocking(move || {
+            let dir = crate::vipers::gboost_planb_train::DataDir::new(&asset_owned);
+            let closes = crate::vipers::gboost_planb_train::read_kline_closes(&dir);
+            let profile = crate::helpers::sigma_profile::SigmaProfile::build(&closes, Utc::now(), lookback);
+            let show = |h: u32, mb: u32| profile.cell(h, mb).map_or("-".to_string(), |c| format!("{:.2}", c.factor));
+            tracing::info!(
+                " FairValue σ profile [{}]: {} cells from {} one-minute closes | 8:00 ET x{} | 9:00 x{} | 9:30 x{} | 16:00 x{} | 20:00 x{}",
+                asset_owned, profile.len(), profile.bars, show(8, 0), show(9, 0), show(9, 30), show(16, 0), show(20, 0),
+            );
+            let g = globals(&asset_owned);
+            if let Ok(mut slot) = g.sigma_profile.lock() {
+                *slot = Some(std::sync::Arc::new(profile));
+            }
+            g.sigma_profile_building.store(false, Ordering::Release);
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_sigma_profile_for_test(asset: &str, profile: crate::helpers::sigma_profile::SigmaProfile) {
+        if let Ok(mut slot) = globals(asset).sigma_profile.lock() {
+            *slot = Some(std::sync::Arc::new(profile));
         }
     }
 
@@ -1763,7 +1843,8 @@ impl Strategy for FairValueStrategyImpl {
         // A scheduled event inside the horizon (the 09:30 ET open, by default)
         // is volatility the trailing window has not seen yet. Priced as an
         // extra σ per side, keeping the lower fair, so it only removes entries.
-        let event_mult = Self::event_sigma_mult(dc, Utc::now(), market.market_close_time);
+        Self::ensure_sigma_profile(&ctx.crypto_filter, dc);
+        let event_mult = Self::event_sigma_mult(&ctx.crypto_filter, dc, Utc::now(), market.market_close_time);
         let (fair_yes_side, fair_no_side) =
             match Self::conservative_side_fairs_ev(spot, strike, sigma_realized, floor, secs_left as f64, event_mult) {
                 Some(f) => f,
@@ -1965,7 +2046,7 @@ impl Strategy for FairValueStrategyImpl {
                 None => self.fair_prob_for_side(
                     &ctx.crypto_filter, market, snap, token_is_yes,
                     Self::min_sigma(dc), dc.fairvalue_sigma_floor_horizon_secs,
-                    Self::event_sigma_mult(dc, Utc::now(), market.market_close_time),
+                    Self::event_sigma_mult(&ctx.crypto_filter, dc, Utc::now(), market.market_close_time),
                 ),
             };
 
@@ -5287,13 +5368,13 @@ mod event_sigma_tests {
         let mut dc = crate::helpers::dynamic_config::DynamicConfig::default();
         dc.fairvalue_event_sigma_multiplier = dec!(1.5);
         let close = et(2026, 10, 6, 10, 0);
-        let at = |h: u32, m: u32| Fv::event_sigma_mult(&dc, et(2026, 10, 6, h, m), Some(close));
+        let at = |h: u32, m: u32| Fv::event_sigma_mult("test-no-profile", &dc, et(2026, 10, 6, h, m), Some(close));
         assert_eq!(at(9, 19), 1.5, "before the open: the full multiplier");
         assert!(at(9, 33) > 1.45, "three minutes after: nearly all of it (was 1.0 before this fix)");
         // 09:55: 25 of 60 minutes post-open, f = 0.417, so 1.5 / sqrt(1.521) = 1.216.
         assert!((at(9, 55) - 1.216).abs() < 0.001, "late in the hour the window is still mostly pre-open: {}", at(9, 55));
         // The 10AM market at 10:40: 70 minutes after the open, window full.
-        assert_eq!(Fv::event_sigma_mult(&dc, et(2026, 10, 6, 10, 40), Some(et(2026, 10, 6, 11, 0))), 1.0);
+        assert_eq!(Fv::event_sigma_mult("test-no-profile", &dc, et(2026, 10, 6, 10, 40), Some(et(2026, 10, 6, 11, 0))), 1.0);
     }
 
     /// The 9AM market at the typical entry time contains the 09:30 open.
@@ -5375,14 +5456,128 @@ mod event_sigma_tests {
         let mut dc = crate::helpers::dynamic_config::DynamicConfig::default();
         let (now, close) = (et(2026, 10, 6, 9, 19), et(2026, 10, 6, 10, 0));
         dc.fairvalue_event_sigma_multiplier = dec!(1.5);
-        assert_eq!(Fv::event_sigma_mult(&dc, now, Some(close)), 1.5);
+        assert_eq!(Fv::event_sigma_mult("test-no-profile", &dc, now, Some(close)), 1.5);
         dc.fairvalue_event_sigma_multiplier = dec!(0.5);
-        assert_eq!(Fv::event_sigma_mult(&dc, now, Some(close)), 1.0);
+        assert_eq!(Fv::event_sigma_mult("test-no-profile", &dc, now, Some(close)), 1.0);
         dc.fairvalue_event_sigma_multiplier = dec!(1.0);
-        assert_eq!(Fv::event_sigma_mult(&dc, now, Some(close)), 1.0);
+        assert_eq!(Fv::event_sigma_mult("test-no-profile", &dc, now, Some(close)), 1.0);
         dc.fairvalue_event_sigma_multiplier = dec!(1.5);
-        assert_eq!(Fv::event_sigma_mult(&dc, now, None), 1.0, "no close time, no adjustment");
-        assert_eq!(Fv::event_sigma_mult(&dc, et(2026, 10, 6, 13, 19), Some(et(2026, 10, 6, 14, 0))), 1.0,
+        assert_eq!(Fv::event_sigma_mult("test-no-profile", &dc, now, None), 1.0, "no close time, no adjustment");
+        assert_eq!(Fv::event_sigma_mult("test-no-profile", &dc, et(2026, 10, 6, 13, 19), Some(et(2026, 10, 6, 14, 0))), 1.0,
             "an afternoon market is untouched");
     }
+    use crate::helpers::sigma_profile::SigmaProfile;
+    use std::collections::HashMap;
+
+    /// Closes with returns that alternate ±amp, and ±hot·amp from 9:30 to 11:00
+    /// ET on weekdays, over enough days to fill every cell past the minimum.
+    fn profile_with_open(hot: f64) -> SigmaProfile {
+        use chrono::{Datelike as _, Weekday};
+        let mut closes = HashMap::new();
+        let mut px = 85_000.0f64;
+        let first = chrono::NaiveDate::from_ymd_opt(2026, 8, 3).unwrap();
+        let mut last = 0i64;
+        for d in 0..40 {
+            let day = first + chrono::Duration::days(d);
+            let midnight = Et.from_local_datetime(&day.and_hms_opt(0, 0, 0).unwrap()).earliest().unwrap().timestamp();
+            let weekend = matches!(day.weekday(), Weekday::Sat | Weekday::Sun);
+            for m in 0..1440i64 {
+                let (h, mi) = ((m / 60) as u32, (m % 60) as u32);
+                let a = if !weekend && ((h == 9 && mi >= 30) || h == 10) { hot * 1e-4 } else { 1e-4 };
+                px *= if m % 2 == 0 { a.exp() } else { (-a).exp() };
+                last = midnight + 60 * m;
+                closes.insert(last, px);
+            }
+        }
+        SigmaProfile::build(&closes, Utc.timestamp_opt(last + 60, 0).unwrap(), 60)
+    }
+
+    fn dc_with_profile() -> crate::helpers::dynamic_config::DynamicConfig {
+        let mut dc = crate::helpers::dynamic_config::DynamicConfig::default();
+        dc.fairvalue_event_sigma_multiplier = dec!(1.5);
+        dc.fairvalue_sigma_profile_enabled = true;
+        dc.fairvalue_sigma_profile_min_cell_n = 15;
+        dc
+    }
+
+    /// Where the profile has a cell, it replaces the point event's flat 1.5.
+    #[test]
+    fn a_profile_cell_supersedes_the_point_event() {
+        Fv::set_sigma_profile_for_test("test-prof-a", profile_with_open(2.0));
+        let dc = dc_with_profile();
+        // Tuesday 2026-10-06, 9:35 ET, hourly close 10:00: the 9:30 cell, forward
+        // entirely hot over a calm trailing hour, is exactly 2.0.
+        // Close-to-close windows: 9:31..10:00 all hot over 8:31..9:30 with one hot return.
+        let exp_930 = (30.0f64 * 4.0 / 30.0).sqrt() / ((59.0f64 + 4.0) / 60.0).sqrt();
+        let m = Fv::event_sigma_mult("test-prof-a", &dc, et(2026, 10, 6, 9, 35), Some(et(2026, 10, 6, 10, 0)));
+        assert!((m - exp_930).abs() < 1e-3, "{m} vs {exp_930}");
+        assert!((m - 1.5).abs() > 0.1, "and it is not the event's flat 1.5");
+        // 9:05: the 9:00 cell, 29 calm + 31 hot returns over a calm hour.
+        let exp_900 = ((29.0f64 + 31.0 * 4.0) / 60.0).sqrt();
+        let m = Fv::event_sigma_mult("test-prof-a", &dc, et(2026, 10, 6, 9, 5), Some(et(2026, 10, 6, 10, 0)));
+        assert!((m - exp_900).abs() < 1e-3, "{m} vs {exp_900}");
+    }
+
+    /// A calm-hour cell below 1 is clamped: the multiplier only ever removes.
+    #[test]
+    fn a_calm_cell_never_deflates_sigma() {
+        Fv::set_sigma_profile_for_test("test-prof-b", profile_with_open(2.0));
+        let dc = dc_with_profile();
+        // 11:05 ET: forward calm over a hot trailing hour, cell 0.5.
+        let m = Fv::event_sigma_mult("test-prof-b", &dc, et(2026, 10, 6, 11, 5), Some(et(2026, 10, 6, 12, 0)));
+        assert_eq!(m, 1.0, "a 0.5 cell would admit trades; that is a separate decision");
+    }
+
+    /// No cell (the :50 bucket, a weekend, or no profile at all): the point
+    /// event rule applies exactly as it did before the profile existed.
+    #[test]
+    fn without_a_usable_cell_the_point_event_rule_applies() {
+        Fv::set_sigma_profile_for_test("test-prof-c", profile_with_open(2.0));
+        let dc = dc_with_profile();
+        // 9:55 ET has no cell (forward window under 15 minutes); the open has
+        // passed, so the event rule's decay applies: 1.5/sqrt(1-f+f*2.25), f=25/60.
+        let m = Fv::event_sigma_mult("test-prof-c", &dc, et(2026, 10, 6, 9, 55), Some(et(2026, 10, 6, 10, 0)));
+        assert!((m - 1.216).abs() < 0.002, "{m}");
+        // Saturday: the profile is weekday-only and the event rule is too.
+        assert_eq!(Fv::event_sigma_mult("test-prof-c", &dc, et(2026, 10, 3, 9, 19), Some(et(2026, 10, 3, 10, 0))), 1.0);
+        // An asset with no profile built: the flat event multiplier.
+        assert_eq!(Fv::event_sigma_mult("test-prof-none", &dc, et(2026, 10, 6, 9, 19), Some(et(2026, 10, 6, 10, 0))), 1.5);
+    }
+
+    /// The profile's cells are remaining-hour ratios, so a daily market keeps
+    /// the point-event rule even where a cell exists.
+    #[test]
+    fn a_daily_horizon_keeps_the_point_event_rule() {
+        Fv::set_sigma_profile_for_test("test-prof-d", profile_with_open(2.0));
+        let dc = dc_with_profile();
+        // 9:35 ET with a close at noon the next day: 2.0 cell exists, but the horizon is 26.4h.
+        let m = Fv::event_sigma_mult("test-prof-d", &dc, et(2026, 10, 6, 9, 35), Some(et(2026, 10, 7, 12, 0)));
+        assert_eq!(m, 1.5, "the next day's 9:30 is in the horizon, so the event rule gives 1.5");
+    }
+
+    /// The knob off: the profile is ignored even when it has a cell.
+    #[test]
+    fn the_profile_knob_off_restores_the_event_rule() {
+        Fv::set_sigma_profile_for_test("test-prof-e", profile_with_open(2.0));
+        let mut dc = dc_with_profile();
+        dc.fairvalue_sigma_profile_enabled = false;
+        // 9:35: the event rule, five minutes into its post-open decay, 1.5/sqrt(1-f+2.25f) at f=5/60.
+        let m = Fv::event_sigma_mult("test-prof-e", &dc, et(2026, 10, 6, 9, 35), Some(et(2026, 10, 6, 10, 0)));
+        let exp = 1.5 / (1.0 - 5.0 / 60.0 + 2.25 * 5.0 / 60.0f64).sqrt();
+        assert!((m - exp).abs() < 1e-9, "{m} vs {exp}");
+        assert!((m - 2.0).abs() > 0.4, "and not the profile's cell");
+    }
+
+    /// The 2026-10-06 trade under the real profile's 9:10 cell (1.47 from the
+    /// production corpus): refused, with its edge gone, as under the event rule.
+    #[test]
+    fn the_oct_6_entry_is_refused_under_the_profile_factor_too() {
+        let (strike, sigma, t) = (86214.0_f64, 4.378005091909438e-5_f64, 2441.0_f64);
+        let spot = strike * (-1.02_f64 * sigma * t.sqrt()).exp();
+        let (_, no) = Fv::conservative_side_fairs_ev(spot, strike, sigma, 4.2e-5, t, 1.47).unwrap();
+        let edge = Fv::side_edge(Decimal::from_f64(no).unwrap(), dec!(0.73));
+        assert!(edge < dec!(0.093), "required edge was 0.093; at the 9:10 cell it is {edge}");
+        assert!(edge < dec!(0.01), "and not narrowly");
+    }
+
 }

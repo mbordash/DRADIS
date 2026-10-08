@@ -862,6 +862,22 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              for the US cash open or \"09:30,14:00\" to add an FOMC release. A position whose remaining life \
              contains one of these has its vol input raised by Event Vol Multiplier. Weekends never match. \
              Malformed entries are ignored."));
+        v.push(F::new(g, e, "fairvalue_sigma_profile_enabled", "Vol Profile", "bool", true,
+            "Scale the realized-vol input by an hour-of-day profile fitted from the stored 1-minute closes: the \
+             coming hour's volatility over the trailing hour's, by Eastern hour and 10-minute bucket, weekdays, \
+             from data before the moment it is applied. Measured over 3,501 hours it runs 1.33x at 9AM ET, 1.22x \
+             at 8AM, 1.24x at 8PM (the 00:00 UTC daily close) and 0.83x to 0.89x through the afternoon. Where the \
+             profile has a cell it replaces the Event Vol Multiplier; where it does not, the event rule applies. \
+             Like the event rule it can only lower a fair value, so it only ever removes an entry. Hourly markets \
+             only; a longer horizon keeps the event rule."));
+        v.push(F::new(g, e, "fairvalue_sigma_profile_min_cell_n", "Vol Profile Min Samples", "int", true,
+            "Fewest weekday observations a profile cell needs before it is read. A thinner cell falls back to the \
+             event rule. The store holds about 120 days, so a full cell has roughly 85 observations.")
+            .range(5.0, 200.0).step(1.0));
+        v.push(F::new(g, e, "fairvalue_sigma_profile_lookback_days", "Vol Profile Lookback", "int", true,
+            "Days of 1-minute closes the profile is fitted on. The kline store is kept for the GBoost training \
+             window, 120 days, so asking for more does not see more.")
+            .range(14.0, 365.0).step(1.0).unit("d"));
         v.push(F::new(g, e, "fairvalue_edge_noise_multiple", "Edge vs Noise", "decimal", true,
             "Multiple of the model's own recent fair-value noise the edge must clear, on top of Base Edge. \
              Noise is the std-dev of successive fair-value moves over the last 15 min, rescaled to a 2-minute \

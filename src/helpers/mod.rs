@@ -38,6 +38,7 @@ pub mod llm_advisor;
 pub mod llm_patch;
 pub mod llm_policy;
 pub mod volatility;
+pub mod sigma_profile;
 pub mod watchdog;
 pub mod logbuf;
 pub mod latency;
