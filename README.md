@@ -343,6 +343,11 @@ before trusting a result.
 | `/api/deployments` | GET | List deployment queue status |
 | `/api/deployment/region` | GET | Region + available market types |
 | `/api/markets/available` | GET | Fetch markets by type from Gamma API |
+| `/api/markets/live` | GET | Live markets for the Markets page (`?market_type=crypto|sports|politics&expiry_window=…`), joined with the squadrons flying them |
+| `/api/markets/{id}` | GET | One market: facts, trading state, quotes, resolution once closed, DRADIS's own activity, and the engine's view (verdicts, model reading, bookmaker line) |
+| `/api/markets/{id}/book` | GET | Depth per side, where the venue publishes it |
+| `/api/markets/{id}/prints` | GET | Recent tape (`?limit=`), where the venue publishes it |
+| `/api/markets/{id}/history` | GET | Price history per side (`?hours=`), where the venue publishes it |
 | `/api/taxonomy/raptors` | GET | Raptor kinds for market class |
 | `/api/taxonomy/vipers` | GET | Viper kinds for market class |
 | `/api/telemetry` | GET | Live Raptor signal snapshots |
@@ -529,10 +534,20 @@ DRADIS ships with a real-time web dashboard called **Control Tower** built on Ne
 | **Viper Cards**    | Live enabled/disabled toggle + all parameters editable inline without a restart                  |
 | **Open Positions** | In-flight positions with entry time, side (YES/NO/UP/DOWN in correct color), entry price, shares |
 | **Telemetry**      | Live Raptor macro cards — **Tide** (ETF premium, institutional pulse), **Horizon** (TradFi velocity, VIX proxy), greyed outside US market hours |
+| **Markets**        | Browse the venue's live markets, open one and see its book beside the engine's own read of it: every Viper's verdict, the FairValue model reading, the bookmaker line. **Take the Helm** from there |
 | **Trade Log**      | Last N completed trades with strategy, side, entry/exit prices, shares, P&L, exit reason         |
 | **CAG Registry**   | Active squadrons with market, state, deployed time, and **+ Deploy** button                      |
 | **AI Actions**     | Full audit trail of LLM-proposed config changes — status lifecycle, delta %, tier, outcome score — with inline apply/reject for pending proposals |
 | **Setup**          | Admin-gated credential management — venue keys, RPC, Alpaca, Telegram — with test-connection buttons, one-click engine restart, and the **AI Autonomy** panel (tier selector, kill switch, circuit-breaker reset) |
+
+### Markets — the venue's picture beside the engine's
+
+The **Markets** page answers "what does DRADIS think of this market, and why is it not trading it?" without a venue login or a log search. Pick a class (crypto, sports, politics) and a closing window, and the table lists the venue's live markets with their liquidity, time to close and, where a squadron is flying one, the squadron badge. Open a market and the page shows two things side by side:
+
+- **The venue's picture.** Best bid and ask, mid and spread per side, the ask sum, then depth, the recent tape and a price history wherever the venue publishes them. Where it does not (Kalshi has no public price history, Polymarket US publishes neither prints nor history) the card says "not published by this venue" rather than showing a zero. A market the venue says is still accepting orders stays live past its listed close, which is how every sports market trades: Polymarket's listed end is kick-off. A closed market shows its resolution once the venue has one.
+- **The engine's view.** If a squadron flies the market, every Viper's current verdict and the gate holding it. On any crypto up/down or strike market, the FairValue model's reading computed with the viper's own math on the global knobs: fair value per side, the edge against the required edge, the sigma it used and how many samples that rests on. On a sports market, the bookmaker consensus, book count and dispersion from the sports ledger. Plus DRADIS's own entries, exits and open positions on the market, from every shard.
+
+**Take the Helm on this market** opens the Helm deploy flow preselected on it, so a browse becomes a hunt in one click. The page reads only through the venue abstraction, so all three venues get it, each to the depth its public API allows. Recorded (closed) markets and a per-market study mode are on the roadmap, not in this release.
 
 ### Live Config Editing
 
