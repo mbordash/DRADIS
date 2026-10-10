@@ -526,36 +526,47 @@ pub async fn clob_market_status(http: &reqwest::Client, condition_id: &str) -> O
 /// resolved to a market nobody chose and traded it. The identity check below is
 /// the real defense, since it holds whatever Gamma does with the parameter.
 pub async fn fetch_market_info(http: &reqwest::Client, condition_id: &str) -> Option<MarketInfo> {
-    let url = format!(
-        "https://gamma-api.polymarket.com/markets?condition_ids={}",
-        condition_id
-    );
-    
-    // Each failure says which one it was. This used to be a chain of `.ok()?`,
-    // so every cause — transport error, unexpected shape, empty result —
-    // collapsed into the same bare None and the caller could only report
-    // "could not load market details", which is true of all of them and
-    // actionable for none.
-    let resp = match http.get(&url).send().await {
-        Ok(r) => r,
-        Err(e) => { warn!(%url, "Gamma request failed: {e}"); return None; }
-    };
-    let status = resp.status();
-    let body = match resp.text().await {
-        Ok(b) => b,
-        Err(e) => { warn!(%status, "Gamma response unreadable: {e}"); return None; }
-    };
-    let markets: Vec<serde_json::Value> = match serde_json::from_str(&body) {
-        Ok(m) => m,
-        Err(e) => {
-            warn!(%status, body = %body.chars().take(200).collect::<String>(),
-                  "Gamma response was not a market list: {e}");
-            return None;
+    // Gamma leaves a closed market out of a `condition_ids` lookup unless
+    // `closed=true` is asked for as well, so a market that resolved an hour ago
+    // answered "no such market" here. The open lookup comes first because it is
+    // the one every deploy and Helm validation makes; the closed one is the
+    // second try, for the Markets page showing a resolved market's outcome.
+    let mut markets: Vec<serde_json::Value> = Vec::new();
+    for closed in [false, true] {
+        let url = format!(
+            "https://gamma-api.polymarket.com/markets?condition_ids={}{}",
+            condition_id, if closed { "&closed=true" } else { "" }
+        );
+
+        // Each failure says which one it was. This used to be a chain of `.ok()?`,
+        // so every cause — transport error, unexpected shape, empty result —
+        // collapsed into the same bare None and the caller could only report
+        // "could not load market details", which is true of all of them and
+        // actionable for none.
+        let resp = match http.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => { warn!(%url, "Gamma request failed: {e}"); return None; }
+        };
+        let status = resp.status();
+        let body = match resp.text().await {
+            Ok(b) => b,
+            Err(e) => { warn!(%status, "Gamma response unreadable: {e}"); return None; }
+        };
+        markets = match serde_json::from_str(&body) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(%status, body = %body.chars().take(200).collect::<String>(),
+                      "Gamma response was not a market list: {e}");
+                return None;
+            }
+        };
+        if !markets.is_empty() {
+            break;
         }
-    };
+    }
 
     let Some(market) = markets.first() else {
-        warn!(%condition_id, %status, "Gamma knows no market with this condition id");
+        warn!(%condition_id, "Gamma knows no market with this condition id, open or closed");
         return None;
     };
 
