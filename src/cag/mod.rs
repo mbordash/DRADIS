@@ -168,7 +168,11 @@ impl SquadronSummary {
             vipers:            Vec::new(),
             stood_down_at:     None,
             stood_down_reason: None,
-            market_id:         None,
+            // The condition id the squadron flies, so readers that join markets
+            // to squadrons (the Markets page) find the hourly crypto squadrons
+            // too: those never pass through `deployment_queue`, so the queue
+            // lookup in `api/server.rs` has no row for them.
+            market_id:         Some(s.market.condition_id.clone()).filter(|c| !c.is_empty()),
         }
     }
 }

@@ -951,6 +951,8 @@ export interface LiveMarketRow {
   criteria?: string;
   market_class: string;
   end_date: string | null;
+  /** The venue's word on whether the book is open; known only for a flown market read from its facts. */
+  accepting_orders?: boolean | null;
   /** The venue's liquidity or volume figure; null for a flown market the venue list omitted. */
   liquidity: number | null;
   /** null only when the venue did not answer for a flown market (see `note`). */
@@ -1051,6 +1053,8 @@ export interface MarketDetail {
   close_time: string | null;
   secs_to_close: number | null;
   state: 'live' | 'closed';
+  /** Live past its listed close because the venue still accepts orders (a sports market's listed close is kick-off). */
+  past_listed_close: boolean;
   resolution: 'yes' | 'no' | null;
   /** null when closed, or when the venue did not answer (see `quotes_unavailable`). */
   quotes: BookSummary | null;

@@ -1020,6 +1020,10 @@ impl Execution for UsRetailVenue {
         // after the game is decided. A time limit validated against it may sit in
         // a stretch where the book has gone, so the posture's own stop remains
         // what gets a position out.
+        // Read before the record is consumed below. `endDate` here is the
+        // settlement date, so the clock alone would call a decided game live;
+        // the venue's own flags say whether the book is open.
+        let accepting_orders = Some(m.active && !m.closed);
         let Some(pair) = markets::pair_markets(vec![m]).into_iter().next() else {
             // Listed but with no tradeable instrument pair: no facts rather than
             // half of them.
@@ -1036,6 +1040,7 @@ impl Execution for UsRetailVenue {
             no_token: pair.short.clone(),
             leg_labels,
             close_time: pair.close_time,
+            accepting_orders,
         }))
     }
 

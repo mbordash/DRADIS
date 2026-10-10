@@ -2956,7 +2956,12 @@ async fn enrich_taxonomy(summary: &mut crate::cag::SquadronSummary) {
     summary.raptors = db::raptors_for_class(pool, &class).await;
     summary.vipers = db::vipers_for_class(pool, &class).await;
     summary.market_class = class;
-    summary.market_id = crate::helpers::helm::market_id_for_squadron(pool, &summary.id).await;
+    // The registry knows the condition id for a squadron it built from a
+    // `MarketConfig` (the hourly crypto rotation); the queue is the record for
+    // everything Helm or the seeder deployed.
+    if summary.market_id.is_none() {
+        summary.market_id = crate::helpers::helm::market_id_for_squadron(pool, &summary.id).await;
+    }
 }
 
 /// GET /api/config/schema

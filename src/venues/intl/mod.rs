@@ -539,6 +539,7 @@ impl Execution for IntlClobVenue {
             no_token: MarketId::new(info.no_token),
             leg_labels: None,
             close_time: info.close_time,
+            accepting_orders: info.accepting_orders,
         }))
     }
 

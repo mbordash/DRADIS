@@ -726,6 +726,17 @@ pub struct MarketFacts {
     /// the close" pass when it should fail, and the position is then held past a
     /// market that has already resolved.
     pub close_time: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether the venue currently accepts orders on this market, where it says.
+    ///
+    /// `close_time` is the EARLIEST credible close, and on a sports market that
+    /// is kick-off: Polymarket's `endDate` for "Will Arsenal FC win on
+    /// 2026-10-10?" is the start of the match, and the book trades on through
+    /// the game. A reader judging "live" from `close_time` alone therefore shows
+    /// a match in play as closed. This is the venue's own answer
+    /// (`acceptingOrders` and `closed` on Polymarket International, `status` on
+    /// Kalshi, `active` and `closed` on Polymarket US); `None` where the venue
+    /// publishes nothing, in which case `close_time` is all there is.
+    pub accepting_orders: Option<bool>,
 }
 
 

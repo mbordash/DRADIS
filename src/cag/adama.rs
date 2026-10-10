@@ -360,6 +360,11 @@ pub struct MarketInfo {
     /// `no market_close_time` and TimeDecay 45 times with `market has no close
     /// time`. The squadrons patrolled, quoted nothing, and looked healthy.
     pub close_time: Option<chrono::DateTime<chrono::Utc>>,
+    /// Gamma's own word on whether the book is open: `false` once `closed`,
+    /// else `acceptingOrders`, `None` when it sends neither. `endDate` is
+    /// kick-off on a sports market and the book trades through the game, so
+    /// this is what says "live", not the date.
+    pub accepting_orders: Option<bool>,
     /// The taker-fee coefficient Gamma publishes for this market, or `None`
     /// when the record carries no schedule this code can read. See
     /// [`parse_gamma_fee_rate`] for what counts as readable.
@@ -610,7 +615,18 @@ pub async fn fetch_market_info(http: &reqwest::Client, condition_id: &str) -> Op
 
     let taker_fee_rate = parse_gamma_fee_rate(market);
 
-    Some(MarketInfo { question, description, yes_token, no_token, close_time, taker_fee_rate })
+    let accepting_orders = match (
+        market.get("closed").and_then(|v| v.as_bool()),
+        market.get("acceptingOrders").and_then(|v| v.as_bool()),
+    ) {
+        (Some(true), _) => Some(false),
+        (_, Some(accepting)) => Some(accepting),
+        // `closed: false` alone is not "the book is open": a market awaiting
+        // resolution or never activated is also not closed. The clock decides.
+        (Some(false), None) | (None, None) => None,
+    };
+
+    Some(MarketInfo { question, description, yes_token, no_token, close_time, accepting_orders, taker_fee_rate })
 }
 
 /// Run the Admiral Adama deployment processor.

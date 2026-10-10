@@ -42,6 +42,17 @@ export function fmtCountdown(secs: number | null): string {
   return `${s}s`;
 }
 
+/**
+ * The list's "closes in" cell. The venue's word wins where the row carries it; without it, a
+ * listed close in the past is only that (a sports market's listed close is kick-off), not "closed".
+ */
+export function fmtClosesIn(endDate: string | null, acceptingOrders: boolean | null | undefined, now: number = Date.now()): string {
+  const secs = secsUntil(endDate, now);
+  if (acceptingOrders === false) return 'closed';
+  if (secs !== null && secs <= 0) return acceptingOrders === true ? 'past close, trading' : 'past listed close';
+  return fmtCountdown(secs);
+}
+
 /** Two significant digits in exponent form, e.g. "1.2e-4". */
 export function fmtSci(x: number): string {
   if (typeof x !== 'number' || !Number.isFinite(x)) return DASH;

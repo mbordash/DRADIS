@@ -70,7 +70,11 @@ function Facts({ d }: { d: MarketDetail }) {
       )}
       <p className="text-[11px] font-mono text-gray-400">
         Closes {fmtLocal(d.close_time)}
-        {d.state === 'live' && <span className="text-gray-500"> ({fmtCountdown(d.secs_to_close)} left)</span>}
+        {d.state === 'live' && (
+          <span className="text-gray-500">
+            {d.past_listed_close ? ' (past its listed close, still trading)' : ` (${fmtCountdown(d.secs_to_close)} left)`}
+          </span>
+        )}
       </p>
     </div>
   );

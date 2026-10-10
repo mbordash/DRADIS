@@ -5,7 +5,7 @@ import useSWR from 'swr';
 import { getLiveMarkets } from '@/lib/api';
 import type { LiveMarketRow, MarketType } from '@/lib/types';
 import MarketDetailPanel from './markets/MarketDetailPanel';
-import { fmtCountdown, fmtMoney, secsUntil } from './markets/format';
+import { fmtClosesIn, fmtMoney } from './markets/format';
 
 interface Props {
   selectedId: string | null;
@@ -136,7 +136,7 @@ export default function MarketsPage({ selectedId, onSelect, onOpenSquadron, onTa
                         </td>
                         <td className="py-2 pr-3 text-[11px] font-mono text-gray-400">{r.market_class}</td>
                         <td className="py-2 pr-3 text-[11px] font-mono text-gray-300 whitespace-nowrap">
-                          {fmtCountdown(secsUntil(r.end_date))}
+                          {fmtClosesIn(r.end_date, r.accepting_orders)}
                         </td>
                         <td className="py-2 pr-3 text-[11px] font-mono text-gray-300 text-right">{fmtMoney(r.liquidity)}</td>
                         <td className="py-2">

@@ -218,14 +218,58 @@ pub fn book_summary(yes: (Option<Decimal>, Option<Decimal>), no: (Option<Decimal
     BookSummary { yes, no, ask_sum }
 }
 
-/// `("live" | "closed", seconds to close)`. A market with no close time is
-/// treated as live with an unknown horizon.
-pub fn market_state(close: Option<DateTime<Utc>>, now: DateTime<Utc>) -> (&'static str, Option<i64>) {
-    match close {
-        Some(c) if c <= now => ("closed", Some(0)),
-        Some(c) => ("live", Some((c - now).num_seconds())),
-        None => ("live", None),
+/// `("live" | "closed", seconds to close)`.
+///
+/// The venue's own word wins when it gives one. A sports market's listed close
+/// is kick-off and the book trades through the game, so with the venue still
+/// accepting orders it is live with `secs_to_close` 0 (past its listed close,
+/// still trading); a market the venue has closed is closed however far off its
+/// listed close. Without a word from the venue the clock decides, and a market
+/// with no close time at all is live with an unknown horizon.
+pub fn market_state(close: Option<DateTime<Utc>>, accepting_orders: Option<bool>, now: DateTime<Utc>) -> (&'static str, Option<i64>) {
+    let countdown = close.map(|c| (c - now).num_seconds().max(0));
+    match accepting_orders {
+        Some(false) => ("closed", Some(0)),
+        Some(true) => ("live", countdown),
+        None => match close {
+            Some(c) if c <= now => ("closed", Some(0)),
+            Some(_) => ("live", countdown),
+            None => ("live", None),
+        },
     }
+}
+
+/// Every market the engine is flying, as `(squadron_id, market_id, class)`.
+///
+/// Two sources, because squadrons arrive two ways. Helm and the auto-deploy
+/// seeder go through `deployment_queue`, whose row carries the class. The
+/// hourly crypto squadrons never touch the queue: the CAG rotates them onto
+/// each hour's market itself, so their only record is the registry summary,
+/// whose `market_id` is the `MarketConfig` condition id. Reading the queue
+/// alone left the BTC hourly unflagged on the list and its detail without a
+/// squadron or verdicts, while the engine was flying it.
+///
+/// A stood-down or returning squadron is not flying anything.
+async fn flown_markets(s: &ApiState) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = match db::pool() {
+        Some(pool) => db::active_deployments(pool).await,
+        None => Vec::new(),
+    };
+    for q in s.cag.list_squadrons() {
+        let Some(market_id) = q.market_id.clone().filter(|m| !m.is_empty()) else { continue };
+        if matches!(q.state.as_str(), "RTB" | "STOOD_DOWN") || out.iter().any(|(sq, _, _)| *sq == q.id) {
+            continue;
+        }
+        let class = if !q.market_class.is_empty() {
+            q.market_class.to_lowercase()
+        } else if matches!(q.asset.to_ascii_lowercase().as_str(), "btc" | "eth" | "sol") {
+            "crypto".to_string()
+        } else {
+            continue;
+        };
+        out.push((q.id.clone(), market_id, class));
+    }
+    out
 }
 
 fn published<T: Serialize>(v: Option<T>) -> serde_json::Value {
@@ -252,6 +296,11 @@ struct LiveMarketRow {
     criteria: String,
     market_class: String,
     end_date: Option<String>,
+    /// The venue's word on whether the book is open, known only for a flown
+    /// market read from its facts; a sports market's `end_date` is kick-off, so
+    /// `true` past it means "in play, still trading", not closed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accepting_orders: Option<bool>,
     /// The venue's liquidity or volume figure; `null` for a market the venue
     /// list omitted and the engine is flying anyway.
     liquidity: Option<f64>,
@@ -298,10 +347,8 @@ async fn live_markets(State(s): State<ApiState>, Query(q): Query<LiveQuery>) -> 
 
         // Which of these the engine is flying, and which flown markets the
         // venue list left out.
-        let deployments: Vec<(String, String, String)> = match db::pool() {
-            Some(pool) => db::active_deployments(pool).await.into_iter().filter(|(_, _, t)| *t == market_type).collect(),
-            None => Vec::new(),
-        };
+        let deployments: Vec<(String, String, String)> =
+            flown_markets(&s).await.into_iter().filter(|(_, _, t)| *t == market_type).collect();
         let squadron_for = |market_id: &str| -> Option<(String, Option<String>)> {
             deployments.iter().find(|(_, m, _)| m == market_id).map(|(sq, _, _)| {
                 let asset = s.cag.get_squadron(sq).map(|q| q.asset.to_lowercase());
@@ -312,7 +359,7 @@ async fn live_markets(State(s): State<ApiState>, Query(q): Query<LiveQuery>) -> 
             let (squadron_id, squadron_asset) = squadron_for(&m.condition_id).map(|(a, b)| (Some(a), b)).unwrap_or((None, None));
             LiveMarketRow {
                 market_id: m.condition_id, question: m.question, criteria: m.criteria,
-                market_class: m.market_class, end_date: m.end_date, liquidity: Some(m.liquidity),
+                market_class: m.market_class, end_date: m.end_date, accepting_orders: None, liquidity: Some(m.liquidity),
                 tokens: Some(LiveTokens { yes_id: m.tokens.yes_id, no_id: m.tokens.no_id }),
                 squadron_id, squadron_asset, note: None,
             }
@@ -327,7 +374,8 @@ async fn live_markets(State(s): State<ApiState>, Query(q): Query<LiveQuery>) -> 
                 let row = match facts_for(session.venue.as_ref(), market_id).await {
                     Ok(facts) => LiveMarketRow {
                         market_id: market_id.clone(), question: facts.question.clone(), criteria: facts.criteria.clone(),
-                        market_class: class.clone(), end_date: facts.close_time.map(|t| t.to_rfc3339()), liquidity: None,
+                        market_class: class.clone(), end_date: facts.close_time.map(|t| t.to_rfc3339()),
+                        accepting_orders: facts.accepting_orders, liquidity: None,
                         tokens: Some(LiveTokens { yes_id: facts.yes_token.as_str().to_string(), no_id: facts.no_token.as_str().to_string() }),
                         squadron_id: Some(sq.clone()), squadron_asset: asset, note: None,
                     },
@@ -336,7 +384,7 @@ async fn live_markets(State(s): State<ApiState>, Query(q): Query<LiveQuery>) -> 
                     Err(_) => LiveMarketRow {
                         market_id: market_id.clone(),
                         question: summary.as_ref().map(|q| q.market_name.clone()).unwrap_or_else(|| market_id.clone()),
-                        criteria: String::new(), market_class: class.clone(), end_date: None, liquidity: None, tokens: None,
+                        criteria: String::new(), market_class: class.clone(), end_date: None, accepting_orders: None, liquidity: None, tokens: None,
                         squadron_id: Some(sq.clone()), squadron_asset: asset,
                         note: Some("the venue did not answer for this market; shown from the squadron's record".to_string()),
                     },
@@ -510,10 +558,7 @@ async fn model_reading(
 }
 
 async fn engine_view(s: &ApiState, market_id: &str, facts: &MarketFacts, quotes: Option<&BookSummary>, now: DateTime<Utc>) -> EngineView {
-    let deployment = match db::pool() {
-        Some(pool) => db::active_deployments(pool).await.into_iter().find(|(_, m, _)| m == market_id),
-        None => None,
-    };
+    let deployment = flown_markets(s).await.into_iter().find(|(_, m, _)| m == market_id);
     let squadron = deployment.as_ref()
         .and_then(|(sq, _, _)| s.cag.get_squadron(sq))
         .map(|q| EngineSquadron { id: q.id.clone(), asset: q.asset.to_lowercase(), name: q.name.clone(), state: q.state.clone(), vipers: q.vipers.clone() });
@@ -560,7 +605,8 @@ async fn market_detail(State(s): State<ApiState>, Path(id): Path<String>) -> Res
         let venue = session.venue.as_ref();
         let facts = facts_for(venue, &id).await?;
         let now = Utc::now();
-        let (state, secs_to_close) = market_state(facts.close_time, now);
+        let (state, secs_to_close) = market_state(facts.close_time, facts.accepting_orders, now);
+        let past_listed_close = state == "live" && facts.close_time.is_some_and(|c| c <= now);
 
         // A failed quote costs the quotes, not the page: facts, our history and
         // the engine's view are all still true without the venue's book.
@@ -596,6 +642,7 @@ async fn market_detail(State(s): State<ApiState>, Path(id): Path<String>) -> Res
             "close_time": facts.close_time.map(|t| t.to_rfc3339()),
             "secs_to_close": secs_to_close,
             "state": state,
+            "past_listed_close": past_listed_close,
             "resolution": resolution,
             "quotes": quotes,
             "quotes_unavailable": quotes_unavailable,
@@ -707,11 +754,22 @@ mod tests {
     #[test]
     fn a_market_past_its_close_is_closed_and_one_before_it_counts_down() {
         let now = Utc::now();
-        assert_eq!(market_state(Some(now - chrono::Duration::seconds(1)), now), ("closed", Some(0)));
-        let (st, secs) = market_state(Some(now + chrono::Duration::seconds(600)), now);
+        assert_eq!(market_state(Some(now - chrono::Duration::seconds(1)), None, now), ("closed", Some(0)));
+        let (st, secs) = market_state(Some(now + chrono::Duration::seconds(600)), None, now);
         assert_eq!(st, "live");
         assert!(secs.is_some_and(|s| (598..=600).contains(&s)));
-        assert_eq!(market_state(None, now), ("live", None));
+        assert_eq!(market_state(None, None, now), ("live", None));
+    }
+
+    /// A sports market's listed close is kick-off. The venue still accepting
+    /// orders makes it live past that close, and the venue closing it makes it
+    /// closed however far off the listed close is.
+    #[test]
+    fn the_venues_word_on_accepting_orders_outranks_the_listed_close() {
+        let now = Utc::now();
+        assert_eq!(market_state(Some(now - chrono::Duration::hours(1)), Some(true), now), ("live", Some(0)));
+        assert_eq!(market_state(Some(now + chrono::Duration::hours(1)), Some(false), now), ("closed", Some(0)));
+        assert_eq!(market_state(None, Some(true), now), ("live", None));
     }
 
     /// The venue's silence and our failure are different facts; only the first

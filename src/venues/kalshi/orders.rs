@@ -324,6 +324,17 @@ impl Execution for KalshiVenue {
         // parse the tick gets `None`, so falling back here would once again judge
         // a posture on a figure the engine will not act on.
         let close_time = parse(&m.close_time);
+        // Kalshi takes orders under `active` (its record vocabulary) or `open`
+        // (its query vocabulary, which `interpret_settlement` also accepts);
+        // `initialized` and `unopened` are before the open, `paused` and
+        // `inactive` a halt, `closed`, `determined`, `finalized` and `settled`
+        // after it. A status this list does not know is left to the clock
+        // rather than read as either answer.
+        let accepting_orders = match m.status.trim() {
+            "active" | "open" => Some(true),
+            "initialized" | "unopened" | "inactive" | "paused" | "closed" | "determined" | "finalized" | "settled" => Some(false),
+            _ => None,
+        };
         Ok(Some(MarketFacts {
             market_id: market.clone(),
             question: m.title,
@@ -334,6 +345,7 @@ impl Execution for KalshiVenue {
             no_token: MarketId::new(crate::venues::kalshi::leg_id(&ticker, false)),
             leg_labels: None,
             close_time,
+            accepting_orders,
         }))
     }
 
