@@ -621,9 +621,12 @@ async fn market_detail(State(s): State<ApiState>, Path(id): Path<String>) -> Res
                 }
             }
         } else {
+            // A venue reports a leg resolved only at a decisive price (Gamma's
+            // reader calls 0.995 final; see `resolution_for_token`), so the
+            // same threshold decides the word here.
             let res = match venue.resolution(&facts.yes_token).await {
-                Ok(TokenResolution::Resolved(p)) if p >= Decimal::ONE => Some("yes"),
-                Ok(TokenResolution::Resolved(p)) if p <= Decimal::ZERO => Some("no"),
+                Ok(TokenResolution::Resolved(p)) if p >= Decimal::new(99, 2) => Some("yes"),
+                Ok(TokenResolution::Resolved(p)) if p <= Decimal::new(1, 2) => Some("no"),
                 _ => None,
             };
             (None, res)

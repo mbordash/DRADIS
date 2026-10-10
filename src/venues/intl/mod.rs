@@ -589,6 +589,12 @@ impl Execution for IntlClobVenue {
             .collect();
         Ok(Some(pts))
     }
+
+    /// Gamma's final price for the leg, through the same reader the settlement
+    /// sweep trusts: `Unknown` while UMA is pending or the price is indecisive.
+    async fn resolution(&self, leg: &MarketId) -> Result<crate::venues::core::TokenResolution> {
+        Ok(crate::helpers::market::resolution_for_token(self.shared_http(), leg.as_str()).await)
+    }
 }
 
 impl IntlClobVenue {
