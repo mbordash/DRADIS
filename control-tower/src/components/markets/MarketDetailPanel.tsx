@@ -41,7 +41,20 @@ function StateBadge({ d }: { d: MarketDetail }) {
   return <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-gray-500/10 text-gray-400">CLOSED</span>;
 }
 
-function Facts({ d }: { d: MarketDetail }) {
+type HelmTarget = Parameters<MarketDetailPanelProps['onTakeHelm']>[0];
+
+/** The market as the Take the Helm modal wants it, built once for both buttons. */
+function helmTarget(d: MarketDetail, marketType: MarketType): HelmTarget {
+  return {
+    condition_id: d.market_id,
+    question: d.question,
+    market_class: marketType,
+    end_date: d.close_time ?? '',
+    criteria: d.criteria || undefined,
+  };
+}
+
+function Facts({ d, onTakeHelm }: { d: MarketDetail; onTakeHelm?: () => void }) {
   const [open, setOpen] = useState(false);
   const long = d.criteria.length > 300;
   const shown = long && !open ? `${d.criteria.slice(0, 300)}…` : d.criteria;
@@ -49,7 +62,18 @@ function Facts({ d }: { d: MarketDetail }) {
     <div className={`${CARD} space-y-2`}>
       <div className="flex items-start justify-between gap-3">
         <h3 className={H3}>Market</h3>
-        <StateBadge d={d} />
+        <div className="flex items-center gap-2">
+          {onTakeHelm && (
+            <button
+              onClick={onTakeHelm}
+              className="rounded border border-teal-500/40 bg-teal-500/10 px-2 py-0.5 text-[10px] font-mono text-teal-200 hover:bg-teal-500/20"
+              title="Deploy a squadron on this market"
+            >
+              Take the Helm
+            </button>
+          )}
+          <StateBadge d={d} />
+        </div>
       </div>
       <p className="text-sm font-mono text-gray-200">{d.question}</p>
       {d.criteria && (
@@ -336,9 +360,12 @@ export default function MarketDetailPanel({ id, marketType, onOpenSquadron, onTa
   const p = prints.data;
   const h = hist.data;
 
+  const canHelm = !DEMO_MODE && d.state === 'live';
+  const takeHelm = () => onTakeHelm(helmTarget(d, marketType));
+
   return (
     <div className="space-y-4">
-      <Facts d={d} />
+      <Facts d={d} onTakeHelm={canHelm ? takeHelm : undefined} />
 
       {d.state === 'closed' ? (
         <div className={CARD}>
@@ -409,15 +436,9 @@ export default function MarketDetailPanel({ id, marketType, onOpenSquadron, onTa
       <Ours d={d} />
       <Engine d={d} onOpenSquadron={onOpenSquadron} />
 
-      {!DEMO_MODE && d.state === 'live' && (
+      {canHelm && (
         <button
-          onClick={() => onTakeHelm({
-            condition_id: d.market_id,
-            question: d.question,
-            market_class: marketType,
-            end_date: d.close_time ?? '',
-            criteria: d.criteria || undefined,
-          })}
+          onClick={takeHelm}
           className="w-full rounded border border-teal-500/40 bg-teal-500/10 px-3 py-2 text-xs font-mono text-teal-200 hover:bg-teal-500/20"
         >
           Take the Helm on this market
