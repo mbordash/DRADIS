@@ -1038,6 +1038,33 @@ impl Execution for UsRetailVenue {
             close_time: pair.close_time,
         }))
     }
+
+    async fn order_book(&self, leg: &MarketId) -> Result<Option<crate::venues::core::LegBook>> {
+        let slug = markets::bare_symbol(leg.as_str());
+        let book = self
+            .client
+            .markets()
+            .order_book(slug)
+            .await
+            .with_context(|| format!("order book query failed for {slug}"))?;
+        let levels = |v: &[polymarket_us::types::PriceLevel]| -> Vec<(Decimal, Decimal)> {
+            v.iter()
+                .filter_map(|l| Some((Decimal::from_str(l.px.value.trim()).ok()?, Decimal::from_str(l.qty.trim()).ok()?)))
+                .collect()
+        };
+        // The venue publishes the long side's book (bids and offers); the short
+        // leg is that book seen through one dollar, exactly as `quote_for_leg`
+        // derives its quote.
+        let long_book = crate::venues::core::LegBook::from_levels(levels(&book.bids), levels(&book.offers));
+        Ok(Some(match markets::leg_is_long(leg.as_str()) {
+            Some(false) => long_book.mirrored(),
+            _ => long_book,
+        }))
+    }
+
+    async fn resolution(&self, leg: &MarketId) -> Result<crate::venues::core::TokenResolution> {
+        Ok(self.settlement_resolution(leg.as_str()).await)
+    }
 }
 
 impl UsRetailVenue {

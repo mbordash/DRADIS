@@ -688,6 +688,8 @@ export function marketLabel(name: string | undefined | null): string {
 /** Summary of one active squadron — returned by GET /api/squadrons and GET /api/squadrons/{id}. */
 export interface SquadronSummary {
   id:                string;        // e.g. "btc-hourly-2026-05-29T14:00:00Z"
+  /** The venue's id for the market this squadron flies; absent on engines before 1.3.5. */
+  market_id?:        string;
   asset:             string;        // "BTC" | "ETH" | "SOL" | …
   name:              string;        // SquadronConfig::name
   state:             SquadronState;
@@ -929,6 +931,151 @@ export interface AvailableMarket {
 export interface AvailableMarketsResponse {
   markets: AvailableMarket[];
 }
+
+// ── Markets page (GET /api/markets/...) ───────────────────────────────────────
+//
+// Honest-state rule ([B43]): a figure the engine does not have arrives as
+// `null`, never as 0. Decimals arrive as strings. A venue that publishes no
+// depth, prints or history answers `published: false` with a reason; a failed
+// read is an HTTP error, which is a different fact.
+
+/** A venue surface the venue may or may not publish. */
+export type Published<T> =
+  | { published: true; data: T }
+  | { published: false; reason: string };
+
+/** One row of GET /api/markets/live. */
+export interface LiveMarketRow {
+  market_id: string;
+  question: string;
+  criteria?: string;
+  market_class: string;
+  end_date: string | null;
+  /** The venue's liquidity or volume figure; null for a flown market the venue list omitted. */
+  liquidity: number | null;
+  /** null only when the venue did not answer for a flown market (see `note`). */
+  tokens: { yes_id: string; no_id: string } | null;
+  squadron_id: string | null;
+  squadron_asset: string | null;
+  note?: string;
+}
+
+export interface LiveMarketsResponse {
+  markets: LiveMarketRow[];
+  as_of: string;
+}
+
+export interface SideQuote {
+  bid: string | null;
+  ask: string | null;
+  mid: string | null;
+  /** ask minus bid; negative on a crossed book, reported rather than clamped. */
+  spread: string | null;
+}
+
+export interface BookSummary {
+  yes: SideQuote;
+  no: SideQuote;
+  /** yes.ask + no.ask; null unless both asks rest. */
+  ask_sum: string | null;
+}
+
+export interface MarketEntryRow {
+  ts: string;
+  strategy: string;
+  token_id: string;
+  market: string;
+  side: string;
+  entry_price: string;
+  shares: string;
+}
+
+export interface MarketActivity {
+  entries: MarketEntryRow[];
+  trades: TradeRow[];
+  open_positions: OpenPositionRow[];
+}
+
+/** FairValue's reading of a crypto market with the global knobs: a reading, not a decision. */
+export interface ModelReadingView {
+  spot: number;
+  strike: number;
+  secs_left: number;
+  sigma_realized: number;
+  sigma_floor: number;
+  sigma_used: number;
+  event_mult: number;
+  fair_yes: number;
+  fair_no: number;
+  required_edge: string;
+  edge_yes: string | null;
+  edge_no: string | null;
+  samples: number;
+}
+
+export interface SportsSideLine {
+  outcome_label: string;
+  consensus: number;
+  num_books: number;
+  dispersion: number | null;
+  drift: number | null;
+  drift_secs: number | null;
+  odds_age_secs: number;
+}
+
+export interface SportsLineView {
+  yes: SportsSideLine | null;
+  no: SportsSideLine | null;
+  commence: string | null;
+}
+
+export interface EngineView {
+  squadron: { id: string; asset: string; name: string; state: string; vipers: string[] } | null;
+  verdicts: import('./api').ViperStatusRow[];
+  /** Verdicts are the squadron's, keyed by its asset, not per market. */
+  verdict_scope: 'squadron';
+  model: ModelReadingView | null;
+  model_unavailable: string | null;
+  sports: SportsLineView | null;
+  sports_unavailable: string | null;
+}
+
+/** GET /api/markets/{id}. */
+export interface MarketDetail {
+  market_id: string;
+  question: string;
+  criteria: string;
+  leg_labels: [string, string] | null;
+  yes_token: string;
+  no_token: string;
+  close_time: string | null;
+  secs_to_close: number | null;
+  state: 'live' | 'closed';
+  resolution: 'yes' | 'no' | null;
+  /** null when closed, or when the venue did not answer (see `quotes_unavailable`). */
+  quotes: BookSummary | null;
+  quotes_unavailable: string | null;
+  ours: MarketActivity;
+  engine: EngineView;
+  as_of: string;
+}
+
+export interface BookLevel { price: string; size: string }
+export interface LegBook { bids: BookLevel[]; asks: BookLevel[] }
+/** GET /api/markets/{id}/book data: a leg the venue does not publish is null. */
+export interface MarketBook { yes: LegBook | null; no: LegBook | null; as_of: string }
+
+export interface PrintRow {
+  at: string;
+  taker_side: 'Buy' | 'Sell';
+  leg_is_yes: boolean;
+  price: string;
+  size: string;
+}
+export interface MarketPrints { prints: PrintRow[]; as_of: string }
+
+export interface PricePoint { at: string; price: string }
+export interface MarketHistory { yes: PricePoint[] | null; no: PricePoint[] | null; hours: number; as_of: string }
 
 /** Raptor kind with implementation status. */
 export interface RaptorKind {

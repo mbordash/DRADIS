@@ -700,23 +700,9 @@ pub async fn cleanup_time_decay_positions(
 /// Examples:
 /// - "Bitcoin Up or Down on June 7?" -> "btc"
 /// - "Will ETH exceed ..." -> "eth"
-fn infer_asset_from_title(title: &str) -> Option<&'static str> {
-    let normalized: String = title
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { ' ' })
-        .collect();
-    let has_word = |needle: &str| normalized.split_whitespace().any(|w| w == needle);
-
-    if has_word("btc") || has_word("bitcoin") {
-        Some("btc")
-    } else if has_word("eth") || has_word("ethereum") {
-        Some("eth")
-    } else if has_word("sol") || has_word("solana") {
-        Some("sol")
-    } else {
-        None
-    }
-}
+// Shared with the Markets API, which infers the asset of a browsed market the
+// same way; one definition so the two can never disagree on a title.
+use crate::helpers::market_title::infer_asset_from_title;
 
 /// HTTP client for the resolution lookups below.
 ///

@@ -25,6 +25,7 @@ pub mod nonce;
 pub mod orders;
 #[cfg(feature = "intl_clob")]
 pub mod market;
+pub mod market_title;
 pub mod notifications;
 pub mod metrics;
 pub mod config_helpers;
@@ -38,6 +39,7 @@ pub mod llm_advisor;
 pub mod llm_patch;
 pub mod llm_policy;
 pub mod volatility;
+pub mod clob_public;
 pub mod sigma_profile;
 pub mod watchdog;
 pub mod logbuf;

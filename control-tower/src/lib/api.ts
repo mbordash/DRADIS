@@ -336,7 +336,7 @@ export async function patchSquadronConfig(squadronId: string, patch: Partial<Dyn
 
 // ── Deployment API ────────────────────────────────────────────────────────────
 
-import type { DeploymentRegionInfo, AvailableMarketsResponse, MarketType, DeploySquadronRequest, DeploySquadronResponse, RaptorKind, ViperKindInfo } from './types';
+import type { DeploymentRegionInfo, AvailableMarketsResponse, MarketType, DeploySquadronRequest, DeploySquadronResponse, RaptorKind, ViperKindInfo, LiveMarketsResponse, MarketDetail, MarketBook, MarketPrints, MarketHistory, Published } from './types';
 
 /** Get deployment region and available market types. */
 export async function getDeploymentRegion(): Promise<DeploymentRegionInfo> {
@@ -356,6 +356,46 @@ export async function getAvailableMarkets(
   
   const res = await fetch(`${BASE}/api/markets/available?${params}`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`GET /api/markets/available → ${res.status}`);
+  return res.json();
+}
+
+// ── Markets page ──────────────────────────────────────────────────────────────
+
+/** Live markets of one class on this instance's venue, with the squadron flying each. */
+export async function getLiveMarkets(
+  marketType: MarketType,
+  options?: { expiryWindow?: string; minLiquidity?: number },
+): Promise<LiveMarketsResponse> {
+  const params = new URLSearchParams({ market_type: marketType });
+  if (options?.expiryWindow) params.set('expiry_window', options.expiryWindow);
+  if (options?.minLiquidity) params.set('min_liquidity', String(options.minLiquidity));
+  const res = await fetch(`${BASE}/api/markets/live?${params}`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/markets/live → ${res.status}`);
+  return res.json();
+}
+
+/** One market: facts, quotes, what DRADIS did on it, and the engine's view. */
+export async function getMarketDetail(marketId: string): Promise<MarketDetail> {
+  const res = await fetch(`${BASE}/api/markets/${encodeURIComponent(marketId)}`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/markets/{id} → ${res.status}`);
+  return res.json();
+}
+
+export async function getMarketBook(marketId: string): Promise<Published<MarketBook>> {
+  const res = await fetch(`${BASE}/api/markets/${encodeURIComponent(marketId)}/book`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/markets/{id}/book → ${res.status}`);
+  return res.json();
+}
+
+export async function getMarketPrints(marketId: string, limit = 50): Promise<Published<MarketPrints>> {
+  const res = await fetch(`${BASE}/api/markets/${encodeURIComponent(marketId)}/prints?limit=${limit}`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/markets/{id}/prints → ${res.status}`);
+  return res.json();
+}
+
+export async function getMarketHistory(marketId: string, hours = 2): Promise<Published<MarketHistory>> {
+  const res = await fetch(`${BASE}/api/markets/${encodeURIComponent(marketId)}/history?hours=${hours}`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/markets/{id}/history → ${res.status}`);
   return res.json();
 }
 

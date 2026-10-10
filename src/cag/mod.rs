@@ -142,6 +142,13 @@ pub struct SquadronSummary {
     /// Why the engine retired it, in the words of the retirement log line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stood_down_reason: Option<String>,
+
+    /// The venue's id for the market this squadron flies (a condition id, a
+    /// slug or a ticker), read from its deployment row by the API layer so the
+    /// Markets page can open it. The registry itself never stored the id, so
+    /// a summary straight from the registry carries `None` and omits the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_id:         Option<String>,
 }
 
 impl SquadronSummary {
@@ -161,6 +168,7 @@ impl SquadronSummary {
             vipers:            Vec::new(),
             stood_down_at:     None,
             stood_down_reason: None,
+            market_id:         None,
         }
     }
 }
@@ -392,6 +400,7 @@ impl Cag {
             vipers:            vipers.to_vec(),
             stood_down_at:     None,
             stood_down_reason: None,
+            market_id:         None,
         };
 
         self.inner.registry.insert(squadron_id.to_string(), CagEntry {

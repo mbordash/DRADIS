@@ -64,6 +64,13 @@ interface Props {
   onClose: () => void;
   /** Called once an intent is acknowledged, with the squadron it lives on. */
   onDone?: (squadronId: string) => void;
+  /**
+   * Open already pointed at one market, as the Markets page does: step 1
+   * skips the browse and shows the market, a name box and Deploy. The
+   * market's class is what the venue files it under; the squadron deployed
+   * still resolves to class helm.
+   */
+  initialMarket?: Pick<AvailableMarket, 'condition_id' | 'question' | 'market_class' | 'end_date' | 'criteria'>;
 }
 
 interface FormState {
@@ -103,7 +110,7 @@ function toRfc3339(local: string): string | null {
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
-export default function TakeTheHelmModal({ isOpen, onClose, onDone }: Props) {
+export default function TakeTheHelmModal({ isOpen, onClose, onDone, initialMarket }: Props) {
   const [step, setStep] = useState<Step>('market');
 
   // Step 1: market and squadron.
@@ -155,12 +162,18 @@ export default function TakeTheHelmModal({ isOpen, onClose, onDone }: Props) {
     setStep('market'); setSelectedMarket(null); setName(''); setSquadronId(null);
     setForm(EMPTY_FORM); setViolations([]); setDetail(null); setCritiqueWaitedOut(false);
     setReadCritique(false); setBusy(false); setError(null);
+    if (initialMarket) {
+      // Pinned from the Markets page: the browse step has nothing to choose.
+      setBrowseType(initialMarket.market_class);
+      setMarkets([{ ...initialMarket, liquidity: 0, tokens: { yes_id: '', no_id: '' } } as AvailableMarket]);
+      setSelectedMarket(initialMarket.condition_id);
+    }
     return clearTimers;
-  }, [isOpen]);
+  }, [isOpen, initialMarket]);
 
   // Browse markets for the chosen type.
   useEffect(() => {
-    if (!isOpen || step !== 'market') return;
+    if (!isOpen || step !== 'market' || initialMarket) return;
     let cancelled = false;
     setLoadingMarkets(true);
     setMarkets([]);
@@ -170,7 +183,7 @@ export default function TakeTheHelmModal({ isOpen, onClose, onDone }: Props) {
       .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : String(e)); })
       .finally(() => { if (!cancelled) setLoadingMarkets(false); });
     return () => { cancelled = true; };
-  }, [isOpen, step, browseType]);
+  }, [isOpen, step, browseType, initialMarket]);
 
   const selected = markets.find((m) => m.condition_id === selectedMarket) ?? null;
 
@@ -350,7 +363,7 @@ export default function TakeTheHelmModal({ isOpen, onClose, onDone }: Props) {
                 venue files the market under, it resolves to class <span className="text-teal-300">helm</span>.
                 The posture you state next is the whole exit plan.
               </p>
-              <div className="flex gap-2">
+              {!initialMarket && <div className="flex gap-2">
                 {BROWSABLE.map((b) => (
                   <button
                     key={b.type}
@@ -365,8 +378,15 @@ export default function TakeTheHelmModal({ isOpen, onClose, onDone }: Props) {
                     {b.icon} {b.label}
                   </button>
                 ))}
-              </div>
-              <MarketBrowser markets={markets} selected={selectedMarket} onSelect={setSelectedMarket} loading={loadingMarkets} />
+              </div>}
+              {initialMarket ? (
+                <div className="rounded border border-teal-500/30 bg-teal-500/[0.06] px-3 py-2 text-xs font-mono text-teal-100">
+                  <p className="truncate" title={initialMarket.question}>{initialMarket.question}</p>
+                  <p className="text-[10px] text-gray-500 mt-0.5">Pinned from the Markets page. Close this and pick another market there to change it.</p>
+                </div>
+              ) : (
+                <MarketBrowser markets={markets} selected={selectedMarket} onSelect={setSelectedMarket} loading={loadingMarkets} />
+              )}
               {selected && (
                 <div className="rounded border border-[#1e1e32] bg-[#0a0a14] px-3 py-2 text-[11px] font-mono text-gray-400 space-y-1">
                   <p>
@@ -375,7 +395,7 @@ export default function TakeTheHelmModal({ isOpen, onClose, onDone }: Props) {
                   </p>
                   <p>
                     Deployed as Helm it resolves to class <span className="text-teal-300">helm</span> — one viper,
-                    no Raptors. Closes {new Date(selected.end_date).toLocaleString()}.
+                    no Raptors.{selected.end_date ? ` Closes ${new Date(selected.end_date).toLocaleString()}.` : ''}
                   </p>
                 </div>
               )}

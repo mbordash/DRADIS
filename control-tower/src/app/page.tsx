@@ -28,6 +28,7 @@ import SquadronsPanel  from '@/components/SquadronsPanel';
 import SquadronDetailView from '@/components/SquadronDetailView';
 import TradelogPage    from '@/components/TradelogPage';
 import HelmPage        from '@/components/HelmPage';
+import TakeTheHelmModal from '@/components/TakeTheHelmModal';
 import SetupPage       from '@/components/SetupPage';
 import AiActionsPage   from '@/components/AiActionsPage';
 import ConsolePage     from '@/components/ConsolePage';
@@ -39,7 +40,7 @@ import { ViperHealthStrip } from '@/components/ViperHealthStrip';
 import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, getPortfolioValue, getVenueIncome, getSquadrons, refusalText } from '@/lib/api';
 import { DEMO_MODE } from '@/lib/demo';
 import { getSetupStatus } from '@/lib/setupApi';
-import type { DynamicConfig, SquadronSummary, PortfolioValue, VenueIncome } from '@/lib/types';
+import type { DynamicConfig, SquadronSummary, PortfolioValue, VenueIncome, AvailableMarket } from '@/lib/types';
 
 // Recharts must be loaded client-side only
 // Loading states are explicit: without one these render nothing at all while
@@ -53,6 +54,12 @@ const PnlChart = dynamic(() => import('@/components/PnlChart'), {
     </div>
   ),
 });
+// Recharts rides along with the history chart, so the page is split off like Telemetry.
+const MarketsPage = dynamic(() => import('@/components/MarketsPage'), {
+  ssr: false,
+  loading: () => <div className="card p-4 text-xs font-mono text-gray-500">Loading Markets…</div>,
+});
+
 const TelemetryPage = dynamic(() => import('@/components/TelemetryPage'), {
   ssr: false,
   loading: () => (
@@ -442,7 +449,7 @@ function PortfolioValueBanner({
 
 // ── Top-level nav ─────────────────────────────────────────────────────────────
 
-type AppView = 'main' | 'telemetry' | 'tradelog' | 'helm' | 'ai' | 'console' | 'setup';
+type AppView = 'main' | 'telemetry' | 'markets' | 'tradelog' | 'helm' | 'ai' | 'console' | 'setup';
 
 /**
  * The app's location, encoded in the URL hash.
@@ -456,11 +463,13 @@ type AppView = 'main' | 'telemetry' | 'tradelog' | 'helm' | 'ai' | 'console' | '
  * Hash rather than real paths because the Control Tower is served as a static
  * export with no server-side routing.
  */
-function encodeRoute(view: AppView, squadronId: string | null): string {
-  return squadronId ? `#${view}/squadron/${encodeURIComponent(squadronId)}` : `#${view}`;
+function encodeRoute(view: AppView, squadronId: string | null, marketId: string | null = null): string {
+  if (squadronId) return `#${view}/squadron/${encodeURIComponent(squadronId)}`;
+  if (marketId) return `#${view}/market/${encodeURIComponent(marketId)}`;
+  return `#${view}`;
 }
 
-function decodeRoute(hash: string): { view: AppView; squadronId: string | null } {
+function decodeRoute(hash: string): { view: AppView; squadronId: string | null; marketId: string | null } {
   const [view, kind, id] = hash.replace(/^#/, '').split('/');
   // An unknown view means a hand-edited or stale URL; fall back rather than
   // rendering nothing.
@@ -468,12 +477,16 @@ function decodeRoute(hash: string): { view: AppView; squadronId: string | null }
   return {
     view: known ? (view as AppView) : 'main',
     squadronId: kind === 'squadron' && id ? decodeURIComponent(id) : null,
+    marketId: kind === 'market' && id ? decodeURIComponent(id) : null,
   };
 }
 
 const VIEW_DEFS: { id: AppView; label: string; icon: string }[] = [
   { id: 'main',      label: 'Main',       icon: '🗺️' },
   { id: 'telemetry', label: 'Telemetry',  icon: '📡' },
+  // Live markets with the venue's picture and the engine's view of each; the
+  // hunt that ends in Take the Helm.
+  { id: 'markets',   label: 'Markets',    icon: '📈' },
   { id: 'tradelog',  label: 'Tradelog',   icon: '📋' },
   // Beside the Tradelog because they answer adjacent questions: the log says
   // what executed, Helm says why it was entered. Its own view because an intent
@@ -561,13 +574,30 @@ export default function DashboardPage() {
   // ── Squadron drill-down state ────────────────────────────────────────────────
   const [focusedSquadronId, setFocusedSquadronId] = useState<string | null>(null);
 
+  // ── Markets page state: the market open in the detail panel, in the hash so a
+  // reload or a shared link lands on it, and the market pinned for Take the Helm.
+  const [focusedMarketId, setFocusedMarketId] = useState<string | null>(null);
+  const [helmMarket, setHelmMarket] = useState<Pick<AvailableMarket, 'condition_id' | 'question' | 'market_class' | 'end_date' | 'criteria'> | null>(null);
+
   /** Move to a view (optionally a squadron) and record it in browser history. */
   const navigate = useCallback((view: AppView, squadronId: string | null = null) => {
     setActiveView(view);
     setFocusedSquadronId(squadronId);
+    setFocusedMarketId(null);
     const next = encodeRoute(view, squadronId);
     if (typeof window !== 'undefined' && window.location.hash !== next) {
       window.history.pushState({ view, squadronId }, '', next);
+    }
+  }, []);
+
+  /** Open (or clear) a market on the Markets page, recorded in history like a squadron. */
+  const selectMarket = useCallback((marketId: string | null) => {
+    setActiveView('markets');
+    setFocusedSquadronId(null);
+    setFocusedMarketId(marketId);
+    const next = encodeRoute('markets', null, marketId);
+    if (typeof window !== 'undefined' && window.location.hash !== next) {
+      window.history.pushState({ view: 'markets', marketId }, '', next);
     }
   }, []);
 
@@ -575,9 +605,10 @@ export default function DashboardPage() {
   // does not push: this reacts to history rather than adding to it.
   useEffect(() => {
     const apply = () => {
-      const { view, squadronId } = decodeRoute(window.location.hash);
+      const { view, squadronId, marketId } = decodeRoute(window.location.hash);
       setActiveView(view);
       setFocusedSquadronId(squadronId);
+      setFocusedMarketId(marketId);
     };
     apply();
     window.addEventListener('popstate', apply);
@@ -835,7 +866,7 @@ export default function DashboardPage() {
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
           {config?.ghost_mode && <GhostBanner ghost />}
           <DarkFeedBanner feeds={status?.dark_market_feeds} />
-          <SquadronDetailView squadron={focusedSquadron} onBack={handleBackToCag} />
+          <SquadronDetailView squadron={focusedSquadron} onBack={handleBackToCag} onOpenMarket={selectMarket} />
           <div className="mt-12"><Footer /></div>
         </main>
       </div>
@@ -933,6 +964,31 @@ export default function DashboardPage() {
               <TelemetryPage availableAssets={availableAssets} venue={setupStatus?.venue} />
             </ChunkBoundary>
           </ErrorBoundary>
+          <Footer />
+        </main>
+      )}
+
+      {/* ── Markets view ───────────────────────────────────────────────────── */}
+      {activeView === 'markets' && (
+        <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+          {config?.ghost_mode && <GhostBanner ghost />}
+          <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <ErrorBoundary label="Markets">
+            <ChunkBoundary name="Markets">
+              <MarketsPage
+                selectedId={focusedMarketId}
+                onSelect={selectMarket}
+                onOpenSquadron={(id) => navigate('main', id)}
+                onTakeHelm={(m) => setHelmMarket(m)}
+              />
+            </ChunkBoundary>
+          </ErrorBoundary>
+          <TakeTheHelmModal
+            isOpen={helmMarket !== null}
+            initialMarket={helmMarket ?? undefined}
+            onClose={() => setHelmMarket(null)}
+            onDone={(squadronId) => { setHelmMarket(null); navigate('main', squadronId); }}
+          />
           <Footer />
         </main>
       )}

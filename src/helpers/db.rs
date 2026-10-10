@@ -3057,6 +3057,112 @@ pub const VIPER_KINDS: &[(&str, &str, i32)] = &[
     (crate::vipers::helm_impl::KIND, "Helm", 1),
 ];
 
+
+/// Deployments that currently have a squadron: `(squadron_id, market_id, market_type)`.
+/// The Markets page joins these onto the venue's live list so a market the
+/// engine is flying carries its squadron, and a flown market the venue list
+/// omitted (under the liquidity floor, or past the expiry window) still appears.
+pub async fn active_deployments(pool: &SqlitePool) -> Vec<(String, String, String)> {
+    sqlx::query(
+        "SELECT squadron_id, market_id, LOWER(market_type) FROM deployment_queue
+         WHERE status IN ('active', 'deployed', 'processing')
+           AND squadron_id IS NOT NULL AND squadron_id <> ''
+         ORDER BY created_at DESC"
+    )
+    .fetch_all(pool).await.ok()
+    .map(|rows| rows.into_iter().filter_map(|r| Some((
+        r.try_get::<String, _>(0).ok()?,
+        r.try_get::<String, _>(1).ok()?,
+        r.try_get::<String, _>(2).ok()?,
+    ))).collect())
+    .unwrap_or_default()
+}
+
+/// One fill event on a market, from the `entries` log.
+#[derive(Debug, Clone, Serialize)]
+pub struct MarketEntryRow {
+    pub ts: String,
+    pub strategy: String,
+    pub token_id: String,
+    pub market: String,
+    pub side: String,
+    pub entry_price: String,
+    pub shares: String,
+}
+
+/// What DRADIS did on one market: fills, round trips and what it still holds.
+///
+/// `trades` rows carry only the market NAME (the table predates token ids), so
+/// they match by name; entries and open positions match by name or by either
+/// token id. A market renamed by the venue loses its older trades here, which
+/// the page says in its caption rather than hiding.
+#[derive(Debug, Default, Serialize)]
+pub struct MarketActivity {
+    pub entries: Vec<MarketEntryRow>,
+    pub trades: Vec<TradeRow>,
+    pub open_positions: Vec<OpenPositionRow>,
+}
+
+impl MarketActivity {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.trades.is_empty() && self.open_positions.is_empty()
+    }
+}
+
+/// The activity on one market in one shard. Callers run it over `all_pools()`
+/// and concatenate, since sports and politics squadrons write to their own.
+pub async fn market_activity(pool: &SqlitePool, market_name: &str, tokens: &[&str]) -> MarketActivity {
+    let tok = |i: usize| tokens.get(i).copied().unwrap_or("").to_string();
+    let (t0, t1) = (tok(0), tok(1));
+    let entries = sqlx::query(
+        "SELECT ts, strategy, token_id, market, side, entry_price, shares FROM entries
+         WHERE market = ? OR token_id IN (?, ?) ORDER BY ts DESC LIMIT 50"
+    )
+    .bind(market_name).bind(&t0).bind(&t1)
+    .fetch_all(pool).await
+    .map(|rows| rows.into_iter().filter_map(|r| Some(MarketEntryRow {
+        ts: r.try_get::<String, _>(0).ok()?,
+        strategy: r.try_get::<String, _>(1).ok()?,
+        token_id: r.try_get::<String, _>(2).ok()?,
+        market: r.try_get::<String, _>(3).ok()?,
+        side: r.try_get::<String, _>(4).ok()?,
+        entry_price: r.try_get::<String, _>(5).ok()?,
+        shares: r.try_get::<String, _>(6).ok()?,
+    })).collect())
+    .unwrap_or_default();
+    let trades = match sqlx::query(
+        "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason,
+                venue, market_class, underlying, fees, ghost, intent_id
+         FROM trades WHERE market = ? ORDER BY ts DESC LIMIT 50"
+    )
+    .bind(market_name)
+    .fetch_all(pool)
+    .await {
+        Ok(rows) => rows.into_iter().filter_map(|r| Some(TradeRow {
+            ts:          r.try_get::<String, _>(0).ok()?,
+            strategy:    r.try_get::<String, _>(1).ok()?,
+            market:      r.try_get::<String, _>(2).ok()?,
+            side:        r.try_get::<String, _>(3).ok()?,
+            entry_price: r.try_get::<String, _>(4).ok()?,
+            exit_price:  r.try_get::<String, _>(5).ok()?,
+            shares:      r.try_get::<String, _>(6).ok()?,
+            pnl:         r.try_get::<String, _>(7).ok()?,
+            reason:      r.try_get::<String, _>(8).ok()?,
+            venue:        r.try_get::<Option<String>, _>(9).ok().flatten(),
+            market_class: r.try_get::<Option<String>, _>(10).ok().flatten(),
+            underlying:   r.try_get::<Option<String>, _>(11).ok().flatten(),
+            fees:         r.try_get::<Option<String>, _>(12).ok().flatten(),
+            ghost:        r.try_get::<i64, _>(13).map(|v| v != 0).unwrap_or(false),
+            intent_id:    r.try_get::<Option<i64>, _>(14).ok().flatten(),
+        })).collect(),
+        Err(e) => { error!("❌ DB market_activity trades failed: {}", e); vec![] }
+    };
+    let open_positions = get_open_positions(pool).await.into_iter()
+        .filter(|p| p.market == market_name || (!t0.is_empty() && p.token_id == t0) || (!t1.is_empty() && p.token_id == t1))
+        .collect();
+    MarketActivity { entries, trades, open_positions }
+}
+
 /// Fetch pending deployment requests from the queue.
 /// Market classes that already have a deployment the engine has not finished with.
 ///

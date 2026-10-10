@@ -541,3 +541,113 @@ mod tests {
         assert_eq!(o.filled_count(), None, "unknown must never read as filled");
     }
 }
+
+// ─── Public market data for the Markets page ──────────────────────────────────
+
+/// One leg's depth from the fixed-point book. Kalshi publishes YES bids and NO
+/// bids; a YES ask is a NO bid seen through one dollar, and the reverse.
+pub fn leg_book_from_fp(book: &OrderbookFp, is_yes: bool) -> crate::venues::core::LegBook {
+    let levels = |v: &[[String; 2]]| -> Vec<(Decimal, Decimal)> {
+        v.iter().filter_map(|l| Some((fp(&l[0])?, fp(&l[1])?))).collect()
+    };
+    let yes_bids = levels(&book.yes_dollars);
+    let no_bids = levels(&book.no_dollars);
+    let through_one = |v: &[(Decimal, Decimal)]| -> Vec<(Decimal, Decimal)> {
+        v.iter().map(|(p, q)| (Decimal::ONE - p, *q)).collect()
+    };
+    if is_yes {
+        crate::venues::core::LegBook::from_levels(yes_bids, through_one(&no_bids))
+    } else {
+        crate::venues::core::LegBook::from_levels(no_bids, through_one(&yes_bids))
+    }
+}
+
+/// `GET /markets/trades?ticker=` response. Fields arrive in the fixed-point
+/// dollar form on current API versions and as integer cents on older ones;
+/// both are accepted and neither is required, so a row missing its price is
+/// skipped rather than read as free.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TradesResponse {
+    #[serde(default)]
+    pub trades: Vec<KalshiTrade>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct KalshiTrade {
+    #[serde(default)]
+    pub created_time: String,
+    #[serde(default)]
+    pub yes_price_dollars: String,
+    /// Legacy cents, sent as a number on some responses and a string on
+    /// others, like the order types' `count` fields; read leniently.
+    #[serde(default)]
+    pub yes_price: serde_json::Value,
+    #[serde(default)]
+    pub count_fp: String,
+    #[serde(default)]
+    pub count: serde_json::Value,
+    /// "yes" or "no": which side the taker bought.
+    #[serde(default)]
+    pub taker_side: String,
+}
+
+/// An integer that Kalshi sends as a number or as a string.
+fn lenient_int(v: &serde_json::Value) -> Option<i64> {
+    v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+/// A Kalshi trade as a tape print on the leg the taker bought. A taker that
+/// bought NO printed on the NO leg at one minus the YES price.
+pub fn print_from_trade(t: &KalshiTrade) -> Option<crate::venues::core::TapePrint> {
+    let yes_price = fp(&t.yes_price_dollars).or_else(|| lenient_int(&t.yes_price).map(|c| Decimal::new(c, 2)))?;
+    let size = fp(&t.count_fp).or_else(|| lenient_int(&t.count).map(Decimal::from))?;
+    let at = chrono::DateTime::parse_from_rfc3339(t.created_time.trim()).ok()?.with_timezone(&chrono::Utc);
+    let leg_is_yes = match t.taker_side.trim().to_ascii_lowercase().as_str() {
+        "yes" => true,
+        "no" => false,
+        _ => return None,
+    };
+    let price = if leg_is_yes { yes_price } else { Decimal::ONE - yes_price };
+    Some(crate::venues::core::TapePrint { at, taker_side: crate::venues::core::Side::Buy, leg_is_yes, price, size })
+}
+
+#[cfg(test)]
+mod market_data_tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    /// Kalshi's book is YES bids and NO bids. The NO leg's asks are the YES bids
+    /// through one dollar, and the YES leg's asks the NO bids through one.
+    #[test]
+    fn the_no_leg_book_is_the_yes_bids_seen_through_one_dollar() {
+        let book = OrderbookFp {
+            yes_dollars: vec![["0.55".into(), "10".into()], ["0.50".into(), "20".into()]],
+            no_dollars: vec![["0.43".into(), "5".into()]],
+        };
+        let yes = leg_book_from_fp(&book, true);
+        assert_eq!(yes.bids[0].price, dec!(0.55));
+        assert_eq!(yes.asks, vec![crate::venues::core::BookLevel { price: dec!(0.57), size: dec!(5) }]);
+        let no = leg_book_from_fp(&book, false);
+        assert_eq!(no.bids[0].price, dec!(0.43));
+        assert_eq!(no.asks.iter().map(|l| l.price).collect::<Vec<_>>(), vec![dec!(0.45), dec!(0.50)]);
+    }
+
+    /// Dollar fields win, cents are the fallback, and a row with neither is no print.
+    #[test]
+    fn a_trade_prints_on_the_leg_the_taker_bought() {
+        let t = KalshiTrade { created_time: "2026-10-09T12:00:00Z".into(), yes_price_dollars: "0.6200".into(), count_fp: "3.00".into(), taker_side: "no".into(), ..Default::default() };
+        let p = print_from_trade(&t).unwrap();
+        assert!(!p.leg_is_yes);
+        assert_eq!(p.price, dec!(0.38));
+        assert_eq!(p.size, dec!(3));
+        let legacy = KalshiTrade { created_time: "2026-10-09T12:00:00Z".into(), yes_price: serde_json::json!(62), count: serde_json::json!("3"), taker_side: "yes".into(), ..Default::default() };
+        let p = print_from_trade(&legacy).unwrap();
+        assert_eq!(p.price, dec!(0.62));
+        assert_eq!(p.size, dec!(3), "a string count is still a count");
+        assert!(print_from_trade(&KalshiTrade { created_time: "2026-10-09T12:00:00Z".into(), ..Default::default() }).is_none());
+        let no_side = KalshiTrade { created_time: "2026-10-09T12:00:00Z".into(), yes_price_dollars: "0.6200".into(), count_fp: "1".into(), ..Default::default() };
+        assert!(print_from_trade(&no_side).is_none(), "a print with no taker side is skipped, not called YES");
+        let resp: TradesResponse = serde_json::from_str(r#"{"trades":[{"created_time":"2026-10-09T12:00:00Z","yes_price":"62","count":"3","taker_side":"no"}]}"#).unwrap();
+        assert_eq!(resp.trades.len(), 1);
+    }
+}

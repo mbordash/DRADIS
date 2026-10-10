@@ -574,14 +574,7 @@ pub fn history_mid_at(series: &[(i64, f64)], t: i64) -> Option<f64> {
 
 /// Points of a `prices-history` response as `(t, p)`, sorted by time. Parsed the
 /// same way as the training fetch, so both paths read identical series.
-pub fn parse_price_history(v: &serde_json::Value) -> Vec<(i64, f64)> {
-    let mut pts: Vec<(i64, f64)> = v["history"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|p| Some((num(&p["t"])? as i64, num(&p["p"])?))).collect())
-        .unwrap_or_default();
-    pts.sort_by_key(|x| x.0);
-    pts
-}
+pub use crate::helpers::clob_public::parse_price_history;
 
 /// Every row of one market, exactly as the reference builder produced them, with the
 /// features from the viper's own `build_features`.
@@ -1715,7 +1708,7 @@ async fn get_json(url: &str) -> Result<serde_json::Value, String> {
 }
 
 fn num(v: &serde_json::Value) -> Option<f64> {
-    v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    crate::helpers::clob_public::num(v)
 }
 /// GET raw bytes with the same pacing and backoff as `get_json`. `Ok(None)` on 404:
 /// for the daily archive that means "not published yet", which is not an error.
@@ -1832,14 +1825,11 @@ async fn fetch_market(w: i64, now: i64) -> Result<Fetched, String> {
     let mut off = 0usize;
     loop {
         let page = get_json(&format!("{DATA_API}/trades?market={cid}&limit={TAPE_PAGE}&offset={off}")).await?;
-        let rows = page.as_array().cloned().unwrap_or_default();
-        for x in &rows {
-            let (Some(ts), Some(side), Some(o), Some(p), Some(s)) = (
-                num(&x["timestamp"]).map(|v| v as i64), x["side"].as_str(), num(&x["outcomeIndex"]), num(&x["price"]), num(&x["size"]),
-            ) else { continue };
-            rec.tape.push(Print { ts, side: side.to_string(), o: o as u8, p, s });
+        let rows_len = page.as_array().map_or(0, |a| a.len());
+        for x in crate::helpers::clob_public::parse_trades(&page) {
+            rec.tape.push(Print { ts: x.ts, side: x.side, o: x.outcome_index, p: x.price, s: x.size });
         }
-        if rows.len() < TAPE_PAGE || off >= TAPE_MAX_OFFSET { break; }
+        if rows_len < TAPE_PAGE || off >= TAPE_MAX_OFFSET { break; }
         off += TAPE_PAGE;
     }
     for (i, tok) in rec.tokens.iter().enumerate() {

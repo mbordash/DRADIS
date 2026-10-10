@@ -77,7 +77,7 @@ impl std::fmt::Display for OrderId {
 // ─── Neutral order primitives ───────────────────────────────────────────────
 
 /// Order direction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum Side {
     Buy,
     Sell,
@@ -582,6 +582,103 @@ pub trait Execution: Send + Sync {
     /// venue could not resolve it, which is a refusal: an intent whose market
     /// cannot be read is one whose posture cannot be checked.
     async fn market_facts(&self, market: &MarketId) -> Result<Option<MarketFacts>>;
+
+    // ── Operator read surfaces ─────────────────────────────────────────────
+    //
+    // The Markets page shows a market the way the venue's own UI would. These
+    // are read surfaces for a human and nothing in the trading lifecycle
+    // consults them, so the `best_ask` warning above does not apply: a venue
+    // that publishes none of this returns `Ok(None)`, which the page renders as
+    // "not published by this venue", and a failed read is an `Err`, which is a
+    // different fact (the venue publishes it and we could not get it).
+
+    /// Resting depth for one leg, bids best-first and asks best-first.
+    async fn order_book(&self, _leg: &MarketId) -> Result<Option<LegBook>> {
+        Ok(None)
+    }
+
+    /// The last `limit` prints on the MARKET, both legs, newest first.
+    async fn recent_prints(&self, _market: &MarketId, _limit: usize) -> Result<Option<Vec<TapePrint>>> {
+        Ok(None)
+    }
+
+    /// One leg's price series since `since`, at the venue's finest public cadence.
+    async fn price_history(
+        &self,
+        _leg: &MarketId,
+        _since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<Vec<PricePoint>>> {
+        Ok(None)
+    }
+
+    /// How one leg resolved, where the venue says. `Unknown` is the honest
+    /// default and the page shows "awaiting resolution" for it.
+    async fn resolution(&self, _leg: &MarketId) -> Result<TokenResolution> {
+        Ok(TokenResolution::Unknown)
+    }
+}
+
+/// One resting level of a leg's book.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BookLevel {
+    pub price: Decimal,
+    pub size: Decimal,
+}
+
+/// One leg's resting depth. Bids are sorted best (highest) first, asks best
+/// (lowest) first, whatever order the venue sent them in.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct LegBook {
+    pub bids: Vec<BookLevel>,
+    pub asks: Vec<BookLevel>,
+}
+
+impl LegBook {
+    /// Build from raw `(price, size)` pairs, sorting each side best-first and
+    /// dropping empty or non-positive levels.
+    pub fn from_levels(bids: Vec<(Decimal, Decimal)>, asks: Vec<(Decimal, Decimal)>) -> Self {
+        let clean = |v: Vec<(Decimal, Decimal)>| -> Vec<BookLevel> {
+            v.into_iter()
+                .filter(|(p, q)| *p > Decimal::ZERO && *p < Decimal::ONE && *q > Decimal::ZERO)
+                .map(|(price, size)| BookLevel { price, size })
+                .collect()
+        };
+        let mut bids = clean(bids);
+        let mut asks = clean(asks);
+        bids.sort_by(|a, b| b.price.cmp(&a.price));
+        asks.sort_by(|a, b| a.price.cmp(&b.price));
+        Self { bids, asks }
+    }
+
+    /// The other leg's book seen through this one: a bid for YES at p is an
+    /// ask for NO at 1 - p, and the reverse. Binary venues that publish one
+    /// side's book (Polymarket US, Kalshi's yes/no levels) derive the other
+    /// leg this way.
+    pub fn mirrored(&self) -> Self {
+        let flip = |v: &[BookLevel]| -> Vec<(Decimal, Decimal)> {
+            v.iter().map(|l| (Decimal::ONE - l.price, l.size)).collect()
+        };
+        Self::from_levels(flip(&self.asks), flip(&self.bids))
+    }
+}
+
+/// One print from the venue's public tape.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct TapePrint {
+    pub at: chrono::DateTime<chrono::Utc>,
+    /// The taker's side: `Buy` lifted an ask, `Sell` hit a bid.
+    pub taker_side: Side,
+    /// Which leg printed; the price is that leg's.
+    pub leg_is_yes: bool,
+    pub price: Decimal,
+    pub size: Decimal,
+}
+
+/// One point of a leg's public price series.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PricePoint {
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub price: Decimal,
 }
 
 /// What a venue can say about one market, in terms no venue owns.
@@ -684,5 +781,32 @@ pub async fn starting_collateral<V: Execution + ?Sized>(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod leg_book_tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    /// Venues send levels in their own order; the page relies on best-first.
+    #[test]
+    fn levels_are_sorted_best_first_and_junk_is_dropped() {
+        let b = LegBook::from_levels(
+            vec![(dec!(0.50), dec!(10)), (dec!(0.55), dec!(5)), (dec!(0), dec!(9)), (dec!(0.52), dec!(0))],
+            vec![(dec!(0.60), dec!(1)), (dec!(0.57), dec!(2)), (dec!(1), dec!(3))],
+        );
+        assert_eq!(b.bids.iter().map(|l| l.price).collect::<Vec<_>>(), vec![dec!(0.55), dec!(0.50)]);
+        assert_eq!(b.asks.iter().map(|l| l.price).collect::<Vec<_>>(), vec![dec!(0.57), dec!(0.60)]);
+    }
+
+    /// A YES bid at 0.55 is a NO ask at 0.45, and a YES ask at 0.57 a NO bid at 0.43.
+    #[test]
+    fn the_no_leg_book_is_the_yes_book_mirrored_through_one() {
+        let yes = LegBook::from_levels(vec![(dec!(0.55), dec!(5)), (dec!(0.50), dec!(10))], vec![(dec!(0.57), dec!(2))]);
+        let no = yes.mirrored();
+        assert_eq!(no.bids, vec![BookLevel { price: dec!(0.43), size: dec!(2) }]);
+        assert_eq!(no.asks, vec![BookLevel { price: dec!(0.45), size: dec!(5) }, BookLevel { price: dec!(0.50), size: dec!(10) }]);
+        assert_eq!(no.mirrored(), yes, "mirroring twice is the identity");
     }
 }

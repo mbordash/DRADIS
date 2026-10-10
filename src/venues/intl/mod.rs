@@ -541,6 +541,53 @@ impl Execution for IntlClobVenue {
             close_time: info.close_time,
         }))
     }
+
+    async fn order_book(&self, leg: &MarketId) -> Result<Option<crate::venues::core::LegBook>> {
+        let url = format!("https://clob.polymarket.com/book?token_id={}", leg.as_str());
+        let v: serde_json::Value = self.shared_http().get(&url)
+            .timeout(std::time::Duration::from_secs(5)).send().await?.error_for_status()?.json().await?;
+        let (bids, asks) = crate::helpers::clob_public::parse_book(&v);
+        Ok(Some(crate::venues::core::LegBook::from_levels(bids, asks)))
+    }
+
+    async fn recent_prints(&self, market: &MarketId, limit: usize) -> Result<Option<Vec<crate::venues::core::TapePrint>>> {
+        let url = format!("https://data-api.polymarket.com/trades?market={}&limit={}", market.as_str(), limit.clamp(1, 500));
+        let v: serde_json::Value = self.shared_http().get(&url)
+            .timeout(std::time::Duration::from_secs(5)).send().await?.error_for_status()?.json().await?;
+        let mut prints: Vec<crate::venues::core::TapePrint> = crate::helpers::clob_public::parse_trades(&v)
+            .into_iter()
+            .filter_map(|p| Some(crate::venues::core::TapePrint {
+                at: chrono::DateTime::from_timestamp(p.ts, 0)?,
+                taker_side: if p.side.eq_ignore_ascii_case("BUY") { crate::venues::core::Side::Buy } else { crate::venues::core::Side::Sell },
+                leg_is_yes: p.outcome_index == 0,
+                price: crate::helpers::clob_public::dec_from_f64(p.price)?,
+                size: crate::helpers::clob_public::dec_from_f64(p.size)?,
+            }))
+            .collect();
+        prints.sort_by(|a, b| b.at.cmp(&a.at));
+        Ok(Some(prints))
+    }
+
+    async fn price_history(
+        &self,
+        leg: &MarketId,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<Vec<crate::venues::core::PricePoint>>> {
+        let url = format!(
+            "https://clob.polymarket.com/prices-history?market={}&startTs={}&endTs={}&fidelity=1",
+            leg.as_str(), since.timestamp(), chrono::Utc::now().timestamp(),
+        );
+        let v: serde_json::Value = self.shared_http().get(&url)
+            .timeout(std::time::Duration::from_secs(5)).send().await?.error_for_status()?.json().await?;
+        let pts = crate::helpers::clob_public::parse_price_history(&v)
+            .into_iter()
+            .filter_map(|(t, p)| Some(crate::venues::core::PricePoint {
+                at: chrono::DateTime::from_timestamp(t, 0)?,
+                price: crate::helpers::clob_public::dec_from_f64(p)?,
+            }))
+            .collect();
+        Ok(Some(pts))
+    }
 }
 
 impl IntlClobVenue {

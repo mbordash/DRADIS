@@ -2956,6 +2956,7 @@ async fn enrich_taxonomy(summary: &mut crate::cag::SquadronSummary) {
     summary.raptors = db::raptors_for_class(pool, &class).await;
     summary.vipers = db::vipers_for_class(pool, &class).await;
     summary.market_class = class;
+    summary.market_id = crate::helpers::helm::market_id_for_squadron(pool, &summary.id).await;
 }
 
 /// GET /api/config/schema
@@ -3341,7 +3342,7 @@ impl<V> VenueSlot<V> {
 ///
 /// Shared by the browse list and Quick deploy: when Quick had its own hardcoded
 /// 7-day window, it found nothing for classes the browse list happily showed.
-fn default_expiry_secs(market_type: &str) -> i64 {
+pub(crate) fn default_expiry_secs(market_type: &str) -> i64 {
     #[cfg(all(not(feature = "intl_clob"), feature = "kalshi"))]
     match market_type.to_lowercase().as_str() {
         "sports" => 63_072_000,   // 2y — championship futures
@@ -3466,7 +3467,7 @@ mod discovery_window_tests {
 /// takes the best, so it uses the same floor as the browse list rather than a
 /// stricter one — otherwise Quick refuses to deploy a market the operator can
 /// see listed, with an error that says none exist.
-const DISCOVERY_MIN_LIQUIDITY: f64 = 500.0;
+pub(crate) const DISCOVERY_MIN_LIQUIDITY: f64 = 500.0;
 
 /// GET /api/markets/available?market_type=crypto&expiry_window=4h&min_liquidity=1000
 ///
@@ -3491,19 +3492,7 @@ async fn get_available_markets(Query(q): Query<AvailableMarketsQuery>) -> Respon
     // a filter doing its job.
     let default_expiry = default_expiry_secs(&q.market_type);
     
-    let max_expiry_secs: i64 = match q.expiry_window.as_deref() {
-        Some("1h") => 3600,
-        Some("4h") => 14400,
-        Some("24h") => 86400,
-        Some("7d") => 604800,
-        Some("30d") => 2592000,
-        Some("90d") => 7776000,
-        // Kalshi season futures and election cycles sit years out; without this
-        // the longest selectable window still hides them.
-        Some("1y") => 31_536_000,
-        Some("2y") => 63_072_000,
-        _ => default_expiry,
-    };
+    let max_expiry_secs: i64 = crate::api::markets::expiry_window_secs(q.expiry_window.as_deref(), default_expiry);
     
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -4652,6 +4641,8 @@ pub async fn run_api_server(
     // Helm intents: the operator's conviction record. Mounted here so the
     // API-key and read-only gates below apply to its writes like any other.
     let protected_routes = protected_routes.merge(crate::api::helm::routes());
+    // The Markets page: live markets, each with the venue's picture and the engine's own view.
+    let protected_routes = protected_routes.merge(crate::api::markets::routes());
 
     let protected_routes = protected_routes
         // API-key check applied to all matched routes (inner layer — runs after CORS).

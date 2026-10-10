@@ -89,7 +89,17 @@ pub fn kline_open_price(kline: &serde_json::Value) -> Option<Decimal> {
     Decimal::from_str(open).ok()
 }
 
-async fn fetch_kline_open(
+/// Binance hosts for the one-minute open at a window start, in the order they
+/// are tried. `api.binance.com` answers HTTP 451 from US-hosted instances, so
+/// the public data mirror goes first; the GBoost trainer already does this.
+const KLINE_HOSTS: [&str; 2] = ["https://data-api.binance.vision", "https://api.binance.com"];
+
+/// The one-minute open of the underlying at `at`: the strike of an "Up or Down"
+/// market whose window starts then. `None` when no host answers. Binance
+/// answers a request for a minute that has not started with an EMPTY array, so
+/// a future `at` falls out as None rather than as some other candle; callers
+/// guard the time anyway and this is the backstop.
+pub async fn fetch_window_open(
     http: &reqwest::Client,
     filter: &str,
     at: DateTime<Utc>,
@@ -99,17 +109,50 @@ async fn fetch_kline_open(
         "sol" => "SOLUSDT",
         _ => "BTCUSDT",
     };
-    let url = format!(
-        "https://api.binance.com/api/v3/klines?symbol={}&interval=1m&startTime={}&limit=1",
-        binance_symbol, at.timestamp_millis(),
-    );
-    let resp = http.get(&url).send().await.ok()?;
-    let json = resp.json::<serde_json::Value>().await.ok()?;
-    let candle = json.as_array().and_then(|a| a.first())?;
-    // Binance answers a request for a minute that has not started with an
-    // EMPTY array, so a future `at` falls out here as None rather than as some
-    // other candle. The callers guard the time anyway; this is the backstop.
-    kline_open_price(candle)
+    for host in KLINE_HOSTS {
+        let url = format!(
+            "{host}/api/v3/klines?symbol={}&interval=1m&startTime={}&limit=1",
+            binance_symbol, at.timestamp_millis(),
+        );
+        let Ok(resp) = http.get(&url).send().await else { continue };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(json) = resp.json::<serde_json::Value>().await else { continue };
+        match json.as_array() {
+            // A minute that has not started yet comes back as an empty array;
+            // the mirror would say the same, so do not ask it.
+            Some(rows) if rows.is_empty() => return None,
+            Some(rows) => {
+                if let Some(price) = rows.first().and_then(kline_open_price) {
+                    return Some(price);
+                }
+            }
+            None => {}
+        }
+    }
+    None
+}
+
+/// The window start of a daily "Up or Down" market: the same Eastern wall-clock
+/// time one calendar day before its close. Not `close - 86400 s`: on the two
+/// clock-change days a year that lands an hour off the prior noon, and the
+/// venue's daily markets are defined in Eastern time.
+pub fn daily_window_reference_time(close_time: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let local = close_time.with_timezone(&Eastern);
+    let prev = local.date_naive().pred_opt()?.and_time(local.time());
+    Eastern.from_local_datetime(&prev).earliest().map(|t| t.with_timezone(&Utc))
+}
+
+/// How long an "Up or Down" market's window is, from its question alone.
+///
+/// Polymarket's hourly markets name a clock time ("Bitcoin Up or Down - October
+/// 8, 12PM ET"); the daily ones name only a date ("Bitcoin Up or Down on
+/// October 8?"). The window start, and so the strike, is the close minus this.
+pub fn up_down_window_secs(question: &str) -> i64 {
+    static CLOCK: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let clock = CLOCK.get_or_init(|| Regex::new(r"(?i)\b\d{1,2}(:\d{2})?\s?(AM|PM)\b").expect("clock-time regex"));
+    if clock.is_match(question) { 3600 } else { 86_400 }
 }
 
 /// Strike for a fixed one-hour window market from its close time: the open of
@@ -127,7 +170,7 @@ pub async fn fetch_strike_price_from_close_time(
         );
         return None;
     };
-    let price = fetch_kline_open(http, filter, reference_time).await?;
+    let price = fetch_window_open(http, filter, reference_time).await?;
     debug!("✅ Fetched strike price from Binance at window open: ${}", price);
     Some(price)
 }
@@ -191,7 +234,7 @@ pub async fn fetch_historical_strike_price(
         );
         return None;
     }
-    fetch_kline_open(http, filter, reference_time).await
+    fetch_window_open(http, filter, reference_time).await
 }
 
 /// Generate candidate market names for hourly crypto events
@@ -465,5 +508,43 @@ mod hourly_slug_tests {
     fn dst_fall_back_dedupes_the_repeated_hour() {
         let slugs = generate_hourly_market_slugs("btc", utc("2026-11-01T05:30:00Z"), 1);
         assert_eq!(slugs, vec!["bitcoin-up-or-down-november-1-2026-1am-et"]);
+    }
+}
+
+#[cfg(test)]
+mod up_down_window_tests {
+    use super::up_down_window_secs;
+
+    /// The two question forms Polymarket uses today.
+    #[test]
+    fn an_hourly_up_or_down_question_has_a_one_hour_window() {
+        assert_eq!(up_down_window_secs("Bitcoin Up or Down - October 8, 12PM ET"), 3600);
+        assert_eq!(up_down_window_secs("Ethereum Up or Down - October 8, 3am ET"), 3600);
+        assert_eq!(up_down_window_secs("Bitcoin Up or Down - October 8, 12:30PM ET"), 3600);
+    }
+
+    #[test]
+    fn a_daily_up_or_down_question_has_a_one_day_window() {
+        assert_eq!(up_down_window_secs("Bitcoin Up or Down on October 8?"), 86_400);
+        assert_eq!(up_down_window_secs("Solana Up or Down on October 9?"), 86_400);
+    }
+}
+
+#[cfg(test)]
+mod daily_reference_tests {
+    use super::*;
+
+    /// 2026-11-01 is the autumn clock change. A daily market closing at noon EST
+    /// that day (17:00Z) started at noon EDT the day before (16:00Z); 24 hours
+    /// of seconds would say 13:00 EDT.
+    #[test]
+    fn the_daily_reference_is_the_prior_noon_in_eastern_wall_clock_time() {
+        let close = Utc.with_ymd_and_hms(2026, 11, 1, 17, 0, 0).unwrap();
+        let reference = daily_window_reference_time(close).unwrap();
+        assert_eq!(reference, Utc.with_ymd_and_hms(2026, 10, 31, 16, 0, 0).unwrap());
+        assert_ne!(reference, close - chrono::Duration::hours(24));
+        // An ordinary day is exactly a day.
+        let close = Utc.with_ymd_and_hms(2026, 10, 8, 16, 0, 0).unwrap();
+        assert_eq!(daily_window_reference_time(close).unwrap(), close - chrono::Duration::hours(24));
     }
 }

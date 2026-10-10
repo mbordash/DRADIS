@@ -171,7 +171,7 @@ const STATE_COLORS: Record<string, string> = {
   STAGED: 'text-gray-500',
 };
 
-function SquadronInfoCard({ squadron }: { squadron: SquadronSummary }) {
+function SquadronInfoCard({ squadron, onOpenMarket }: { squadron: SquadronSummary; onOpenMarket?: (marketId: string) => void }) {
   const stateColor = STATE_COLORS[squadron.state] ?? 'text-gray-400';
   return (
     <div className="card p-4">
@@ -206,6 +206,15 @@ function SquadronInfoCard({ squadron }: { squadron: SquadronSummary }) {
           <span className={`text-[11px] break-words ${squadron.market_name ? 'text-gray-300' : 'text-gray-500 italic'}`}>
             {squadron.market_name ? squadron.market_name : `⏳ ${marketLabel(squadron.market_name)}`}
           </span>
+          {squadron.market_id && onOpenMarket && (
+            <button
+              onClick={() => onOpenMarket(squadron.market_id!)}
+              className="self-start text-[10px] font-mono text-teal-300 hover:text-teal-200 underline underline-offset-2"
+              title="The venue's picture of this market and the engine's view of it"
+            >
+              Open in Markets →
+            </button>
+          )}
         </div>
         {squadron.maker_market_name && (
           <div className="flex flex-col gap-1 pt-2 border-t border-[#1e1e32]">
@@ -226,6 +235,8 @@ function SquadronInfoCard({ squadron }: { squadron: SquadronSummary }) {
 interface Props {
   squadron: SquadronSummary;
   onBack: () => void;
+  /** Open this squadron's market on the Markets page; absent on engines that send no market id. */
+  onOpenMarket?: (marketId: string) => void;
 }
 
 /**
@@ -287,7 +298,7 @@ function SquadronSettingsCard({
   );
 }
 
-export default function SquadronDetailView({ squadron, onBack }: Props) {
+export default function SquadronDetailView({ squadron, onBack, onOpenMarket }: Props) {
   const asset = squadron.asset.toLowerCase();
   // Raptor health is keyed by crypto underlying (btc/eth/sol), which may
   // differ from the squadron's venue asset (e.g. "kalshi"). Fall back to
@@ -452,7 +463,7 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
 
       {/* ── Squadron + Raptor info ────────────────────────────────────────── */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <SquadronInfoCard squadron={squadron} />
+        <SquadronInfoCard squadron={squadron} onOpenMarket={onOpenMarket} />
         <RaptorHealthPanel
           raptorKinds={raptorKinds}
           raptors={status?.raptors}

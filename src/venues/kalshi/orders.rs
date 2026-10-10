@@ -336,6 +336,26 @@ impl Execution for KalshiVenue {
             close_time,
         }))
     }
+
+    async fn order_book(&self, leg: &MarketId) -> Result<Option<crate::venues::core::LegBook>> {
+        let (ticker, is_yes) = split_market_id(leg.as_str());
+        let book = self.orderbook(&ticker).await?;
+        Ok(Some(crate::venues::kalshi::types::leg_book_from_fp(&book, is_yes)))
+    }
+
+    async fn recent_prints(&self, market: &MarketId, limit: usize) -> Result<Option<Vec<crate::venues::core::TapePrint>>> {
+        let (ticker, _) = split_market_id(market.as_str());
+        let resp: crate::venues::kalshi::types::TradesResponse = self
+            .get_json(&format!("/markets/trades?ticker={ticker}&limit={}", limit.clamp(1, 1000)))
+            .await?;
+        let mut prints: Vec<_> = resp.trades.iter().filter_map(crate::venues::kalshi::types::print_from_trade).collect();
+        prints.sort_by(|a, b| b.at.cmp(&a.at));
+        Ok(Some(prints))
+    }
+
+    async fn resolution(&self, leg: &MarketId) -> Result<crate::venues::core::TokenResolution> {
+        Ok(self.settlement_resolution(leg.as_str()).await)
+    }
 }
 
 /// Random v4-style UUID for client_order_id idempotency (no new dep — derived

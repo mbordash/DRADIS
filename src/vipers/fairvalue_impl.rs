@@ -5581,3 +5581,228 @@ mod event_sigma_tests {
     }
 
 }
+
+// ── The model reading, for the Markets page ──────────────────────────────────
+
+/// What FairValue would make of a market right now, with the viper's own math:
+/// the floored and event-adjusted σ, the conservative per-side fairs, the edge
+/// taper and the fee-aware edges. A reading, not a decision: it runs none of
+/// the gates after the edge (coin-flip, pin, price band, persistence, OBI).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ModelReading {
+    pub spot: f64,
+    pub strike: f64,
+    pub secs_left: i64,
+    pub sigma_realized: f64,
+    pub sigma_floor: f64,
+    /// `max(realized, floor) * event_mult`, the σ the fair is priced with.
+    pub sigma_used: f64,
+    pub event_mult: f64,
+    pub fair_yes: f64,
+    pub fair_no: f64,
+    pub required_edge: Decimal,
+    /// Fee-aware edge against the live ask; `None` without an ask.
+    pub edge_yes: Option<Decimal>,
+    pub edge_no: Option<Decimal>,
+    /// σ samples the sampler holds; the viper needs `FAIRVALUE_MIN_VOL_SAMPLES`.
+    pub samples: usize,
+}
+
+/// Why no reading exists, in words the page can print.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModelUnavailable {
+    /// The σ sampler for this asset holds too few samples. It is fed only by a
+    /// running FairValue viper on a squadron for the asset.
+    NoSamples { have: usize, need: usize },
+    /// The sampler has samples but nothing recent: the viper that fed it has
+    /// stopped, so its σ describes a tape that ended `age_secs` ago.
+    Stale { age_secs: u64 },
+    /// The market has closed.
+    Expired,
+    /// A spot, strike or σ that cannot be priced.
+    Degenerate,
+}
+
+/// Newest sample older than this and the sampler is a record, not a reading.
+/// The viper samples every `FAIRVALUE_VOL_SAMPLE_SECS`; four misses is stopped.
+const SAMPLER_STALE_SECS: u64 = config::FAIRVALUE_VOL_SAMPLE_SECS * 4;
+
+impl std::fmt::Display for ModelUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSamples { have, need } => write!(
+                f,
+                "sigma sampler warming: {have} of {need} samples (it is fed by a running FairValue viper for this asset)"
+            ),
+            Self::Stale { age_secs } => write!(
+                f,
+                "sigma sampler stale: its newest sample is {age_secs}s old (no FairValue viper is feeding it)"
+            ),
+            Self::Expired => write!(f, "the market has closed"),
+            Self::Degenerate => write!(f, "spot, strike or sigma cannot be priced"),
+        }
+    }
+}
+
+impl FairValueStrategyImpl {
+    /// Read the sampler without feeding it: the running viper owns the samples
+    /// and the σ profile; this only looks.
+    fn sampler_sigma(asset: &str) -> Result<(f64, usize), ModelUnavailable> {
+        let samples = match globals(asset).vol_samples.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let have = samples.len();
+        let need = config::FAIRVALUE_MIN_VOL_SAMPLES;
+        if have < need {
+            return Err(ModelUnavailable::NoSamples { have, need });
+        }
+        let (span_secs, age_secs) = match (samples.front(), samples.back()) {
+            (Some((f, _)), Some((b, _))) => (b.duration_since(*f).as_secs_f64(), Instant::now().duration_since(*b).as_secs()),
+            _ => return Err(ModelUnavailable::NoSamples { have, need }),
+        };
+        if age_secs > SAMPLER_STALE_SECS {
+            return Err(ModelUnavailable::Stale { age_secs });
+        }
+        let prices: Vec<f64> = samples.iter().map(|(_, p)| *p).collect();
+        drop(samples);
+        sigma_per_sqrt_sec(&prices, span_secs, need)
+            .map(|s| (s, have))
+            .ok_or(ModelUnavailable::Degenerate)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn model_reading(
+        asset: &str,
+        dc: &crate::helpers::dynamic_config::DynamicConfig,
+        spot: f64,
+        strike: f64,
+        now: DateTime<Utc>,
+        close: DateTime<Utc>,
+        yes_ask: Option<Decimal>,
+        no_ask: Option<Decimal>,
+    ) -> Result<ModelReading, ModelUnavailable> {
+        let secs_left = (close - now).num_seconds();
+        if secs_left <= 0 {
+            return Err(ModelUnavailable::Expired);
+        }
+        if !(spot > 0.0) || !(strike > 0.0) {
+            return Err(ModelUnavailable::Degenerate);
+        }
+        let (sigma_realized, samples) = Self::sampler_sigma(asset)?;
+        let floor = Self::sigma_floor(Self::min_sigma(dc), dc.fairvalue_sigma_floor_horizon_secs, secs_left);
+        let event_mult = Self::event_sigma_mult(asset, dc, now, Some(close));
+        let (fair_yes, fair_no) =
+            Self::conservative_side_fairs_ev(spot, strike, sigma_realized, floor, secs_left as f64, event_mult)
+                .ok_or(ModelUnavailable::Degenerate)?;
+        let to_dec = |p: f64| Decimal::from_f64_retain(p).map(|d| d.round_dp(10)).unwrap_or(dec!(0.5));
+        let edge_for = |fair: f64, ask: Option<Decimal>| -> Option<Decimal> {
+            let e = Self::side_edge(to_dec(fair), ask?);
+            (e != NO_EDGE).then_some(e)
+        };
+        Ok(ModelReading {
+            spot,
+            strike,
+            secs_left,
+            sigma_realized,
+            sigma_floor: floor,
+            sigma_used: sigma_realized.max(floor) * event_mult,
+            event_mult,
+            fair_yes,
+            fair_no,
+            required_edge: Self::required_edge(dc, secs_left),
+            edge_yes: edge_for(fair_yes, yes_ask),
+            edge_no: edge_for(fair_no, no_ask),
+            samples,
+        })
+    }
+}
+
+#[cfg(test)]
+mod model_reading_tests {
+    use super::*;
+    use crate::helpers::dynamic_config::DynamicConfig;
+    use std::time::Duration;
+
+    /// Fill an asset's sampler with `n` alternating prices, 15 s apart, as the
+    /// running viper would have over the last minutes.
+    fn seed(asset: &str, n: usize) {
+        seed_ending(asset, n, 0);
+    }
+
+    /// Like `seed`, with the newest sample `ended_secs_ago` in the past.
+    fn seed_ending(asset: &str, n: usize, ended_secs_ago: u64) {
+        let mut g = globals(asset).vol_samples.lock().unwrap();
+        g.clear();
+        let now = Instant::now() - Duration::from_secs(ended_secs_ago);
+        for i in 0..n {
+            let t = now - Duration::from_secs(15 * (n - i) as u64);
+            let p = if i % 2 == 0 { 81_000.0 } else { 81_040.0 };
+            g.push_back((t, p));
+        }
+    }
+
+    fn dc() -> DynamicConfig {
+        let mut d = DynamicConfig::default();
+        d.fairvalue_sigma_profile_enabled = false;
+        d.fairvalue_event_sigma_multiplier = dec!(1.0);
+        d
+    }
+
+    /// The reading is the viper's own arithmetic: the two sides' fairs are each
+    /// the conservative one, so together they never exceed a dollar, and with
+    /// no ask there is no edge to report.
+    #[test]
+    fn a_warm_sampler_prices_both_sides_conservatively() {
+        seed("MODEL-TEST-A", 48);
+        let now = Utc::now();
+        let r = FairValueStrategyImpl::model_reading(
+            "MODEL-TEST-A", &dc(), 81_100.0, 81_000.0, now, now + chrono::Duration::seconds(1800), None, None,
+        ).unwrap();
+        assert!(r.fair_yes > 0.5, "spot above strike favors YES: {}", r.fair_yes);
+        assert!(r.fair_yes + r.fair_no <= 1.0 + 1e-9);
+        assert!(r.edge_yes.is_none() && r.edge_no.is_none());
+        assert!(r.sigma_used >= r.sigma_realized);
+        assert_eq!(r.samples, 48);
+        assert_eq!(r.secs_left, 1800);
+        let with_ask = FairValueStrategyImpl::model_reading(
+            "MODEL-TEST-A", &dc(), 81_100.0, 81_000.0, now, now + chrono::Duration::seconds(1800), Some(dec!(0.60)), Some(dec!(0.42)),
+        ).unwrap();
+        assert!(with_ask.edge_yes.is_some() && with_ask.edge_no.is_some());
+    }
+
+    /// Until a running viper has fed forty samples there is no σ, and the
+    /// reading says how many it has rather than inventing one.
+    #[test]
+    fn a_cold_sampler_says_how_many_samples_it_has() {
+        seed("MODEL-TEST-B", 10);
+        let now = Utc::now();
+        let e = FairValueStrategyImpl::model_reading(
+            "MODEL-TEST-B", &dc(), 81_100.0, 81_000.0, now, now + chrono::Duration::seconds(1800), None, None,
+        ).unwrap_err();
+        assert_eq!(e, ModelUnavailable::NoSamples { have: 10, need: config::FAIRVALUE_MIN_VOL_SAMPLES });
+        assert!(e.to_string().contains("10 of"));
+    }
+
+    /// A squadron that stood down leaves its last hour of samples behind. They
+    /// are a record of a tape that ended, not a σ for now.
+    #[test]
+    fn a_sampler_nobody_feeds_is_stale_not_current() {
+        seed_ending("MODEL-TEST-D", 48, 600);
+        let now = Utc::now();
+        let e = FairValueStrategyImpl::model_reading(
+            "MODEL-TEST-D", &dc(), 81_100.0, 81_000.0, now, now + chrono::Duration::seconds(1800), None, None,
+        ).unwrap_err();
+        assert!(matches!(e, ModelUnavailable::Stale { age_secs } if age_secs >= 600), "{e:?}");
+    }
+
+    #[test]
+    fn a_closed_market_has_no_reading() {
+        seed("MODEL-TEST-C", 48);
+        let now = Utc::now();
+        let e = FairValueStrategyImpl::model_reading(
+            "MODEL-TEST-C", &dc(), 81_100.0, 81_000.0, now, now - chrono::Duration::seconds(1), None, None,
+        ).unwrap_err();
+        assert_eq!(e, ModelUnavailable::Expired);
+    }
+}

@@ -19,4 +19,5 @@ pub mod config_schema;
 pub mod setup;
 pub mod migration;
 pub mod helm;
+pub mod markets;
 
