@@ -491,6 +491,18 @@ pub struct Plan {
     pub margin: f64,
     pub first_minute: i64,
     pub last_minute: i64,
+    /// The exit the labels assume: `false` is the gates plan (resting take-profit,
+    /// taker stop, else settle), `true` holds every entry to settlement, so the
+    /// label is "did this side win" and the return is the payout less the ask
+    /// and the entry fee. From `gboost_planb_exit_posture`: settlement maps to
+    /// `true`; gates and split map to `false`, because a split instance is an
+    /// A/B of exits over the same entries and its model is judged on the gates
+    /// arm, as it always was. Absent on a report written before the posture
+    /// joined the plan, which reads as gates: that is what those labels were,
+    /// and `plan_changed` then sees the transition on a settlement instance and
+    /// retrains ([B46], second half).
+    #[serde(default)]
+    pub hold: bool,
 }
 
 fn entry_rule_before_b47() -> EntryRule { EntryRule::LastBefore }
@@ -509,6 +521,8 @@ impl Plan {
             margin: f(dc.gboost_planb_margin),
             first_minute: dc.gboost_planb_first_minute,
             last_minute: dc.gboost_planb_last_minute,
+            hold: crate::vipers::gboost_planb::ExitPosture::from_i64(dc.gboost_planb_exit_posture)
+                == crate::vipers::gboost_planb::ExitPosture::Settlement,
         }
     }
     /// The plan as stamped on a model file, and as the viper compares it.
@@ -516,9 +530,29 @@ impl Plan {
     /// Carries the label generation, so a model trained on the old entry price is
     /// refused rather than served: `e1` bought at a stale mid the book never
     /// showed, `e2` buys at the first observable price at or after the decision
-    /// minute ([B47]).
+    /// minute ([B47]). A settlement plan carries `_hold`; a gates plan keeps the
+    /// stamp it always had, so a model trained before the posture joined the
+    /// plan still matches a gates instance and is not retrained for nothing.
     pub fn label(&self) -> String {
-        format!("tp{:.4}_sl{:.4}_band{:.4}-{:.4}_{}", self.tp, self.sl, self.lo, self.hi, self.entry.stamp())
+        let base = format!("tp{:.4}_sl{:.4}_band{:.4}-{:.4}_{}", self.tp, self.sl, self.lo, self.hi, self.entry.stamp());
+        if self.hold { format!("{base}_hold") } else { base }
+    }
+    /// The posture word stamped on a model file (`plan_posture`) and compared by
+    /// `plan_mismatch`.
+    pub fn posture_stamp(&self) -> &'static str {
+        if self.hold { "settlement" } else { "gates" }
+    }
+    /// The calibrated probability at which an entry at `ask` breaks even under
+    /// this plan's exit. Under the gates plan that is the take-profit, stop and
+    /// fee arithmetic of `break_even`; held to settlement the payout is one
+    /// dollar or nothing, so the bar is the ask plus the entry fee, per dollar
+    /// of payout. The margin sits on top of this in both cases.
+    pub fn break_even(&self, ask: f64) -> f64 {
+        if self.hold {
+            crate::vipers::gboost_planb::settlement_break_even(ask, self.fee)
+        } else {
+            break_even(ask, self.tp, self.sl, self.fee, self.tp_ceiling)
+        }
     }
 }
 
@@ -733,7 +767,11 @@ pub fn build_market_rows(
             let tp_possible = a_tp < 1.0 && a_tp > a;
             let stop_px = a * (1.0 - plan.sl);
             let (mut exit_kind, mut exit_px, mut exit_t) = (ExitKind::Settle, if side_won { 1.0 } else { 0.0 }, w_end);
-            for &i in &order {
+            // Held to settlement, nothing between entry and close is an exit: the
+            // row is labeled on the outcome alone, which is the question a
+            // settlement instance's model is asked ([B46], second half).
+            let exits = if plan.hold { &order[..0] } else { &order[..] };
+            for &i in exits {
                 let (te, cls, px, sz) = ev[i];
                 let is_mid = mids_tag[i];
                 if !is_mid && cls == 0 && px <= stop_px {
@@ -912,7 +950,7 @@ pub struct FoldStats {
 pub fn rule_stats(rows: &[&TrainingRow], p: &[f64], plan: &Plan) -> RuleStats {
     let mut order: Vec<usize> = (0..rows.len()).filter(|&i| {
         let r = rows[i];
-        p[i] >= break_even(r.ask, plan.tp, plan.sl, plan.fee, plan.tp_ceiling) + plan.margin
+        p[i] >= plan.break_even(r.ask) + plan.margin
     }).collect();
     order.sort_by_key(|&i| (rows[i].w + 60 * rows[i].k, rows[i].w, rows[i].side));
     let mut seen: HashSet<(i64, usize)> = HashSet::new();
@@ -1115,7 +1153,7 @@ async fn shadow_trades_recorded(asset: &str, serving_path: &std::path::Path, pla
 /// serving model is usable. When they disagreed, the trainer kept a model the
 /// viper refused and GBoost sat idle behind it with no way out.
 pub fn incumbent_usable(model: &crate::vipers::gboost_planb::PlanBModel, plan: &Plan) -> bool {
-    model.plan_mismatch(plan.tp, plan.sl, plan.lo, plan.hi, plan.entry.stamp()).is_none()
+    model.plan_mismatch(plan.tp, plan.sl, plan.lo, plan.hi, plan.entry.stamp(), plan.posture_stamp()).is_none()
 }
 
 /// What the serving model looked like when this cycle started.
@@ -1464,6 +1502,7 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
         ("asset", inputs.asset.to_ascii_lowercase()),
         ("label", inputs.plan.label()),
         ("entry_rule", inputs.plan.entry.stamp().to_string()),
+        ("plan_posture", inputs.plan.posture_stamp().to_string()),
         ("plan_tp", format!("{:?}", inputs.plan.tp)),
         ("plan_sl", format!("{:?}", inputs.plan.sl)),
         ("plan_min_ask", format!("{:?}", inputs.plan.lo)),
@@ -2527,6 +2566,7 @@ mod tests {
             // The fixture rows come from the reference harness, which buys at the
             // price before the minute; production trains on `FirstAfter` ([B47]).
             entry: EntryRule::LastBefore,
+            hold: false,
         }
     }
 
@@ -2655,7 +2695,7 @@ mod tests {
         let dir = DataDir { root: tmp.join("pipeline") };
         let serving = tmp.join("btc-gboost_planb_v1.json");
         let rows = synthetic_rows(60, 7);
-        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45 };
+        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45, hold: false };
         let now = rows.last().unwrap().w + 3600 + 60;
         // Write the rows as a fake market store would not exercise the fetchers; call
         // the cycle on already-built rows through the same fit/stamp/write path.
@@ -2687,6 +2727,7 @@ mod tests {
             ("model_version", "engine-btc-test".into()), ("trained_by", "dradis-engine".into()), ("venue", TRAINED_VENUE.into()),
             ("platt_a", format!("{a:?}")), ("platt_b", format!("{b:?}")), ("zeroed_features", "oi_d5,oi_d30,tlsr,tlsr15".into()),
             ("plan_tp", "0.2".into()), ("plan_sl", "0.11".into()), ("plan_min_ask", "0.43".into()), ("plan_max_ask", "0.75".into()),
+            ("plan_posture", "settlement".into()),
             ("calibrated_through", rfc3339(fold_start - PURGE_SECS)),
         ] {
             booster.insert_metadata(k.to_string(), v);
@@ -2699,6 +2740,9 @@ mod tests {
         assert_eq!(model.trained_by.as_deref(), Some("dradis-engine"));
         assert_eq!(model.zeroed, vec![23, 24, 25, 26]);
         assert_eq!(model.plan, Some([0.2, 0.11, 0.43, 0.75]));
+        assert_eq!(model.posture.as_deref(), Some("settlement"), "the loader reads the posture stamp");
+        assert!(model.plan_mismatch(0.2, 0.11, 0.43, 0.75, "e1", "settlement").is_none());
+        assert!(model.plan_mismatch(0.2, 0.11, 0.43, 0.75, "e1", "gates").is_some(), "a held model is refused on a gates instance");
         let xt: Vec<[f64; N_FEATURES]> = test.iter().map(|r| r.features).collect();
         let preds = model.predict(&xt);
         assert!(preds.iter().all(|(r, c)| r.is_finite() && c.is_finite() && *c > 0.0 && *c < 1.0));
@@ -2817,7 +2861,7 @@ mod tests {
     /// First qualifying minute per market and side, and only eligible rows count.
     #[test]
     fn the_rule_takes_the_first_qualifying_minute_per_market_and_side() {
-        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45 };
+        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45, hold: false };
         let mk = |w, k, side, ret| TrainingRow { w, k, side, ask: 0.5, features: [0.0; N_FEATURES], y: ret > 0.0, ret, exit: ExitKind::Tp, exit_t: 0, elig: true };
         let rows = vec![mk(0, 10, 0, 0.1), mk(0, 5, 0, 0.3), mk(0, 7, 1, -0.1), mk(3600, 20, 0, 0.2)];
         let refs: Vec<&TrainingRow> = rows.iter().collect();
@@ -2853,7 +2897,7 @@ mod tests {
             tape: vec![Print { ts: w + 1, side: "BUY".into(), o: 1, p: 0.50, s: 1.0 }],
             ..Default::default()
         };
-        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.40, hi: 0.75, fee: 0.0, margin: 0.10, first_minute: 5, last_minute: 5 };
+        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.40, hi: 0.75, fee: 0.0, margin: 0.10, first_minute: 5, last_minute: 5, hold: false };
         let up_of = |rows: &[TrainingRow]| rows.iter().find(|r| r.side == 0).cloned().expect("a row for the Up side");
 
         // No print in the minute: the entry is the first sample AFTER it, plus half a spread.
@@ -2882,6 +2926,112 @@ mod tests {
         assert_eq!(row.exit, ExitKind::Sl, "under LastBefore the sale is inside the position");
         assert!(!row.y);
         assert_ne!(plan.label(), old.label(), "the stamp must tell the two rules apart");
+    }
+
+    /// Held to settlement, the same tape produces a different row: a sale that
+    /// would have stopped the gates plan is not an exit, the label is the
+    /// outcome, the return is the payout less the ask and the entry fee, and
+    /// the stamp names the posture so a gates model is retrained rather than
+    /// served on a settlement instance ([B46], second half).
+    #[test]
+    fn a_settlement_plan_labels_on_the_outcome_alone() {
+        let w = 1_780_286_400;
+        let t = w + 60 * 5;
+        let bars: Vec<Bar> = (0..125)
+            .map(|i| { let o = w - 62 * 60 + 60 * i; Bar { open_s: o, open: 100.0, high: 100.0, low: 100.0, close: 100.0 } })
+            .collect();
+        let samples: Vec<HistPoint> = (0..50).map(|i| HistPoint { t: w + 60 * i + 9, p: 0.50 }).collect();
+        let rec = MarketRecord {
+            outcome_prices: Some("[\"1\", \"0\"]".into()), // Up won
+            hist: HashMap::from([("0".to_string(), samples.clone()), ("1".to_string(), samples)]),
+            tape: vec![
+                Print { ts: w + 1, side: "BUY".into(), o: 1, p: 0.50, s: 1.0 },
+                // Both sides bought at 0.60 five seconds into the minute.
+                Print { ts: t + 5, side: "BUY".into(), o: 0, p: 0.60, s: 10.0 },
+                Print { ts: t + 5, side: "BUY".into(), o: 1, p: 0.60, s: 10.0 },
+                // A sale deep below the stop on both sides a minute later.
+                Print { ts: t + 65, side: "SELL".into(), o: 0, p: 0.20, s: 100.0 },
+                Print { ts: t + 65, side: "SELL".into(), o: 1, p: 0.20, s: 100.0 },
+            ],
+            ..Default::default()
+        };
+        let gates = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.40, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 5, hold: false };
+        let hold = Plan { hold: true, ..gates };
+        let side = |rows: &[TrainingRow], s: usize| rows.iter().find(|r| r.side == s).cloned().expect("a row per side");
+
+        let g = build_market_rows(w, &rec, &bars, &[], (&[], &[]), &gates);
+        assert_eq!(side(&g, 0).exit, ExitKind::Sl, "under gates the sale stops the winning side too");
+        assert!(!side(&g, 0).y);
+
+        let h = build_market_rows(w, &rec, &bars, &[], (&[], &[]), &hold);
+        assert_eq!(h.len(), 2);
+        let up = side(&h, 0);
+        let dn = side(&h, 1);
+        assert_eq!((up.exit, dn.exit), (ExitKind::Settle, ExitKind::Settle), "held, nothing on the tape is an exit");
+        assert_eq!(up.exit_t, w + 3600, "a held position ends at the close");
+        assert!(up.y && !dn.y, "the label is the outcome");
+        let fee = fee_per_share(0.07, 0.60);
+        assert!((up.ret - (1.0 - 0.60 - fee) / 0.60).abs() < 1e-12, "a win pays the dollar less the ask and the entry fee: {}", up.ret);
+        assert!((dn.ret - (0.0 - 0.60 - fee) / 0.60).abs() < 1e-12, "a loss is the whole stake and the fee: {}", dn.ret);
+
+        assert_ne!(hold.label(), gates.label(), "the stamp must tell the postures apart");
+        assert!(hold.label().ends_with("_hold"));
+        assert_eq!(gates.label(), "tp0.2000_sl0.1100_band0.4000-0.7500_e2", "a gates plan keeps the stamp it always had");
+        assert_eq!((gates.posture_stamp(), hold.posture_stamp()), ("gates", "settlement"));
+        // A report written before the posture joined the plan reads as gates,
+        // which on a settlement instance is the change that triggers the retrain.
+        let old: Plan = serde_json::from_str(&serde_json::to_string(&gates).unwrap().replace(",\"hold\":false", "")).unwrap();
+        assert_eq!(old, gates);
+        assert_ne!(old, hold);
+    }
+
+    /// The knob maps onto the plan: only the settlement posture holds; gates and
+    /// split train and are judged as gates, and an unknown value reads as gates
+    /// the way the viper reads it.
+    #[test]
+    fn the_posture_knob_sets_the_plans_exit() {
+        let mut dc = DynamicConfig::default();
+        for (posture, hold) in [(0, false), (1, true), (2, false), (7, false)] {
+            dc.gboost_planb_exit_posture = posture;
+            let plan = Plan::from_config(&dc, 0.07);
+            assert_eq!(plan.hold, hold, "posture {posture}");
+            assert_eq!(plan.posture_stamp(), if hold { "settlement" } else { "gates" });
+        }
+    }
+
+    /// The holdout rule under a held plan admits a row by the settlement bar, so
+    /// a probability that cleared the gates bar at the same ask is refused and
+    /// the trade's return is the row's settlement return.
+    #[test]
+    fn the_holdout_rule_judges_a_held_plan_by_the_settlement_bar() {
+        let gates = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.25, hi: 0.90, fee: 0.07, margin: 0.05, first_minute: 5, last_minute: 45, hold: false };
+        let hold = Plan { hold: true, ..gates };
+        let row = |w: i64, ask: f64, ret: f64| TrainingRow {
+            w, k: 10, side: 0, ask, features: [0.0; N_FEATURES], y: ret > 0.0, ret, exit: ExitKind::Settle, exit_t: w + 3600, elig: true,
+        };
+        let rows = vec![row(0, 0.79, 0.25), row(3600, 0.50, 1.0 - 0.50 - 0.0175), row(7200, 0.50, -1.0)];
+        let refs: Vec<&TrainingRow> = rows.iter().collect();
+        // p 0.62 at $0.79 clears the gates bar (about 0.585) and not the held bar (about 0.85);
+        // p 0.70 at $0.50 clears both (held bar about 0.57).
+        let p = vec![0.62, 0.70, 0.40];
+        let g = rule_stats(&refs, &p, &gates);
+        let h = rule_stats(&refs, &p, &hold);
+        assert_eq!(g.trades, 2, "gates takes the $0.79 and the first $0.50");
+        assert_eq!(h.trades, 1, "held takes only the $0.50 that beats its price by the margin");
+        assert!((h.mean_ret - (1.0 - 0.50 - 0.0175)).abs() < 1e-12, "the held trade's return is the row's settlement return");
+        assert_eq!(h.settle, 1);
+    }
+
+    /// The rule's bar follows the plan's exit: held to settlement the break-even
+    /// is the ask plus the entry fee, and the gates arithmetic no longer applies.
+    #[test]
+    fn the_break_even_follows_the_plans_exit() {
+        let gates = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.25, hi: 0.90, fee: 0.07, margin: 0.05, first_minute: 5, last_minute: 45, hold: false };
+        let hold = Plan { hold: true, ..gates };
+        assert!((gates.break_even(0.50) - break_even(0.50, 0.20, 0.11, 0.07, 0.90)).abs() < 1e-12);
+        assert!((hold.break_even(0.50) - (0.50 + 0.07 * 0.50 * 0.50)).abs() < 1e-12);
+        // At the asks the shadow lane has been buying, the held bar is far above the gates bar.
+        assert!(hold.break_even(0.79) > 0.79 && hold.break_even(0.79) > gates.break_even(0.79));
     }
 
     /// A whole training cycle on the research harness's own June to July 2026 market
@@ -2925,7 +3075,7 @@ mod tests {
         funding.sort_by_key(|x| x.0);
         write_json_atomically(&dir.funding(), &funding).unwrap();
         let serving = tmp.join("btc-gboost_planb_v1.json");
-        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45 };
+        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45, hold: false };
         let inputs = CycleInputs {
             asset: "btc".into(), dir: dir.clone(), serving_path: serving.clone(), plan, now: last_w + 3600 + 1800,
             window_days: 120, holdout_days: 14, min_trades: 30, min_win: 0.53, budget: 2.0, auto_adopt: true, threads: fit_threads(),
@@ -2972,7 +3122,7 @@ mod tests {
             Err(e) => { println!("funding unavailable here ({e}); rows will carry none"); Vec::new() }
         };
         let bars: Vec<Bar> = bars_from_day(&prev).chain(bars_from_day(&day)).collect();
-        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45 };
+        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45, hold: false };
         let rows = build_market_rows(w, &rec, &bars, &funding, (&[], &[]), &plan);
         println!("rows: {} ({} eligible); first: ask {:.3} y {} exit {:?}", rows.len(), rows.iter().filter(|r| r.elig).count(), rows[0].ask, rows[0].y, rows[0].exit);
         assert!(rows.len() >= 60);
@@ -3179,7 +3329,7 @@ mod tests {
 
         let plan = Plan {
             entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90,
-            lo: 0.0, hi: 1.0, fee: 0.07, margin: 0.0, first_minute: 5, last_minute: 45,
+            lo: 0.0, hi: 1.0, fee: 0.07, margin: 0.0, first_minute: 5, last_minute: 45, hold: false,
         };
         let inputs = CycleInputs {
             asset: "btc".into(), dir: DataDir::at(std::path::PathBuf::from(&dir)),

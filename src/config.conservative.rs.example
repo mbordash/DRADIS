@@ -1155,6 +1155,11 @@ pub const GBOOST_RESTING_TP_ENABLED: bool = true;
 /// takes one arm or the other, deterministically, so both run on the same markets.
 /// Any other value reads as 0.
 ///
+/// The posture is part of the model's plan ([B46]): a settlement instance trains,
+/// gates and shadow-trades on outcome labels (the entry bar is the ask plus the
+/// entry fee), a gates instance on the take-profit and stop labels. Switching
+/// retrains; split trains and is judged as gates.
+///
 /// Default 0 on every profile. On the exit study's 608 spent entries a hold returned
 /// +6.11% per trade against +3.24% for the gates, with a maximum drawdown of $40.83
 /// against $11.01 at $4 stakes and 36.3% of trades losing the whole stake against

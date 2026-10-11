@@ -624,7 +624,11 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              WARNING: posture 1 is a different risk profile, not a free improvement. On 608 replayed entries a \
              hold returned +6.11% per trade against +3.24% for the gates, but its maximum drawdown was $40.83 \
              against $11.01 at $4 stakes, and 36.3% of trades lost the whole stake against 0.8%. A held position \
-             also locks its capital until the market resolves and cannot be managed after the rotation."
+             also locks its capital until the market resolves and cannot be managed after the rotation. \
+             The posture is part of the model's plan: switching between gates and settlement retrains the model \
+             on labels for that exit (settlement labels are the outcome alone, with the entry bar at the ask plus \
+             the fee), the holdout gate and the shadow lane judge it under that exit, and until the new model is \
+             in service the viper stands aside. Split trains and is judged as gates."
         ).range(0.0, 2.0).step(1.0).clamp_fallback(0.0));
         v.push(F::new(g, e, "gboost_planb_stop_loss_pct", "Plan Stop Loss", "pct", true,
             "Taker stop marked against the bid, entry-relative. The model's labels were built with 11%, so a \

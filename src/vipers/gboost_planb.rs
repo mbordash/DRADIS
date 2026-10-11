@@ -220,13 +220,19 @@ pub struct ShadowStats {
 ///   settlement, where the labeler scored stops and take-profits through to the
 ///   close;
 /// * the record therefore measures the PLAN the holdout measured, which is the
-///   point, and not the live exit posture: at the default `ExitPosture::Gates`
-///   the live viper flattens at the bid before rotation instead of holding to
-///   settlement. A promotion licenses the plan on this instance's evidence; it
-///   is not evidence about the posture.
+///   point. Since the posture joined the plan ([B46], second half) that
+///   includes the exit: `hold` is the settlement posture, under which the lane
+///   ignores the book and every simulated position ends at settlement, as the
+///   labels do. At `ExitPosture::Gates` the live viper still flattens at the
+///   bid before rotation where the lane waits for settlement, so a promotion
+///   licenses the plan on this instance's evidence, not every detail of the
+///   live exit.
 pub fn shadow_exit(
-    entry: f64, tp_price: f64, stop_price: f64, bid: Option<f64>, resolved: Option<f64>,
+    entry: f64, tp_price: f64, stop_price: f64, bid: Option<f64>, resolved: Option<f64>, hold: bool,
 ) -> Option<(f64, &'static str)> {
+    if hold {
+        return resolved.map(|r| (r, "settlement"));
+    }
     // A bid of zero is not a price, it is the absence of one: an empty bid side
     // is published as $0.00 so that a dark feed reads as a market nobody is
     // bidding on rather than as an error (`state.rs`, `snapshot_has_book`).
@@ -382,7 +388,7 @@ pub fn live_stake(rec: &ShadowStats, full: Decimal, probation: Decimal) -> (Deci
 /// deleted, and no row is added: a row the old rule refused was never opened.
 pub fn rows_under_rule(rows: &[(i64, f64, f64, f64)], plan: &crate::vipers::gboost_planb_train::Plan) -> Vec<(i64, f64)> {
     rows.iter()
-        .filter(|(_, _, ask, p)| decide_side(*ask, *p, plan.fee, plan.tp, plan.sl, plan.tp_ceiling, plan.margin, plan.lo, plan.hi).qualifies)
+        .filter(|(_, _, ask, p)| decide_side(*ask, *p, plan.fee, plan.tp, plan.sl, plan.tp_ceiling, plan.margin, plan.lo, plan.hi, plan.hold).qualifies)
         .map(|(w, ret, _, _)| (*w, *ret))
         .collect()
 }
@@ -601,6 +607,13 @@ pub fn break_even(ask: f64, tp: f64, sl: f64, fee_rate: f64, ceiling: f64) -> f6
     loss / (gain + loss)
 }
 
+/// Break-even win rate of an entry at `ask` held to settlement: the payout is a
+/// dollar or nothing and nothing is sold, so the only cost beyond the ask is the
+/// entry fee. Per dollar of payout, `p × 1 ≥ ask + fee` ([B46], second half).
+pub fn settlement_break_even(ask: f64, fee_rate: f64) -> f64 {
+    ask + fee_rate * ask * (1.0 - ask)
+}
+
 /// Platt calibration of a raw model probability, clipped as the evaluator clipped it.
 pub fn calibrate(raw: f64, a: f64, b: f64) -> f64 {
     let r = raw.clamp(1e-4, 1.0 - 1e-4);
@@ -617,18 +630,21 @@ pub struct SideDecision {
     pub reason: &'static str,
 }
 
-pub fn decide_side(ask: f64, p: f64, fee_rate: f64, tp: f64, sl: f64, ceiling: f64, margin: f64, min_ask: f64, max_ask: f64) -> SideDecision {
+/// `hold` is the plan's exit posture: held to settlement the bar is
+/// `settlement_break_even` and there is no take-profit to reach, so the ceiling
+/// test does not apply; otherwise the gates arithmetic of `break_even`.
+pub fn decide_side(ask: f64, p: f64, fee_rate: f64, tp: f64, sl: f64, ceiling: f64, margin: f64, min_ask: f64, max_ask: f64, hold: bool) -> SideDecision {
     if !(ask > 0.0 && ask < 1.0) {
         return SideDecision { qualifies: false, break_even: f64::NAN, required: f64::NAN, reason: "no usable ask" };
     }
-    let be = break_even(ask, tp, sl, fee_rate, ceiling);
+    let be = if hold { settlement_break_even(ask, fee_rate) } else { break_even(ask, tp, sl, fee_rate, ceiling) };
     let required = be + margin;
     if ask < min_ask || ask > max_ask {
         return SideDecision { qualifies: false, break_even: be, required, reason: "ask outside the trained band" };
     }
     // Named rather than left to the arithmetic (a break-even of 1.0 fails every
     // p) so the log says why a $0.90 ask never qualifies under a $0.90 ceiling.
-    if !(effective_target(ask, tp, ceiling) > ask) {
+    if !hold && !(effective_target(ask, tp, ceiling) > ask) {
         return SideDecision { qualifies: false, break_even: be, required, reason: "no take-profit above the entry under the ceiling" };
     }
     if p >= required {
@@ -810,6 +826,10 @@ pub struct PlanBModel {
     pub zeroed: Vec<usize>,
     /// `[tp, sl, min_ask, max_ask]` the labels were built with, when stamped.
     pub plan: Option<[f64; 4]>,
+    /// The exit the labels assumed (`plan_posture`: "gates" or "settlement").
+    /// `None` is a model from before the posture joined the plan, whose labels
+    /// were the gates plan; `plan_mismatch` reads it as "gates".
+    pub posture: Option<String>,
     /// Which price the labels bought at (`entry_rule` stamp). `None` on a model
     /// written before the stamp existed, which means the old rule ([B47]).
     pub entry_rule: Option<String>,
@@ -921,6 +941,7 @@ pub fn load_model(path: &std::path::Path) -> std::result::Result<PlanBModel, Str
     // rather than trusted: `plan_mismatch` refuses whatever does not match the
     // configured rule.
     let entry_rule = Some(meta("entry_rule").unwrap_or_else(|| "e1".to_string()));
+    let posture = meta("plan_posture");
     let trained_by = meta("trained_by");
     let created_at = meta("created_at");
     let calibrated_through = meta("calibrated_through");
@@ -956,7 +977,7 @@ pub fn load_model(path: &std::path::Path) -> std::result::Result<PlanBModel, Str
             num("holdout_win"),
         ),
     };
-    Ok(PlanBModel { booster, platt_a, platt_b, version, trees, zeroed, plan, entry_rule, trained_by, created_at, calibrated_through, holdout_summary, gate_passed })
+    Ok(PlanBModel { booster, platt_a, platt_b, version, trees, zeroed, plan, posture, entry_rule, trained_by, created_at, calibrated_through, holdout_summary, gate_passed })
 }
 
 impl PlanBModel {
@@ -972,11 +993,22 @@ impl PlanBModel {
     /// The entry rule is part of the plan: a model labeled on the old entry price
     /// answers a different question from the one the engine now trades, and serving
     /// it would keep the [B47] artifact alive. An unstamped model is `e1`.
-    pub fn plan_mismatch(&self, tp: f64, sl: f64, lo: f64, hi: f64, entry_rule: &str) -> Option<String> {
+    ///
+    /// The posture is part of the plan too: a model labeled for the gates exit
+    /// predicts "does the take-profit fill before the stop", which is not the
+    /// question a settlement instance asks ([B46], second half). An unstamped
+    /// model is gates.
+    pub fn plan_mismatch(&self, tp: f64, sl: f64, lo: f64, hi: f64, entry_rule: &str, posture: &str) -> Option<String> {
         if self.entry_rule.as_deref().unwrap_or("e1") != entry_rule {
             return Some(format!(
                 "model {} was labeled with entry rule {}, and the engine trades {}; a model for the configured rule is needed",
                 self.version, self.entry_rule.as_deref().unwrap_or("e1"), entry_rule,
+            ));
+        }
+        if self.posture.as_deref().unwrap_or("gates") != posture {
+            return Some(format!(
+                "model {} was labeled for the {} exit, and the engine's posture is {}; a model for the configured posture is needed",
+                self.version, self.posture.as_deref().unwrap_or("gates"), posture,
             ));
         }
         let p = self.plan?;
@@ -1605,7 +1637,12 @@ async fn sweep_shadow_exits(ctx: &StrategyContext, fee_rate: f64) {
             }
         }
 
-        let Some((exit_price, reason)) = shadow_exit(t.entry_price, t.tp_price, t.stop_price, bid, resolved) else {
+        // The configured posture, not the one the row was opened under: a row
+        // carries its levels but not its posture, and a posture change retrains
+        // the model, so rows of the replaced version no longer count toward any
+        // record this lane is building.
+        let hold = ExitPosture::from_i64(ctx.dynamic_config.gboost_planb_exit_posture) == ExitPosture::Settlement;
+        let Some((exit_price, reason)) = shadow_exit(t.entry_price, t.tp_price, t.stop_price, bid, resolved, hold) else {
             continue;
         };
         let ret = shadow_ret(t.entry_price, t.entry_fee, exit_price, reason, fee_rate);
@@ -1717,7 +1754,7 @@ impl Strategy for GboostPlanBStrategy {
         }
         if let Some(m) = &model {
             let plan = crate::vipers::gboost_planb_train::Plan::from_config(dc, f(crate::venues::taker_fee_rate()));
-            if let Some(why) = m.plan_mismatch(f(dc.gboost_planb_take_profit_pct), f(dc.gboost_planb_stop_loss_pct), f(dc.gboost_planb_min_ask), f(dc.gboost_planb_max_ask), plan.entry.stamp()) {
+            if let Some(why) = m.plan_mismatch(f(dc.gboost_planb_take_profit_pct), f(dc.gboost_planb_stop_loss_pct), f(dc.gboost_planb_min_ask), f(dc.gboost_planb_max_ask), plan.entry.stamp(), plan.posture_stamp()) {
                 idle(&format!("{why}; waiting for the pipeline to train a model for the configured plan"));
                 return Ok(StrategySignal::NoSignal);
             }
@@ -1821,6 +1858,7 @@ impl Strategy for GboostPlanBStrategy {
                 ask[side], preds[side].1, f(crate::venues::taker_fee_rate()), f(dc.gboost_planb_take_profit_pct),
                 f(dc.gboost_planb_stop_loss_pct), f(dc.gboost_planb_tp_ceiling), f(dc.gboost_planb_margin),
                 f(dc.gboost_planb_min_ask), f(dc.gboost_planb_max_ask),
+                ExitPosture::from_i64(dc.gboost_planb_exit_posture) == ExitPosture::Settlement,
             ))
             .collect();
         let label = ["YES", "NO"];
@@ -1955,11 +1993,16 @@ impl Strategy for GboostPlanBStrategy {
                 // the same population the live rule would have traded.
                 lock(&g.attempted).insert((cid.clone(), side));
                 invalidate_shadow_record(&ctx.crypto_filter);
+                let exit_plan = if plan_now.hold {
+                    "held to settlement".to_string()
+                } else {
+                    format!("take-profit ${tp_price:.3}, stop ${stop_price:.3}")
+                };
                 info!(
                     "👻 GBoost shadow ENTRY [{}] {} at ${:.3} x {:.2} (p={:.4} need={:.4}, model {}) | \
-                     take-profit ${:.3}, stop ${:.3} | not spending real money: {}",
+                     {} | not spending real money: {}",
                     market.market_name, label[side], ask[side], shares, preds[side].1,
-                    decisions[side].required, model.version, tp_price, stop_price, why,
+                    decisions[side].required, model.version, exit_plan, why,
                 );
             }
             idle(&format!("trading simulated — {why}"));
@@ -2325,19 +2368,31 @@ mod tests {
             let matrix = Matrix::new(&data, 4, 2);
             let mut b = PerpetualBooster::default().set_iteration_limit(Some(1)).set_num_threads(Some(1));
             b.fit(&matrix, &[0.0, 1.0, 0.0, 1.0], None, None).unwrap();
-            PlanBModel { booster: b, platt_a: 1.0, platt_b: 0.0, version: "t".into(), trees: 1, zeroed: vec![23, 24, 25, 26], plan, entry_rule, trained_by: None, created_at: None, calibrated_through: None, holdout_summary: None, gate_passed: true }
+            PlanBModel { booster: b, platt_a: 1.0, platt_b: 0.0, version: "t".into(), trees: 1, zeroed: vec![23, 24, 25, 26], plan, posture: Some("gates".to_string()), entry_rule, trained_by: None, created_at: None, calibrated_through: None, holdout_summary: None, gate_passed: true }
         };
         let m = |plan: Option<[f64; 4]>| m_with(plan, Some("e2".to_string()));
-        assert!(m(Some(REFERENCE_PLAN)).plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2").is_none());
-        assert!(m(Some(REFERENCE_PLAN)).plan_mismatch(0.15, 0.11, 0.43, 0.75, "e2").is_some());
-        assert!(m(None).plan_mismatch(0.15, 0.11, 0.43, 0.75, "e2").is_none(), "an unstamped plan cannot be compared");
+        assert!(m(Some(REFERENCE_PLAN)).plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "gates").is_none());
+        // The posture is part of the plan: a gates model is refused on a settlement
+        // instance, and one from before the stamp existed reads as gates.
+        let why = m(Some(REFERENCE_PLAN)).plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "settlement").expect("a gates model is refused for a settlement posture");
+        assert!(why.contains("labeled for the gates exit") && why.contains("posture is settlement"), "{why}");
+        let mut held = m(Some(REFERENCE_PLAN));
+        held.posture = Some("settlement".to_string());
+        assert!(held.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "settlement").is_none());
+        assert!(held.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "gates").is_some());
+        let mut prestamp = m(Some(REFERENCE_PLAN));
+        prestamp.posture = None;
+        assert!(prestamp.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "gates").is_none(), "an unstamped model is gates");
+        assert!(prestamp.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "settlement").is_some());
+        assert!(m(Some(REFERENCE_PLAN)).plan_mismatch(0.15, 0.11, 0.43, 0.75, "e2", "gates").is_some());
+        assert!(m(None).plan_mismatch(0.15, 0.11, 0.43, 0.75, "e2", "gates").is_none(), "an unstamped plan cannot be compared");
         // The entry rule is refused on its own, and a model with no stamp is the old
         // rule, whatever its numbers say ([B47]).
-        let why = m(Some(REFERENCE_PLAN)).plan_mismatch(0.20, 0.11, 0.43, 0.75, "e1").expect("an e2 model is refused for an e1 plan");
+        let why = m(Some(REFERENCE_PLAN)).plan_mismatch(0.20, 0.11, 0.43, 0.75, "e1", "gates").expect("an e2 model is refused for an e1 plan");
         assert!(why.contains("entry rule"), "{why}");
         let unstamped = m_with(Some(REFERENCE_PLAN), None);
-        assert!(unstamped.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2").is_some(), "a model from before the stamp is e1 and must be refused");
-        assert!(unstamped.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e1").is_none());
+        assert!(unstamped.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "gates").is_some(), "a model from before the stamp is e1 and must be refused");
+        assert!(unstamped.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e1", "gates").is_none());
         assert!(m(Some(REFERENCE_PLAN)).needs_funding());
         let mut z = m(Some(REFERENCE_PLAN));
         z.zeroed.push(FUNDING_COLUMN);
@@ -2352,7 +2407,7 @@ mod tests {
         use crate::vipers::gboost_planb_train::{incumbent_usable, EntryRule, Plan};
         let plan = Plan {
             entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90,
-            lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45,
+            lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45, hold: false,
         };
         assert!(incumbent_usable(&m(Some(REFERENCE_PLAN)), &plan),
                 "a model stamped for the configured plan is worth keeping");
@@ -2419,7 +2474,7 @@ mod tests {
     /// the asks the shadow lane actually bought.
     #[test]
     fn a_favorite_the_ceiling_leaves_little_on_needs_the_probability_to_show_it() {
-        let d = |ask: f64, p: f64| decide_side(ask, p, 0.07, 0.20, 0.11, 0.90, 0.05, 0.25, 0.90);
+        let d = |ask: f64, p: f64| decide_side(ask, p, 0.07, 0.20, 0.11, 0.90, 0.05, 0.25, 0.90, false);
         // The old rule's requirement at $0.79 was about 0.49; a calibrated 0.55 cleared it.
         // The corrected rule needs about 0.585 there (break-even 0.535 plus the margin).
         assert!(!d(0.79, 0.55).qualifies, "0.55 is below the corrected {:.3}", d(0.79, 0.55).required);
@@ -2439,7 +2494,7 @@ mod tests {
 
     #[test]
     fn a_side_qualifies_only_inside_the_band_and_above_break_even_plus_margin() {
-        let d = |ask: f64, p: f64| decide_side(ask, p, 0.07, 0.20, 0.11, 0.90, 0.10, 0.43, 0.75);
+        let d = |ask: f64, p: f64| decide_side(ask, p, 0.07, 0.20, 0.11, 0.90, 0.10, 0.43, 0.75, false);
         let need = break_even(0.50, 0.20, 0.11, 0.07, 0.90) + 0.10;
         assert!(d(0.50, need + 0.001).qualifies);
         assert!(!d(0.50, need - 0.001).qualifies);
@@ -2632,7 +2687,7 @@ mod deriv_feature_tests {
 
 #[cfg(test)]
 mod shadow_promotion_tests {
-    use super::{lane_line, live_stake, rows_under_rule, shadow_blocks_live, shadow_exit, shadow_levels, shadow_ret, shadow_stats, ShadowStats};
+    use super::{decide_side, lane_line, live_stake, rows_under_rule, settlement_break_even, shadow_blocks_live, shadow_exit, shadow_levels, shadow_ret, shadow_stats, ShadowStats};
     use rust_decimal_macros::dec;
 
     fn passing() -> ShadowStats {
@@ -2692,7 +2747,7 @@ mod shadow_promotion_tests {
     #[test]
     fn the_record_counts_only_the_rows_the_configured_rule_would_take() {
         use crate::vipers::gboost_planb_train::{EntryRule, Plan};
-        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.25, hi: 0.90, fee: 0.07, margin: 0.05, first_minute: 5, last_minute: 45 };
+        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.25, hi: 0.90, fee: 0.07, margin: 0.05, first_minute: 5, last_minute: 45, hold: false };
         let rows = vec![
             (0, 0.14, 0.50, 0.60),      // $0.50 at p 0.60: below the knee, qualifies under both rules
             (3600, -0.15, 0.79, 0.55),  // $0.79 at p 0.55: the old rule took it at need 0.49; the corrected rule needs 0.61
@@ -2701,6 +2756,10 @@ mod shadow_promotion_tests {
         ];
         let kept = rows_under_rule(&rows, &plan);
         assert_eq!(kept, vec![(0, 0.14), (7200, 0.13)]);
+        // Held, the bar is the ask plus the fee plus the margin: $0.79 at p 0.65 no
+        // longer counts, and $0.90 at p 0.70 is refused by the price, not the ceiling.
+        let held = Plan { hold: true, ..plan };
+        assert_eq!(rows_under_rule(&rows, &held), vec![(0, 0.14)]);
         // A wider margin re-scores the same rows without touching them.
         let strict = Plan { margin: 0.20, ..plan };
         assert_eq!(rows_under_rule(&rows, &strict), vec![]);
@@ -2710,46 +2769,75 @@ mod shadow_promotion_tests {
     /// The plan's exit rule, which the shadow record is only evidence about if
     /// it is the same rule the holdout measured.
     #[test]
+    fn a_held_shadow_position_ignores_the_book() {
+        let (entry, tp, stop) = (0.60, 0.72, 0.51);
+        // Levels the gates plan would act on are not exits under the settlement posture.
+        assert_eq!(shadow_exit(entry, tp, stop, Some(0.49), None, true), None, "a bid through the stop is not a stop");
+        assert_eq!(shadow_exit(entry, tp, stop, Some(0.80), None, true), None, "a bid through the target is not a take-profit");
+        assert_eq!(shadow_exit(entry, tp, stop, Some(0.49), Some(1.0), true), Some((1.0, "settlement")));
+        assert_eq!(shadow_exit(entry, tp, stop, None, Some(0.0), true), Some((0.0, "settlement")));
+    }
+
+    /// Held to settlement, the decision's bar is the ask plus the entry fee, and an
+    /// ask with no take-profit under the ceiling is still a trade: there is no
+    /// take-profit to reach.
+    #[test]
+    fn a_held_decision_needs_the_outcome_probability_not_the_path() {
+        let gates = |ask: f64, p: f64| decide_side(ask, p, 0.07, 0.20, 0.11, 0.90, 0.05, 0.25, 0.90, false);
+        let held = |ask: f64, p: f64| decide_side(ask, p, 0.07, 0.20, 0.11, 0.90, 0.05, 0.25, 0.90, true);
+        assert!((held(0.50, 0.60).break_even - settlement_break_even(0.50, 0.07)).abs() < 1e-12);
+        assert!((held(0.50, 0.60).required - (settlement_break_even(0.50, 0.07) + 0.05)).abs() < 1e-12);
+        // 0.62 at $0.79 cleared the gates bar; held, it needs about 0.85.
+        assert!(gates(0.79, 0.62).qualifies);
+        assert!(!held(0.79, 0.62).qualifies, "{}", held(0.79, 0.62).reason);
+        assert!(held(0.79, 0.86).qualifies);
+        // $0.90 has no target under the $0.90 ceiling, which only matters with a target.
+        assert_eq!(gates(0.90, 0.99).reason, "no take-profit above the entry under the ceiling");
+        assert!(held(0.90, 0.99).qualifies);
+        assert_eq!(held(0.20, 0.99).reason, "ask outside the trained band");
+    }
+
+    #[test]
     fn the_shadow_exit_is_the_plans_own_rule() {
         let (entry, tp, stop) = (0.60, 0.72, 0.51);
 
         // Nothing while the bid sits between the levels and the market is open.
-        assert_eq!(shadow_exit(entry, tp, stop, Some(0.65), None), None);
+        assert_eq!(shadow_exit(entry, tp, stop, Some(0.65), None, false), None);
 
         // The stop sells into the book at the bid, not at the level.
-        assert_eq!(shadow_exit(entry, tp, stop, Some(0.49), None), Some((0.49, "stop")));
-        assert_eq!(shadow_exit(entry, tp, stop, Some(0.51), None), Some((0.51, "stop")),
+        assert_eq!(shadow_exit(entry, tp, stop, Some(0.49), None, false), Some((0.49, "stop")));
+        assert_eq!(shadow_exit(entry, tp, stop, Some(0.51), None, false), Some((0.51, "stop")),
                    "at the level is a stop, as the labeler has it");
 
         // A resting take-profit fills at its own price, not at the bid that
         // reached it: that is what resting means.
-        assert_eq!(shadow_exit(entry, tp, stop, Some(0.80), None), Some((0.72, "take-profit")));
+        assert_eq!(shadow_exit(entry, tp, stop, Some(0.80), None, false), Some((0.72, "take-profit")));
 
         // A tick that satisfies both is scored the conservative way. It takes a
         // degenerate plan to overlap the levels (the stop above the target), but
         // the knobs are the operator's and the precedence must be defined.
-        assert_eq!(shadow_exit(entry, 0.61, 0.65, Some(0.63), None), Some((0.63, "stop")),
+        assert_eq!(shadow_exit(entry, 0.61, 0.65, Some(0.63), None, false), Some((0.63, "stop")),
                    "the stop is checked first, as the labeler checks it");
 
         // A take-profit that cannot fill is not an exit.
-        assert_eq!(shadow_exit(entry, 1.00, stop, Some(0.99), None), None,
+        assert_eq!(shadow_exit(entry, 1.00, stop, Some(0.99), None, false), None,
                    "a dollar take-profit can never fill");
-        assert_eq!(shadow_exit(entry, 0.55, stop, Some(0.99), None), None,
+        assert_eq!(shadow_exit(entry, 0.55, stop, Some(0.99), None, false), None,
                    "a take-profit at or below the entry is not a profit");
 
         // An empty bid side is published as $0.00, which is the absence of a
         // price and not a price of zero. Booking it would record a total loss
         // the live viper would never take — `exit_action` refuses to stop on a
         // zero bid — and one such row would poison a 40-trade record.
-        assert_eq!(shadow_exit(entry, tp, stop, Some(0.0), None), None,
+        assert_eq!(shadow_exit(entry, tp, stop, Some(0.0), None, false), None,
                    "a websocket resync must not book a shadow trade as a total loss");
-        assert_eq!(shadow_exit(entry, tp, stop, Some(0.0), Some(1.0)), Some((1.0, "settlement")),
+        assert_eq!(shadow_exit(entry, tp, stop, Some(0.0), Some(1.0), false), Some((1.0, "settlement")),
                    "and it must not stop the real resolution from closing the trade");
 
         // With no book — the market rotated away — only a resolution closes it.
-        assert_eq!(shadow_exit(entry, tp, stop, None, None), None);
-        assert_eq!(shadow_exit(entry, tp, stop, None, Some(1.0)), Some((1.0, "settlement")));
-        assert_eq!(shadow_exit(entry, tp, stop, None, Some(0.0)), Some((0.0, "settlement")));
+        assert_eq!(shadow_exit(entry, tp, stop, None, None, false), None);
+        assert_eq!(shadow_exit(entry, tp, stop, None, Some(1.0), false), Some((1.0, "settlement")));
+        assert_eq!(shadow_exit(entry, tp, stop, None, Some(0.0), false), Some((0.0, "settlement")));
     }
 
     /// Fees land where the plan puts them: on the way in always, on the way out
