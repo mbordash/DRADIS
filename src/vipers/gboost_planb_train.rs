@@ -88,8 +88,8 @@ use tracing::{info, warn};
 
 use crate::helpers::dynamic_config::DynamicConfig;
 use crate::vipers::gboost_planb::{
-    break_even, build_features, calibrate, load_model, model_path, Bar, DecisionInputs, PlanBModel, FEATURE_NAMES, N_FEATURES,
-    TRAINED_VENUE,
+    break_even, build_features, calibrate, load_model, model_path, residual_probability, Bar, DecisionInputs, ModelForm, PlanBModel,
+    FEATURE_NAMES, MID_COLUMN, N_FEATURES, TRAINED_FORM, TRAINED_VENUE,
 };
 
 // ── Mechanism constants (not risk appetite, so not profile constants) ────────
@@ -940,7 +940,19 @@ pub struct FoldStats {
     pub base_rate: f64,
     pub fold_rate: f64,
     pub logloss: f64,
+    /// `1 - logloss / logloss(base rate)`: skill over knowing nothing.
     pub skill: f64,
+    /// Log-loss of the market mid (`mid_s`) read as a probability, on the same rows.
+    #[serde(default)]
+    pub market_logloss: f64,
+    /// `1 - logloss / market_logloss`: skill over the price the model trades
+    /// against. The base rate is the wrong baseline for a model that buys at a
+    /// market price: on the 2026-10-11 production holdout a model with +0.083
+    /// skill over the base rate had -0.006 over the mid, and on the rows where it
+    /// disagreed with the ask by the margin it claimed 9.3 points and realized
+    /// 0.1. `gate` requires this to be positive; `serve_decision` compares on it.
+    #[serde(default)]
+    pub market_skill: f64,
     pub auc: f64,
     pub rule: RuleStats,
 }
@@ -1000,6 +1012,8 @@ pub fn fold_stats(rows: &[&TrainingRow], p: &[f64], base_rate: f64, plan: &Plan)
     let y: Vec<bool> = rows.iter().map(|r| r.y).collect();
     let ll = log_loss(&y, p);
     let ll0 = log_loss(&y, &vec![base_rate; y.len()]);
+    let market: Vec<f64> = rows.iter().map(|r| r.features[MID_COLUMN]).collect();
+    let llm = log_loss(&y, &market);
     let markets: HashSet<i64> = rows.iter().map(|r| r.w).collect();
     FoldStats {
         n_rows: rows.len(),
@@ -1008,6 +1022,8 @@ pub fn fold_stats(rows: &[&TrainingRow], p: &[f64], base_rate: f64, plan: &Plan)
         fold_rate: y.iter().filter(|&&v| v).count() as f64 / y.len().max(1) as f64,
         logloss: ll,
         skill: 1.0 - ll / ll0,
+        market_logloss: llm,
+        market_skill: 1.0 - ll / llm,
         auc: auc(&y, p),
         rule: rule_stats(rows, p, plan),
     }
@@ -1033,13 +1049,27 @@ pub fn fit_threads() -> usize {
     if cores <= 2 { 1 } else { 2 }
 }
 
-/// Fit the harness's booster configuration.
-pub fn fit_booster(x: &[[f64; N_FEATURES]], y: &[bool], zeroed: &[usize], budget: f32, threads: usize) -> Result<PerpetualBooster, String> {
+/// Fit the harness's booster configuration in the given form.
+///
+/// `Logit` boosts log-loss on the outcome. `ResidualMid` boosts squared loss on
+/// `y - mid`, the outcome's deviation from the market mid at the decision minute:
+/// the price is the starting point and the trees learn only what it misses, so a
+/// model with nothing to add predicts a deviation of zero and the probability is
+/// the price (`residual_probability`). The library offers a scalar base score and
+/// no per-row offset, so the residual is taken in probability space rather than
+/// in log-odds.
+pub fn fit_booster(x: &[[f64; N_FEATURES]], y: &[bool], zeroed: &[usize], budget: f32, threads: usize, form: ModelForm) -> Result<PerpetualBooster, String> {
     let data = column_major(x, zeroed);
     let m = Matrix::new(&data, x.len(), N_FEATURES);
-    let yy: Vec<f64> = y.iter().map(|&v| if v { 1.0 } else { 0.0 }).collect();
+    let (objective, yy): (Objective, Vec<f64>) = match form {
+        ModelForm::Logit => (Objective::LogLoss, y.iter().map(|&v| if v { 1.0 } else { 0.0 }).collect()),
+        ModelForm::ResidualMid => (
+            Objective::SquaredLoss,
+            y.iter().zip(x).map(|(&v, row)| (if v { 1.0 } else { 0.0 }) - row[MID_COLUMN]).collect(),
+        ),
+    };
     let mut b = PerpetualBooster::default()
-        .set_objective(Objective::LogLoss)
+        .set_objective(objective)
         .set_budget(budget)
         .set_num_threads(Some(threads))
         .set_log_iterations(0)
@@ -1052,11 +1082,77 @@ pub fn fit_booster(x: &[[f64; N_FEATURES]], y: &[bool], zeroed: &[usize], budget
     Ok(b)
 }
 
-fn predict_raw(b: &PerpetualBooster, x: &[[f64; N_FEATURES]], zeroed: &[usize]) -> Vec<f64> {
+/// A residual booster's predicted deviation from the mid, per row, before any shrink.
+fn predict_deviation(b: &PerpetualBooster, x: &[[f64; N_FEATURES]], zeroed: &[usize]) -> Vec<f64> {
     if x.is_empty() { return Vec::new(); }
     let data = column_major(x, zeroed);
     let m = Matrix::new(&data, x.len(), N_FEATURES);
-    b.predict_proba(&m, false, false)
+    b.predict(&m, false)
+}
+
+/// The raw probability of each row, as `PlanBModel::predict` computes it for the
+/// form: the log-loss booster's probability, or the mid plus the shrunk deviation.
+fn predict_raw(b: &PerpetualBooster, x: &[[f64; N_FEATURES]], zeroed: &[usize], form: ModelForm, shrink: f64) -> Vec<f64> {
+    if x.is_empty() { return Vec::new(); }
+    match form {
+        ModelForm::Logit => {
+            let data = column_major(x, zeroed);
+            let m = Matrix::new(&data, x.len(), N_FEATURES);
+            b.predict_proba(&m, false, false)
+        }
+        ModelForm::ResidualMid => predict_deviation(b, x, zeroed).into_iter().zip(x)
+            .map(|(deviation, row)| residual_probability(row[MID_COLUMN], shrink * deviation))
+            .collect(),
+    }
+}
+
+/// How much of the booster's deviation from the mid to believe: the least-squares
+/// slope of the realized deviation `y - mid` on the predicted one, over rows the
+/// booster did not fit, clamped to `[0, 1]`.
+///
+/// This is the residual form's calibration and its regularization in one number.
+/// The booster fits noise at any budget (on synthetic rows with nothing to learn
+/// it predicts deviations of 7 to 23 points out of sample, depending on the
+/// budget), and a Platt fit on top would shrink the whole probability toward 0.5,
+/// mid included, which is the failure the form exists to remove. Measured out of
+/// sample, noise has no slope: the deviation is multiplied by about zero and the
+/// model returns the price. A real signal keeps its slope. Nothing above one is
+/// believed: an under-fitted deviation is not amplified on the strength of one
+/// slice.
+pub fn fit_residual_shrink(deviation: &[f64], y: &[bool], mid: &[f64]) -> f64 {
+    let (mut num, mut den) = (0.0f64, 0.0f64);
+    for ((&d, &yy), &m) in deviation.iter().zip(y).zip(mid) {
+        if !(d.is_finite() && m.is_finite()) { continue; }
+        num += d * ((if yy { 1.0 } else { 0.0 }) - m);
+        den += d * d;
+    }
+    if den > 0.0 { (num / den).clamp(0.0, 1.0) } else { 0.0 }
+}
+
+/// What turns a booster's output into the calibrated probability: Platt scaling
+/// for the log-loss form, the deviation shrink for the residual form (whose Platt
+/// is the identity, so the mid passes through untouched).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Calibration {
+    pub platt_a: f64,
+    pub platt_b: f64,
+    pub residual_shrink: f64,
+}
+
+/// Fit the form's calibration on the calibration slice.
+pub fn calibrate_candidate(b: &PerpetualBooster, xc: &[[f64; N_FEATURES]], yc: &[bool], zeroed: &[usize], form: ModelForm) -> Result<Calibration, String> {
+    match form {
+        ModelForm::Logit => {
+            let pc = predict_raw(b, xc, zeroed, form, 1.0);
+            let (platt_a, platt_b) = fit_platt(&pc, yc).ok_or_else(|| "Platt calibration did not converge".to_string())?;
+            Ok(Calibration { platt_a, platt_b, residual_shrink: 1.0 })
+        }
+        ModelForm::ResidualMid => {
+            let dev = predict_deviation(b, xc, zeroed);
+            let mid: Vec<f64> = xc.iter().map(|r| r[MID_COLUMN]).collect();
+            Ok(Calibration { platt_a: 1.0, platt_b: 0.0, residual_shrink: fit_residual_shrink(&dev, yc, &mid) })
+        }
+    }
 }
 
 /// Columns with no value anywhere in the fit rows carry nothing and are zeroed in
@@ -1101,6 +1197,9 @@ pub fn gate(trees: usize, stats: &FoldStats, min_trades: usize, min_win: f64) ->
     if !(stats.skill > 0.0) {
         reasons.push(format!("log-loss skill {:+.4} is not above the base rate", stats.skill));
     }
+    if !(stats.market_skill > 0.0) {
+        reasons.push(format!("log-loss skill over the market mid {:+.4} is not positive: the model knows less than the price", stats.market_skill));
+    }
     if stats.rule.trades < min_trades {
         reasons.push(format!("{} holdout trades, fewer than the {min_trades} required", stats.rule.trades));
     }
@@ -1115,7 +1214,7 @@ pub fn gate(trees: usize, stats: &FoldStats, min_trades: usize, min_win: f64) ->
 
 /// Does the candidate do at least as well as the incumbent on the same fold? Compared
 /// on return per trade when the incumbent trades enough there to be measured, on
-/// log-loss skill otherwise.
+/// log-loss skill over the market otherwise.
 pub fn beats_incumbent(candidate: &FoldStats, incumbent: &FoldStats, min_trades: usize) -> (bool, String) {
     if incumbent.rule.trades >= min_trades {
         let ok = candidate.rule.mean_ret >= incumbent.rule.mean_ret;
@@ -1124,10 +1223,10 @@ pub fn beats_incumbent(candidate: &FoldStats, incumbent: &FoldStats, min_trades:
             candidate.rule.mean_ret * 100.0, incumbent.rule.mean_ret * 100.0,
         ))
     } else {
-        let ok = candidate.skill >= incumbent.skill;
+        let ok = candidate.market_skill >= incumbent.market_skill;
         (ok, format!(
-            "the incumbent took only {} holdout trades, so log-loss skill decides: {:+.4} against {:+.4}",
-            incumbent.rule.trades, candidate.skill, incumbent.skill,
+            "the incumbent took only {} holdout trades, so log-loss skill over the market decides: {:+.4} against {:+.4}",
+            incumbent.rule.trades, candidate.market_skill, incumbent.market_skill,
         ))
     }
 }
@@ -1153,7 +1252,7 @@ async fn shadow_trades_recorded(asset: &str, serving_path: &std::path::Path, pla
 /// serving model is usable. When they disagreed, the trainer kept a model the
 /// viper refused and GBoost sat idle behind it with no way out.
 pub fn incumbent_usable(model: &crate::vipers::gboost_planb::PlanBModel, plan: &Plan) -> bool {
-    model.plan_mismatch(plan.tp, plan.sl, plan.lo, plan.hi, plan.entry.stamp(), plan.posture_stamp()).is_none()
+    model.plan_mismatch(plan.tp, plan.sl, plan.lo, plan.hi, plan.entry.stamp(), plan.posture_stamp(), TRAINED_FORM).is_none()
 }
 
 /// What the serving model looked like when this cycle started.
@@ -1169,8 +1268,9 @@ pub struct Incumbent {
     /// accepts: the refusal happens before any lane is chosen, so the viper
     /// scores nothing, records nothing and can never improve its position.
     pub usable: bool,
-    /// Its log-loss skill on THIS cycle's fold, so the two are comparable.
-    pub skill: f64,
+    /// Its log-loss skill over the market mid on THIS cycle's fold, so the two
+    /// are comparable.
+    pub market_skill: f64,
     /// Closed shadow trades it has recorded so far, and the bar it needs. While
     /// `0 < recorded < needed` it is mid-experiment.
     pub shadow_trades: usize,
@@ -1219,7 +1319,7 @@ pub enum Serve {
 ///   decides, unchanged.
 pub fn serve_decision(
     gate_passed: bool,
-    cand_skill: f64,
+    cand_market_skill: f64,
     cand_beats_incumbent: bool,
     incumbent: Option<Incumbent>,
 ) -> Serve {
@@ -1258,7 +1358,7 @@ pub fn serve_decision(
             // (the arm above), so this delays nothing that has earned its way.
             let mid_experiment = inc.shadow_trades > 0 && inc.shadow_trades < inc.shadow_needed;
             if mid_experiment { Serve::Incumbent }
-            else if cand_skill >= inc.skill { Serve::CandidateInShadow }
+            else if cand_market_skill >= inc.market_skill { Serve::CandidateInShadow }
             else { Serve::Incumbent }
         }
     }
@@ -1289,6 +1389,9 @@ pub struct CycleReport {
     pub trees: usize,
     pub platt_a: f64,
     pub platt_b: f64,
+    /// The residual form's deviation shrink (`fit_residual_shrink`); 1 for the log-loss form.
+    #[serde(default)]
+    pub residual_shrink: f64,
     pub zeroed_features: Vec<String>,
     pub candidate: Option<FoldStats>,
     pub incumbent: Option<FoldStats>,
@@ -1301,6 +1404,19 @@ pub struct CycleReport {
     pub decision: String,
     pub detail: String,
     pub model_version: Option<String>,
+    /// The `ModelForm` stamp this cycle trained (`logit` or `residual_mid`). A
+    /// report from before the stamp reads as empty, which `form_changed` takes as
+    /// the original form.
+    #[serde(default)]
+    pub model_form: String,
+}
+
+/// Whether the last cycle trained a different form from the one this build
+/// trades. The viper refuses a model of the other form (`plan_mismatch`), so a
+/// deploy that changes the form must retrain at once rather than wait for the
+/// schedule, exactly as a plan change does.
+pub fn form_changed(last: Option<&CycleReport>) -> bool {
+    last.is_some_and(|c| ModelForm::from_stamp(Some(c.model_form.as_str())) != Some(TRAINED_FORM))
 }
 
 /// Everything a cycle needs, gathered on the async side so the blocking thread touches
@@ -1374,6 +1490,7 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
     let mut rep = CycleReport {
         started_at: rfc3339(inputs.now),
         plan: Some(inputs.plan),
+        model_form: TRAINED_FORM.stamp().to_string(),
         budget: inputs.budget,
         window_days: inputs.window_days,
         holdout_days: inputs.holdout_days,
@@ -1443,21 +1560,23 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
     }
     zeroed.sort_unstable();
     rep.zeroed_features = zeroed.iter().map(|&j| FEATURE_NAMES[j].to_string()).collect();
-    let booster = match fit_booster(&xf, &yf, &zeroed, inputs.budget as f32, inputs.threads) {
+    let booster = match fit_booster(&xf, &yf, &zeroed, inputs.budget as f32, inputs.threads, TRAINED_FORM) {
         Ok(b) => b,
         Err(e) => return finish(rep, "error", e),
     };
     rep.trees = booster.get_prediction_trees().len();
     let xc: Vec<[f64; N_FEATURES]> = cal.iter().map(|r| r.features).collect();
     let yc: Vec<bool> = cal.iter().map(|r| r.y).collect();
-    let pc = predict_raw(&booster, &xc, &zeroed);
-    let Some((a, b)) = fit_platt(&pc, &yc) else {
-        return finish(rep, "error", "Platt calibration did not converge".to_string());
+    let calib = match calibrate_candidate(&booster, &xc, &yc, &zeroed, TRAINED_FORM) {
+        Ok(c) => c,
+        Err(e) => return finish(rep, "error", e),
     };
+    let (a, b) = (calib.platt_a, calib.platt_b);
     rep.platt_a = a;
     rep.platt_b = b;
+    rep.residual_shrink = calib.residual_shrink;
     let xt: Vec<[f64; N_FEATURES]> = test.iter().map(|r| r.features).collect();
-    let pt: Vec<f64> = predict_raw(&booster, &xt, &zeroed).into_iter().map(|raw| calibrate(raw, a, b)).collect();
+    let pt: Vec<f64> = predict_raw(&booster, &xt, &zeroed, TRAINED_FORM, calib.residual_shrink).into_iter().map(|raw| calibrate(raw, a, b)).collect();
     let base_rate = train.iter().filter(|r| r.y).count() as f64 / train.len() as f64;
     let cand = fold_stats(&test, &pt, base_rate, &inputs.plan);
     rep.gate = gate(rep.trees, &cand, inputs.min_trades, inputs.min_win);
@@ -1501,6 +1620,8 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
         ("venue", TRAINED_VENUE.into()),
         ("asset", inputs.asset.to_ascii_lowercase()),
         ("label", inputs.plan.label()),
+        ("model_form", TRAINED_FORM.stamp().to_string()),
+        ("market_baseline", FEATURE_NAMES[MID_COLUMN].to_string()),
         ("entry_rule", inputs.plan.entry.stamp().to_string()),
         ("plan_posture", inputs.plan.posture_stamp().to_string()),
         ("plan_tp", format!("{:?}", inputs.plan.tp)),
@@ -1514,6 +1635,7 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
         ("iteration_limit", ITERATION_LIMIT.to_string()),
         ("platt_a", format!("{a:?}")),
         ("platt_b", format!("{b:?}")),
+        ("residual_shrink", format!("{:?}", calib.residual_shrink)),
         ("zeroed_features", rep.zeroed_features.join(",")),
         ("sigma_floor_per_sqrt_sec", "4.2e-5".into()),
         ("trained_from", rfc3339(fit_from)),
@@ -1528,6 +1650,9 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
         ("holdout_mean_ret", format!("{:?}", cand.rule.mean_ret)),
         ("holdout_win", format!("{:?}", cand.rule.win)),
         ("holdout_skill", format!("{:?}", cand.skill)),
+        ("holdout_logloss", format!("{:?}", cand.logloss)),
+        ("holdout_market_logloss", format!("{:?}", cand.market_logloss)),
+        ("holdout_market_skill", format!("{:?}", cand.market_skill)),
         ("created_at", rfc3339(Utc::now().timestamp())),
         // The verdict travels with the model, because the file outlives this
         // report: the viper's loader reads it back and `shadow_blocks_live`
@@ -1561,7 +1686,7 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
         // this cycle was trained for, so the trainer and the viper cannot
         // disagree about whether the serving model is usable.
         usable: incumbent.as_ref().is_some_and(|m| incumbent_usable(m, &inputs.plan)),
-        skill: stats.skill,
+        market_skill: stats.market_skill,
         shadow_trades: inputs.incumbent_shadow_trades,
         shadow_needed: inputs.shadow_min_trades,
     });
@@ -1571,7 +1696,7 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
     let beats = comparison.as_ref().map(|(ok, _)| *ok).unwrap_or(true);
     let overlap = if rep.incumbent_overlaps_fold { " (the incumbent's training range overlaps the fold, which favors it)" } else { "" };
     let inc_name = rep.incumbent_version.clone().unwrap_or_default();
-    let served = serve_decision(rep.gate.passed, cand.skill, beats, inc_state);
+    let served = serve_decision(rep.gate.passed, cand.market_skill, beats, inc_state);
     let shadow_only = served == Serve::CandidateInShadow;
 
     match served {
@@ -1590,13 +1715,13 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
                 Some(inc) if inc.shadow_trades > 0 && inc.shadow_trades < inc.shadow_needed => format!(
                     "candidate {version} failed the holdout gate: {why}; the serving model {inc_name} is \
                      {}/{} through its shadow record, so it is kept rather than restarting the count \
-                     (its skill {:+.4} against the candidate's {:+.4})",
-                    inc.shadow_trades, inc.shadow_needed, inc.skill, cand.skill,
+                     (its skill over the market {:+.4} against the candidate's {:+.4})",
+                    inc.shadow_trades, inc.shadow_needed, inc.market_skill, cand.market_skill,
                 ),
                 Some(inc) => format!(
                     "candidate {version} failed the holdout gate: {why}; the serving model {inc_name} has not cleared it \
-                     either but scores better on the same fold ({:+.4} against {:+.4}), so it is kept",
-                    inc.skill, cand.skill,
+                     either but scores better over the market on the same fold ({:+.4} against {:+.4}), so it is kept",
+                    inc.market_skill, cand.market_skill,
                 ),
                 None => format!("candidate {version} failed the holdout gate: {why}"),
             };
@@ -1633,8 +1758,8 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
                 ))
             } else {
                 inc_state.map(|inc| format!(
-                    "log-loss skill {:+.4} against the serving model's {:+.4}; neither has cleared the gate",
-                    cand.skill, inc.skill,
+                    "log-loss skill over the market mid {:+.4} against the serving model's {:+.4}; neither has cleared the gate",
+                    cand.market_skill, inc.market_skill,
                 ))
             };
         }
@@ -1696,19 +1821,24 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
         (false, false) => " (Auto Adopt is off, but nothing was in service, so there was no operator \
                             decision to defer to)",
     };
+    let form_note = match TRAINED_FORM {
+        ModelForm::Logit => String::new(),
+        ModelForm::ResidualMid => format!(", a residual over the market mid believed at {:.2}", calib.residual_shrink),
+    };
     let summary = if shadow_only {
         format!(
-            "serving {version} in the shadow lane: {} trees, holdout {} trades at {:+.2}% per trade, win {:.3}, \
-             skill {:+.4}; it did not clear the gate ({}), so it trades simulated until this instance's own \
-             record earns real money{}{bypassed}",
-            rep.trees, cand.rule.trades, cand.rule.mean_ret * 100.0, cand.rule.win, cand.skill,
+            "serving {version} in the shadow lane: {} trees{form_note}, holdout {} trades at {:+.2}% per trade, win {:.3}, \
+             skill {:+.4} over the base rate and {:+.4} over the market mid; it did not clear the gate ({}), so it \
+             trades simulated until this instance's own record earns real money{}{bypassed}",
+            rep.trees, cand.rule.trades, cand.rule.mean_ret * 100.0, cand.rule.win, cand.skill, cand.market_skill,
             rep.gate.reasons.join("; "),
             rep.comparison.as_deref().map(|c| format!("; {c}")).unwrap_or_default(),
         )
     } else {
         format!(
-            "adopted {version}: {} trees, holdout {} trades at {:+.2}% per trade, win {:.3}, skill {:+.4}{}{bypassed}",
-            rep.trees, cand.rule.trades, cand.rule.mean_ret * 100.0, cand.rule.win, cand.skill,
+            "adopted {version}: {} trees{form_note}, holdout {} trades at {:+.2}% per trade, win {:.3}, skill {:+.4} over the base rate \
+             and {:+.4} over the market mid{}{bypassed}",
+            rep.trees, cand.rule.trades, cand.rule.mean_ret * 100.0, cand.rule.win, cand.skill, cand.market_skill,
             rep.comparison.as_deref().map(|c| format!("; {c}")).unwrap_or_default(),
         )
     };
@@ -2456,7 +2586,8 @@ pub async fn run_pipeline(asset: String) {
         let now = Utc::now().timestamp();
         let complete = catch_up(&asset, &dir, &knobs, now).await;
 
-        let plan_changed = last_cycle.as_ref().and_then(|c| c.plan).is_some_and(|p| p != plan);
+        let plan_changed = last_cycle.as_ref().and_then(|c| c.plan).is_some_and(|p| p != plan)
+            || form_changed(last_cycle.as_ref());
         // A refusal is not a cycle: it does not push the schedule.
         let due_at = last_cycle.as_ref()
             .filter(|c| c.decision != "refused")
@@ -2479,7 +2610,7 @@ pub async fn run_pipeline(asset: String) {
             // refused, and the card says why. Checked again next pass, so a resize takes.
             if !last_cycle.as_ref().is_some_and(|c| c.decision == "refused" && c.detail == why) {
                 warn!("GBoost plan-B pipeline [{asset}]: {why}");
-                let rep = CycleReport { decision: "refused".into(), detail: why.clone(), started_at: rfc3339(now), finished_at: rfc3339(now), plan: Some(plan), ..Default::default() };
+                let rep = CycleReport { decision: "refused".into(), detail: why.clone(), started_at: rfc3339(now), finished_at: rfc3339(now), plan: Some(plan), model_form: TRAINED_FORM.stamp().to_string(), ..Default::default() };
                 let _ = write_json_atomically(&dir.status(), &rep);
                 last_cycle = Some(rep.clone());
                 update_status(&asset, |s| s.last_cycle = Some(rep));
@@ -2492,7 +2623,7 @@ pub async fn run_pipeline(asset: String) {
             update_status(&asset, |s| { s.phase = "training".into(); s.next_train_at = None; });
             info!(
                 "GBoost plan-B pipeline [{asset}]: training cycle starting ({}; plan {}, window {} d, holdout {} d, budget {})",
-                if plan_changed { "the plan changed" } else { "scheduled" }, plan.label(), knobs.window_days, knobs.holdout_days, knobs.budget,
+                if plan_changed { "the plan or the model form changed" } else { "scheduled" }, plan.label(), knobs.window_days, knobs.holdout_days, knobs.budget,
             );
             let inputs = CycleInputs {
                 asset: asset.clone(),
@@ -2520,9 +2651,9 @@ pub async fn run_pipeline(asset: String) {
             let report = match spawned {
                 Ok(_) => match rx.await {
                     Ok(r) => r,
-                    Err(_) => CycleReport { decision: "error".into(), detail: "the training thread ended without a report".into(), finished_at: rfc3339(Utc::now().timestamp()), ..Default::default() },
+                    Err(_) => CycleReport { decision: "error".into(), detail: "the training thread ended without a report".into(), finished_at: rfc3339(Utc::now().timestamp()), model_form: TRAINED_FORM.stamp().to_string(), ..Default::default() },
                 },
-                Err(e) => CycleReport { decision: "error".into(), detail: format!("cannot start the training thread: {e}"), finished_at: rfc3339(Utc::now().timestamp()), ..Default::default() },
+                Err(e) => CycleReport { decision: "error".into(), detail: format!("cannot start the training thread: {e}"), finished_at: rfc3339(Utc::now().timestamp()), model_form: TRAINED_FORM.stamp().to_string(), ..Default::default() },
             };
             match report.decision.as_str() {
                 "adopted" | "shadow_adopted" => info!("GBoost plan-B pipeline [{asset}]: {}", report.detail),
@@ -2671,10 +2802,15 @@ mod tests {
                     let mut f = [0.0f64; N_FEATURES];
                     for (j, v) in f.iter_mut().enumerate() { *v = (rng.next() % 1000) as f64 / 1000.0 + j as f64; }
                     f[0] = side as f64;
-                    let ask = 0.43 + (rng.next() % 33) as f64 / 100.0;
-                    f[2] = ask;
                     // A learnable signal: the label follows feature 19 (fv_edge) plus noise.
                     let signal = (f[19] - 19.0) > 0.5;
+                    // The market half-reads the signal (a mid of about 0.60 or 0.40 for a
+                    // true rate of 0.75 or 0.25), so a model has something to add over it;
+                    // the ask sits a cent and a half above the mid, inside the test band.
+                    let mid = (if signal { 0.60 } else { 0.40 }) + (rng.next() % 5) as f64 / 100.0 - 0.02;
+                    f[MID_COLUMN] = mid;
+                    let ask = mid + 0.015;
+                    f[2] = ask;
                     let noise = rng.next() % 4 == 0;
                     let y = signal ^ noise;
                     let ret = if y { 0.2 } else { -0.11 };
@@ -2717,17 +2853,19 @@ mod tests {
         let cal: Vec<&TrainingRow> = train.iter().copied().filter(|r| r.w >= cut).collect();
         let xf: Vec<[f64; N_FEATURES]> = fit.iter().map(|r| r.features).collect();
         let yf: Vec<bool> = fit.iter().map(|r| r.y).collect();
-        let mut booster = fit_booster(&xf, &yf, &[], 0.5, 1).expect("fits");
+        let mut booster = fit_booster(&xf, &yf, &[], 0.5, 1, TRAINED_FORM).expect("fits");
         assert!(booster.get_prediction_trees().len() >= STRUCTURAL_MIN_TREES);
         let xc: Vec<[f64; N_FEATURES]> = cal.iter().map(|r| r.features).collect();
         let yc: Vec<bool> = cal.iter().map(|r| r.y).collect();
-        let (a, b) = fit_platt(&predict_raw(&booster, &xc, &[]), &yc).expect("calibrates");
+        let calib = calibrate_candidate(&booster, &xc, &yc, &[], TRAINED_FORM).expect("calibrates");
+        let (a, b) = (calib.platt_a, calib.platt_b);
         for (k, v) in [
             ("feature_layout", "column_major".to_string()), ("feature_names", FEATURE_NAMES.join(",")),
             ("model_version", "engine-btc-test".into()), ("trained_by", "dradis-engine".into()), ("venue", TRAINED_VENUE.into()),
-            ("platt_a", format!("{a:?}")), ("platt_b", format!("{b:?}")), ("zeroed_features", "oi_d5,oi_d30,tlsr,tlsr15".into()),
+            ("platt_a", format!("{a:?}")), ("platt_b", format!("{b:?}")), ("residual_shrink", format!("{:?}", calib.residual_shrink)),
+            ("zeroed_features", "oi_d5,oi_d30,tlsr,tlsr15".into()),
             ("plan_tp", "0.2".into()), ("plan_sl", "0.11".into()), ("plan_min_ask", "0.43".into()), ("plan_max_ask", "0.75".into()),
-            ("plan_posture", "settlement".into()),
+            ("plan_posture", "settlement".into()), ("model_form", TRAINED_FORM.stamp().into()),
             ("calibrated_through", rfc3339(fold_start - PURGE_SECS)),
         ] {
             booster.insert_metadata(k.to_string(), v);
@@ -2741,8 +2879,12 @@ mod tests {
         assert_eq!(model.zeroed, vec![23, 24, 25, 26]);
         assert_eq!(model.plan, Some([0.2, 0.11, 0.43, 0.75]));
         assert_eq!(model.posture.as_deref(), Some("settlement"), "the loader reads the posture stamp");
-        assert!(model.plan_mismatch(0.2, 0.11, 0.43, 0.75, "e1", "settlement").is_none());
-        assert!(model.plan_mismatch(0.2, 0.11, 0.43, 0.75, "e1", "gates").is_some(), "a held model is refused on a gates instance");
+        assert_eq!(model.form, TRAINED_FORM, "the loader reads the form stamp");
+        assert!((model.residual_shrink - calib.residual_shrink).abs() < 1e-12, "and the shrink stamp");
+        assert!(calib.residual_shrink > 0.3, "the signal is real, so the deviation is believed: {}", calib.residual_shrink);
+        assert!(model.plan_mismatch(0.2, 0.11, 0.43, 0.75, "e1", "settlement", TRAINED_FORM).is_none());
+        assert!(model.plan_mismatch(0.2, 0.11, 0.43, 0.75, "e1", "gates", TRAINED_FORM).is_some(), "a held model is refused on a gates instance");
+        assert!(model.plan_mismatch(0.2, 0.11, 0.43, 0.75, "e1", "settlement", ModelForm::Logit).is_some(), "a residual model is refused by a logit build");
         let xt: Vec<[f64; N_FEATURES]> = test.iter().map(|r| r.features).collect();
         let preds = model.predict(&xt);
         assert!(preds.iter().all(|(r, c)| r.is_finite() && c.is_finite() && *c > 0.0 && *c < 1.0));
@@ -2750,8 +2892,9 @@ mod tests {
         let pc: Vec<f64> = preds.iter().map(|p| p.1).collect();
         let base = train.iter().filter(|r| r.y).count() as f64 / train.len() as f64;
         let stats = fold_stats(&test, &pc, base, &plan);
-        assert!(stats.auc > 0.7, "auc {}", stats.auc);
+        assert!(stats.auc > 0.65, "auc {}", stats.auc);
         assert!(stats.skill > 0.0, "skill {} (a={a} b={b})", stats.skill);
+        assert!(stats.market_skill.is_finite(), "skill over the market is measured on the same fold: {}", stats.market_skill);
         let _ = inputs;
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -2766,8 +2909,8 @@ mod tests {
     #[test]
     fn the_serve_table_always_leaves_a_model_in_service() {
         use super::{serve_decision, Incumbent, Serve};
-        let passed = |skill| Some(Incumbent { gate_passed: true, usable: true, skill, shadow_trades: 40, shadow_needed: 40 });
-        let shadow = |skill| Some(Incumbent { gate_passed: false, usable: true, skill, shadow_trades: 40, shadow_needed: 40 });
+        let passed = |skill| Some(Incumbent { gate_passed: true, usable: true, market_skill: skill, shadow_trades: 40, shadow_needed: 40 });
+        let shadow = |skill| Some(Incumbent { gate_passed: false, usable: true, market_skill: skill, shadow_trades: 40, shadow_needed: 40 });
 
         // A fresh instance serves whatever it trained, in the lane it earned.
         assert_eq!(serve_decision(true, 0.05, true, None), Serve::Candidate);
@@ -2809,7 +2952,7 @@ mod tests {
         // because the engine trades e2. Without this it outranked every honest
         // e2 candidate the pipeline could produce, forever — the permanently
         // idle viper, rebuilt out of a licensed model.
-        let refused = |skill| Some(Incumbent { gate_passed: true, usable: false, skill, shadow_trades: 0, shadow_needed: 40 });
+        let refused = |skill| Some(Incumbent { gate_passed: true, usable: false, market_skill: skill, shadow_trades: 0, shadow_needed: 40 });
         assert_eq!(serve_decision(false, -0.0034, false, refused(0.112)), Serve::CandidateInShadow,
                    "a failing candidate the engine CAN trade beats a passing one it cannot");
         assert_eq!(serve_decision(true, 0.01, false, refused(0.112)), Serve::Candidate,
@@ -2824,7 +2967,7 @@ mod tests {
         // slot over about every two days and reset the record each time: a lane
         // that records forever and promotes never.
         let growing = |trades| Some(Incumbent {
-            gate_passed: false, usable: true, skill: -0.004, shadow_trades: trades, shadow_needed: 40,
+            gate_passed: false, usable: true, market_skill: -0.004, shadow_trades: trades, shadow_needed: 40,
         });
         assert_eq!(serve_decision(false, 0.05, true, growing(12)), Serve::Incumbent,
                    "a better-scoring failed candidate must not restart a record in progress");
@@ -2838,24 +2981,163 @@ mod tests {
                    "a passing candidate is not held back by an experiment in progress");
     }
 
+    /// Skill is measured against the price the model trades at: a probability equal
+    /// to the mid has no skill over the market, one that improves on it has positive
+    /// skill, and the base rate itself scores negative against an informative mid.
+    #[test]
+    fn skill_over_the_market_is_measured_against_the_mid() {
+        let mut rng = SplitMix(5);
+        let mut rows: Vec<TrainingRow> = Vec::new();
+        for m in 0..400 {
+            let mut f = [0.0f64; N_FEATURES];
+            let mid = 0.2 + (rng.next() % 61) as f64 / 100.0;
+            f[MID_COLUMN] = mid;
+            f[2] = mid + 0.015;
+            let y = (rng.next() % 1000) as f64 / 1000.0 < mid;
+            rows.push(TrainingRow { w: 1_780_000_000 + m * 3600, k: 5, side: 0, ask: f[2], features: f, y, ret: if y { 1.0 } else { -1.0 }, exit: ExitKind::Settle, exit_t: 0, elig: true });
+        }
+        let refs: Vec<&TrainingRow> = rows.iter().collect();
+        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.25, hi: 0.90, fee: 0.07, margin: 0.05, first_minute: 5, last_minute: 45, hold: true };
+        let base = refs.iter().filter(|r| r.y).count() as f64 / refs.len() as f64;
+        let as_mid: Vec<f64> = refs.iter().map(|r| r.features[MID_COLUMN]).collect();
+        let same = fold_stats(&refs, &as_mid, base, &plan);
+        assert!(same.market_skill.abs() < 1e-12, "the mid has no skill over itself: {}", same.market_skill);
+        assert!(same.skill > 0.0, "an informative mid beats the base rate");
+        let flat = fold_stats(&refs, &vec![base; refs.len()], base, &plan);
+        assert!(flat.market_skill < 0.0, "the base rate knows less than the price: {}", flat.market_skill);
+        assert!(flat.skill.abs() < 1e-9);
+        // Nudging the mid toward the realized outcome is skill over the market.
+        let better: Vec<f64> = refs.iter().map(|r| if r.y { (r.features[MID_COLUMN] + 0.05).min(0.99) } else { (r.features[MID_COLUMN] - 0.05).max(0.01) }).collect();
+        assert!(fold_stats(&refs, &better, base, &plan).market_skill > 0.0);
+    }
+
+    /// Under the residual form the booster learns `y - mid`. Where the outcome is
+    /// exactly the market's probability it has nothing to add: the booster still
+    /// fits noise, the out-of-sample shrink finds no slope in it, and the model
+    /// returns the mid, with no skill over the market. Given a signal the market
+    /// lacks, the deviation keeps its slope, the model moves off the mid and beats
+    /// the price.
+    #[test]
+    fn a_residual_model_returns_the_market_unless_it_has_something_to_add() {
+        fn make(seed: u64, signal: bool) -> Vec<TrainingRow> {
+            let mut rng = SplitMix(seed);
+            let mut rows = Vec::new();
+            for m in 0..160 {
+                let w = 1_780_000_000 + m * 3600;
+                for k in 5..=45 {
+                    let mut f = [0.0f64; N_FEATURES];
+                    for (j, v) in f.iter_mut().enumerate() { *v = (rng.next() % 1000) as f64 / 1000.0 + j as f64; }
+                    f[0] = 0.0;
+                    let mid = 0.2 + (rng.next() % 61) as f64 / 100.0;
+                    f[MID_COLUMN] = mid;
+                    f[2] = mid + 0.015;
+                    let shift = if signal { if f[19] - 19.0 > 0.5 { 0.25 } else { -0.25 } } else { 0.0 };
+                    let p = (mid + shift).clamp(0.02, 0.98);
+                    let y = (rng.next() % 1000) as f64 / 1000.0 < p;
+                    rows.push(TrainingRow { w, k, side: 0, ask: f[2], features: f, y, ret: if y { 1.0 } else { -1.0 }, exit: ExitKind::Settle, exit_t: 0, elig: true });
+                }
+            }
+            rows
+        }
+        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.25, hi: 0.90, fee: 0.07, margin: 0.05, first_minute: 5, last_minute: 45, hold: true };
+        // Fit on the oldest 60% of markets, shrink on the next 15%, judge on the newest 25%.
+        let run = |rows: &[TrainingRow]| -> (f64, f64, f64, FoldStats) {
+            let cut_fit = rows[rows.len() * 60 / 100].w;
+            let cut_cal = rows[rows.len() * 75 / 100].w;
+            let fit: Vec<&TrainingRow> = rows.iter().filter(|r| r.w < cut_fit).collect();
+            let cal: Vec<&TrainingRow> = rows.iter().filter(|r| r.w >= cut_fit && r.w < cut_cal).collect();
+            let test: Vec<&TrainingRow> = rows.iter().filter(|r| r.w >= cut_cal).collect();
+            let xf: Vec<[f64; N_FEATURES]> = fit.iter().map(|r| r.features).collect();
+            let yf: Vec<bool> = fit.iter().map(|r| r.y).collect();
+            let booster = fit_booster(&xf, &yf, &[], 0.5, 1, ModelForm::ResidualMid).expect("fits");
+            let xc: Vec<[f64; N_FEATURES]> = cal.iter().map(|r| r.features).collect();
+            let yc: Vec<bool> = cal.iter().map(|r| r.y).collect();
+            let calib = calibrate_candidate(&booster, &xc, &yc, &[], ModelForm::ResidualMid).expect("calibrates");
+            assert_eq!((calib.platt_a, calib.platt_b), (1.0, 0.0), "the residual form's Platt is the identity");
+            let xt: Vec<[f64; N_FEATURES]> = test.iter().map(|r| r.features).collect();
+            let unshrunk = predict_raw(&booster, &xt, &[], ModelForm::ResidualMid, 1.0);
+            let raw = predict_raw(&booster, &xt, &[], ModelForm::ResidualMid, calib.residual_shrink);
+            assert!(raw.iter().all(|p| p.is_finite() && *p > 0.0 && *p < 1.0));
+            let drift = |p: &[f64]| p.iter().zip(&test).map(|(p, r)| (p - r.features[MID_COLUMN]).abs()).sum::<f64>() / p.len() as f64;
+            let base = fit.iter().filter(|r| r.y).count() as f64 / fit.len() as f64;
+            (calib.residual_shrink, drift(&unshrunk), drift(&raw), fold_stats(&test, &raw, base, &plan))
+        };
+        let (shrink, before, after, stats) = run(&make(3, false));
+        assert!(before > 0.10, "the booster fits noise at this budget, which is the thing the shrink exists for: {before:.4}");
+        assert!(shrink < 0.15, "noise has no out-of-sample slope: shrink {shrink:.3}");
+        assert!(after < 0.03, "with nothing to add the model stays on the mid: mean |raw - mid| {after:.4}");
+        assert!(stats.market_skill.abs() < 0.01, "and has no skill over it: {:+.4}", stats.market_skill);
+        let (shrink, _, after, stats) = run(&make(3, true));
+        assert!(shrink > 0.3, "a real signal keeps much of its slope (the rest of the deviation is noise at this budget): shrink {shrink:.3}");
+        assert!(after > 0.10, "given a signal it moves off the mid: {after:.4}");
+        assert!(stats.market_skill > 0.05, "and beats the price: {:+.4}", stats.market_skill);
+    }
+
+    /// The shrink is the least-squares slope of the realized deviation on the
+    /// predicted one, clamped to the unit interval: a perfect deviation is believed
+    /// in full, an inverted one not at all, and a booster that predicted nothing
+    /// cannot be believed either way.
+    #[test]
+    fn the_residual_shrink_is_a_clamped_slope() {
+        let mid = [0.3, 0.5, 0.7, 0.4];
+        let y = [true, false, true, false];
+        let realized: Vec<f64> = y.iter().zip(&mid).map(|(&yy, &m)| (if yy { 1.0 } else { 0.0 }) - m).collect();
+        assert!((fit_residual_shrink(&realized, &y, &mid) - 1.0).abs() < 1e-12, "a deviation that is the realized one has slope one");
+        let half: Vec<f64> = realized.iter().map(|d| d * 2.0).collect();
+        assert!((fit_residual_shrink(&half, &y, &mid) - 0.5).abs() < 1e-12, "twice the realized deviation is believed by half");
+        let inverted: Vec<f64> = realized.iter().map(|d| -d).collect();
+        assert_eq!(fit_residual_shrink(&inverted, &y, &mid), 0.0, "an anti-informative deviation is not believed");
+        let timid: Vec<f64> = realized.iter().map(|d| d * 0.25).collect();
+        assert_eq!(fit_residual_shrink(&timid, &y, &mid), 1.0, "an under-fitted deviation is not amplified");
+        assert_eq!(fit_residual_shrink(&[0.0; 4], &y, &mid), 0.0, "no deviation, nothing to believe");
+        assert_eq!(fit_residual_shrink(&[f64::NAN, 0.2, 0.0, 0.0], &y, &mid), 0.0, "a row with no prediction is skipped: zero slope remains");
+    }
+
+    /// A report from before the form stamp, or one that trained the other form,
+    /// makes the next pass retrain at once; one that trained this build's form does not.
+    #[test]
+    fn a_form_change_is_due_at_once() {
+        assert!(!form_changed(None), "a fresh instance has nothing to compare");
+        let current = CycleReport { model_form: TRAINED_FORM.stamp().to_string(), ..Default::default() };
+        assert!(!form_changed(Some(&current)));
+        let pre_stamp = CycleReport::default();
+        assert_eq!(pre_stamp.model_form, "", "serde default for a report written before the stamp");
+        assert!(form_changed(Some(&pre_stamp)), "an unstamped report trained the original form");
+        let other = CycleReport { model_form: "logit".to_string(), ..Default::default() };
+        assert!(form_changed(Some(&other)));
+        let failed = CycleReport { decision: "error".into(), model_form: TRAINED_FORM.stamp().to_string(), ..Default::default() };
+        assert!(!form_changed(Some(&failed)), "a cycle that failed under this build keeps the schedule rather than retraining every pass");
+        let parsed: CycleReport = serde_json::from_str(r#"{"started_at":"","finished_at":"","duration_secs":0,"plan":null,"budget":2,"window_days":120,"holdout_days":14,"rows_total":0,"rows_eligible":0,"markets":0,"data_from":"","data_through":"","fold_from":"","fold_through":"","fit_rows":0,"fit_markets":0,"cal_rows":0,"cal_markets":0,"test_rows":0,"trees":0,"platt_a":1,"platt_b":0,"zeroed_features":[],"candidate":null,"incumbent":null,"incumbent_version":null,"incumbent_overlaps_fold":false,"gate":{"passed":false,"reasons":[]},"comparison":null,"decision":"shadow_adopted","detail":"","model_version":null}"#).expect("an old status.json still parses");
+        assert!(form_changed(Some(&parsed)));
+    }
+
     /// The gate refuses a degenerate or losing candidate for a named reason and passes a
     /// sound one; a candidate beats an incumbent on return when the incumbent trades, on
     /// skill when it does not.
     #[test]
     fn the_gate_names_every_failure_and_the_comparison_is_by_return_then_skill() {
-        let good = FoldStats { skill: 0.05, rule: RuleStats { trades: 40, mean_ret: 0.03, win: 0.60, ..Default::default() }, ..Default::default() };
+        let good = FoldStats { skill: 0.05, market_skill: 0.02, rule: RuleStats { trades: 40, mean_ret: 0.03, win: 0.60, ..Default::default() }, ..Default::default() };
         assert!(gate(300, &good, 30, 0.53).passed);
-        let g = gate(3, &FoldStats { skill: -0.01, rule: RuleStats { trades: 10, mean_ret: -0.02, win: 0.40, ..Default::default() }, ..Default::default() }, 30, 0.53);
+        let g = gate(3, &FoldStats { skill: -0.01, market_skill: -0.01, rule: RuleStats { trades: 10, mean_ret: -0.02, win: 0.40, ..Default::default() }, ..Default::default() }, 30, 0.53);
         assert!(!g.passed);
-        assert_eq!(g.reasons.len(), 5, "{:?}", g.reasons);
+        assert_eq!(g.reasons.len(), 6, "{:?}", g.reasons);
+        // The production shape of 2026-10-11: skill over the base rate, none over the price.
+        let price_knows_more = FoldStats { skill: 0.083, market_skill: -0.006, rule: RuleStats { trades: 468, mean_ret: 0.01, win: 0.60, ..Default::default() }, ..Default::default() };
+        let g = gate(359, &price_knows_more, 30, 0.53);
+        assert!(!g.passed);
+        assert_eq!(g.reasons, vec!["log-loss skill over the market mid -0.0060 is not positive: the model knows less than the price".to_string()]);
+        let unmeasured = FoldStats { skill: 0.083, market_skill: 0.0, ..good.clone() };
+        assert!(!gate(359, &unmeasured, 30, 0.53).passed, "a report that never measured the market reads as zero and fails");
         let nan = gate(300, &FoldStats { skill: f64::NAN, rule: RuleStats { trades: 0, mean_ret: f64::NAN, win: f64::NAN, ..Default::default() }, ..Default::default() }, 30, 0.53);
         assert!(!nan.passed, "a fold with no trades cannot pass");
-        let worse = FoldStats { skill: 0.09, rule: RuleStats { trades: 40, mean_ret: 0.04, win: 0.6, ..Default::default() }, ..Default::default() };
+        let worse = FoldStats { skill: 0.09, market_skill: 0.04, rule: RuleStats { trades: 40, mean_ret: 0.04, win: 0.6, ..Default::default() }, ..Default::default() };
         assert!(!beats_incumbent(&good, &worse, 30).0, "a lower return loses even with lower skill on the incumbent's side");
         assert!(beats_incumbent(&worse, &good, 30).0);
-        let silent = FoldStats { skill: 0.09, rule: RuleStats { trades: 3, mean_ret: 0.5, ..Default::default() }, ..Default::default() };
-        assert!(!beats_incumbent(&good, &silent, 30).0, "an incumbent that barely trades is compared on skill");
+        let silent = FoldStats { skill: 0.09, market_skill: 0.04, rule: RuleStats { trades: 3, mean_ret: 0.5, ..Default::default() }, ..Default::default() };
+        assert!(!beats_incumbent(&good, &silent, 30).0, "an incumbent that barely trades is compared on skill over the market");
         assert!(beats_incumbent(&worse, &silent, 30).0);
+        let base_rate_only = FoldStats { skill: 0.20, market_skill: 0.03, rule: RuleStats { trades: 3, mean_ret: 0.5, ..Default::default() }, ..Default::default() };
+        assert!(!beats_incumbent(&base_rate_only, &silent, 30).0, "skill over the base rate does not decide the comparison");
     }
 
     /// First qualifying minute per market and side, and only eligible rows count.

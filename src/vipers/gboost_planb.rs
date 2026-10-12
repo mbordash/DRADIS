@@ -98,6 +98,61 @@ pub const STRATEGY_NAME: &str = "GboostStrategy";
 pub const TRAINED_VENUE: &str = "polymarket-intl";
 
 /// Column index of `funding`, the one input whose availability differs by instance.
+/// Column of the market mid for the scored side (`mid_s`): the price the model is
+/// measured against and, under [`ModelForm::ResidualMid`], the base it predicts a
+/// deviation from.
+pub const MID_COLUMN: usize = 3;
+
+/// How the booster's output becomes the raw probability.
+///
+/// `Logit` is the original form: a log-loss booster predicting the outcome from the
+/// features alone, with the market price one feature among 29. On the 2026-10-11
+/// production holdout that form knew less than the price it traded against
+/// (log-loss 0.623 against the mid's 0.619 and the ask's 0.611): on the 489 rows
+/// where its calibrated probability cleared the ask by the margin it claimed 9.3
+/// points of edge and realized 0.1, because Platt shrinks a probability toward 0.5
+/// rather than toward the price, which makes the cheap side look mispriced at
+/// every minute. `ResidualMid` makes the market the starting point: a squared-loss
+/// booster predicts `y - mid`, and the probability is the mid plus that deviation.
+/// A model with nothing to add returns the price and never clears the margin, and
+/// the trainer's gate measures skill over the mid rather than over the base rate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelForm {
+    Logit,
+    ResidualMid,
+}
+
+impl ModelForm {
+    /// The word stamped on a model file as `model_form` and compared by `plan_mismatch`.
+    pub fn stamp(self) -> &'static str {
+        match self { ModelForm::Logit => "logit", ModelForm::ResidualMid => "residual_mid" }
+    }
+    /// A stamp read back. A model without one predates the stamp and is `Logit`.
+    pub fn from_stamp(stamp: Option<&str>) -> Option<Self> {
+        match stamp {
+            None | Some("") | Some("logit") => Some(ModelForm::Logit),
+            Some("residual_mid") => Some(ModelForm::ResidualMid),
+            Some(_) => None,
+        }
+    }
+    /// What the form predicts, for log lines and refusals.
+    pub fn describe(self) -> &'static str {
+        match self {
+            ModelForm::Logit => "the outcome directly from its features",
+            ModelForm::ResidualMid => "the outcome's deviation from the market mid",
+        }
+    }
+}
+
+/// The form this build trains and trades.
+pub const TRAINED_FORM: ModelForm = ModelForm::ResidualMid;
+
+/// The raw probability of a residual model: the mid plus the predicted deviation,
+/// kept inside the open interval `calibrate` works on.
+pub fn residual_probability(mid: f64, deviation: f64) -> f64 {
+    (mid + deviation).clamp(1e-4, 1.0 - 1e-4)
+}
+
 const FUNDING_COLUMN: usize = 22;
 /// `oi_d5`, `oi_d30`, `tlsr`, `tlsr15` in `FEATURE_NAMES`.
 pub const DERIV_COLUMNS: [usize; 4] = [23, 24, 25, 26];
@@ -824,6 +879,12 @@ pub struct PlanBModel {
     pub trees: usize,
     /// Columns the model's training rows never had a value for, fed as zeros.
     pub zeroed: Vec<usize>,
+    /// How the booster's output becomes a probability (`model_form` stamp).
+    pub form: ModelForm,
+    /// Under `ResidualMid`, how much of the predicted deviation to believe
+    /// (`residual_shrink` stamp, fitted out of sample by the trainer; 1 when
+    /// absent). Unused by the log-loss form.
+    pub residual_shrink: f64,
     /// `[tp, sl, min_ask, max_ask]` the labels were built with, when stamped.
     pub plan: Option<[f64; 4]>,
     /// The exit the labels assumed (`plan_posture`: "gates" or "settlement").
@@ -874,11 +935,14 @@ pub struct PlanBModel {
 /// DynamicConfig in reach. That only ever applies to pre-stamp files; anything
 /// this build trains carries the verdict the operator's own knobs produced.
 pub fn gate_from_stamp(
-    trees: usize, skill: Option<f64>, trades: Option<usize>, mean_ret: Option<f64>, win: Option<f64>,
+    trees: usize, skill: Option<f64>, market_skill: Option<f64>, trades: Option<usize>, mean_ret: Option<f64>, win: Option<f64>,
 ) -> bool {
     use crate::vipers::gboost_planb_train::{gate, FoldStats, RuleStats};
     let stats = FoldStats {
         skill: skill.unwrap_or(f64::NAN),
+        // A file that never measured itself against the market has not shown it
+        // beats the price, which is the gate's question.
+        market_skill: market_skill.unwrap_or(f64::NAN),
         rule: RuleStats {
             trades: trades.unwrap_or(0),
             mean_ret: mean_ret.unwrap_or(f64::NAN),
@@ -919,6 +983,9 @@ pub fn load_model(path: &std::path::Path) -> std::result::Result<PlanBModel, Str
         return Err(format!("model has {trees} trees, below the structural minimum {}", STRUCTURAL_MIN_TREES));
     }
     let version = meta("model_version").unwrap_or_else(|| "unversioned".to_string());
+    let form = ModelForm::from_stamp(meta("model_form").as_deref())
+        .ok_or_else(|| format!("model has an unknown form '{}'", meta("model_form").unwrap_or_default()))?;
+    let residual_shrink = num("residual_shrink").unwrap_or(1.0);
     // The four futures columns are zeroed whatever the stamp says: no engine has ever
     // computed them. Any other zeroed column must be a known input.
     let mut zeroed: Vec<usize> = vec![23, 24, 25, 26];
@@ -963,6 +1030,14 @@ pub fn load_model(path: &std::path::Path) -> std::result::Result<PlanBModel, Str
     // externally provided model) has recorded no evidence at all and stays in
     // the shadow lane, which is the right answer for a model nobody can check.
     //
+    // Since the gate began asking for skill over the market (`holdout_market_skill`),
+    // no file old enough to lack `gate_passed` can clear this fallback: it never
+    // measured itself against the price, and that absence is read as no evidence
+    // of beating it. That is deliberate, and in practice moot, because such a
+    // file is of the `logit` form and `plan_mismatch` refuses it before any lane
+    // is chosen. The fallback stays so the verdict is still derived rather than
+    // assumed, and so the rule is one place.
+    //
     // The bar used here is the compile-time one rather than the operator's
     // current knob, because this runs in a loader that has no DynamicConfig. It
     // applies only to pre-stamp files; anything this build trains carries the
@@ -972,12 +1047,13 @@ pub fn load_model(path: &std::path::Path) -> std::result::Result<PlanBModel, Str
         None => gate_from_stamp(
             trees,
             num("holdout_skill"),
+            num("holdout_market_skill"),
             meta("holdout_trades").and_then(|s| s.parse::<usize>().ok()),
             num("holdout_mean_ret"),
             num("holdout_win"),
         ),
     };
-    Ok(PlanBModel { booster, platt_a, platt_b, version, trees, zeroed, plan, posture, entry_rule, trained_by, created_at, calibrated_through, holdout_summary, gate_passed })
+    Ok(PlanBModel { booster, platt_a, platt_b, version, trees, zeroed, form, residual_shrink, plan, posture, entry_rule, trained_by, created_at, calibrated_through, holdout_summary, gate_passed })
 }
 
 impl PlanBModel {
@@ -998,7 +1074,17 @@ impl PlanBModel {
     /// predicts "does the take-profit fill before the stop", which is not the
     /// question a settlement instance asks ([B46], second half). An unstamped
     /// model is gates.
-    pub fn plan_mismatch(&self, tp: f64, sl: f64, lo: f64, hi: f64, entry_rule: &str, posture: &str) -> Option<String> {
+    ///
+    /// The form (`ModelForm`) is checked first: a model that predicts the outcome
+    /// directly is not one this build can score as a residual over the mid, and
+    /// the other way round. An unstamped model is `logit`.
+    pub fn plan_mismatch(&self, tp: f64, sl: f64, lo: f64, hi: f64, entry_rule: &str, posture: &str, form: ModelForm) -> Option<String> {
+        if self.form != form {
+            return Some(format!(
+                "model {} predicts {}, and this engine trades a model that predicts {}; a model of the configured form is needed",
+                self.version, self.form.describe(), form.describe(),
+            ));
+        }
         if self.entry_rule.as_deref().unwrap_or("e1") != entry_rule {
             return Some(format!(
                 "model {} was labeled with entry rule {}, and the engine trades {}; a model for the configured rule is needed",
@@ -1033,9 +1119,13 @@ impl PlanBModel {
             }
         }
         let matrix = Matrix::new(&data, n, N_FEATURES);
-        self.booster
-            .predict_proba(&matrix, false, false)
-            .into_iter()
+        let raw: Vec<f64> = match self.form {
+            ModelForm::Logit => self.booster.predict_proba(&matrix, false, false),
+            ModelForm::ResidualMid => self.booster.predict(&matrix, false).into_iter().zip(rows)
+                .map(|(deviation, row)| residual_probability(row[MID_COLUMN], self.residual_shrink * deviation))
+                .collect(),
+        };
+        raw.into_iter()
             .map(|raw| (raw, calibrate(raw, self.platt_a, self.platt_b)))
             .collect()
     }
@@ -1209,8 +1299,8 @@ fn ensure_model(g: &'static PlanBGlobals, asset: &str) -> Option<Arc<PlanBModel>
                     match result {
                         Ok(model) => {
                             info!(
-                                "GBoost plan-B: loaded model {} from {} ({} trees, Platt a={:.6} b={:.6}, zeroed {:?}, trained by {}, plan {:?})",
-                                model.version, path.display(), model.trees, model.platt_a, model.platt_b,
+                                "GBoost plan-B: loaded model {} from {} ({} trees, form {} shrink {:.3}, Platt a={:.6} b={:.6}, zeroed {:?}, trained by {}, plan {:?})",
+                                model.version, path.display(), model.trees, model.form.stamp(), model.residual_shrink, model.platt_a, model.platt_b,
                                 model.zeroed.iter().map(|&j| FEATURE_NAMES[j]).collect::<Vec<_>>(),
                                 model.trained_by.as_deref().unwrap_or("unknown"), model.plan,
                             );
@@ -1754,8 +1844,8 @@ impl Strategy for GboostPlanBStrategy {
         }
         if let Some(m) = &model {
             let plan = crate::vipers::gboost_planb_train::Plan::from_config(dc, f(crate::venues::taker_fee_rate()));
-            if let Some(why) = m.plan_mismatch(f(dc.gboost_planb_take_profit_pct), f(dc.gboost_planb_stop_loss_pct), f(dc.gboost_planb_min_ask), f(dc.gboost_planb_max_ask), plan.entry.stamp(), plan.posture_stamp()) {
-                idle(&format!("{why}; waiting for the pipeline to train a model for the configured plan"));
+            if let Some(why) = m.plan_mismatch(f(dc.gboost_planb_take_profit_pct), f(dc.gboost_planb_stop_loss_pct), f(dc.gboost_planb_min_ask), f(dc.gboost_planb_max_ask), plan.entry.stamp(), plan.posture_stamp(), TRAINED_FORM) {
+                idle(&format!("{why}; waiting for the pipeline to train a model this engine can trade"));
                 return Ok(StrategySignal::NoSignal);
             }
         }
@@ -2368,31 +2458,31 @@ mod tests {
             let matrix = Matrix::new(&data, 4, 2);
             let mut b = PerpetualBooster::default().set_iteration_limit(Some(1)).set_num_threads(Some(1));
             b.fit(&matrix, &[0.0, 1.0, 0.0, 1.0], None, None).unwrap();
-            PlanBModel { booster: b, platt_a: 1.0, platt_b: 0.0, version: "t".into(), trees: 1, zeroed: vec![23, 24, 25, 26], plan, posture: Some("gates".to_string()), entry_rule, trained_by: None, created_at: None, calibrated_through: None, holdout_summary: None, gate_passed: true }
+            PlanBModel { booster: b, platt_a: 1.0, platt_b: 0.0, version: "t".into(), trees: 1, zeroed: vec![23, 24, 25, 26], form: TRAINED_FORM, residual_shrink: 1.0, plan, posture: Some("gates".to_string()), entry_rule, trained_by: None, created_at: None, calibrated_through: None, holdout_summary: None, gate_passed: true }
         };
         let m = |plan: Option<[f64; 4]>| m_with(plan, Some("e2".to_string()));
-        assert!(m(Some(REFERENCE_PLAN)).plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "gates").is_none());
+        assert!(m(Some(REFERENCE_PLAN)).plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "gates", TRAINED_FORM).is_none());
         // The posture is part of the plan: a gates model is refused on a settlement
         // instance, and one from before the stamp existed reads as gates.
-        let why = m(Some(REFERENCE_PLAN)).plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "settlement").expect("a gates model is refused for a settlement posture");
+        let why = m(Some(REFERENCE_PLAN)).plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "settlement", TRAINED_FORM).expect("a gates model is refused for a settlement posture");
         assert!(why.contains("labeled for the gates exit") && why.contains("posture is settlement"), "{why}");
         let mut held = m(Some(REFERENCE_PLAN));
         held.posture = Some("settlement".to_string());
-        assert!(held.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "settlement").is_none());
-        assert!(held.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "gates").is_some());
+        assert!(held.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "settlement", TRAINED_FORM).is_none());
+        assert!(held.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "gates", TRAINED_FORM).is_some());
         let mut prestamp = m(Some(REFERENCE_PLAN));
         prestamp.posture = None;
-        assert!(prestamp.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "gates").is_none(), "an unstamped model is gates");
-        assert!(prestamp.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "settlement").is_some());
-        assert!(m(Some(REFERENCE_PLAN)).plan_mismatch(0.15, 0.11, 0.43, 0.75, "e2", "gates").is_some());
-        assert!(m(None).plan_mismatch(0.15, 0.11, 0.43, 0.75, "e2", "gates").is_none(), "an unstamped plan cannot be compared");
+        assert!(prestamp.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "gates", TRAINED_FORM).is_none(), "an unstamped model is gates");
+        assert!(prestamp.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "settlement", TRAINED_FORM).is_some());
+        assert!(m(Some(REFERENCE_PLAN)).plan_mismatch(0.15, 0.11, 0.43, 0.75, "e2", "gates", TRAINED_FORM).is_some());
+        assert!(m(None).plan_mismatch(0.15, 0.11, 0.43, 0.75, "e2", "gates", TRAINED_FORM).is_none(), "an unstamped plan cannot be compared");
         // The entry rule is refused on its own, and a model with no stamp is the old
         // rule, whatever its numbers say ([B47]).
-        let why = m(Some(REFERENCE_PLAN)).plan_mismatch(0.20, 0.11, 0.43, 0.75, "e1", "gates").expect("an e2 model is refused for an e1 plan");
+        let why = m(Some(REFERENCE_PLAN)).plan_mismatch(0.20, 0.11, 0.43, 0.75, "e1", "gates", TRAINED_FORM).expect("an e2 model is refused for an e1 plan");
         assert!(why.contains("entry rule"), "{why}");
         let unstamped = m_with(Some(REFERENCE_PLAN), None);
-        assert!(unstamped.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "gates").is_some(), "a model from before the stamp is e1 and must be refused");
-        assert!(unstamped.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e1", "gates").is_none());
+        assert!(unstamped.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "gates", TRAINED_FORM).is_some(), "a model from before the stamp is e1 and must be refused");
+        assert!(unstamped.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e1", "gates", TRAINED_FORM).is_none());
         assert!(m(Some(REFERENCE_PLAN)).needs_funding());
         let mut z = m(Some(REFERENCE_PLAN));
         z.zeroed.push(FUNDING_COLUMN);
@@ -2418,6 +2508,14 @@ mod tests {
             assert!(!incumbent_usable(&m(Some(REFERENCE_PLAN)), &shifted),
                     "an operator moving a plan knob makes the stamped model unusable");
         }
+
+        // The form is part of the stamp: a model of the other form is refused, by name.
+        let why = m(Some(REFERENCE_PLAN)).plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "gates", ModelForm::Logit).expect("a residual model is refused by a logit build");
+        assert!(why.contains("the outcome directly from its features") && why.contains("deviation from the market mid"), "{why}");
+        assert_eq!(ModelForm::from_stamp(None), Some(ModelForm::Logit), "an unstamped model is the original form");
+        assert_eq!(ModelForm::from_stamp(Some("residual_mid")), Some(ModelForm::ResidualMid));
+        assert_eq!(ModelForm::from_stamp(Some("something_else")), None);
+        assert_eq!(ModelForm::ResidualMid.stamp(), "residual_mid");
     }
 
     #[test]
@@ -2989,8 +3087,39 @@ mod shadow_promotion_tests {
     }
 
 
+    /// A residual model's raw probability is the mid plus the booster's deviation, so
+    /// a booster with nothing to add returns the market price exactly; the clamp keeps
+    /// the result inside the interval the calibrator works on.
+    #[test]
+    fn a_residual_model_adds_its_deviation_to_the_mid() {
+        use super::{residual_probability, ModelForm, PlanBModel, MID_COLUMN, N_FEATURES};
+        use perpetual::objective::Objective;
+        use perpetual::{Matrix, PerpetualBooster};
+        // A squared-loss booster fitted to a constant deviation of 0.2 everywhere.
+        let data = vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
+        let matrix = Matrix::new(&data, 4, 2);
+        let mut b = PerpetualBooster::default().set_objective(Objective::SquaredLoss).set_iteration_limit(Some(1)).set_num_threads(Some(1));
+        b.fit(&matrix, &[0.2, 0.2, 0.2, 0.2], None, None).unwrap();
+        let model = |b: PerpetualBooster, shrink: f64| PlanBModel { booster: b, platt_a: 1.0, platt_b: 0.0, version: "r".into(), trees: 1, zeroed: vec![23, 24, 25, 26], form: ModelForm::ResidualMid, residual_shrink: shrink, plan: None, posture: Some("settlement".into()), entry_rule: Some("e2".into()), trained_by: None, created_at: None, calibrated_through: None, holdout_summary: None, gate_passed: false };
+        let mut row = [0.0f64; N_FEATURES];
+        row[MID_COLUMN] = 0.37;
+        let (raw, p) = model(b.clone(), 1.0).predict(&[row])[0];
+        assert!((raw - 0.57).abs() < 1e-9, "raw {raw} should be the mid plus the deviation");
+        assert!((p - 0.57).abs() < 1e-6, "an identity Platt leaves it there: {p}");
+        let (raw, _) = model(b.clone(), 0.5).predict(&[row])[0];
+        assert!((raw - 0.47).abs() < 1e-9, "the shrink scales the deviation, not the mid: {raw}");
+        let (raw, _) = model(b, 0.0).predict(&[row])[0];
+        assert!((raw - 0.37).abs() < 1e-9, "a deviation believed at zero returns the price: {raw}");
+        assert_eq!(residual_probability(0.98, 0.1), 1.0 - 1e-4);
+        assert_eq!(residual_probability(0.02, -0.1), 1e-4);
+        assert!((residual_probability(0.40, 0.05) - 0.45).abs() < 1e-12);
+    }
+
     /// A model written before the gate verdict was stamped is judged on the
-    /// holdout it did record, not stranded in the shadow lane forever.
+    /// holdout it did record, not stranded in the shadow lane forever. (Since the
+    /// market-skill condition joined the gate, a real pre-stamp file cannot clear
+    /// this fallback, because it never measured itself against the price; the
+    /// combinations below exercise the rule, not a file that exists.)
     ///
     /// This matters because `shadow_blocks_live` refuses on a failed gate BEFORE
     /// it looks at the record: a model read as failed can never be promoted by
@@ -3004,28 +3133,35 @@ mod shadow_promotion_tests {
         let min_trades = crate::config::GBOOST_PLANB_GATE_MIN_TRADES as usize;
 
         // A model that recorded a passing holdout passes.
-        assert!(gate_from_stamp(trees, Some(0.05), Some(min_trades), Some(0.03), Some(0.60)));
+        assert!(gate_from_stamp(trees, Some(0.05), Some(0.02), Some(min_trades), Some(0.03), Some(0.60)));
 
         // Each gate condition still bites on the recorded numbers.
-        assert!(!gate_from_stamp(trees, Some(-0.003), Some(min_trades), Some(0.03), Some(0.60)),
+        assert!(!gate_from_stamp(trees, Some(-0.003), Some(0.02), Some(min_trades), Some(0.03), Some(0.60)),
                 "skill at or below the base rate fails");
-        assert!(!gate_from_stamp(trees, Some(0.05), Some(1), Some(0.03), Some(0.60)),
+        assert!(!gate_from_stamp(trees, Some(0.05), Some(0.02), Some(1), Some(0.03), Some(0.60)),
                 "one holdout trade is not a holdout");
-        assert!(!gate_from_stamp(trees, Some(0.05), Some(min_trades), Some(-0.39), Some(0.60)),
+        assert!(!gate_from_stamp(trees, Some(0.05), Some(0.02), Some(min_trades), Some(-0.39), Some(0.60)),
                 "a negative mean return fails");
-        assert!(!gate_from_stamp(trees, Some(0.05), Some(min_trades), Some(0.03), Some(0.10)),
+        assert!(!gate_from_stamp(trees, Some(0.05), Some(0.02), Some(min_trades), Some(0.03), Some(0.10)),
                 "a win rate below the bar fails");
-        assert!(!gate_from_stamp(1, Some(0.05), Some(min_trades), Some(0.03), Some(0.60)),
+        assert!(!gate_from_stamp(1, Some(0.05), Some(0.02), Some(min_trades), Some(0.03), Some(0.60)),
                 "the structural tree minimum still applies");
 
         // A file with no holdout stamp at all has recorded no evidence, so it
         // stays simulated — the right answer for a model nobody can check.
-        assert!(!gate_from_stamp(trees, None, None, None, None),
+        assert!(!gate_from_stamp(trees, None, None, None, None, None),
                 "no recorded evidence must never read as a passing gate");
 
         // The production shape at the time this shipped: skill -0.0034, one
         // holdout trade, -39.32% mean return. It must not be licensed.
-        assert!(!gate_from_stamp(trees, Some(-0.0034), Some(1), Some(-0.3932), Some(0.0)));
+        assert!(!gate_from_stamp(trees, Some(-0.0034), Some(0.02), Some(1), Some(-0.3932), Some(0.0)));
+
+        // Skill over the market is a gate condition of its own: a file that never
+        // measured itself against the price, or measured worse than it, is not licensed.
+        assert!(!gate_from_stamp(trees, Some(0.05), None, Some(min_trades), Some(0.03), Some(0.60)),
+                "no market-skill stamp is no evidence of beating the price");
+        assert!(!gate_from_stamp(trees, Some(0.083), Some(-0.006), Some(min_trades), Some(0.03), Some(0.60)),
+                "positive skill over the base rate with negative skill over the market fails");
     }
 
 }
