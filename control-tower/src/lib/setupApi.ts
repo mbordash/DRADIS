@@ -389,18 +389,23 @@ export function resumeTrading(): Promise<{ ok: boolean; message: string }> {
   return request('/api/migration/resume', { method: 'POST' });
 }
 
-/** Download the latest backup archive. It holds credentials and the full ledger. */
-export async function downloadMigrationArchive(): Promise<Blob> {
-  const res = await fetch(`${BASE}/api/migration/archive`, { headers: authHeaders(), cache: 'no-store' });
-  if (!res.ok) {
-    let msg = `download failed: HTTP ${res.status}`;
-    try {
-      const body = await res.json();
-      if (body?.error) msg = body.error;
-    } catch { /* non-JSON error body */ }
-    throw new SetupApiError(res.status, msg);
-  }
-  return res.blob();
+/**
+ * Mint a one-time ticket that opens the backup download for the next minute.
+ *
+ * The download itself is a browser NAVIGATION to `archiveDownloadUrl(ticket)`,
+ * so the archive streams straight to disk. A `fetch` into a Blob held the
+ * whole archive in the tab's memory, which is where a backup carrying the
+ * GBoost models (hundreds of megabytes) stopped working (E69). A navigation
+ * cannot send the admin session header, hence the ticket, minted by that
+ * session and consumed by its first use.
+ */
+export function requestArchiveTicket(): Promise<{ ticket: string; expires_in_secs: number }> {
+  return request('/api/migration/archive/ticket', { method: 'POST' });
+}
+
+/** Where a browser navigation downloads the backup with a ticket from `requestArchiveTicket`. */
+export function archiveDownloadUrl(ticket: string): string {
+  return `${BASE}/api/migration/archive?ticket=${encodeURIComponent(ticket)}`;
 }
 
 export interface RestoreUploadResult {

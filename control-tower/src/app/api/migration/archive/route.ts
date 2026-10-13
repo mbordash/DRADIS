@@ -21,6 +21,13 @@
  * labels it JSON, which would corrupt a binary archive and hold hundreds of
  * megabytes in memory. This route hands the engine's body through as a stream,
  * with its download headers.
+ *
+ * The browser reaches it by NAVIGATION, not `fetch`, so the archive streams
+ * straight to disk instead of into a tab-memory blob (E69). A navigation
+ * carries CT Basic Auth but not the admin session header, so the page first
+ * mints a one-time ticket (`POST /api/migration/archive/ticket`, through the
+ * catch-all proxy with its admin session) and navigates here with `?ticket=`;
+ * the query string is forwarded to the engine, which checks and consumes it.
  */
 import type { NextRequest } from 'next/server';
 import { ENGINE_API_BASE, engineHeaders } from '@/lib/engineUpstream';
@@ -30,7 +37,7 @@ export const dynamic = 'force-dynamic';
 
 export async function GET(req: NextRequest) {
   try {
-    const upstream = await fetch(`${ENGINE_API_BASE}/api/migration/archive`, {
+    const upstream = await fetch(`${ENGINE_API_BASE}/api/migration/archive${req.nextUrl.search}`, {
       headers: engineHeaders(req),
       cache: 'no-store',
     });

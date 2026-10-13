@@ -39,7 +39,7 @@ import {
   getProfiles, applyProfile, ConfigProfile,
   getAdminToken, clearAdminToken, SetupApiError,
   MigrationStatus, MigrationManifest, RestoreNeedsOverwrite,
-  getMigrationStatus, prepareMigration, resumeTrading, downloadMigrationArchive,
+  getMigrationStatus, prepareMigration, resumeTrading, requestArchiveTicket, archiveDownloadUrl,
   uploadMigrationArchive, applyStagedRestore, discardStagedRestore,
 } from '@/lib/setupApi';
 import { useConfirm } from '@/components/ConfirmDialog';
@@ -1749,14 +1749,21 @@ function MigrationPanel({ onAuthError }: { onAuthError: () => void }) {
     setBusy(true);
     setMessage(null);
     try {
-      const blob = await downloadMigrationArchive();
-      const url = URL.createObjectURL(blob);
+      // A navigation, not a fetch: the browser streams the archive straight to
+      // disk and shows its own download progress. A Blob held the whole archive
+      // in this tab's memory first, which fails on a backup carrying the GBoost
+      // models (E69). The ticket stands in for the admin session header, which a
+      // navigation cannot carry; it is single-use and dies in a minute.
+      // In a new tab: a download closes it again at once, and a refused ticket
+      // (the engine restarted between mint and click, so the in-memory jar is
+      // empty) shows its error there instead of replacing this page.
+      const { ticket } = await requestArchiveTicket();
       const a = document.createElement('a');
-      a.href = url;
-      a.download = latest.archive_name;
+      a.href = archiveDownloadUrl(ticket);
+      a.target = '_blank';
+      a.rel = 'noopener';
       a.click();
-      URL.revokeObjectURL(url);
-      setMessage({ kind: 'ok', text: 'Backup downloaded. It holds your credentials and full ledger, so keep it safe. Restore it on the new instance from this same panel.' });
+      setMessage({ kind: 'ok', text: `Download started: ${latest.archive_name} (${formatBytes(latest.archive_bytes)}). Watch your browser's downloads for it to finish; if it is interrupted, click Download again for a fresh link, since each link works once. The backup holds your credentials and full ledger, so keep it safe. Restore it on the new instance from this same panel.` });
     } catch (err) {
       fail(err, 'Download failed');
     } finally {

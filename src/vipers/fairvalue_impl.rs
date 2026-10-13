@@ -407,11 +407,54 @@ pub(crate) fn event_in_horizon(now: DateTime<Utc>, close: DateTime<Utc>, events:
 /// the open as finished the moment it passed would have left most of the loss
 /// in place, because at 09:33 the trailing hour is still 95% pre-open.
 pub(crate) fn post_event_multiplier(m: f64, secs_since_event: f64, window_secs: f64) -> f64 {
-    if !(m > 1.0) || !(window_secs > 0.0) {
+    post_event_multiplier_toward(m, m, secs_since_event, window_secs)
+}
+
+/// [`post_event_multiplier`] when what lies ahead is not the event's own `m`.
+///
+/// The trailing estimate still reads `sqrt(1 - f + f*m_event^2)` of the prior
+/// σ, because that is what the window has seen; but on a horizon much longer
+/// than the elevated regime what lies ahead is the horizon-weighted
+/// `m_ahead` (see [`horizon_weighted_multiplier`]), so the multiplier that
+/// closes the gap is `m_ahead / sqrt(1 - f + f*m_event^2)`. Floored at 1: once
+/// the window is mostly post-event the honest ratio dips below 1 for a long
+/// horizon, and this multiplier only ever removes edge, never adds it.
+///
+/// `window_secs` is the span the estimate was MEASURED over, not necessarily
+/// the configured window: after a restart the sampler is younger than the
+/// window, and most of what it holds is post-event. A restart at 09:25 read
+/// at 09:40 holds 15 minutes, 10 of them after the open; treating that as a
+/// 60-minute window one sixth post-open priced the open twice (x1.37 on an
+/// estimate that already ran x1.35), where the 15-minute truth is x1.11.
+pub(crate) fn post_event_multiplier_toward(m_event: f64, m_ahead: f64, secs_since_event: f64, window_secs: f64) -> f64 {
+    if !(m_event > 1.0) || !(window_secs > 0.0) {
         return 1.0;
     }
     let f = (secs_since_event / window_secs).clamp(0.0, 1.0);
-    m / (1.0 - f + f * m * m).sqrt()
+    (m_ahead / (1.0 - f + f * m_event * m_event).sqrt()).max(1.0)
+}
+
+/// The point multiplier spread over a horizon longer than the regime it
+/// describes.
+///
+/// `m` is the volatility ratio DURING an event's elevated regime, which the
+/// post-event rule treats as lasting about one vol window (`elevated_secs`).
+/// On a horizon no longer than that the whole horizon runs elevated and the
+/// answer is `m`, unchanged: every hourly market is left exactly as it was.
+/// On a longer horizon only the fraction `elevated_secs / horizon_secs` of the
+/// variance runs elevated, so the σ ratio over the horizon is
+/// `sqrt(1 + (m^2 - 1) * min(1, E/T))`: a daily market with ten hours left and
+/// the 09:30 open inside them carries x1.06 for `m` = 1.5, not x1.5. Only
+/// matters if daily entries are re-enabled; the σ profile applies to hourly
+/// horizons alone and dailies keep this point rule.
+pub(crate) fn horizon_weighted_multiplier(m: f64, elevated_secs: f64, horizon_secs: f64) -> f64 {
+    if !(m > 1.0) {
+        return 1.0;
+    }
+    if !(elevated_secs > 0.0) || horizon_secs <= elevated_secs {
+        return m;
+    }
+    (1.0 + (m * m - 1.0) * (elevated_secs / horizon_secs)).sqrt()
 }
 
 /// The most recent scheduled event in `(now - lookback, now]`, if any.
@@ -597,6 +640,34 @@ impl FairValueStrategyImpl {
     /// below 1.0 disable it: the knob exists to inflate σ ahead of an event the
     /// trailing window cannot see, never to deflate it.
     fn event_sigma_mult(asset: &str, dc: &crate::helpers::dynamic_config::DynamicConfig, now: DateTime<Utc>, close: Option<DateTime<Utc>>) -> f64 {
+        Self::event_sigma_mult_with_span(asset, dc, now, close, Self::sampler_span_secs(asset))
+    }
+
+    /// How much history the vol sampler actually holds, first to last sample,
+    /// or `None` with fewer than two samples. The post-event rule divides by
+    /// this rather than the configured window, because it is the span the σ
+    /// estimate was measured over. In steady state that is within two sample
+    /// intervals of the window (pruning runs on the front only as samples age
+    /// past it), so a long-running instance moves by about a thousandth; the
+    /// restart case is where it matters. Measured to the last sample, not to
+    /// now: a frozen oracle leaves `f` slightly overstated, and `sampler_sigma`
+    /// already refuses a stale sampler for the Markets page reading.
+    fn sampler_span_secs(asset: &str) -> Option<f64> {
+        let samples = match globals(asset).vol_samples.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        match (samples.front(), samples.back()) {
+            (Some((f, _)), Some((b, _))) if b > f => Some(b.duration_since(*f).as_secs_f64()),
+            _ => None,
+        }
+    }
+
+    /// [`event_sigma_mult`](Self::event_sigma_mult) with the sampler span
+    /// passed in, so the restart case can be pinned in a test without a
+    /// sampler. `None` (no sampler yet) falls back to the configured window,
+    /// which is also what a sampler that has run a full window reports.
+    fn event_sigma_mult_with_span(asset: &str, dc: &crate::helpers::dynamic_config::DynamicConfig, now: DateTime<Utc>, close: Option<DateTime<Utc>>, sampler_span_secs: Option<f64>) -> f64 {
         let Some(close) = close else { return 1.0 };
         // The hour-of-day profile, where it has a trustworthy cell, on an hourly
         // horizon. Its cells are forward-over-remaining-HOUR ratios, which is
@@ -620,13 +691,21 @@ impl FairValueStrategyImpl {
             return 1.0;
         }
         let events = parse_event_times_et(&dc.fairvalue_event_times_et);
+        // The regime the point multiplier describes lasts about one vol window;
+        // on a longer horizon (a daily market) only that fraction of the
+        // variance runs elevated. Hourly horizons get `mult` unchanged.
+        let window = config::FAIRVALUE_VOL_WINDOW_SECS as f64;
+        let ahead = horizon_weighted_multiplier(mult, window, (close - now).num_seconds() as f64);
         if event_in_horizon(now, close, &events) {
-            return mult;
+            return ahead;
         }
-        // The event has passed but the trailing window has not caught up.
-        let window = config::FAIRVALUE_VOL_WINDOW_SECS as i64;
-        match last_event_within(now, window, &events) {
-            Some(at) => post_event_multiplier(mult, (now - at).num_seconds() as f64, window as f64),
+        // The event has passed but the trailing estimate has not caught up.
+        // Divide by the span the estimate was measured over: a sampler younger
+        // than the window (after a restart) is mostly post-event already, and
+        // the full-window formula would price the event a second time.
+        let span = sampler_span_secs.filter(|s| *s > 0.0).map_or(window, |s| s.min(window));
+        match last_event_within(now, window as i64, &events) {
+            Some(at) => post_event_multiplier_toward(mult, ahead, (now - at).num_seconds() as f64, span),
             None => 1.0,
         }
     }
@@ -5552,7 +5631,74 @@ mod event_sigma_tests {
         let dc = dc_with_profile();
         // 9:35 ET with a close at noon the next day: 2.0 cell exists, but the horizon is 26.4h.
         let m = Fv::event_sigma_mult("test-prof-d", &dc, et(2026, 10, 6, 9, 35), Some(et(2026, 10, 7, 12, 0)));
-        assert_eq!(m, 1.5, "the next day's 9:30 is in the horizon, so the event rule gives 1.5");
+        // The next day's 9:30 is in the horizon, so the event rule applies: the
+        // point 1.5 weighted over 26.4 h with one elevated hour inside it,
+        // sqrt(1 + 1.25 * 3600 / 95100) = 1.023, and not the profile's 2.0.
+        let exp = (1.0 + 1.25 * 3600.0 / 95_100.0f64).sqrt();
+        assert!((m - exp).abs() < 1e-9, "{m} vs {exp}");
+        assert!((m - 2.0).abs() > 0.9, "and not the profile's cell");
+    }
+
+    /// E76: the point multiplier describes one elevated hour. An hourly market
+    /// gets all of it; a daily market gets the variance-weighted share.
+    #[test]
+    fn the_horizon_weight_leaves_hourly_markets_alone() {
+        use super::horizon_weighted_multiplier as hw;
+        assert_eq!(hw(1.5, 3600.0, 3600.0), 1.5, "a full hour left: the point multiplier");
+        assert_eq!(hw(1.5, 3600.0, 1800.0), 1.5, "half an hour left: still all of it");
+        assert_eq!(hw(1.5, 3600.0, 0.0), 1.5, "an expired horizon is not divided by");
+        let ten_hours = hw(1.5, 3600.0, 36_000.0);
+        assert!((ten_hours - (1.0 + 1.25 * 0.1f64).sqrt()).abs() < 1e-12, "{ten_hours}");
+        assert!(ten_hours > 1.0 && ten_hours < 1.07);
+        let mut prev = 1.5;
+        for hours in 1..=30 {
+            let m = hw(1.5, 3600.0, hours as f64 * 3600.0);
+            assert!(m <= prev + 1e-12, "non-increasing in the horizon at {hours}h");
+            assert!(m >= 1.0);
+            prev = m;
+        }
+        assert_eq!(hw(1.0, 3600.0, 36_000.0), 1.0, "a disabled multiplier stays disabled");
+        assert_eq!(hw(0.5, 3600.0, 36_000.0), 1.0, "and cannot deflate");
+    }
+
+    /// E76: after a restart the sampler is younger than the configured window,
+    /// and most of what it holds is already post-event. Dividing by the full
+    /// window priced the open twice.
+    #[test]
+    fn a_young_sampler_is_not_treated_as_a_full_window() {
+        let mut dc = crate::helpers::dynamic_config::DynamicConfig::default();
+        dc.fairvalue_event_sigma_multiplier = dec!(1.5);
+        let close = et(2026, 10, 6, 10, 0);
+        let at = |span: Option<f64>| Fv::event_sigma_mult_with_span("test-no-profile", &dc, et(2026, 10, 6, 9, 40), Some(close), span);
+        // A sampler that has run all hour: the full-window reading, f = 10/60.
+        let full = 1.5 / (1.0 - 10.0 / 60.0 + 2.25 * 10.0 / 60.0f64).sqrt();
+        assert!((at(None) - full).abs() < 1e-9, "no sampler yet falls back to the window: {}", at(None));
+        assert!((at(Some(3600.0)) - full).abs() < 1e-9, "a full sampler reads the same");
+        assert!((at(Some(4000.0)) - full).abs() < 1e-9, "a sampler a little over the window (pruning lag) is capped at it");
+        // Restarted at 09:25: 15 minutes held, 10 of them post-open, f = 2/3.
+        let young = 1.5 / (1.0 - 2.0 / 3.0 + 2.25 * 2.0 / 3.0f64).sqrt();
+        assert!((at(Some(900.0)) - young).abs() < 1e-9, "{} vs {young}", at(Some(900.0)));
+        assert!(young < 1.12 && full > 1.36, "the two readings differ materially: {young} vs {full}");
+        // Restarted after the open: everything the sampler holds is post-open.
+        assert_eq!(at(Some(300.0)), 1.0, "nothing left to owe");
+        // The live entry point reads the same sampler-free asset the same way.
+        assert_eq!(Fv::event_sigma_mult("test-no-profile", &dc, et(2026, 10, 6, 9, 40), Some(close)), at(None));
+    }
+
+    /// E76: on a long horizon the owed multiplier is measured toward the
+    /// horizon-weighted ahead value, floored at 1.
+    #[test]
+    fn the_post_event_multiplier_toward_a_long_horizon_never_deflates() {
+        use super::post_event_multiplier_toward as toward;
+        // Same as the plain rule when ahead == event.
+        assert!((toward(1.5, 1.5, 600.0, 3600.0) - super::post_event_multiplier(1.5, 600.0, 3600.0)).abs() < 1e-12);
+        // A daily horizon just after the open: the trailing window has seen
+        // almost none of it, so nearly the whole (small) ahead value is owed.
+        let ahead = (1.0 + 1.25 * 0.1f64).sqrt();
+        assert!((toward(1.5, ahead, 0.0, 3600.0) - ahead).abs() < 1e-12);
+        // Once the window has caught up the honest ratio is ahead / 1.5 < 1: floored.
+        assert_eq!(toward(1.5, ahead, 3600.0, 3600.0), 1.0);
+        assert_eq!(toward(1.0, ahead, 0.0, 3600.0), 1.0, "a disabled multiplier stays disabled");
     }
 
     /// The knob off: the profile is ignored even when it has a cell.

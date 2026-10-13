@@ -360,7 +360,8 @@ before trusting a result.
 | `/api/setup/import` | POST | Restore a config bundle on a new instance; restart applies (admin-gated) |
 | `/api/migration/status` | GET | Ledger size, retirement, backup progress, staged or applied restore (admin-gated) |
 | `/api/migration/prepare` | POST | Retire this instance (no new orders, squadrons down) and build a full backup (admin-gated) |
-| `/api/migration/archive` | GET | Download the latest backup: databases, GBoost models and training data, config bundle (admin-gated) |
+| `/api/migration/archive/ticket` | POST | Mint a one-time, one-minute ticket that opens the archive download without the session header, so a browser navigation can stream it to disk (admin-gated) |
+| `/api/migration/archive` | GET | Download the latest backup: databases, GBoost models and training data, config bundle (admin session, or `?ticket=` from the route above) |
 | `/api/migration/resume` | POST | Clear the retirement and restart so this instance trades again (admin-gated) |
 | `/api/migration/restore` | POST | Upload a backup (`?overwrite=true` to replace an instance that has trades); verified and staged (admin-gated) |
 | `/api/migration/restore/apply` | POST | Restart and apply the staged restore before any database opens (admin-gated) |

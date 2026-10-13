@@ -531,7 +531,7 @@ fn verify_password(password: &str, hash: &str) -> bool {
 /// Extract and verify the admin token: `Authorization: Bearer` (proxy path)
 /// or `X-Admin-Token` (direct browser → engine in local dev, where the
 /// Authorization header is reserved for CT Basic Auth).
-fn request_is_admin(req: &Request) -> bool {
+pub(crate) fn request_is_admin(req: &Request) -> bool {
     let bearer = req.headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -554,6 +554,15 @@ fn setup_auth_disabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the admin gate is enforced at all: it stands down on first boot,
+/// before any admin password exists, and when the operator has waived it with
+/// `DRADIS_SETUP_AUTH=off`. Shared with the one route that checks the gate
+/// itself instead of sitting behind `require_admin` (the archive download,
+/// which also admits a one-time ticket).
+pub(crate) fn admin_gate_active() -> bool {
+    !setup_auth_disabled() && admin_hash().is_some()
+}
+
 /// Middleware: require a valid admin session token.
 ///
 /// First-boot exception: while NO admin password is configured, requests pass so
@@ -561,7 +570,7 @@ fn setup_auth_disabled() -> bool {
 /// moment a hash exists, everything behind this gate requires a login.
 /// Operator exception: DRADIS_SETUP_AUTH=off waives the gate entirely.
 pub(crate) async fn require_admin(req: Request, next: Next) -> Response {
-    if !setup_auth_disabled() && admin_hash().is_some() && !request_is_admin(&req) {
+    if admin_gate_active() && !request_is_admin(&req) {
         // `code` lets the Control Tower say "your session expired" at the
         // login card instead of re-showing the card with no explanation.
         return (

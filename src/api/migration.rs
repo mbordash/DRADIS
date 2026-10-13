@@ -42,12 +42,111 @@ pub fn admin_routes() -> Router<ApiState> {
     Router::new()
         .route("/api/migration/status",          get(status))
         .route("/api/migration/prepare",         post(prepare))
-        .route("/api/migration/archive",         get(archive))
+        .route("/api/migration/archive/ticket",  post(archive_ticket))
         .route("/api/migration/resume",          post(resume))
         .route("/api/migration/restore",         post(restore_upload))
         .route("/api/migration/restore/apply",   post(restore_apply))
         .route("/api/migration/restore/discard", post(restore_discard))
         .layer(axum::middleware::from_fn(crate::api::setup::require_admin))
+        // Added AFTER the layer on purpose: the archive checks the admin gate
+        // itself, because it also admits a one-time ticket (see `archive`).
+        // The X-API-Key and read-only layers in `server.rs` still wrap it.
+        .route("/api/migration/archive",         get(archive))
+}
+
+/// How long a download ticket opens the archive for.
+///
+/// Long enough for the browser to turn the ticket into a navigation (well under
+/// a second), short enough that a ticket copied out of a proxy log or the
+/// browser history is dead by the time anyone reads it. The download itself
+/// is not bounded by this: the ticket is checked once, when the stream starts.
+pub(crate) const ARCHIVE_TICKET_TTL_SECS: u64 = 60;
+
+/// Outstanding tickets the jar keeps at most. An operator clicking Download
+/// repeatedly mints one per click; anything past this many unredeemed tickets
+/// forgets the oldest, so a stuck button cannot grow the process.
+const ARCHIVE_TICKET_CAP: usize = 32;
+
+/// One-time tickets that open the archive download without the admin session.
+///
+/// A browser navigation is the only way to stream a multi-hundred-megabyte
+/// archive straight to disk; a `fetch` lands the whole thing in a tab-memory
+/// blob first, which is where the 119 MB serving model plus the 85 MB archived
+/// model plus the ledger stop working (E69). But a navigation cannot carry the
+/// `X-Admin-Token` header the admin gate wants. So the Control Tower first
+/// asks, with its admin session, for a ticket, then navigates to
+/// `/api/migration/archive?ticket=…`. A ticket is 32 random bytes, lives
+/// [`ARCHIVE_TICKET_TTL_SECS`], and is consumed by its first use, so the URL
+/// that lands in a log opens nothing afterward. The archive still holds
+/// credentials and the full ledger, which is why the ticket is not a weaker
+/// gate than the session: it is minted BY the session, once, for one download.
+#[derive(Default)]
+pub(crate) struct TicketJar {
+    tickets: Vec<(String, std::time::Instant)>,
+}
+
+impl TicketJar {
+    /// Mint a ticket valid until `now + TTL`.
+    pub(crate) fn issue(&mut self, now: std::time::Instant) -> String {
+        self.prune(now);
+        let ticket = mint_ticket();
+        self.tickets.push((ticket.clone(), now + std::time::Duration::from_secs(ARCHIVE_TICKET_TTL_SECS)));
+        if self.tickets.len() > ARCHIVE_TICKET_CAP {
+            let excess = self.tickets.len() - ARCHIVE_TICKET_CAP;
+            self.tickets.drain(..excess);
+        }
+        ticket
+    }
+
+    /// Consume `ticket` if it is outstanding and unexpired. True at most once
+    /// per ticket.
+    pub(crate) fn redeem(&mut self, ticket: &str, now: std::time::Instant) -> bool {
+        self.prune(now);
+        match self.tickets.iter().position(|(t, _)| eq_constant_time(t, ticket)) {
+            Some(i) => {
+                self.tickets.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Tickets outstanding, for the tests.
+    #[cfg(test)]
+    fn outstanding(&self) -> usize {
+        self.tickets.len()
+    }
+
+    fn prune(&mut self, now: std::time::Instant) {
+        self.tickets.retain(|(_, expires)| *expires > now);
+    }
+}
+
+/// 32 bytes from the OS RNG, hex. The same source the admin session key uses.
+fn mint_ticket() -> String {
+    use argon2::password_hash::rand_core::RngCore;
+    let mut bytes = [0u8; 32];
+    argon2::password_hash::rand_core::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Equality that takes the same time for every unequal pair of the same
+/// length, so a ticket cannot be guessed a byte at a time off the timing. The
+/// length check short-circuits, which gives away only the length, and every
+/// ticket has the same one.
+fn eq_constant_time(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn ticket_jar() -> std::sync::MutexGuard<'static, TicketJar> {
+    static JAR: std::sync::OnceLock<std::sync::Mutex<TicketJar>> = std::sync::OnceLock::new();
+    JAR.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The engine runs from its install directory; `logs/` and `data/` hang off it.
@@ -195,9 +294,46 @@ async fn prepare(State(s): State<ApiState>, body: axum::body::Bytes) -> Response
     (StatusCode::ACCEPTED, Json(json!({ "ok": true, "state": mig::local_state(work()) }))).into_response()
 }
 
+/// POST /api/migration/archive/ticket: mint a one-time ticket that opens the
+/// archive download for the next minute. Admin-gated; see [`TicketJar`].
+async fn archive_ticket() -> Response {
+    if mig::latest_archive(work()).is_none() {
+        return error_response(StatusCode::NOT_FOUND, "no backup has been built on this instance");
+    }
+    let ticket = ticket_jar().issue(std::time::Instant::now());
+    Json(json!({ "ticket": ticket, "expires_in_secs": ARCHIVE_TICKET_TTL_SECS })).into_response()
+}
+
+#[derive(Deserialize)]
+struct ArchiveQuery {
+    ticket: Option<String>,
+}
+
 /// GET /api/migration/archive: stream the latest backup. It holds credentials
-/// and the full ledger, so it is admin-gated like the config bundle.
-async fn archive() -> Response {
+/// and the full ledger, so it is admin-gated like the config bundle: the admin
+/// session as everywhere else, or a one-time ticket minted by that session
+/// (`?ticket=`), which is how a browser navigation downloads it straight to
+/// disk. The ticket is consumed before the first byte, whatever happens next.
+async fn archive(Query(q): Query<ArchiveQuery>, req: axum::extract::Request) -> Response {
+    // `get()` also answers HEAD. A download manager that probes with HEAD first
+    // would spend the ticket and then be refused on its GET, so HEAD is refused
+    // before the jar is consulted; browsers never HEAD a navigation.
+    if req.method() != axum::http::Method::GET {
+        return error_response(StatusCode::METHOD_NOT_ALLOWED, "the archive answers GET only");
+    }
+    let admitted = !crate::api::setup::admin_gate_active()
+        || crate::api::setup::request_is_admin(&req)
+        || q.ticket.as_deref().is_some_and(|t| ticket_jar().redeem(t, std::time::Instant::now()));
+    if !admitted {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "admin session or a valid download ticket required",
+                "code": "session_required",
+                "login": "/api/auth/login",
+            })),
+        ).into_response();
+    }
     let Some((path, latest)) = mig::latest_archive(work()) else {
         return error_response(StatusCode::NOT_FOUND, "no backup has been built on this instance");
     };
@@ -415,6 +551,87 @@ async fn restore_discard() -> Response {
 #[cfg(test)]
 mod tests {
     use super::describe_shortfall;
+    use super::{TicketJar, ARCHIVE_TICKET_TTL_SECS};
+    use std::time::{Duration, Instant};
+
+    /// E69: a ticket opens the archive exactly once. The second attempt with the
+    /// same ticket, the one a copied URL would make, is refused.
+    #[test]
+    fn a_ticket_opens_the_archive_once() {
+        let mut jar = TicketJar::default();
+        let now = Instant::now();
+        let t = jar.issue(now);
+        assert_eq!(t.len(), 64, "32 random bytes, hex: {t}");
+        assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(jar.redeem(&t, now + Duration::from_secs(1)));
+        assert!(!jar.redeem(&t, now + Duration::from_secs(2)), "spent");
+        assert_eq!(jar.outstanding(), 0);
+    }
+
+    /// A ticket is good for the TTL and not a second longer.
+    #[test]
+    fn an_expired_ticket_is_refused() {
+        let mut jar = TicketJar::default();
+        let now = Instant::now();
+        let t = jar.issue(now);
+        assert!(!jar.redeem(&t, now + Duration::from_secs(ARCHIVE_TICKET_TTL_SECS + 1)));
+        let t = jar.issue(now);
+        assert!(jar.redeem(&t, now + Duration::from_secs(ARCHIVE_TICKET_TTL_SECS - 1)));
+    }
+
+    /// Two tickets never collide, a near miss opens nothing, and the empty
+    /// string (a bare `?ticket=`) opens nothing.
+    #[test]
+    fn a_wrong_ticket_is_refused() {
+        let mut jar = TicketJar::default();
+        let now = Instant::now();
+        let a = jar.issue(now);
+        let b = jar.issue(now);
+        assert_ne!(a, b);
+        let mut near = a.clone();
+        near.replace_range(63..64, if a.ends_with('0') { "1" } else { "0" });
+        assert!(!jar.redeem(&near, now));
+        assert!(!jar.redeem("", now));
+        assert!(!jar.redeem(&a[..63], now), "a prefix is not a ticket");
+        assert!(jar.redeem(&a, now) && jar.redeem(&b, now), "the real ones still work");
+    }
+
+    /// A stuck Download button cannot grow the process: the jar keeps the
+    /// newest tickets and forgets the oldest.
+    #[test]
+    fn the_jar_is_bounded() {
+        let mut jar = TicketJar::default();
+        let now = Instant::now();
+        let first = jar.issue(now);
+        let mut last = String::new();
+        for _ in 0..100 {
+            last = jar.issue(now);
+        }
+        assert!(jar.outstanding() <= super::ARCHIVE_TICKET_CAP);
+        assert!(!jar.redeem(&first, now), "the oldest was forgotten");
+        assert!(jar.redeem(&last, now), "the newest still opens");
+    }
+
+    /// The archive route sits outside the `require_admin` layer, because it
+    /// has to admit a ticket, and it must therefore do the admin check itself.
+    /// Asserted at source level: the defect would be a missing call.
+    #[test]
+    fn the_archive_route_checks_the_gate_itself() {
+        let src = include_str!("migration.rs");
+        let routes = src.split("pub fn admin_routes()").nth(1).expect("admin_routes must exist");
+        let routes = &routes[..routes.find("\n}\n").unwrap_or(routes.len())];
+        let layer = routes.find("require_admin").expect("the admin layer must be applied");
+        let archive = routes.find("get(archive))").expect("the archive route must exist");
+        assert!(archive > layer, "the archive route must be added after the admin layer, or no ticket can open it");
+        let ticket = routes.find("post(archive_ticket)").expect("the ticket route must exist");
+        assert!(ticket < layer, "the ticket route must sit behind the admin layer, or anyone could mint one");
+        let body = src.split("async fn archive(").nth(1).expect("archive must exist");
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        assert!(body.contains("admin_gate_active()") && body.contains("request_is_admin(&req)") && body.contains("redeem("),
+            "archive must consult the admin gate, the session and the ticket jar");
+        assert!(body.find("Method::GET").is_some_and(|m| m < body.find("redeem(").unwrap()),
+            "HEAD must be refused before a ticket is spent");
+    }
 
     #[test]
     fn a_truncated_upload_is_described_as_a_shortfall() {
