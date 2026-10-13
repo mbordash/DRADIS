@@ -56,6 +56,64 @@ pub type MarketState = (
     String,                      // condition_id (NEW)
 );
 
+/// Why the maker venue the monitor publishes differs from what the scan found.
+#[derive(Debug, PartialEq, Eq)]
+enum MakerCarry {
+    /// Publish what the scan found, including None when nothing is held either.
+    Scan,
+    /// The scan found no venue but the held one is still open: keep it.
+    Kept,
+    /// The scan found no venue and the held one has closed: release it.
+    Released,
+}
+
+/// The maker venue to publish, given what the scan found and what is held.
+///
+/// A scan that misses the venue is not evidence that the venue is gone. From
+/// noon to midnight ET the direct daily lookup finds nothing (E71), so the
+/// venue comes from the paged Gamma volume scan, and a page that fails drops
+/// every market on it. Production, 2026-10-13: the 4PM to 8PM window market
+/// ($6.4k of 24h volume against a $1.4k scan floor) vanished and returned
+/// three times in an hour, and each change restarted the squadron's patrol
+/// (B60). A held venue is kept while its close time is known and in the
+/// future; a closed one is released, and so is one with no close time, because
+/// an unknown close time cannot prove the market is still open. A scan that
+/// found a venue always wins, so a real replacement is never held back.
+fn carry_held_maker(
+    scanned: Option<MarketCandidate>,
+    held: Option<&MarketCandidate>,
+    now: chrono::DateTime<Utc>,
+) -> (Option<MarketCandidate>, MakerCarry) {
+    match (scanned, held) {
+        (Some(c), _) => (Some(c), MakerCarry::Scan),
+        (None, None) => (None, MakerCarry::Scan),
+        (None, Some(h)) if h.close_time.is_some_and(|ct| ct > now) => (Some(h.clone()), MakerCarry::Kept),
+        (None, Some(_)) => (None, MakerCarry::Released),
+    }
+}
+
+/// Epoch seconds of the last "keeping the held maker venue" line, so a long
+/// run of missed scans says so once every ten minutes rather than every 90 s.
+static LAST_MAKER_KEPT_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn log_maker_carry(carry: &MakerCarry, held: Option<&MarketCandidate>, now: chrono::DateTime<Utc>) {
+    use std::sync::atomic::Ordering;
+    match (carry, held) {
+        (MakerCarry::Kept, Some(h)) => {
+            let now_secs = now.timestamp() as u64;
+            let last = LAST_MAKER_KEPT_LOG.load(Ordering::Relaxed);
+            if now_secs.saturating_sub(last) >= 600 {
+                LAST_MAKER_KEPT_LOG.store(now_secs, Ordering::Relaxed);
+                info!("🏦 Maker venue missing from this scan — keeping \"{}\" until it closes or a scan finds a venue", h.name);
+            }
+        }
+        (MakerCarry::Released, Some(h)) => {
+            info!("🏦 Maker venue released: \"{}\" has closed and no replacement was found", h.name);
+        }
+        _ => {}
+    }
+}
+
 /// Whether the held hourly market is owed a strike it did not have at rotation.
 ///
 /// An "Up or Down" market's strike is the open of the Binance candle that
@@ -230,7 +288,7 @@ pub async fn run_market_monitor(
             std::time::Duration::from_secs(scan_cap_secs),
             get_market_pair(&http, &crypto_filter),
         ).await;
-        let (candidate, mut maker_candidate) = match scan_result {
+        let (candidate, maker_candidate) = match scan_result {
             Ok(pair) => {
                 if consecutive_timeouts > 0 {
                     info!("✅ Market monitor: Gamma API recovered after {} timed-out scan(s)", consecutive_timeouts);
@@ -305,14 +363,19 @@ pub async fn run_market_monitor(
             // poll in `wait_for_scan_chasing_strike`; this is the belt-and-braces
             // path for the case where the scan itself was what unblocked it.
             resolve_owed_strike(&http, &crypto_filter, &market_tx).await;
-            // Hourly market unchanged — still check if maker market changed
-            let cur_maker_yes = market_tx.borrow().6.as_ref().map(|m| m.yes_token.clone());
+            // Hourly market unchanged — still check if maker market changed.
+            // A scan that found no venue does not evict a held one that is
+            // still open (B60); see `carry_held_maker`.
+            let (y, n, nm, ct, sp, ds, prev_mk, cid) = market_tx.borrow().clone();
+            let now = Utc::now();
+            let (mut maker_candidate, carry) = carry_held_maker(maker_candidate, prev_mk.as_ref(), now);
+            log_maker_carry(&carry, prev_mk.as_ref(), now);
+            let cur_maker_yes = prev_mk.as_ref().map(|m| m.yes_token.clone());
             let new_maker_yes = maker_candidate.as_ref().map(|m| m.yes_token.clone());
             if cur_maker_yes != new_maker_yes {
                 if let Some(ref mk) = maker_candidate {
                     info!("🏦 Maker market updated: \"{}\"", mk.name);
                 }
-                let (y, n, nm, ct, sp, ds, prev_mk, cid) = market_tx.borrow().clone();
                 if let Some(ref mut mk) = maker_candidate {
                     resolve_maker_strike(&http, &crypto_filter, prev_mk.as_ref(), mk).await;
                 }
@@ -376,8 +439,13 @@ pub async fn run_market_monitor(
             ),
             (None, _) => tracing::warn!("⚠️ Hourly strike unresolved for \"{}\"", candidate.name),
         }
+        // The hourly rotated; the maker venue rides along, held through a
+        // scan that missed it (B60).
+        let prev_mk = market_tx.borrow().6.clone();
+        let now = Utc::now();
+        let (mut maker_candidate, carry) = carry_held_maker(maker_candidate, prev_mk.as_ref(), now);
+        log_maker_carry(&carry, prev_mk.as_ref(), now);
         if let Some(ref mut mk) = maker_candidate {
-            let prev_mk = market_tx.borrow().6.clone();
             resolve_maker_strike(&http, &crypto_filter, prev_mk.as_ref(), mk).await;
         }
         let _ = market_tx.send((
@@ -478,5 +546,78 @@ mod release_expired_market_tests {
     fn the_close_boundary_counts_as_expired() {
         let now = Utc::now();
         assert!(should_release_held_market(true, Some(now), now));
+    }
+}
+
+#[cfg(test)]
+mod maker_carry_tests {
+    use super::{carry_held_maker, MakerCarry};
+    use crate::helpers::market::MarketCandidate;
+    use crate::venues::intl::market_id_from_u256;
+    use alloy::primitives::U256;
+    use chrono::{Duration, TimeZone, Utc};
+
+    fn venue(id: u64, name: &str, close: Option<chrono::DateTime<Utc>>) -> MarketCandidate {
+        MarketCandidate {
+            yes_token: market_id_from_u256(U256::from(id)),
+            no_token: market_id_from_u256(U256::from(id + 1)),
+            name: name.to_string(),
+            link: String::new(),
+            description: String::new(),
+            is_hot: false,
+            close_time: close,
+            volume: 0.0,
+            condition_id: format!("0x{id:064x}"),
+            strike_price: None,
+        }
+    }
+
+    fn now() -> chrono::DateTime<Utc> { Utc.with_ymd_and_hms(2026, 10, 13, 22, 0, 0).unwrap() }
+
+    /// A scan that found a venue always wins, even over a held one still open.
+    #[test]
+    fn a_scanned_venue_replaces_the_held_one() {
+        let held = venue(1, "Bitcoin Up or Down - October 13, 4:00PM-8:00PM ET", Some(now() + Duration::hours(2)));
+        let fresh = venue(7, "Bitcoin Up or Down on October 14?", Some(now() + Duration::hours(14)));
+        let (out, carry) = carry_held_maker(Some(fresh.clone()), Some(&held), now());
+        assert_eq!(carry, MakerCarry::Scan);
+        assert_eq!(out.unwrap().yes_token, fresh.yes_token);
+    }
+
+    /// Nothing held and nothing found: publish None, the pre-B60 behavior.
+    #[test]
+    fn nothing_held_and_nothing_scanned_is_none() {
+        let (out, carry) = carry_held_maker(None, None, now());
+        assert_eq!(carry, MakerCarry::Scan);
+        assert!(out.is_none());
+    }
+
+    /// The B60 case: the scan missed the window market that is still two hours
+    /// from its close. It is kept, identity unchanged, so the channel does not
+    /// fire and the patrol does not restart.
+    #[test]
+    fn a_missed_scan_keeps_the_open_held_venue() {
+        let held = venue(1, "Bitcoin Up or Down - October 13, 4:00PM-8:00PM ET", Some(now() + Duration::hours(2)));
+        let (out, carry) = carry_held_maker(None, Some(&held), now());
+        assert_eq!(carry, MakerCarry::Kept);
+        assert_eq!(out.unwrap().yes_token, held.yes_token);
+    }
+
+    /// A held venue past its close is released when no scan finds a replacement.
+    #[test]
+    fn a_closed_held_venue_is_released() {
+        let held = venue(1, "Bitcoin Up or Down - October 13, 4:00PM-8:00PM ET", Some(now() - Duration::minutes(1)));
+        let (out, carry) = carry_held_maker(None, Some(&held), now());
+        assert_eq!(carry, MakerCarry::Released);
+        assert!(out.is_none());
+    }
+
+    /// No close time cannot prove the venue is open, so it is not held.
+    #[test]
+    fn a_held_venue_with_no_close_time_is_released() {
+        let held = venue(1, "Bitcoin Up or Down on October 13?", None);
+        let (out, carry) = carry_held_maker(None, Some(&held), now());
+        assert_eq!(carry, MakerCarry::Released);
+        assert!(out.is_none());
     }
 }

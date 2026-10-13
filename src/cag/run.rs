@@ -277,6 +277,11 @@ where
     // ── Market-rotation loop ──────────────────────────────────────────────────
     // Restarts on every market rotation (market_rx.changed() fires inside
     // patrol()) or when the loop-watchdog forces a restart via patrol_cancel.
+    // The hourly market the previous iteration flew. A restart that keeps the
+    // same hourly (a maker-venue change, a retried fee lookup) keeps the
+    // patrol's market clock too; see `market_started_at_for` (B60).
+    let mut last_hourly_cid: Option<String> = None;
+
     'market_loop: loop {
         // Check external cancellation token — fired by Cag::stand_down_asset().
         // Checked first so a stand-down during bootstrap or fee-rate fetch is
@@ -510,7 +515,13 @@ where
 
         // Finalise per-market PatrolContext fields.
         patrol_ctx.maker_market_config = maker_market_config;
-        patrol_ctx.market_started_at   = Utc::now();
+        patrol_ctx.market_started_at = market_started_at_for(
+            last_hourly_cid.as_deref(),
+            &hourly_condition_id,
+            patrol_ctx.market_started_at,
+            Utc::now(),
+        );
+        last_hourly_cid = Some(hourly_condition_id.clone());
 
         // Now that the maker venue is resolved, update the CAG registry so the
         // Control Tower shows both the hourly AND the window/daily market name.
@@ -543,3 +554,51 @@ where
     }
 }
 
+/// When the patrol's market clock starts for this pass through `'market_loop`.
+///
+/// Momentum, TrendReversal and Convergence measure their market warmup from
+/// `PatrolContext::market_started_at`. The loop re-runs for every change on the
+/// market channel, and a maker-venue change (or a retried fee lookup) re-runs
+/// it for the SAME hourly market; resetting the clock then put every warmup
+/// gate back to zero on a market that had been flying for half an hour.
+/// Production, 2026-10-13: nine restarts in the first 2.5 hours after a
+/// migration against three real rotations (B60). The clock restarts only when
+/// the hourly identity changes.
+fn market_started_at_for(
+    prev_cid: Option<&str>,
+    cid: &str,
+    prev_started: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+) -> chrono::DateTime<Utc> {
+    if prev_cid == Some(cid) { prev_started } else { now }
+}
+
+#[cfg(test)]
+mod market_clock_tests {
+    use super::market_started_at_for;
+    use chrono::{Duration, TimeZone, Utc};
+
+    fn t0() -> chrono::DateTime<Utc> { Utc.with_ymd_and_hms(2026, 10, 13, 21, 50, 0).unwrap() }
+
+    /// The first pass has no previous market: the clock starts now.
+    #[test]
+    fn the_first_market_starts_its_clock_now() {
+        let now = t0() + Duration::minutes(5);
+        assert_eq!(market_started_at_for(None, "0xabc", t0(), now), now);
+    }
+
+    /// A rotation to a new hourly restarts the clock.
+    #[test]
+    fn a_new_hourly_restarts_the_clock() {
+        let now = t0() + Duration::minutes(5);
+        assert_eq!(market_started_at_for(Some("0xabc"), "0xdef", t0(), now), now);
+    }
+
+    /// The B60 case: the loop re-ran for a maker-venue change on the same
+    /// hourly. The clock keeps its original start, so no warmup gate re-arms.
+    #[test]
+    fn the_same_hourly_keeps_its_clock_across_a_restart() {
+        let now = t0() + Duration::minutes(25);
+        assert_eq!(market_started_at_for(Some("0xabc"), "0xabc", t0(), now), t0());
+    }
+}

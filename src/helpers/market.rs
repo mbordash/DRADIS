@@ -597,13 +597,38 @@ pub async fn fetch_recent_crypto_candidates(http: &reqwest::Client, filter: &str
 pub async fn fetch_simplified_crypto_candidates(http: &reqwest::Client, filter: &str) -> Vec<GammaCandidate> {
     let mut out = vec![];
     let now = Utc::now();
+    // Pages this scan lost. Each one silently removed up to 100 markets from
+    // the result, and until 2026-10-13 nothing said so: the maker venue then
+    // vanished from the scan and the squadron restarted its patrol (B60).
+    let mut dropped: Vec<String> = Vec::new();
     for page in 0..config::GAMMA_API_MARKET_SCAN_PAGES {
         let url = format!("https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100&offset={}&order=volume24hrClob&ascending=false&include=event", page * 100);
-        let resp = match http.get(&url).send().await { Ok(r) => r, Err(_) => continue };
-        let data: serde_json::Value = match resp.json().await { Ok(d) => d, Err(_) => break };
+        let resp = match http.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => { dropped.push(format!("page {page}: {e}")); continue }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            // Gamma answers an error object, which the array check below would
+            // read as the end of the catalogue. Stop here, as that did, but say
+            // why: a 429 on page 3 is not "the catalogue ended at page 3".
+            dropped.push(format!("page {page}: HTTP {status}, scan stopped"));
+            break;
+        }
+        let data: serde_json::Value = match resp.json().await {
+            Ok(d) => d,
+            Err(e) => { dropped.push(format!("page {page}: unreadable body ({e}), scan stopped")); break }
+        };
         let markets = gamma_market_array(&data);
         if markets.is_empty() { break; }
         out.extend(markets.iter().filter_map(|m| candidate_from_gamma_market(m, filter, now, config::MIN_MARKET_VOLUME)));
+    }
+    if !dropped.is_empty() {
+        warn!(
+            "⚠️ Gamma volume scan lost {} page(s) — markets on them are missing from this scan ({})",
+            dropped.len(),
+            dropped.join("; "),
+        );
     }
     out
 }
