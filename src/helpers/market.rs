@@ -450,21 +450,28 @@ pub async fn get_market_pair(http: &reqwest::Client, asset_filter: &str) -> (Mar
     };
     let now = Utc::now();
 
-    // Three sources, merged in this order of authority:
-    //   1. Slug lookup: the current hour's "Up or Down" market and the next,
-    //      addressed directly. Volume-independent and independent of how many
-    //      markets Gamma lists. This is the source that finds the hourly market.
-    //   2. Volume-sorted scan: established markets with accumulated volume
-    //      (strike markets, window and daily maker venues).
-    //   3. createdAt-sorted scan: whatever is newest. It used to be how fresh
+    // Four sources, merged in this order of authority:
+    //   1. Hourly slug lookup: the current hour's "Up or Down" market and the
+    //      next, addressed directly. Volume-independent and independent of how
+    //      many markets Gamma lists. This is the source that finds the hourly
+    //      market.
+    //   2. Window slug lookup: the live four-hour "Up or Down" window, addressed
+    //      directly. This is the source that finds the window maker venue; the
+    //      volume scan reached it only when it happened to rank inside Gamma's
+    //      offset cap (B60).
+    //   3. Volume-sorted scan: established markets with accumulated volume
+    //      (strike markets, and the window and daily maker venues when they
+    //      rank high enough).
+    //   4. createdAt-sorted scan: whatever is newest. It used to be how fresh
     //      hourly markets were found, until Polymarket's catalogue outgrew it;
     //      see `fetch_recent_crypto_candidates`.
-    let (by_slug, all, recent) = tokio::join!(
+    let (by_slug, by_window_slug, all, recent) = tokio::join!(
         fetch_hourly_candidates_by_slug(http, &filter, now),
+        fetch_window_candidates_by_slug(http, &filter, now),
         fetch_simplified_crypto_candidates(http, &filter),
         fetch_recent_crypto_candidates(http, &filter),
     );
-    let merged = merge_candidates(vec![by_slug, all, recent]);
+    let merged = merge_candidates(vec![by_slug, by_window_slug, all, recent]);
 
     let hourly_count = merged.iter().filter(|c| is_hourly_candidate(c)).count();
     // Prefer more time left; on a tie the earlier-listed candidate, as the
@@ -493,7 +500,7 @@ pub async fn get_market_pair(http: &reqwest::Client, asset_filter: &str) -> (Mar
     let daily_direct = fetch_specific_window_daily_market(http, &filter, now).await;
     let maker = daily_direct.or_else(|| {
         if let Some(b) = maker_c {
-            info!("📋 Using volume-scan window/daily fallback for maker venue");
+            debug!("📋 Maker venue from discovery: \"{}\" ({})", b.1, b.2);
             Some(to_market_candidate(b))
         } else {
             // No daily/window maker venue — expected for assets (e.g. BTC) where Polymarket
@@ -539,29 +546,73 @@ pub async fn fetch_hourly_candidates_by_slug(
         .into_iter()
         .flat_map(|asset| crate::helpers::time::generate_hourly_market_slugs(asset, now, HOURLY_SLUG_LOOKAHEAD_HOURS))
         .collect();
+    fetch_candidates_by_slugs(http, filter, now, &slugs, "Hourly").await
+}
+
+/// How many windows past the live one the window slug lookup probes.
+///
+/// Zero, and not a knob: the maker venue is the live window. A window that has
+/// not opened has no reference price, and the monitor carries the held venue
+/// through the last `MAKER_MIN_SECS_TO_EXPIRY` of its life (`carry_held_maker`),
+/// when the live window no longer validates and the next has not opened.
+const WINDOW_SLUG_LOOKAHEAD: i64 = 0;
+
+/// The live four-hour "Up or Down" window market, fetched by slug.
+///
+/// Production, 2026-10-13: "Bitcoin Up or Down - October 13, 4:00PM-8:00PM ET"
+/// had $6.4k of 24h volume and still dropped in and out of the maker venue,
+/// because the volume scan ends at Gamma's offset cap (page 21 answers HTTP 422
+/// on every scan) and the window ranked beyond it. Each disappearance restarted
+/// the BTC patrol (B60). The slug is deterministic
+/// (`helpers::time::window_market_slug`), one `markets?slug=` request answers
+/// regardless of listing volume or order, and each hit goes through
+/// `candidate_from_gamma_market` with the maker expiry bounds, so it is validated
+/// exactly as a scanned window would be.
+pub async fn fetch_window_candidates_by_slug(
+    http: &reqwest::Client,
+    filter: &str,
+    now: DateTime<Utc>,
+) -> Vec<GammaCandidate> {
+    let slugs: Vec<String> = hourly_assets_for(filter)
+        .into_iter()
+        .flat_map(|asset| crate::helpers::time::generate_window_market_slugs(asset, now, WINDOW_SLUG_LOOKAHEAD))
+        .collect();
+    fetch_candidates_by_slugs(http, filter, now, &slugs, "Window").await
+}
+
+/// One `markets?slug=` request per slug, every hit validated through
+/// `candidate_from_gamma_market` with a zero volume floor. `kind` names the
+/// market class in the log lines ("Hourly", "Window").
+async fn fetch_candidates_by_slugs(
+    http: &reqwest::Client,
+    filter: &str,
+    now: DateTime<Utc>,
+    slugs: &[String],
+    kind: &str,
+) -> Vec<GammaCandidate> {
     let mut out = Vec::new();
-    for slug in &slugs {
+    for slug in slugs {
         let url = format!("https://gamma-api.polymarket.com/markets?slug={}", slug);
         let resp = match http.get(&url).send().await {
             Ok(r) => r,
-            Err(e) => { warn!("⚠️ Hourly slug fetch failed for '{}': {}", slug, e); continue; }
+            Err(e) => { warn!("⚠️ {} slug fetch failed for '{}': {}", kind, slug, e); continue; }
         };
         let data: serde_json::Value = match resp.json().await {
             Ok(d) => d,
-            Err(e) => { warn!("⚠️ Hourly slug response unreadable for '{}': {}", slug, e); continue; }
+            Err(e) => { warn!("⚠️ {} slug response unreadable for '{}': {}", kind, slug, e); continue; }
         };
         let markets = gamma_market_array(&data);
         if markets.is_empty() {
-            debug!("Hourly slug '{}' is not listed (yet)", slug);
+            debug!("{} slug '{}' is not listed (yet)", kind, slug);
             continue;
         }
         for m in &markets {
             match candidate_from_gamma_market(m, filter, now, 0.0) {
                 Some(c) => {
-                    debug!("🎯 Hourly slug '{}' → \"{}\" (vol24h={:.0})", slug, c.1, c.3);
+                    debug!("🎯 {} slug '{}' → \"{}\" (vol24h={:.0})", kind, slug, c.1, c.3);
                     out.push(c);
                 }
-                None => debug!("Hourly slug '{}' listed but failed validation", slug),
+                None => debug!("{} slug '{}' listed but failed validation", kind, slug),
             }
         }
     }
@@ -586,14 +637,28 @@ pub async fn fetch_recent_crypto_candidates(http: &reqwest::Client, filter: &str
         .collect()
 }
 
+/// The largest `offset` Gamma's `/markets` listing accepts. Page 21 (offset
+/// 2100) answered HTTP 422 Unprocessable Entity on every scan on 2026-10-14,
+/// 463 times in twelve hours, which the loss log introduced for B60 reported as
+/// a lost page each time. It is a limit of the venue, not a tunable.
+const GAMMA_MAX_OFFSET: usize = 2000;
+
+/// Pages the volume scan may request: the configured count, capped at the last
+/// page Gamma serves. Requests past the cap are refused, not empty, so without
+/// this the scan reports a loss on every run.
+pub fn volume_scan_pages(configured: usize) -> usize {
+    configured.min(GAMMA_MAX_OFFSET / 100 + 1)
+}
+
 /// Fetch active crypto markets in descending 24h volume, page by page.
 ///
 /// Finds established markets: strike markets and the window and daily maker
-/// venues. Fresh hourly markets rank below the reachable floor; they come from
-/// `fetch_hourly_candidates_by_slug`. Paging stops at the first empty or
-/// non-array page: Gamma rejects `offset` beyond 2000 with an error object, so
-/// with `GAMMA_API_MARKET_SCAN_PAGES` above 21 the remaining requests were
-/// answering nothing on every scan.
+/// venues when they rank high enough. Fresh hourly markets rank below the
+/// reachable floor and come from `fetch_hourly_candidates_by_slug`; the live
+/// window comes from `fetch_window_candidates_by_slug`, since on 2026-10-13 a
+/// window with $6.4k of 24h volume ranked beyond the cap. Paging stops at the
+/// first empty page or at `GAMMA_MAX_OFFSET`, whichever comes first; a page
+/// lost to an error is logged, not silently skipped.
 pub async fn fetch_simplified_crypto_candidates(http: &reqwest::Client, filter: &str) -> Vec<GammaCandidate> {
     let mut out = vec![];
     let now = Utc::now();
@@ -601,7 +666,7 @@ pub async fn fetch_simplified_crypto_candidates(http: &reqwest::Client, filter: 
     // the result, and until 2026-10-13 nothing said so: the maker venue then
     // vanished from the scan and the squadron restarted its patrol (B60).
     let mut dropped: Vec<String> = Vec::new();
-    for page in 0..config::GAMMA_API_MARKET_SCAN_PAGES {
+    for page in 0..volume_scan_pages(config::GAMMA_API_MARKET_SCAN_PAGES) {
         let url = format!("https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100&offset={}&order=volume24hrClob&ascending=false&include=event", page * 100);
         let resp = match http.get(&url).send().await {
             Ok(r) => r,
@@ -1031,6 +1096,74 @@ mod gamma_mark_tests {
         assert_eq!(mark_from_gamma_market(&m, "333"), None);
         assert_eq!(mark_from_gamma_market(&m, "111"), None, "a settled $1.00 is not an open-market mark");
         assert_eq!(mark_from_gamma_market(&serde_json::json!({ "clobTokenIds": ["111"] }), "111"), None);
+    }
+}
+
+#[cfg(test)]
+mod window_slug_discovery_tests {
+    use super::*;
+
+    fn utc(s: &str) -> DateTime<Utc> { s.parse().unwrap() }
+
+    const WINDOW_CID: &str = "0x00000000000000000000000000000000000000000000000000000000000000b1";
+
+    /// The live window as Gamma served it by slug at 09:06 ET on 2026-10-14,
+    /// values as returned live: created a day ahead, $10,256 of 24h volume.
+    fn eight_am_window() -> serde_json::Value {
+        serde_json::json!({
+            "question": "Bitcoin Up or Down - October 14, 8:00AM-12:00PM ET",
+            "slug": "btc-updown-4h-1791979200", "conditionId": WINDOW_CID,
+            "endDate": "2026-10-14T16:00:00Z", "createdAt": "2026-10-13T12:08:49.364124Z",
+            "active": true, "closed": false, "acceptingOrders": true, "enableOrderBook": true,
+            "volume24hrClob": 10255.99,
+            "clobTokenIds": "[\"21111111111111111111111111111111111111111111111111111111111111111111111111101\", \"21111111111111111111111111111111111111111111111111111111111111111111111111102\"]",
+            "description": "This market will resolve to Up if the Binance 1 minute candle for BTC/USDT 12:00 PM ET closes higher than it opened at 8:00 AM ET.",
+            "events": [{ "slug": "btc-updown-4h-1791979200", "title": "Bitcoin Up or Down - October 14, 8:00AM-12:00PM ET", "endDate": "2026-10-14T16:00:00Z" }],
+        })
+    }
+
+    /// A window found by slug validates under the maker expiry bounds and is a
+    /// maker venue candidate, never an hourly one, so `get_market_pair` offers
+    /// it as the maker venue whatever the volume scan reached.
+    #[test]
+    fn the_live_window_validates_as_a_maker_venue() {
+        let now = utc("2026-10-14T13:06:00Z");
+        let c = candidate_from_gamma_market(&eight_am_window(), "btc", now, 0.0)
+            .expect("the live window validates");
+        assert!(is_maker_venue_candidate(&c));
+        assert!(!is_hourly_candidate(&c));
+        assert_eq!(c.7, WINDOW_CID);
+        assert_eq!(c.5, Some(utc("2026-10-14T16:00:00Z")));
+    }
+
+    /// Inside the maker entry floor the window no longer validates; the
+    /// monitor's carry keeps the held venue through that half hour, so the
+    /// lookup must say "nothing" rather than offer a venue the maker cannot use.
+    #[test]
+    fn the_window_drops_out_inside_the_maker_entry_floor() {
+        let now = utc("2026-10-14T16:00:00Z") - chrono::Duration::seconds(config::MAKER_MIN_SECS_TO_EXPIRY - 1);
+        assert!(candidate_from_gamma_market(&eight_am_window(), "btc", now, 0.0).is_none());
+    }
+
+    /// The slug lookup is the first maker source in the merge, so a window the
+    /// scan also found is kept once, under the slug source's entry.
+    #[test]
+    fn the_window_is_merged_once_when_both_sources_find_it() {
+        let now = utc("2026-10-14T13:06:00Z");
+        let by_slug = vec![candidate_from_gamma_market(&eight_am_window(), "btc", now, 0.0).unwrap()];
+        let scanned = vec![candidate_from_gamma_market(&eight_am_window(), "btc", now, config::MIN_MARKET_VOLUME).unwrap()];
+        let merged = merge_candidates(vec![by_slug, scanned]);
+        assert_eq!(merged.iter().filter(|c| is_maker_venue_candidate(c)).count(), 1);
+    }
+
+    /// Gamma serves offsets 0 to 2000: 21 pages of 100. A configured 30 is
+    /// capped there, so the scan never asks for the page that answers 422.
+    #[test]
+    fn the_volume_scan_never_requests_past_gammas_offset_cap() {
+        assert_eq!(volume_scan_pages(30), 21);
+        assert_eq!(volume_scan_pages(21), 21);
+        assert_eq!(volume_scan_pages(5), 5);
+        assert_eq!(volume_scan_pages(0), 0);
     }
 }
 

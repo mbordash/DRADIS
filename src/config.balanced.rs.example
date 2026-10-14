@@ -1966,6 +1966,10 @@ pub const CLOB_API_BASE: &str = "https://clob.polymarket.com";
 // MARKET FILTERING CRITERIA
 // ============================================================================
 
+/// Pages of 100 the volume-sorted Gamma scan may request. Gamma serves offsets
+/// up to 2000 (21 pages) and refuses the rest with HTTP 422, so the scan caps
+/// this at 21 (`helpers::market::volume_scan_pages`); the live hourly and window
+/// markets are found by slug and do not depend on the scan reaching them.
 pub const GAMMA_API_MARKET_SCAN_PAGES: usize = 30;
 
 pub fn is_bad_market(name: &str) -> bool {

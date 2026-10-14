@@ -35,10 +35,10 @@ use crate::venues::intl::market_id_from_u256;
 
 /// Hard cap on how long a single `get_market_pair` scan may run.
 ///
-/// `fetch_simplified_crypto_candidates` pages through GAMMA_API_MARKET_SCAN_PAGES (currently 30)
-/// Gamma API pages sequentially, each with a 20-second reqwest timeout.  In the worst
-/// case (all 30 pages stall until timeout) the scan takes 600 s.  Without an outer cap
-/// the market_monitor task can go silent for up to 10 minutes, missing market switches.
+/// `fetch_simplified_crypto_candidates` pages through GAMMA_API_MARKET_SCAN_PAGES (currently 30,
+/// capped at the 21 pages Gamma serves) sequentially, each with a 20-second reqwest timeout.
+/// In the worst case (every page stalls until timeout) the scan takes over 400 s.  Without an
+/// outer cap the market_monitor task can go silent for minutes, missing market switches.
 ///
 /// 90 s = 1 full 90-second monitor interval.  If the scan hasn't finished in 90 s
 /// something is badly wrong with the Gamma API; log a warning and retry next tick.

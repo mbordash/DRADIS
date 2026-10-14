@@ -334,6 +334,70 @@ pub fn generate_hourly_market_slugs(
     slugs
 }
 
+/// Slug of the four-hour "Up or Down" window market that opens at
+/// `window_start_utc`, e.g. `btc-updown-4h-1791979200` for "Bitcoin Up or Down -
+/// October 14, 8:00AM-12:00PM ET" (the window that opened 2026-10-14 12:00Z).
+///
+/// Unlike the hourly markets, which Polymarket names by Eastern wall-clock
+/// hour, the window markets are keyed by the window's opening time as a Unix
+/// timestamp, so the slug carries no date arithmetic. Verified against Gamma
+/// on 2026-10-14 for BTC, ETH and SOL, current and next windows; Polymarket
+/// creates each window about a day ahead.
+///
+/// This is the only deterministic handle on a window market. The volume scan
+/// that used to find them stops at Gamma's offset cap (2000), and a live window
+/// with $6.4k of 24h volume sat beyond it on 2026-10-13, so the maker venue
+/// came and went with the scan and every change restarted the patrol (B60).
+pub fn window_market_slug(crypto_filter: &str, window_start_utc: DateTime<Utc>) -> String {
+    let asset = match crypto_filter {
+        "eth" | "ethereum" => "eth",
+        "sol" | "solana" => "sol",
+        _ => "btc",
+    };
+    format!("{}-updown-4h-{}", asset, window_start_utc.timestamp())
+}
+
+/// Opening time of the four-hour window that contains `now`.
+///
+/// The grid is Eastern wall-clock: windows open at 12AM, 4AM, 8AM, 12PM, 4PM
+/// and 8PM ET, so the floor is taken in Eastern time and converted back. DST
+/// never lands on a grid hour (the clocks change at 2AM), so the local time is
+/// unambiguous; the fallback for a time the zone cannot place is the UTC hour.
+pub fn window_market_start(now: DateTime<Utc>) -> DateTime<Utc> {
+    let et = now.with_timezone(&Eastern);
+    let grid_hour = et.hour() - et.hour() % 4;
+    et.date_naive()
+        .and_hms_opt(grid_hour, 0, 0)
+        .and_then(|naive| Eastern.from_local_datetime(&naive).earliest())
+        .map(|t| t.with_timezone(&Utc))
+        .unwrap_or_else(|| {
+            now.with_minute(0).and_then(|t| t.with_second(0)).and_then(|t| t.with_nanosecond(0)).unwrap_or(now)
+        })
+}
+
+/// Slugs of the window markets the maker venue can be right now: the window
+/// that contains `now`, then the next `lookahead_windows` in order.
+///
+/// Production uses a lookahead of zero: the maker venue is the live window, a
+/// window that has not opened has no reference price, and the monitor carries
+/// the held venue through the last half hour (`carry_held_maker`) until the
+/// next window is live. Duplicates are dropped, as for the hourly slugs.
+pub fn generate_window_market_slugs(
+    crypto_filter: &str,
+    now: DateTime<Utc>,
+    lookahead_windows: i64,
+) -> Vec<String> {
+    let mut slugs: Vec<String> = Vec::new();
+    for i in 0..=lookahead_windows.max(0) {
+        let start = window_market_start(now + chrono::Duration::hours(4 * i));
+        let slug = window_market_slug(crypto_filter, start);
+        if !slugs.contains(&slug) {
+            slugs.push(slug);
+        }
+    }
+    slugs
+}
+
 /// Generate Polymarket event slugs for the daily "Up or Down on [date]?" event.
 ///
 /// Polymarket's slug format is: `{crypto}-up-or-down-on-{month}-{day}-{year}`
@@ -508,6 +572,54 @@ mod hourly_slug_tests {
     fn dst_fall_back_dedupes_the_repeated_hour() {
         let slugs = generate_hourly_market_slugs("btc", utc("2026-11-01T05:30:00Z"), 1);
         assert_eq!(slugs, vec!["bitcoin-up-or-down-november-1-2026-1am-et"]);
+    }
+}
+
+#[cfg(test)]
+mod window_slug_tests {
+    use super::*;
+
+    fn utc(s: &str) -> DateTime<Utc> { s.parse().unwrap() }
+
+    /// The slug Gamma answered on 2026-10-14 for the live window: 09:06 ET sits
+    /// in the 8AM to 12PM window, which opened at 12:00Z = 1791979200.
+    #[test]
+    fn the_live_window_slug_matches_gamma() {
+        let now = utc("2026-10-14T13:06:00Z");
+        assert_eq!(generate_window_market_slugs("btc", now, 0), vec!["btc-updown-4h-1791979200"]);
+        assert_eq!(generate_window_market_slugs("eth", now, 0), vec!["eth-updown-4h-1791979200"]);
+        assert_eq!(generate_window_market_slugs("sol", now, 0), vec!["sol-updown-4h-1791979200"]);
+        assert_eq!(generate_window_market_slugs("bitcoin", now, 0), vec!["btc-updown-4h-1791979200"]);
+    }
+
+    /// The window is the floor of the Eastern four-hour grid: 11:59 ET is still
+    /// the 8AM window, 12:00 ET opens the next one (1791993600, as Gamma lists
+    /// "October 14, 12:00PM-4:00PM ET"), and the lookahead names it.
+    #[test]
+    fn the_window_is_the_floor_of_the_eastern_four_hour_grid() {
+        assert_eq!(generate_window_market_slugs("btc", utc("2026-10-14T15:59:59Z"), 0)[0], "btc-updown-4h-1791979200");
+        assert_eq!(generate_window_market_slugs("btc", utc("2026-10-14T16:00:00Z"), 0)[0], "btc-updown-4h-1791993600");
+        assert_eq!(generate_window_market_slugs("btc", utc("2026-10-14T13:06:00Z"), 1), vec![
+            "btc-updown-4h-1791979200",
+            "btc-updown-4h-1791993600",
+        ]);
+    }
+
+    /// The grid is Eastern, not UTC: in standard time 13:00Z is 8AM ET and
+    /// opens a window; 12:00Z is 7AM ET and belongs to the 4AM window.
+    #[test]
+    fn the_grid_follows_eastern_standard_time_in_winter() {
+        let eight_am_est = utc("2026-01-14T13:00:00Z");
+        assert_eq!(window_market_start(eight_am_est), eight_am_est);
+        assert_eq!(window_market_start(utc("2026-01-14T12:00:00Z")), utc("2026-01-14T09:00:00Z"));
+    }
+
+    /// Midnight ET opens a window, and the date rolls with Eastern time: 03:30Z
+    /// on the 15th is 11:30PM ET on the 14th, inside the 8PM window.
+    #[test]
+    fn midnight_eastern_opens_a_window() {
+        assert_eq!(window_market_start(utc("2026-10-15T03:30:00Z")), utc("2026-10-15T00:00:00Z"));
+        assert_eq!(window_market_start(utc("2026-10-15T04:00:00Z")), utc("2026-10-15T04:00:00Z"));
     }
 }
 

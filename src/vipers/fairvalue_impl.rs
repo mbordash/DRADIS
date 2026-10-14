@@ -4432,6 +4432,12 @@ mod entry_book_tests {
         dc.fairvalue_stop_loss_pct = dec!(0.15);
         dc.fairvalue_settle_snipe_hold = true;
         dc.fairvalue_sigma_floor_horizon_secs = 0;
+        // The exit path reads the event multiplier off the wall clock. Run
+        // between 08:30 and 09:30 ET on a weekday, the 09:30 event sat inside
+        // the horizon, σ went x1.5, fair(NO) fell to 0.756 and the hold became
+        // a sale (2026-10-14). Pin it to the 1.0 the direct call below uses.
+        dc.fairvalue_event_sigma_multiplier = dec!(1.0);
+        dc.fairvalue_sigma_profile_enabled = false;
         c.dynamic_config = Arc::new(dc);
 
         let strat = FairValueStrategyImpl::default();
