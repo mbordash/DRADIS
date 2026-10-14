@@ -1539,6 +1539,15 @@ pub const FAIRVALUE_BAIL_PROB: f64 = 0.70;
 pub const FAIRVALUE_MIN_EXIT_BID: Decimal = dec!(0.05);
 pub const FAIRVALUE_MAX_SNAPSHOT_AGE_SECS: i64 = 900; // daily book is quiet; FAK orders can't fill vs phantom quotes
 pub const FAIRVALUE_POST_EXIT_COOLDOWN_SECS: i64 = 600;
+/// Seconds before the close inside which FairValue may open a position; 0 means
+/// no restriction. The E80 replays (tape fills, Sep 14 to Oct 8 2026) split the
+/// balanced profile's 21 entries into 5 inside the last 15 minutes for +$7.51
+/// and 16 earlier for −$2.97; entries only inside the last 15 minutes kept
+/// +$3.69 of the +$4.54 on 9 trades and cut the aggressive profile's loss from
+/// −$15.83 to −$4.89. The one-hour σ window describes the remaining horizon
+/// only when little of the hour is left. Operator-tunable as
+/// `fairvalue_entry_window_secs`.
+pub const FAIRVALUE_ENTRY_WINDOW_SECS: i64 = 900;
 /// Record a counterfactual for every position the percentage stop closes.
 ///
 /// Observe-only: the live stop keeps

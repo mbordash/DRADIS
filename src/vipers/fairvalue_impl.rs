@@ -875,6 +875,23 @@ impl FairValueStrategyImpl {
         Some(var.sqrt() * scale)
     }
 
+    /// Whether the late-window rule admits an entry with `secs_left` to the
+    /// close. `window_secs` of 0 (or less) means no restriction; otherwise the
+    /// entry must fall strictly inside the window, the replay's `T < 900`.
+    ///
+    /// Why a window at all: the E80 replays over Sep 14 to Oct 8 2026 (600
+    /// hourly markets, tape fills) found the balanced profile's net came
+    /// entirely from entries inside the last 15 minutes (+$7.51 on 5) while
+    /// its earlier entries lost (−$2.97 on 16), and the same split held for
+    /// the aggressive profile in every period. The trailing one-hour realized
+    /// σ describes the remaining horizon only when little of the hour is left;
+    /// earlier in the hour it is a forecast the market prices better than the
+    /// model does. Exits are not gated; a position opened late is managed by
+    /// the same rules as before.
+    pub fn entry_window_open(window_secs: i64, secs_left: i64) -> bool {
+        window_secs <= 0 || secs_left < window_secs
+    }
+
     /// Time-scaled edge requirement: linear taper MIN_EDGE→BASE_EDGE inside the
     /// taper horizon, then √(T/taper) growth beyond it (capped) — the further
     /// out settlement is, the less the 1-hour realized-vol window can be
@@ -1989,6 +2006,15 @@ impl Strategy for FairValueStrategyImpl {
                     },
                 );
             }
+        }
+
+        // ── Late-window entry rule (E80) ─────────────────────────────────────
+        // After the diagnostic and the noise feed on purpose: the model keeps
+        // reading and logging all hour, it only declines to act early. See
+        // `entry_window_open`.
+        if !Self::entry_window_open(dc.fairvalue_entry_window_secs, secs_left) {
+            idle("outside the entry window (late-window rule)");
+            return Ok(StrategySignal::NoSignal);
         }
 
         // ── Pick the better side, if any qualifies ───────────────────────────
@@ -5736,6 +5762,12 @@ mod event_sigma_tests {
 /// the gates after the edge (coin-flip, pin, price band, persistence, OBI).
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ModelReading {
+    /// The late-window rule's knob as read (`fairvalue_entry_window_secs`);
+    /// 0 means no restriction.
+    pub entry_window_secs: i64,
+    /// Whether the rule admits an entry at `secs_left`; see `entry_window_open`.
+    /// A positive edge with the window closed is a reading, not a trade.
+    pub entry_window_open: bool,
     pub spot: f64,
     pub strike: f64,
     pub secs_left: i64,
@@ -5847,6 +5879,8 @@ impl FairValueStrategyImpl {
             (e != NO_EDGE).then_some(e)
         };
         Ok(ModelReading {
+            entry_window_secs: dc.fairvalue_entry_window_secs,
+            entry_window_open: Self::entry_window_open(dc.fairvalue_entry_window_secs, secs_left),
             spot,
             strike,
             secs_left,
@@ -5950,5 +5984,34 @@ mod model_reading_tests {
             "MODEL-TEST-C", &dc(), 81_100.0, 81_000.0, now, now - chrono::Duration::seconds(1), None, None,
         ).unwrap_err();
         assert_eq!(e, ModelUnavailable::Expired);
+    }
+}
+
+#[cfg(test)]
+mod entry_window_tests {
+    use super::FairValueStrategyImpl as FV;
+
+    /// Zero (and anything below) means the rule is off: every horizon admits.
+    #[test]
+    fn zero_disables_the_window() {
+        assert!(FV::entry_window_open(0, 3500));
+        assert!(FV::entry_window_open(0, 30));
+        assert!(FV::entry_window_open(-1, 3500));
+    }
+
+    /// Inside the last 15 minutes the entry is admitted.
+    #[test]
+    fn inside_the_window_admits() {
+        assert!(FV::entry_window_open(900, 899));
+        assert!(FV::entry_window_open(900, 120));
+    }
+
+    /// Earlier in the hour the entry is declined, and the boundary is
+    /// exclusive, matching the replay's `T < 900`.
+    #[test]
+    fn outside_or_on_the_boundary_declines() {
+        assert!(!FV::entry_window_open(900, 900));
+        assert!(!FV::entry_window_open(900, 901));
+        assert!(!FV::entry_window_open(900, 3500));
     }
 }

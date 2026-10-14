@@ -215,6 +215,7 @@ fn default_fairvalue_sigma_profile_enabled() -> bool    { config::FAIRVALUE_SIGM
 fn default_fairvalue_sigma_profile_min_cell_n() -> i64  { config::FAIRVALUE_SIGMA_PROFILE_MIN_CELL_N }
 fn default_fairvalue_sigma_profile_lookback_days() -> i64 { config::FAIRVALUE_SIGMA_PROFILE_LOOKBACK_DAYS }
 fn default_fairvalue_post_exit_cooldown()  -> i64     { config::FAIRVALUE_POST_EXIT_COOLDOWN_SECS     }
+fn default_fairvalue_entry_window_secs()   -> i64     { config::FAIRVALUE_ENTRY_WINDOW_SECS           }
 fn default_fairvalue_max_stop_losses()     -> u32     { config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET  }
 fn default_fairvalue_edge_noise_multiple() -> Decimal { config::FAIRVALUE_EDGE_NOISE_MULTIPLE         }
 fn default_fairvalue_stop_model_confirm() -> Decimal { config::FAIRVALUE_STOP_MODEL_CONFIRM_FRAC      }
@@ -1049,6 +1050,11 @@ pub struct DynamicConfig {
     /// market the viper has just left were 0-for-4 in prod (2026-08-13/14).
     #[serde(default = "default_fairvalue_post_exit_cooldown")]
     pub fairvalue_post_exit_cooldown_secs: i64,
+    /// Seconds before the close inside which FairValue may open a position;
+    /// 0 means no restriction. The E80 late-window rule: entries in the last
+    /// 15 minutes carried the balanced profile's whole net, earlier ones lost.
+    #[serde(default = "default_fairvalue_entry_window_secs")]
+    pub fairvalue_entry_window_secs: i64,
     /// Stop-outs allowed on one market before the breaker bars further entries.
     #[serde(default = "default_fairvalue_max_stop_losses")]
     pub fairvalue_max_stop_losses_per_market: u32,
@@ -1590,6 +1596,7 @@ impl Default for DynamicConfig {
             fairvalue_sigma_profile_min_cell_n: config::FAIRVALUE_SIGMA_PROFILE_MIN_CELL_N,
             fairvalue_sigma_profile_lookback_days: config::FAIRVALUE_SIGMA_PROFILE_LOOKBACK_DAYS,
             fairvalue_post_exit_cooldown_secs: config::FAIRVALUE_POST_EXIT_COOLDOWN_SECS,
+            fairvalue_entry_window_secs:      config::FAIRVALUE_ENTRY_WINDOW_SECS,
             fairvalue_max_stop_losses_per_market: config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET,
             fairvalue_edge_noise_multiple:    config::FAIRVALUE_EDGE_NOISE_MULTIPLE,
             fairvalue_stop_model_confirm_frac: config::FAIRVALUE_STOP_MODEL_CONFIRM_FRAC,

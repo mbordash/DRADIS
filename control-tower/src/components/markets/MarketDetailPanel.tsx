@@ -259,6 +259,16 @@ function ModelCard({ m }: { m: ModelReadingView }) {
       <Cell label="event multiplier" value={String(m.event_mult)} />
       <Cell label="spot / strike" value={`${m.spot} / ${m.strike}`} />
       <Cell label="time left" value={fmtDur(m.secs_left)} />
+      <Cell
+        label="entry window"
+        value={
+          m.entry_window_secs <= 0
+            ? 'off'
+            : m.entry_window_open
+              ? `open (last ${fmtDur(m.entry_window_secs)})`
+              : `closed until ${fmtDur(m.entry_window_secs)} before close`
+        }
+      />
       <Cell label="samples" value={String(m.samples)} />
     </div>
   );

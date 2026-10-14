@@ -968,6 +968,14 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Seconds a token is locked out after any FairValue exit. Second entries into a market the viper had \
              just left went 0-for-4 for −$1.88 gross on 2026-08-13/14 while first entries were flat, and the \
              300s setting let one of them back in 365s after the stop.").min(0.0).step(60.0).unit("s"));
+        v.push(F::new(g, e, "fairvalue_entry_window_secs", "Entry Window", "secs", true,
+            "Seconds before the market closes inside which FairValue may open a position; 0 removes the \
+             restriction. Replays over Sep 14 to Oct 8 2026 (600 hourly markets, tape fills) found that the \
+             balanced profile's whole net came from its entries inside the last 15 minutes (+$7.51 on 5) while \
+             its earlier entries lost (−$2.97 on 16); entering only inside the last 900 s kept +$3.69 of +$4.54 \
+             on 9 trades and cut the aggressive profile's loss from −$15.83 to −$4.89. The trailing one-hour σ \
+             describes the remaining horizon only when little of the hour is left. Exits are unaffected.")
+            .min(0.0).step(60.0).unit("s"));
         v.push(F::new(g, e, "fairvalue_max_stop_losses_per_market", "Max Stops / Market", "int", true,
             "Stop-outs allowed on one market before the breaker bars further entries there. Counts genuine \
              stop-outs, not exit retries. At 2 the breaker only fires after both losses are booked.")

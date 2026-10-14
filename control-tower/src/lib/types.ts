@@ -48,6 +48,7 @@ export interface DynamicConfig {
   fairvalue_sigma_floor_horizon_secs: number;
   fairvalue_min_sigma_per_sqrt_sec:   string;
   fairvalue_post_exit_cooldown_secs:  number;
+  fairvalue_entry_window_secs:        number;
   fairvalue_max_stop_losses_per_market: number;
   fairvalue_edge_noise_multiple:      string;
   fairvalue_stop_model_confirm_frac:  string;
@@ -1000,6 +1001,10 @@ export interface MarketActivity {
 
 /** FairValue's reading of a crypto market with the global knobs: a reading, not a decision. */
 export interface ModelReadingView {
+  /** The late-window rule's knob (`fairvalue_entry_window_secs`); 0 means no restriction. */
+  entry_window_secs: number;
+  /** Whether the rule admits an entry now; a positive edge with the window closed is a reading, not a trade. */
+  entry_window_open: boolean;
   spot: number;
   strike: number;
   secs_left: number;
