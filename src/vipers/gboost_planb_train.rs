@@ -49,7 +49,10 @@
 //!    `gboost_planb_retrain_hours`, or at once when the operator changes the plan the
 //!    labels are built for). Rows are built and the booster fit on a dedicated OS
 //!    thread, never on the tokio runtime or its blocking pool, with at most two rayon
-//!    threads and one on a two-core box.
+//!    threads and one on a two-core box. The fit runs inside the engine process, so it
+//!    is bounded: the booster stops adding trees at `FIT_MEMORY_LIMIT_GB` of its own
+//!    accounting, and a model that still serializes over `MODEL_FILE_MAX_BYTES` is
+//!    refused rather than written (2026-10-15, three OOM kills in one night).
 //!
 //! # Validation and adoption
 //!
@@ -173,6 +176,8 @@ const FUNDING_HOSTS: [&str; 1] = ["https://fapi.binance.com"];
 /// reports 3.7 GB total after kernel reservations and, with the engine, Control Tower
 /// and proxy running, about 3.0 GB available (production t3.medium, 2026-09-13),
 /// which is room for a fit. A 2 GB instance has about 1.1 GB available and is not.
+/// This gate only decides whether a fit may start; `FIT_MEMORY_LIMIT_GB` bounds how
+/// far it may go.
 const TRAIN_MIN_FREE_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Below this much total memory the machine can never make the room above beside the
 /// engine's own ~0.8 GB, whatever else it stops, so the refusal recommends a larger
@@ -180,6 +185,40 @@ const TRAIN_MIN_FREE_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// memory, so the refusal says that instead of naming an instance type it would
 /// itself refuse. A t3.medium reports 3.7 GB, a t3.small 1.9 GB.
 const TRAIN_MIN_TOTAL_MEMORY_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+/// The memory bound, in GB, the booster is given for one fit (`set_memory_limit`).
+/// The booster stops adding trees once its own estimate of the histogram arena plus
+/// the ensemble passes 90% of this. Without it a fit is bounded only by the iteration
+/// cap and the timeout, and a fit whose stop criterion never fires grows until the
+/// kernel kills the engine: on 2026-10-15 three cycles in a row reached 3.3 GB
+/// resident on a 3.8 GB instance and were OOM-killed about 13 minutes in, and the
+/// replay of that fit ran to 931 trees and a 2.0 GB model file.
+///
+/// The bound is set by what the engine can carry, not by what the fit could hold: the
+/// model file is read back at every squadron start and in every training cycle (as
+/// the incumbent), and a loaded model stays resident at about 1.6 times its file.
+/// Calibrated on the 2026-10-15 replay (122k fit rows, budget 2): 1.17 GB gave 421
+/// trees and a 471 MB file, 0.6 GB gave 336 trees and a 287 MB file, both stopped by
+/// the bound; at 0.5 GB the smaller histogram arena caps the nodes a tree may grow,
+/// and the fit then found its own stop at 233 trees and a 169 MB file with a 0.13 GB
+/// peak over the rows, the size class of the models that have served so far (the
+/// 2026-10-12 production model is 178 trees and 148 MB). The free-memory gate
+/// (`TRAIN_MIN_FREE_MEMORY_BYTES`) decides whether a fit may start; this bounds how
+/// far it may go.
+const FIT_MEMORY_LIMIT_GB: f32 = 0.5;
+/// A model whose file is larger than this is not written or served: at 1.6 times its
+/// file resident it would hold about 0.65 GB of a 4 GB instance for good, and the
+/// trainer carries two of them (serving and candidate) while it compares. The booster's
+/// bound above keeps a fit well under this; the check is the last line, independent of
+/// the booster's own memory accounting.
+const MODEL_FILE_MAX_BYTES: usize = 400_000_000;
+
+/// Why a fitted model may not be written, or `None` when it may.
+pub fn model_size_refusal(file_bytes: usize) -> Option<String> {
+    (file_bytes > MODEL_FILE_MAX_BYTES).then(|| format!(
+        "model serializes to {:.0} MB, over the {:.0} MB the engine can carry; the fit's memory bound ({FIT_MEMORY_LIMIT_GB} GB) should have stopped it sooner",
+        file_bytes as f64 / 1e6, MODEL_FILE_MAX_BYTES as f64 / 1e6,
+    ))
+}
 
 // ── Data store ───────────────────────────────────────────────────────────────
 
@@ -1058,7 +1097,7 @@ pub fn fit_threads() -> usize {
 /// the price (`residual_probability`). The library offers a scalar base score and
 /// no per-row offset, so the residual is taken in probability space rather than
 /// in log-odds.
-pub fn fit_booster(x: &[[f64; N_FEATURES]], y: &[bool], zeroed: &[usize], budget: f32, threads: usize, form: ModelForm) -> Result<PerpetualBooster, String> {
+pub fn fit_booster(x: &[[f64; N_FEATURES]], y: &[bool], zeroed: &[usize], budget: f32, threads: usize, memory_limit_gb: f32, form: ModelForm) -> Result<PerpetualBooster, String> {
     let data = column_major(x, zeroed);
     let m = Matrix::new(&data, x.len(), N_FEATURES);
     let (objective, yy): (Objective, Vec<f64>) = match form {
@@ -1075,6 +1114,7 @@ pub fn fit_booster(x: &[[f64; N_FEATURES]], y: &[bool], zeroed: &[usize], budget
         .set_log_iterations(0)
         .set_max_bin(MAX_BIN)
         .set_iteration_limit(Some(ITERATION_LIMIT))
+        .set_memory_limit(Some(memory_limit_gb))
         .set_stopping_rounds(None)
         .set_save_node_stats(false)
         .set_timeout(Some(TRAIN_TIMEOUT_SECS));
@@ -1387,6 +1427,10 @@ pub struct CycleReport {
     pub cal_markets: usize,
     pub test_rows: usize,
     pub trees: usize,
+    /// The memory bound the booster was given, in GB (`FIT_MEMORY_LIMIT_GB`); 0 in a
+    /// report from before the bound existed.
+    #[serde(default)]
+    pub fit_memory_limit_gb: f32,
     pub platt_a: f64,
     pub platt_b: f64,
     /// The residual form's deviation shrink (`fit_residual_shrink`); 1 for the log-loss form.
@@ -1434,6 +1478,9 @@ pub struct CycleInputs {
     pub budget: f64,
     pub auto_adopt: bool,
     pub threads: usize,
+    /// The booster's memory bound for this fit (`FIT_MEMORY_LIMIT_GB` in the engine;
+    /// tests and the replay vary it).
+    pub fit_memory_limit_gb: f32,
     /// How many closed shadow trades the SERVING model has recorded, and the bar
     /// it is working toward. A shadow model part-way through gathering its
     /// evidence is not replaced by a coin-flip skill comparison; see
@@ -1492,6 +1539,7 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
         plan: Some(inputs.plan),
         model_form: TRAINED_FORM.stamp().to_string(),
         budget: inputs.budget,
+        fit_memory_limit_gb: inputs.fit_memory_limit_gb,
         window_days: inputs.window_days,
         holdout_days: inputs.holdout_days,
         ..Default::default()
@@ -1560,7 +1608,7 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
     }
     zeroed.sort_unstable();
     rep.zeroed_features = zeroed.iter().map(|&j| FEATURE_NAMES[j].to_string()).collect();
-    let booster = match fit_booster(&xf, &yf, &zeroed, inputs.budget as f32, inputs.threads, TRAINED_FORM) {
+    let booster = match fit_booster(&xf, &yf, &zeroed, inputs.budget as f32, inputs.threads, inputs.fit_memory_limit_gb, TRAINED_FORM) {
         Ok(b) => b,
         Err(e) => return finish(rep, "error", e),
     };
@@ -1667,6 +1715,9 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
         Err(e) => return finish(rep, "error", format!("model serialization failed: {e:?}")),
     };
     drop(booster);
+    if let Some(why) = model_size_refusal(bytes.len()) {
+        return finish(rep, "error", why);
+    }
     if let Err(e) = write_atomically(&inputs.dir.candidate(), &bytes) {
         return finish(rep, "error", format!("cannot write the candidate file: {e}"));
     }
@@ -2638,6 +2689,7 @@ pub async fn run_pipeline(asset: String) {
                 budget: knobs.budget,
                 auto_adopt: knobs.auto_adopt,
                 threads: fit_threads(),
+                fit_memory_limit_gb: FIT_MEMORY_LIMIT_GB,
                 // Read here rather than in the blocking cycle: the record lives
                 // in SQLite and the cycle runs on a native thread with no
                 // runtime to await on.
@@ -2678,6 +2730,17 @@ pub async fn run_pipeline(asset: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A model the engine cannot carry is refused with a figure, and one it can is
+    /// written without comment.
+    #[test]
+    fn oversized_model_files_are_refused() {
+        assert!(model_size_refusal(148_000_000).is_none(), "the 2026-10-12 production model passes");
+        assert!(model_size_refusal(MODEL_FILE_MAX_BYTES).is_none(), "the bound itself passes");
+        assert!(model_size_refusal(MODEL_FILE_MAX_BYTES + 1).is_some(), "one byte over is refused");
+        let why = model_size_refusal(450_000_000).expect("refused");
+        assert!(why.contains("450 MB") && why.contains("400 MB"), "{why}");
+    }
 
     fn fixture() -> serde_json::Value {
         serde_json::from_str(include_str!("testdata/gboost_planb_rows.json")).unwrap()
@@ -2837,7 +2900,7 @@ mod tests {
         // the cycle on already-built rows through the same fit/stamp/write path.
         let inputs = CycleInputs {
             asset: "btc".into(), dir: dir.clone(), serving_path: serving.clone(), plan, now,
-            window_days: 30, holdout_days: 1, min_trades: 5, min_win: 0.5, budget: 0.5, auto_adopt: true, threads: 1,
+            window_days: 30, holdout_days: 1, min_trades: 5, min_win: 0.5, budget: 0.5, auto_adopt: true, threads: 1, fit_memory_limit_gb: 8.0,
             incumbent_shadow_trades: 0, shadow_min_trades: 40,
         };
         // Split as the cycle would, then train directly.
@@ -2853,7 +2916,7 @@ mod tests {
         let cal: Vec<&TrainingRow> = train.iter().copied().filter(|r| r.w >= cut).collect();
         let xf: Vec<[f64; N_FEATURES]> = fit.iter().map(|r| r.features).collect();
         let yf: Vec<bool> = fit.iter().map(|r| r.y).collect();
-        let mut booster = fit_booster(&xf, &yf, &[], 0.5, 1, TRAINED_FORM).expect("fits");
+        let mut booster = fit_booster(&xf, &yf, &[], 0.5, 1, 8.0, TRAINED_FORM).expect("fits");
         assert!(booster.get_prediction_trees().len() >= STRUCTURAL_MIN_TREES);
         let xc: Vec<[f64; N_FEATURES]> = cal.iter().map(|r| r.features).collect();
         let yc: Vec<bool> = cal.iter().map(|r| r.y).collect();
@@ -3049,7 +3112,7 @@ mod tests {
             let test: Vec<&TrainingRow> = rows.iter().filter(|r| r.w >= cut_cal).collect();
             let xf: Vec<[f64; N_FEATURES]> = fit.iter().map(|r| r.features).collect();
             let yf: Vec<bool> = fit.iter().map(|r| r.y).collect();
-            let booster = fit_booster(&xf, &yf, &[], 0.5, 1, ModelForm::ResidualMid).expect("fits");
+            let booster = fit_booster(&xf, &yf, &[], 0.5, 1, 8.0, ModelForm::ResidualMid).expect("fits");
             let xc: Vec<[f64; N_FEATURES]> = cal.iter().map(|r| r.features).collect();
             let yc: Vec<bool> = cal.iter().map(|r| r.y).collect();
             let calib = calibrate_candidate(&booster, &xc, &yc, &[], ModelForm::ResidualMid).expect("calibrates");
@@ -3360,7 +3423,7 @@ mod tests {
         let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45, hold: false };
         let inputs = CycleInputs {
             asset: "btc".into(), dir: dir.clone(), serving_path: serving.clone(), plan, now: last_w + 3600 + 1800,
-            window_days: 120, holdout_days: 14, min_trades: 30, min_win: 0.53, budget: 2.0, auto_adopt: true, threads: fit_threads(),
+            window_days: 120, holdout_days: 14, min_trades: 30, min_win: 0.53, budget: 2.0, auto_adopt: true, threads: fit_threads(), fit_memory_limit_gb: 8.0,
             incumbent_shadow_trades: 0, shadow_min_trades: 40,
         };
         let t0 = Instant::now();
@@ -3373,7 +3436,7 @@ mod tests {
             assert_eq!(m.trained_by.as_deref(), Some("dradis-engine"));
             assert_eq!(m.plan, Some([0.20, 0.11, 0.43, 0.75]));
             // A second cycle now has an incumbent to beat.
-            let rep2 = run_cycle_blocking(&CycleInputs { now: inputs.now + 3600, ..CycleInputs { asset: "btc".into(), dir: dir.clone(), serving_path: serving.clone(), plan, now: 0, window_days: 120, holdout_days: 14, min_trades: 30, min_win: 0.53, budget: 2.0, auto_adopt: true, threads: fit_threads(), incumbent_shadow_trades: 0, shadow_min_trades: 40 } });
+            let rep2 = run_cycle_blocking(&CycleInputs { now: inputs.now + 3600, ..CycleInputs { asset: "btc".into(), dir: dir.clone(), serving_path: serving.clone(), plan, now: 0, window_days: 120, holdout_days: 14, min_trades: 30, min_win: 0.53, budget: 2.0, auto_adopt: true, threads: fit_threads(), fit_memory_limit_gb: 8.0, incumbent_shadow_trades: 0, shadow_min_trades: 40 } });
             println!("second cycle: {} ({})", rep2.decision, rep2.detail);
             assert!(rep2.incumbent.is_some());
             assert_eq!(rep2.incumbent_version.as_deref(), rep.model_version.as_deref());
@@ -3618,7 +3681,7 @@ mod tests {
             serving_path: std::path::PathBuf::from(&model_path), plan,
             now: Utc::now().timestamp(), window_days, holdout_days,
             min_trades: 30, min_win: 0.53, budget: 2.0, auto_adopt: false,
-            threads: 1, incumbent_shadow_trades: 0, shadow_min_trades: 40,
+            threads: 1, fit_memory_limit_gb: 8.0, incumbent_shadow_trades: 0, shadow_min_trades: 40,
         };
         // Band wide open at build time so every row survives to be filtered here.
         let (rows, _markets, _span) = load_rows(&inputs).expect("rows build");
@@ -3657,6 +3720,99 @@ mod tests {
         println!();
     }
 
+    /// Loads a model file named by `DRADIS_PLANB_REPRO_MODEL` the way the viper and
+    /// the trainer do (`load_model`) and reports the process's peak resident memory
+    /// over the load, against the file's size. The booster parses its JSON through a
+    /// generic value tree first, so a file costs several times its size to load.
+    /// Ignored: it needs a model file and the figure only means something in release.
+    #[test]
+    #[ignore]
+    fn repro_model_load() {
+        let Ok(path) = std::env::var("DRADIS_PLANB_REPRO_MODEL") else { eprintln!("DRADIS_PLANB_REPRO_MODEL not set"); return; };
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let pid = std::process::id();
+        let rss = || std::process::Command::new("ps").args(["-o", "rss=", "-p", &pid.to_string()]).output().ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok()).unwrap_or(0);
+        let before = rss();
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (p2, s2) = (peak.clone(), stop.clone());
+        let sampler = std::thread::spawn(move || {
+            while !s2.load(std::sync::atomic::Ordering::Relaxed) {
+                let kb = std::process::Command::new("ps").args(["-o", "rss=", "-p", &pid.to_string()]).output().ok()
+                    .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok()).unwrap_or(0);
+                p2.fetch_max(kb, std::sync::atomic::Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        let t0 = Instant::now();
+        let model = crate::vipers::gboost_planb::load_model(Path::new(&path)).expect("model loads");
+        let loaded = model.trees;
+        let after = rss();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = sampler.join();
+        let gb = |kb: u64| kb as f64 / 1_048_576.0;
+        println!(
+            "model {} ({:.0} MB, {} trees) loaded in {:.1}s: rss before {:.2} GB, peak {:.2} GB, after {:.2} GB -> peak cost {:.1}x the file, resident cost {:.1}x",
+            path, size as f64 / 1e6, loaded, t0.elapsed().as_secs_f64(), gb(before), gb(peak.load(std::sync::atomic::Ordering::Relaxed)), gb(after),
+            (gb(peak.load(std::sync::atomic::Ordering::Relaxed)) - gb(before)) * 1e9 / size as f64,
+            (gb(after) - gb(before)) * 1e9 / size as f64,
+        );
+    }
+
+    /// Replays one production training cycle against a data store copied off an
+    /// instance (`DRADIS_PLANB_REPRO_DIR`, the `logs/gboost_planb/btc` directory) at
+    /// the moment the instance started it (`DRADIS_PLANB_REPRO_NOW`, unix seconds),
+    /// and reports the fit's wall time, tree count and the process's peak resident
+    /// memory. Ignored: it needs the copied store and runs for minutes.
+    #[test]
+    #[ignore]
+    fn repro_production_cycle() {
+        let Ok(root) = std::env::var("DRADIS_PLANB_REPRO_DIR") else { eprintln!("DRADIS_PLANB_REPRO_DIR not set"); return; };
+        let now: i64 = std::env::var("DRADIS_PLANB_REPRO_NOW").ok().and_then(|v| v.parse().ok()).unwrap_or(1_792_033_816);
+        let dir = DataDir::at(PathBuf::from(root));
+        let serving = dir.root.join("repro-serving-model.json");
+        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.25, hi: 0.90, fee: 0.07, margin: 0.05, first_minute: 5, last_minute: 45, hold: true };
+        let threads: usize = std::env::var("DRADIS_PLANB_REPRO_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        // The engine's bound unless `DRADIS_PLANB_REPRO_LIMIT_GB` says otherwise, which is
+        // how the bound was calibrated against the model file it yields.
+        let limit_gb = std::env::var("DRADIS_PLANB_REPRO_LIMIT_GB").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(FIT_MEMORY_LIMIT_GB);
+        // The booster reports its stop reason through `log`; the engine's filter hides it
+        // (`logbuf::build_env_filter`), the replay shows it.
+        let _ = tracing_subscriber::fmt().with_env_filter("perpetual=info,dradis=info").with_test_writer().try_init();
+        eprintln!("booster memory limit {limit_gb:.2} GB, threads {threads}");
+        let inputs = CycleInputs {
+            asset: "btc".into(), dir: dir.clone(), serving_path: serving, plan, now,
+            window_days: 120, holdout_days: 14, min_trades: 30, min_win: 0.53, budget: 2.0, auto_adopt: false, threads, fit_memory_limit_gb: limit_gb,
+            incumbent_shadow_trades: 0, shadow_min_trades: 40,
+        };
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (p2, s2) = (peak.clone(), stop.clone());
+        let pid = std::process::id();
+        let sampler = std::thread::spawn(move || {
+            let t0 = Instant::now();
+            while !s2.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(out) = std::process::Command::new("ps").args(["-o", "rss=", "-p", &pid.to_string()]).output() {
+                    if let Ok(kb) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() {
+                        let prev = p2.fetch_max(kb, std::sync::atomic::Ordering::Relaxed);
+                        if kb > prev + 262_144 { eprintln!("[{:>6.1}s] rss {:.2} GB", t0.elapsed().as_secs_f64(), kb as f64 / 1_048_576.0); }
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+        let t0 = Instant::now();
+        let rep = run_cycle_blocking(&inputs);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = sampler.join();
+        let cand_bytes = std::fs::metadata(dir.candidate()).map(|m| m.len()).unwrap_or(0);
+        println!(
+            "cycle {} in {:.1}s: decision {} | trees {} (memory limit {:.2} GB) | fit {} rows / cal {} / test {} | candidate.json {:.1} MB | peak rss {:.2} GB\n{}",
+            rep.model_version.as_deref().unwrap_or("-"), t0.elapsed().as_secs_f64(), rep.decision, rep.trees, rep.fit_memory_limit_gb, rep.fit_rows, rep.cal_rows, rep.test_rows,
+            cand_bytes as f64 / 1e6, peak.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1_048_576.0, rep.detail,
+        );
+    }
 }
 
 #[cfg(test)]

@@ -962,7 +962,18 @@ pub fn gate_from_stamp(
 /// venue and its size must all be what this code feeds it.
 pub fn load_model(path: &std::path::Path) -> std::result::Result<PlanBModel, String> {
     let json = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let booster = PerpetualBooster::from_json(&json).map_err(|e| format!("cannot parse {}: {e:?}", path.display()))?;
+    // Parse the booster straight into its own type. The library's `from_json` first
+    // builds a generic JSON value tree and then converts it, which at peak costs about
+    // 9.5 times the file (1.4 GB for the 148 MB production model, measured 2026-10-15),
+    // and this load runs inside the engine at every squadron start and in every
+    // training cycle. The value tree exists only to rewrite one legacy categorical
+    // split encoding that this build never wrote, so it stays as the fallback for a
+    // file the direct parse rejects.
+    let booster = match serde_json::from_str::<PerpetualBooster>(&json) {
+        Ok(b) => b,
+        Err(direct) => PerpetualBooster::from_json(&json)
+            .map_err(|e| format!("cannot parse {}: {e:?} (direct parse: {direct})", path.display()))?,
+    };
     let meta = |key: &str| booster.get_metadata(&key.to_string());
     if meta("feature_layout").as_deref() != Some("column_major") {
         return Err("model is not stamped feature_layout=column_major".to_string());
