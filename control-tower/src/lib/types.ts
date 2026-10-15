@@ -108,6 +108,10 @@ export interface DynamicConfig {
   momentum_reversal_persist_secs:        number;
   momentum_resting_tp_enabled:           boolean;
   momentum_catastrophic_persist_secs:    number;
+  momentum_catastrophic_grace_secs:      number;
+  momentum_event_times_et:               string;
+  momentum_event_blackout_before_secs:   number;
+  momentum_event_blackout_after_secs:    number;
   momentum_scaled_sizing_enabled:        boolean;
   momentum_decay_exit_fraction:          string;
   momentum_decay_fee_margin_mult:        string;

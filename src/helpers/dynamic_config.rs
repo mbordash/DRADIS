@@ -366,6 +366,9 @@ fn default_momentum_take_profit_ceiling()   -> Decimal { config::MOMENTUM_TAKE_P
 fn default_momentum_catastrophic_sl_pct()   -> Decimal { config::MOMENTUM_CATASTROPHIC_SL_PCT          }
 fn default_momentum_min_secs_to_expiry_for_entry() -> i64 { config::MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY }
 fn default_momentum_window_open_warmup_secs()     -> i64 { config::MOMENTUM_WINDOW_OPEN_WARMUP_SECS      }
+fn default_momentum_event_times_et()              -> String { config::MOMENTUM_EVENT_TIMES_ET.to_string() }
+fn default_momentum_event_blackout_before_secs()  -> i64 { config::MOMENTUM_EVENT_BLACKOUT_BEFORE_SECS }
+fn default_momentum_event_blackout_after_secs()   -> i64 { config::MOMENTUM_EVENT_BLACKOUT_AFTER_SECS  }
 fn default_momentum_obi_exhaust_max_adverse_pct() -> Decimal { config::MOMENTUM_OBI_EXHAUST_MAX_ADVERSE_PCT }
 fn default_momentum_obi_exhaust_min_hold_secs()   -> i64     { config::MOMENTUM_OBI_EXHAUST_MIN_HOLD_SECS   }
 fn default_momentum_obi_exhaust_persist_secs()    -> i64     { config::MOMENTUM_OBI_EXHAUST_PERSIST_SECS    }
@@ -378,6 +381,7 @@ fn default_momentum_reversal_min_hold_secs()      -> i64     { config::MOMENTUM_
 fn default_momentum_reversal_persist_secs()       -> i64     { config::MOMENTUM_REVERSAL_PERSIST_SECS       }
 fn default_momentum_resting_tp_enabled()          -> bool    { config::MOMENTUM_RESTING_TP_ENABLED          }
 fn default_momentum_catastrophic_persist_secs()   -> i64     { config::MOMENTUM_CATASTROPHIC_PERSIST_SECS   }
+fn default_momentum_catastrophic_grace_secs()     -> i64     { config::MOMENTUM_CATASTROPHIC_GRACE_SECS     }
 fn default_momentum_scaled_sizing_enabled()       -> bool    { config::ENABLE_KELLY_SIZING                  }
 fn default_gboost_planb_exit_posture()            -> i64     { config::GBOOST_PLANB_EXIT_POSTURE            }
 fn default_gboost_planb_held_exposure_usdc()      -> Decimal { config::GBOOST_PLANB_HELD_EXPOSURE_USDC      }
@@ -617,6 +621,17 @@ pub struct DynamicConfig {
     /// window closes, leaving the first seconds of each new window unguarded.
     #[serde(default = "default_momentum_window_open_warmup_secs")]
     pub momentum_window_open_warmup_secs: i64,
+    /// Weekday Eastern times ("HH:MM", comma-separated) of scheduled releases
+    /// around which Momentum takes no new entry. The 1 s and 5 s velocity it
+    /// trades on is the release's own whipsaw for a minute or two either side.
+    #[serde(default = "default_momentum_event_times_et")]
+    pub momentum_event_times_et: String,
+    /// Seconds before each scheduled event that the entry blackout starts.
+    #[serde(default = "default_momentum_event_blackout_before_secs")]
+    pub momentum_event_blackout_before_secs: i64,
+    /// Seconds after each scheduled event that the entry blackout lasts.
+    #[serde(default = "default_momentum_event_blackout_after_secs")]
+    pub momentum_event_blackout_after_secs: i64,
     /// Deepest drawdown at which the in-position OBI-exhaustion exit may still fire.
     /// Beyond it the (catastrophic) stop-loss owns the position instead.
     #[serde(default = "default_momentum_obi_exhaust_max_adverse_pct")]
@@ -667,6 +682,12 @@ pub struct DynamicConfig {
     /// top-of-book reading from selling into a book that reposts a second later.
     #[serde(default = "default_momentum_catastrophic_persist_secs")]
     pub momentum_catastrophic_persist_secs: i64,
+    /// For this many seconds after a fill the catastrophic floor fires only when
+    /// the oracle has crossed the strike against the position; a mark-only
+    /// breach in those seconds is a bounce, not a broken thesis. 0 restores the
+    /// mark-only floor at every age.
+    #[serde(default = "default_momentum_catastrophic_grace_secs")]
+    pub momentum_catastrophic_grace_secs: i64,
     /// Scale each Momentum trade between min and max size by the strength of the
     /// triggering move; off means every trade uses the min size.
     #[serde(default = "default_momentum_scaled_sizing_enabled")]
@@ -1454,6 +1475,9 @@ impl Default for DynamicConfig {
             momentum_catastrophic_sl_pct:  config::MOMENTUM_CATASTROPHIC_SL_PCT,
             momentum_min_secs_to_expiry_for_entry: config::MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY,
             momentum_window_open_warmup_secs: config::MOMENTUM_WINDOW_OPEN_WARMUP_SECS,
+            momentum_event_times_et:          config::MOMENTUM_EVENT_TIMES_ET.to_string(),
+            momentum_event_blackout_before_secs: config::MOMENTUM_EVENT_BLACKOUT_BEFORE_SECS,
+            momentum_event_blackout_after_secs:  config::MOMENTUM_EVENT_BLACKOUT_AFTER_SECS,
             momentum_obi_exhaust_max_adverse_pct: config::MOMENTUM_OBI_EXHAUST_MAX_ADVERSE_PCT,
             momentum_obi_exhaust_min_hold_secs:   config::MOMENTUM_OBI_EXHAUST_MIN_HOLD_SECS,
             momentum_obi_exhaust_persist_secs:    config::MOMENTUM_OBI_EXHAUST_PERSIST_SECS,
@@ -1466,6 +1490,7 @@ impl Default for DynamicConfig {
             momentum_reversal_persist_secs:       config::MOMENTUM_REVERSAL_PERSIST_SECS,
             momentum_resting_tp_enabled:          config::MOMENTUM_RESTING_TP_ENABLED,
             momentum_catastrophic_persist_secs:   config::MOMENTUM_CATASTROPHIC_PERSIST_SECS,
+            momentum_catastrophic_grace_secs:     config::MOMENTUM_CATASTROPHIC_GRACE_SECS,
             momentum_scaled_sizing_enabled:       config::ENABLE_KELLY_SIZING,
             gboost_planb_exit_posture:            config::GBOOST_PLANB_EXIT_POSTURE,
             gboost_planb_held_exposure_usdc:      config::GBOOST_PLANB_HELD_EXPOSURE_USDC,
@@ -2482,6 +2507,8 @@ mod tests {
             "gboost_planb_exit_posture", "gboost_planb_held_exposure_usdc",
             "gboost_planb_shadow_min_trades", "gboost_planb_shadow_min_win_rate", "gboost_planb_probation_trade_size_usdc",
             "momentum_window_open_warmup_secs",
+            "momentum_event_times_et", "momentum_event_blackout_before_secs", "momentum_event_blackout_after_secs",
+            "momentum_catastrophic_grace_secs",
             "bookline_enabled",
             "bookline_base_edge",
             "bookline_min_edge",
@@ -2531,6 +2558,10 @@ mod tests {
         assert_eq!(cfg.gboost_planb_held_exposure_usdc, config::GBOOST_PLANB_HELD_EXPOSURE_USDC);
         assert_eq!(cfg.gboost_planb_shadow_min_trades, config::GBOOST_PLANB_SHADOW_MIN_TRADES);
         assert_eq!(cfg.momentum_window_open_warmup_secs, config::MOMENTUM_WINDOW_OPEN_WARMUP_SECS);
+        assert_eq!(cfg.momentum_event_times_et, config::MOMENTUM_EVENT_TIMES_ET);
+        assert_eq!(cfg.momentum_event_blackout_before_secs, config::MOMENTUM_EVENT_BLACKOUT_BEFORE_SECS);
+        assert_eq!(cfg.momentum_event_blackout_after_secs, config::MOMENTUM_EVENT_BLACKOUT_AFTER_SECS);
+        assert_eq!(cfg.momentum_catastrophic_grace_secs, config::MOMENTUM_CATASTROPHIC_GRACE_SECS);
         assert_eq!(cfg.bookline_enabled, config::BOOKLINE_ENABLED);
         assert_eq!(cfg.bookline_min_consensus, config::BOOKLINE_MIN_CONSENSUS);
         assert_eq!(cfg.bookline_max_open_markets, config::BOOKLINE_MAX_OPEN_MARKETS);

@@ -660,3 +660,61 @@ mod daily_reference_tests {
         assert_eq!(daily_window_reference_time(close).unwrap(), close - chrono::Duration::hours(24));
     }
 }
+
+/// Weekday Eastern event times from an operator knob such as
+/// `fairvalue_event_times_et` or `momentum_event_times_et`.
+///
+/// "09:30" or "08:30,09:30,14:00". A malformed entry is skipped rather than
+/// failing the viper: a typo in an operator knob should cost one event, not
+/// trading.
+pub fn parse_event_times_et(s: &str) -> Vec<(u32, u32)> {
+    s.split(',')
+        .filter_map(|part| {
+            let (h, m) = part.trim().split_once(':')?;
+            let (h, m) = (h.trim().parse::<u32>().ok()?, m.trim().parse::<u32>().ok()?);
+            (h < 24 && m < 60).then_some((h, m))
+        })
+        .collect()
+}
+
+/// Every scheduled weekday event in `(from, to]`, as UTC instants.
+///
+/// The one place weekdays and daylight saving are decided, so the "event
+/// ahead", "event just passed" and "inside the blackout" questions cannot
+/// disagree. Evaluated in America/New_York so the event moves with the clock
+/// it is scheduled on. Weekends never match: the events this exists for are
+/// the US cash open and the US data releases.
+pub fn weekday_events_between(from: DateTime<Utc>, to: DateTime<Utc>, events: &[(u32, u32)]) -> Vec<DateTime<Utc>> {
+    use chrono::Weekday;
+    use chrono_tz::America::New_York as Et;
+    let mut out = Vec::new();
+    if to <= from || events.is_empty() {
+        return out;
+    }
+    let mut day = from.with_timezone(&Et).date_naive();
+    let last = to.with_timezone(&Et).date_naive();
+    // Bounded: hourly and daily markets span at most a couple of dates.
+    for _ in 0..8 {
+        if day > last {
+            break;
+        }
+        if !matches!(day.weekday(), Weekday::Sat | Weekday::Sun) {
+            for &(h, m) in events {
+                let at = day
+                    .and_hms_opt(h, m, 0)
+                    .and_then(|naive| Et.from_local_datetime(&naive).earliest())
+                    .map(|t| t.with_timezone(&Utc));
+                if let Some(t) = at {
+                    if t > from && t <= to {
+                        out.push(t);
+                    }
+                }
+            }
+        }
+        match day.succ_opt() {
+            Some(next) => day = next,
+            None => break,
+        }
+    }
+    out
+}

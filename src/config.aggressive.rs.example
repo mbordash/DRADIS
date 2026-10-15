@@ -338,6 +338,18 @@ pub const MOMENTUM_REVERSAL_PERSIST_SECS: i64 = 6;
 /// book that reposts a second later. 2026-09-15 trade 37 still exits about 14s
 /// in at $0.52 with this set. Any reading back above the floor resets the clock.
 pub const MOMENTUM_CATASTROPHIC_PERSIST_SECS: i64 = 2;
+/// For this many seconds after a Momentum fill, the catastrophic floor fires
+/// only when the oracle has crossed the strike against the position. A binary
+/// token inside 0.2% of its strike moves twenty cents on a $150 BTC wiggle, so
+/// in the seconds after a fill the floor can be breached by a bounce that has
+/// not touched the thesis: on 2026-10-15 08:30 ET the NO bid went $0.70 to
+/// $0.51 in five seconds while BTC stayed below the strike by $17, the floor
+/// sold at $0.52, and the window settled Down. Once the oracle is through the
+/// strike the floor fires at any age, exactly as before; after the grace it
+/// fires on the mark alone, exactly as before. Positions without a strike (a
+/// reconciled daily token) get no grace. Seeds
+/// `momentum_catastrophic_grace_secs`; 0 restores the old behavior.
+pub const MOMENTUM_CATASTROPHIC_GRACE_SECS: i64 = 45;
 
 /// Take Momentum's profit with a resting post-only ask instead of a taker FAK.
 ///
@@ -659,6 +671,25 @@ pub const MOMENTUM_MARKET_WARMUP_SECS: i64 = 30;
 /// replay tested: an aggressive operator is choosing to trade earlier into a
 /// window, and this profile already makes that trade on the rotation warmup.
 pub const MOMENTUM_WINDOW_OPEN_WARMUP_SECS: i64 = 30;
+
+/// Weekday Eastern times of scheduled releases around which Momentum takes no
+/// new entry. Momentum trades the 1 s and 5 s oracle velocity, and a US data
+/// release (08:30 ET: CPI, PPI, jobless claims, retail sales; 10:00 ET: ISM,
+/// consumer sentiment; 14:00 ET: FOMC) moves BTC 0.5% in four seconds and half
+/// of that back in the next ten. On 2026-10-15 the 08:30 release dropped BTC
+/// from $81,094 to $80,615 by 08:30:04; Momentum bought NO at $0.70 on the
+/// second leg down at 08:30:21 and the bounce five seconds later marked it at
+/// $0.51. The 09:30 cash open is here for the same reason FairValue lists it.
+/// Seeds the `momentum_event_times_et` Control Tower setting.
+pub const MOMENTUM_EVENT_TIMES_ET: &str = "08:30,09:30,10:00,14:00";
+/// Seconds before each scheduled event that the Momentum entry blackout starts.
+/// Seeds `momentum_event_blackout_before_secs`; 0 with the `after` figure at 0
+/// turns the blackout off.
+pub const MOMENTUM_EVENT_BLACKOUT_BEFORE_SECS: i64 = 30;
+/// Seconds after each scheduled event that the Momentum entry blackout lasts.
+/// The release itself lands in the first four seconds; the whipsaw that follows
+/// runs for a minute or two. Seeds `momentum_event_blackout_after_secs`.
+pub const MOMENTUM_EVENT_BLACKOUT_AFTER_SECS: i64 = 90;
 
 
 // ============================================================================

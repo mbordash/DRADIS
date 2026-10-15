@@ -515,6 +515,54 @@ pub fn window_entry_block(
     }
 }
 
+pub const EVENT_BLACKOUT: &str = "scheduled event blackout";
+
+/// The scheduled weekday event whose blackout covers `now`, if any.
+///
+/// An event at Eastern time `E` blocks entries for `now` in
+/// `[E - before_secs, E + after_secs]`. The events are the operator's
+/// `momentum_event_times_et` list, parsed by the caller. Weekends never match.
+/// `before_secs` and `after_secs` both at 0 leave only the event's own second,
+/// which the 50 ms patrol may or may not sample; the knob doc calls that "off".
+pub fn event_blackout(
+    now: chrono::DateTime<chrono::Utc>,
+    events: &[(u32, u32)],
+    before_secs: i64,
+    after_secs: i64,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let before = chrono::Duration::seconds(before_secs.max(0));
+    let after = chrono::Duration::seconds(after_secs.max(0));
+    // `weekday_events_between` is half-open on the left, so step one second
+    // further back to make `E == now - after` count.
+    let from = now - after - chrono::Duration::seconds(1);
+    let to = now + before;
+    crate::helpers::time::weekday_events_between(from, to, events).into_iter().next()
+}
+
+/// Whether the catastrophic floor may act on a position `secs_held` old.
+///
+/// For the first `grace_secs` after the fill the floor needs the oracle to have
+/// crossed the strike against the position: a YES holder needs the oracle below
+/// the strike, a NO holder needs it above. A mark that breaches the floor while
+/// the oracle is still on the position's side is a bounce in a token priced
+/// near its strike, not a broken thesis. After the grace, or with no strike or
+/// no oracle to consult, the floor acts on the mark alone, as it always did.
+pub fn catastrophic_floor_confirmed(
+    is_yes: bool,
+    oracle: Decimal,
+    strike: Option<Decimal>,
+    secs_held: i64,
+    grace_secs: i64,
+) -> bool {
+    if secs_held >= grace_secs {
+        return true;
+    }
+    let (Some(strike), true) = (strike, oracle > dec!(0)) else {
+        return true;
+    };
+    if is_yes { oracle < strike } else { oracle > strike }
+}
+
 pub fn spike_blockers(g: &SpikeGates) -> Vec<&'static str> {
     let mut out = Vec::new();
     match g.strike {
@@ -777,6 +825,28 @@ impl Strategy for MomentumStrategyImpl {
             };
             report_gate(asset, why, why, config::MOMENTUM_GATE_LOG_INTERVAL_SECS, || detail.clone());
             return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Scheduled-event blackout ──────────────────────────────────────────
+        // A US data release moves the oracle half a percent in four seconds and
+        // half of that back in the next ten. The 1 s and 5 s velocity this viper
+        // trades on reads both legs as momentum. 2026-10-15 08:30 ET: the
+        // release dropped BTC $480 by 08:30:04, Momentum bought NO at $0.70 on
+        // the second leg down at 08:30:21, and the bounce five seconds later
+        // marked it at $0.51. Held positions are untouched: every exit rule
+        // below keeps running through the event.
+        {
+            let events = crate::helpers::time::parse_event_times_et(&dc.momentum_event_times_et);
+            if let Some(at) = event_blackout(
+                chrono::Utc::now(), &events,
+                dc.momentum_event_blackout_before_secs, dc.momentum_event_blackout_after_secs,
+            ) {
+                report_gate(asset, EVENT_BLACKOUT, EVENT_BLACKOUT, config::MOMENTUM_GATE_LOG_INTERVAL_SECS, || format!(
+                    "{EVENT_BLACKOUT} | {} ET, {}s before to {}s after",
+                    at.with_timezone(&chrono_tz::US::Eastern).format("%H:%M"),
+                    dc.momentum_event_blackout_before_secs, dc.momentum_event_blackout_after_secs));
+                return Ok(StrategySignal::NoSignal);
+            }
         }
 
         // ── Snapshot staleness gate ───────────────────────────────────────────
@@ -1280,6 +1350,20 @@ impl Strategy for MomentumStrategyImpl {
 
             let secs_held = (chrono::Utc::now() - position.opened_at).num_seconds();
 
+            // Resolve the market this token belongs to (hourly or daily/maker).
+            // Reconciled positions can sit on the maker market even though MomentumStrategy
+            // is normally venue=Hourly.  We need the right market context for exit params
+            // and for the near-expiry check.
+            let is_maker_token = ctx.maker_market.as_ref()
+                .map(|mk| tok == mk.yes_token || tok == mk.no_token)
+                .unwrap_or(false);
+            let exit_market: &crate::state::MarketConfig = if is_maker_token {
+                ctx.maker_market.as_ref().unwrap()
+            } else {
+                &ctx.market
+            };
+            let exit_close_time = exit_market.market_close_time;
+
             // A "catastrophic" stop that is TIGHTER than the normal stop is not an
             // emergency floor, it is a stricter stop that fires first — and it fires
             // during the fill-confirmation window, when the position is underwater by
@@ -1296,6 +1380,13 @@ impl Strategy for MomentumStrategyImpl {
                 && (bid - position.avg_entry) / position.avg_entry <= -catastrophic_sl_pct;
             let floor_persisted_secs = reversal_persisted_secs(
                 &mut self.catastrophic_since.lock().unwrap(), &tok, floor_breached, chrono::Utc::now());
+            // Inside `momentum_catastrophic_grace_secs` of the fill the floor also
+            // needs the oracle through the strike against the position; see
+            // `catastrophic_floor_confirmed`. Decided here so the fill-confirmation
+            // branch below and the floor itself read the same answer.
+            let floor_confirmed = catastrophic_floor_confirmed(
+                tok == exit_market.yes_token, ctx.snapshot.oracle_price, exit_market.strike_price,
+                secs_held, dc.momentum_catastrophic_grace_secs);
 
             // Ghost fills count as confirmed; without this a simulated position
             // sat in the fill-confirmation branch for its entire life, where only
@@ -1309,8 +1400,8 @@ impl Strategy for MomentumStrategyImpl {
                     // the Polymarket indexer to register the balance.
                     // Root cause: 2026-05-13 Trade #3 lost -14% during a 30s lock with
                     // no exit allowed; a catastrophic SL at 8% would have exited at ~5s.
-                    if profit_margin_check > -catastrophic_sl_pct {
-                        continue; // Not catastrophic yet — wait for fill confirmation
+                    if profit_margin_check > -catastrophic_sl_pct || !floor_confirmed {
+                        continue; // Not catastrophic yet (or a bounce inside the grace) — wait for fill confirmation
                     }
                     // Fall through: the catastrophic floor below exits this tick
                 } else {
@@ -1326,19 +1417,6 @@ impl Strategy for MomentumStrategyImpl {
             if avg_entry <= dec!(0) { continue; }
             let profit_margin = (bid - avg_entry) / avg_entry;
 
-            // Resolve the market this token belongs to (hourly or daily/maker).
-            // Reconciled positions can sit on the maker market even though MomentumStrategy
-            // is normally venue=Hourly.  We need the right market context for exit params
-            // and for the near-expiry check.
-            let is_maker_token = ctx.maker_market.as_ref()
-                .map(|mk| tok == mk.yes_token || tok == mk.no_token)
-                .unwrap_or(false);
-            let exit_market: &crate::state::MarketConfig = if is_maker_token {
-                ctx.maker_market.as_ref().unwrap()
-            } else {
-                &ctx.market
-            };
-            let exit_close_time = exit_market.market_close_time;
 
             // Macro: build exit params for this token
             macro_rules! exit_params {
@@ -1375,14 +1453,32 @@ impl Strategy for MomentumStrategyImpl {
             // continuous breach (the clock is advanced above) before it sells: one thin
             // level with the next bid ten cents down must not sell into a book that
             // reposts a second later. Zero bids never reach this point.
+            //
+            // In the first `momentum_catastrophic_grace_secs` after the fill the
+            // floor also needs the oracle through the strike against the position
+            // (`catastrophic_floor_confirmed`). 2026-10-15 08:30 ET: NO bought at
+            // $0.70 five seconds before a bounce marked it at $0.51, with BTC
+            // still $17 below the strike; the floor sold at $0.52 and the window
+            // settled Down. The persistence clock keeps running through the
+            // grace, so a breach that outlives it fires on the next tick.
             if floor_breached && floor_persisted_secs >= dc.momentum_catastrophic_persist_secs {
+                let oracle = ctx.snapshot.oracle_price;
+                let strike = exit_market.strike_price;
+                let is_yes = tok == exit_market.yes_token;
                 let spread = if ask > bid { ask - bid } else { dec!(0) };
                 let age = (chrono::Utc::now() - snap_ts).num_seconds();
-                let reason = format!(
-                    "MomentumCatastrophicSL: bid=${:.4}, loss={:.2}%, held={}s, persisted={}s | ask=${:.4} spread=${:.2} bid_depth={:.0} age={}s",
-                    bid, profit_margin * dec!(100), secs_held, floor_persisted_secs, ask, spread, bid_depth, age,
-                );
-                return Ok(StrategySignal::Exit { params: exit_params!(), reason, exit_pair: false });
+                let strike_txt = strike.map(|k| format!("${k:.2}")).unwrap_or_else(|| "none".into());
+                if !floor_confirmed {
+                    debug!(" Momentum catastrophic floor breached but unconfirmed: bid=${:.4} ({:.2}%) {}s in, oracle=${:.2} still on the {} side of strike {} (grace {}s)",
+                        bid, profit_margin * dec!(100), secs_held, oracle, if is_yes { "YES" } else { "NO" }, strike_txt,
+                        dc.momentum_catastrophic_grace_secs);
+                } else {
+                    let reason = format!(
+                        "MomentumCatastrophicSL: bid=${:.4}, loss={:.2}%, held={}s, persisted={}s | ask=${:.4} spread=${:.2} bid_depth={:.0} age={}s | oracle=${:.2} strike={}",
+                        bid, profit_margin * dec!(100), secs_held, floor_persisted_secs, ask, spread, bid_depth, age, oracle, strike_txt,
+                    );
+                    return Ok(StrategySignal::Exit { params: exit_params!(), reason, exit_pair: false });
+                }
             }
 
             // Near-expiry forced exit
@@ -1742,6 +1838,68 @@ pub fn kelly_momentum_size(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-10-15 08:30 ET, the trade that motivated the blackout: the release
+    /// window should cover both legs of the whipsaw and nothing else.
+    #[test]
+    fn the_release_blackout_covers_the_minute_before_and_two_after() {
+        use chrono::TimeZone;
+        let et = chrono_tz::US::Eastern;
+        let ev = crate::helpers::time::parse_event_times_et("08:30,09:30,10:00,14:00");
+        let at = |h: u32, m: u32, s: u32| et.with_ymd_and_hms(2026, 10, 15, h, m, s).unwrap().with_timezone(&chrono::Utc);
+        let release = at(8, 30, 0);
+        // The entry that lost: 21 s after the release.
+        assert_eq!(event_blackout(at(8, 30, 21), &ev, 60, 120), Some(release));
+        // Both edges, inclusive.
+        assert_eq!(event_blackout(at(8, 29, 0), &ev, 60, 120), Some(release));
+        assert_eq!(event_blackout(at(8, 32, 0), &ev, 60, 120), Some(release));
+        // Just outside either edge.
+        assert_eq!(event_blackout(at(8, 28, 59), &ev, 60, 120), None);
+        assert_eq!(event_blackout(at(8, 32, 1), &ev, 60, 120), None);
+        // Between events nothing blocks; the next event blocks on its own schedule.
+        assert_eq!(event_blackout(at(9, 0, 0), &ev, 60, 120), None);
+        assert_eq!(event_blackout(at(13, 59, 30), &ev, 60, 120), Some(at(14, 0, 0)));
+    }
+
+    /// Weekends have no releases, an empty list blocks nothing, and a
+    /// negative figure from a mis-set knob reads as zero.
+    #[test]
+    fn the_release_blackout_skips_weekends_and_empty_lists() {
+        use chrono::TimeZone;
+        let et = chrono_tz::US::Eastern;
+        let ev = crate::helpers::time::parse_event_times_et("08:30");
+        // 2026-10-17 is a Saturday.
+        let sat = et.with_ymd_and_hms(2026, 10, 17, 8, 30, 10).unwrap().with_timezone(&chrono::Utc);
+        assert_eq!(event_blackout(sat, &ev, 60, 120), None);
+        let thu = et.with_ymd_and_hms(2026, 10, 15, 8, 30, 10).unwrap().with_timezone(&chrono::Utc);
+        assert_eq!(event_blackout(thu, &[], 60, 120), None);
+        assert_eq!(event_blackout(thu, &ev, -5, -5), None);
+        assert_eq!(event_blackout(thu, &ev, 0, 10), Some(thu - chrono::Duration::seconds(10)));
+    }
+
+    /// The 2026-10-15 stop: NO at $0.70, bid $0.51 five seconds in, BTC $17
+    /// below the strike. Inside the grace the floor waits; through the strike,
+    /// or past the grace, it fires as before.
+    #[test]
+    fn the_catastrophic_floor_waits_for_the_oracle_inside_the_grace() {
+        let strike = Some(dec!(80980.01));
+        // NO holder, oracle still below the strike, 5 s in: a bounce, not a break.
+        assert!(!catastrophic_floor_confirmed(false, dec!(80963.06), strike, 5, 30));
+        // Oracle through the strike against a NO holder: fires at any age.
+        assert!(catastrophic_floor_confirmed(false, dec!(80990.00), strike, 5, 30));
+        // YES holder mirrors it.
+        assert!(!catastrophic_floor_confirmed(true, dec!(80990.00), strike, 5, 30));
+        assert!(catastrophic_floor_confirmed(true, dec!(80963.06), strike, 5, 30));
+        // Exactly at the strike is not through it.
+        assert!(!catastrophic_floor_confirmed(false, dec!(80980.01), strike, 5, 30));
+        // Past the grace the mark alone decides.
+        assert!(catastrophic_floor_confirmed(false, dec!(80963.06), strike, 30, 30));
+        // No strike (a reconciled daily token) or no oracle: no grace.
+        assert!(catastrophic_floor_confirmed(false, dec!(80963.06), None, 5, 30));
+        assert!(catastrophic_floor_confirmed(false, dec!(0), strike, 5, 30));
+        // Grace 0 restores the old behavior.
+        assert!(catastrophic_floor_confirmed(false, dec!(80963.06), strike, 0, 0));
+    }
     use crate::helpers::dynamic_config::DynamicConfig;
 
     fn clean_bull_spike() -> SpikeGates {
@@ -2504,6 +2662,10 @@ mod tests {
     /// The floor must act inside that hold, confirmed or not, once the breach has
     /// persisted; a single reading must not sell, a recovery resets the clock, an
     /// ordinary dip inside the hold still waits, and an empty bid never triggers it.
+    ///
+    /// The fixture's oracle sits exactly on the strike, which the grace rule reads
+    /// as "not through it", so the cases inside the grace move the oracle back
+    /// below the strike, as the reversal that trade 37 rode actually did.
     #[tokio::test]
     async fn the_catastrophic_floor_exits_inside_the_stop_hold() {
         let mut dc = plan();
@@ -2512,7 +2674,8 @@ mod tests {
         // Confirmed fill, 12 s held, bid $0.52 against a $0.63 entry. The first
         // reading past the floor only starts the clock.
         let strat = MomentumStrategyImpl::default();
-        let c = ctx(book(dec!(0.52), dec!(0.54)), dc.clone());
+        let mut c = ctx(book(dec!(0.52), dec!(0.54)), dc.clone());
+        c.snapshot.oracle_price = dec!(64900); // the spike reversed back through the strike
         hold_yes(&c, dec!(0.63), dec!(7.11), 12, true).await;
         let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
         assert!(!matches!(sig, StrategySignal::Exit { .. }), "one reading past the floor must not sell, got {sig:?}");
@@ -2529,6 +2692,38 @@ mod tests {
         assert!(!params.post_only && params.order_type == TimeInForce::Fak, "the floor crosses");
         assert!(reason.starts_with("MomentumCatastrophicSL: bid=$0.5200, loss=-17.46%, held="), "{reason}");
         assert!(reason.contains("persisted=3s | ask=$0.5400 spread=$0.02 bid_depth=100 age="), "{reason}");
+        assert!(reason.ends_with("| oracle=$64900.00 strike=$65000.00"), "{reason}");
+
+        // The same breach with the oracle still on the position's side of the
+        // strike (2026-10-15 08:30 ET: NO at $0.70 marked $0.51 five seconds in,
+        // BTC $17 short of the strike) waits out the grace, clock still running,
+        // and fires on the mark alone once the grace has passed.
+        let strat = MomentumStrategyImpl::default();
+        let mut c = ctx(book(dec!(0.52), dec!(0.54)), dc.clone());
+        c.snapshot.oracle_price = dec!(65100);
+        hold_yes(&c, dec!(0.63), dec!(7.11), 12, true).await;
+        floor_breached_since(&strat, &c.market.yes_token, 3);
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        assert!(!matches!(sig, StrategySignal::Exit { .. }), "inside the grace with the oracle on side, the floor must wait, got {sig:?}");
+        assert!(strat.catastrophic_since.lock().unwrap().contains_key(&c.market.yes_token), "the clock keeps running through the grace");
+        let strat = MomentumStrategyImpl::default();
+        let mut c = ctx(book(dec!(0.52), dec!(0.54)), dc.clone());
+        c.snapshot.oracle_price = dec!(65100);
+        hold_yes(&c, dec!(0.63), dec!(7.11), dc.momentum_catastrophic_grace_secs, true).await;
+        floor_breached_since(&strat, &c.market.yes_token, 3);
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        let StrategySignal::Exit { reason, .. } = sig else { panic!("past the grace the mark alone must exit, got {sig:?}"); };
+        assert!(reason.starts_with("MomentumCatastrophicSL: bid=$0.5200"), "{reason}");
+        // Grace 0 restores the old rule: the mark alone, at any age.
+        let mut dcg = plan();
+        dcg.momentum_catastrophic_grace_secs = 0;
+        let strat = MomentumStrategyImpl::default();
+        let mut c = ctx(book(dec!(0.52), dec!(0.54)), dcg);
+        c.snapshot.oracle_price = dec!(65100);
+        hold_yes(&c, dec!(0.63), dec!(7.11), 5, true).await;
+        floor_breached_since(&strat, &c.market.yes_token, 3);
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        assert!(matches!(sig, StrategySignal::Exit { .. }), "grace 0 must fire on the mark alone, got {sig:?}");
 
         // A reading back above the floor resets the clock, so the next breach starts over.
         let strat = MomentumStrategyImpl::default();
@@ -2541,7 +2736,8 @@ mod tests {
 
         // Unconfirmed fill, 5 s held, breach persisted: the escape the fill-confirmation branch promises.
         let strat = MomentumStrategyImpl::default();
-        let c = ctx(book(dec!(0.52), dec!(0.54)), dc.clone());
+        let mut c = ctx(book(dec!(0.52), dec!(0.54)), dc.clone());
+        c.snapshot.oracle_price = dec!(64900);
         hold_yes(&c, dec!(0.63), dec!(7.11), 5, false).await;
         floor_breached_since(&strat, &c.market.yes_token, 3);
         let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
@@ -2575,7 +2771,8 @@ mod tests {
         let mut dc0 = plan();
         dc0.momentum_catastrophic_persist_secs = 0;
         let strat = MomentumStrategyImpl::default();
-        let c = ctx(book(dec!(0.52), dec!(0.54)), dc0);
+        let mut c = ctx(book(dec!(0.52), dec!(0.54)), dc0);
+        c.snapshot.oracle_price = dec!(64900);
         hold_yes(&c, dec!(0.63), dec!(7.11), 12, true).await;
         let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
         assert!(matches!(sig, StrategySignal::Exit { .. }), "persistence 0 must fire on the first reading, got {sig:?}");

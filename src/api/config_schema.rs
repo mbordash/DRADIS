@@ -339,6 +339,20 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              likely to be the open's own noise rather than a move: on 2026-09-24 Momentum bought six seconds \
              into a window and gave back 23% in under a minute. 0 restores the old behavior."
         ).min(0.0).step(1.0).unit("s"));
+        v.push(F::new(g, e, "momentum_event_times_et", "Event Times (ET)", "string", true,
+            "Weekday Eastern times of scheduled releases, \"HH:MM\" comma-separated, around which Momentum takes no \
+             new entry: 08:30 (CPI, PPI, jobless claims, retail sales), 09:30 (US cash open), 10:00 (ISM, consumer \
+             sentiment), 14:00 (FOMC). Momentum trades the 1 s and 5 s oracle velocity, and a release moves BTC half \
+             a percent in four seconds and half of that back in the next ten: on 2026-10-15 the 08:30 release had \
+             Momentum buy NO at $0.70 on the second leg down and marked at $0.51 five seconds later. Weekends never \
+             match. Malformed entries are ignored; an empty list turns the blackout off."));
+        v.push(F::new(g, e, "momentum_event_blackout_before_secs", "Event Blackout Before", "secs", true,
+            "How long before each Event Time the entry blackout starts. Positions already held are not touched; \
+             every exit rule keeps running through the event.").range(0.0, 900.0).step(10.0).unit("s"));
+        v.push(F::new(g, e, "momentum_event_blackout_after_secs", "Event Blackout After", "secs", true,
+            "How long after each Event Time the entry blackout lasts. The release lands in the first four seconds; \
+             the whipsaw that follows runs a minute or two. 0 here and 0 before turns the blackout off."
+            ).range(0.0, 1800.0).step(10.0).unit("s"));
         v.push(F::new(g, e, "momentum_deriv_gate_enabled", "Deriv Gate Enforce", "bool", true,
             "Derivatives-Raptor confirmation gate: block entries the perp book contradicts (counter CVD flow or hard \
              OI unwind). Inert when OI/CVD report no data. Observe-first: the verdict (pass, would veto, no data) is \
@@ -401,6 +415,14 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              The catastrophic stop acts at any hold time, inside the stop-loss's minimum hold, so this keeps a single \
              thin top-of-book reading from selling into a book that reposts a second later. Any reading back above \
              the floor resets the clock. 0 fires on the first reading.").range(0.0, 30.0).step(1.0).unit("s"));
+        v.push(F::new(g, e, "momentum_catastrophic_grace_secs", "Catastrophic Grace", "secs", true,
+            "For this many seconds after a fill the Catastrophic Stop fires only when the oracle has crossed the strike \
+             against the position. A binary token inside 0.2% of its strike moves twenty cents on a $150 BTC wiggle, \
+             so in the seconds after a fill the floor can be breached by a bounce that never touched the thesis: on \
+             2026-10-15 08:30 ET the NO bid went $0.70 to $0.51 in five seconds while BTC stayed below the strike by \
+             $17, the floor sold at $0.52, and the window settled Down. Once the oracle is through the strike the \
+             floor fires at any age, as before; after the grace it fires on the mark alone, as before. Positions \
+             without a strike get no grace. 0 restores the old behavior.").range(0.0, 120.0).step(5.0).unit("s"));
         v.push(F::new(g, e, "momentum_scaled_sizing_enabled", "Scaled Sizing", "bool", true,
             "On: scale each trade between Min Size and Max Size by the strength of the oracle move that triggered it. \
              Off: every trade uses Min Size. The strongest moves are often the most exhausted, so flat sizing is the \
