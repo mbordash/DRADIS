@@ -127,8 +127,9 @@ Parameters:
     Default: t3.medium
     AllowedValues:
       # t3.small (2 GB) is deliberately absent: the GBoost model training that
-      # every instance runs peaks at 1.2 to 2 GB beside the engine, and the
-      # engine refuses to train unless 2 GB is free; a t3.small has about 1 GB.
+      # every instance runs is bounded to 0.5 GB of booster memory beside the
+      # engine, and the engine refuses to train unless 2 GB is free; a t3.small
+      # has about 1 GB.
       - t3.medium
       - t3.large
       - c5.large
@@ -150,7 +151,7 @@ Parameters:
 Mappings:
   RegionMap:
     us-east-1:
-      AMI: ami-036142ba6369232ea
+      AMI: ami-04011c4eb397941ed
 
 Conditions:
   PreselectVenue: !Not [!Equals [!Ref VenueSelection, choose-in-the-control-tower]]
