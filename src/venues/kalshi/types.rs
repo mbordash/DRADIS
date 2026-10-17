@@ -144,6 +144,13 @@ pub struct KalshiMarket {
 }
 
 impl KalshiMarket {
+    /// Market open time, parsed; `None` when the venue did not publish one.
+    pub fn open_time_utc(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.open_time
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .ok()
+    }
+
     /// Market close time, parsed.
     pub fn close_time_utc(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         self.close_time

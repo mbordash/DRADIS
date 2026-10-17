@@ -651,6 +651,14 @@ async fn run() -> Result<()> {
         match dradis::venues::us::UsRetailVenue::connect(Arc::clone(&shared_http)).await {
             Ok(venue) => {
                 let venue = Arc::new(venue);
+                // The venue's own settlement answers the shadow lane's questions.
+                {
+                    let v = Arc::clone(&venue);
+                    dradis::venues::core::install_resolver(Arc::new(move |_cid: String, leg| {
+                        let v = Arc::clone(&v);
+                        Box::pin(async move { v.settlement_for_sports(leg.as_str()).await }) as dradis::venues::core::ResolverFuture
+                    }));
+                }
                 use dradis::venues::core::Execution as _;
                 match venue.collateral().await {
                     Ok(c)  => tracing::info!("✅ US retail venue connected — available margin ${:.2}", c),
@@ -736,6 +744,14 @@ async fn run() -> Result<()> {
         match dradis::venues::kalshi::KalshiVenue::from_env() {
             Ok(venue) => {
                 let venue = Arc::new(venue);
+                // The venue's own settlement answers the shadow lane's questions.
+                {
+                    let v = Arc::clone(&venue);
+                    dradis::venues::core::install_resolver(Arc::new(move |_cid: String, leg| {
+                        let v = Arc::clone(&v);
+                        Box::pin(async move { v.settlement_resolution(leg.as_str()).await }) as dradis::venues::core::ResolverFuture
+                    }));
+                }
                 use dradis::venues::core::Execution as _;
                 match venue.collateral().await {
                     Ok(c)  => tracing::info!("✅ Kalshi venue connected — balance ${:.2}", c),
@@ -1153,6 +1169,21 @@ async fn run() -> Result<()> {
             cancel:         loop_cancel.clone(),
         };
 
+        // Polymarket International settles through Gamma, keyed by condition id.
+        // Installed once (the registry keeps the first); every asset loop shares it.
+        {
+            let http = Arc::clone(&shared_http);
+            dradis::venues::core::install_resolver(Arc::new(move |cid: String, leg| {
+                let http = Arc::clone(&http);
+                Box::pin(async move {
+                    let got = dradis::raptors::sports_ledger::settled_prices_for_market(&http, &cid, std::slice::from_ref(&leg.to_string())).await;
+                    match got.get(leg.as_str()).copied().and_then(|p| rust_decimal::Decimal::try_from(p).ok()) {
+                        Some(px) => dradis::venues::core::TokenResolution::Resolved(px),
+                        None => dradis::venues::core::TokenResolution::Unknown,
+                    }
+                }) as dradis::venues::core::ResolverFuture
+            }));
+        }
         info!(" Spawning market loop for asset: {}", asset.to_uppercase());
         let handle = tokio::spawn(run_market_loop(args));
 

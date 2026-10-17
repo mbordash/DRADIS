@@ -316,6 +316,9 @@ export interface ConfigFieldSchema {
   max:         number | null;
   step:        number | null;
   advanced:    boolean;         // false → Basic panel, true → Advanced modal
+  /** Market classes this field applies to; absent or null means every class.
+   *  A viper card on a squadron of another class leaves the field out. */
+  market_classes?: string[] | null;
   /**
    * Which config row this field lives in. 'global' fields are written by
    * PATCH /api/config and read instance-wide; 'squadron' fields are written by

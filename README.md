@@ -184,14 +184,18 @@ ASSETS=kalshi                            # keep the dashboard pool tidy (data in
 ```
 
 > **Kalshi status:** the loop (`src/venues/kalshi/trader.rs`) is **crypto-first** —
-> it discovers the open markets across the configured series (15-minute and
-> daily BTC/ETH by default), flies the highest-volume 15-minute market as the
-> primary with a daily market on the same coin beside it for the slower Vipers,
-> classifies both via the shared taxonomy, and runs all nine crypto Vipers with the
-> full Raptor intelligence stack. GBoost scores only one-hour markets, the shape its
-> model is trained on, so on the default 15-minute and daily series it idles and
-> says so; on an hourly series it scores, and a model stamped for another venue
-> trades the shadow lane until one stamped for Kalshi passes the holdout. Order books stream over the
+> it discovers the open markets across the configured series (`KXBTC15M` and
+> `KXBTCD` for BTC, their ETH twins, by default), reads each market's window from
+> its published open and close, and flies the hottest market of the best shape as
+> the primary: Kalshi's one-hour above/below listing when one is on the board
+> (`KXBTCD` carries both an hourly and a daily listing), the 15-minute market
+> otherwise, with the daily market on the same coin beside it for the slower
+> Vipers. It classifies both via the shared taxonomy and runs all nine crypto
+> Vipers with the full Raptor intelligence stack. GBoost scores one-hour markets,
+> the shape its model is trained on, so it idles and says so between hourly
+> listings; a model stamped for another venue trades the shadow lane, settling
+> through the venue's own resolution, until one stamped for Kalshi passes the
+> holdout. Order books stream over the
 > authenticated WebSocket (`orderbook_delta` with sequence-gap recovery) and fills
 > confirm event-precisely via the private `fill` channel. Kalshi's quadratic taker
 > fee (max 1.75¢/contract at P=0.50) is priced into Viper edge thresholds. Positions
@@ -980,7 +984,7 @@ setup for why write-capable tools are gated behind future work.
 
 **Does DRADIS support the US Polymarket API?** Yes.  Polymarket's **US platform** is a separate, custodial, CFTC-regulated exchange with web2 auth (API key / secret / session token) and string/UUID market IDs. We have **venue abstraction** so a build targets one venue via a Cargo feature flag (`intl_clob` default, `us_retail`, `kalshi`) — single-venue per binary, so the US deployment carries none of the Polygon crypto weight and stays inside its own regulatory/network footprint. Start a US build with `VENUE=us ./start-local.sh`.
 
-**What about Kalshi?** Fully supported. Build with `--features kalshi` (or `VENUE=kalshi ./start-local.sh`) — RSA-PSS signed REST + WebSocket, crypto-first trading loop over Kalshi's 15-minute and daily BTC/ETH series, all nine crypto Vipers with the full Raptor stack (GBoost scores one-hour markets only, see above), and event-precise fill confirmation. Paper-trade it risk-free against [demo.kalshi.co](https://demo.kalshi.co) with `KALSHI_DEMO=1`. See "Kalshi configuration" above.
+**What about Kalshi?** Fully supported. Build with `--features kalshi` (or `VENUE=kalshi ./start-local.sh`) — RSA-PSS signed REST + WebSocket, crypto-first trading loop over Kalshi's hourly, 15-minute and daily BTC/ETH series (the one-hour market is preferred when listed), all nine crypto Vipers with the full Raptor stack (GBoost scores one-hour markets only, see above), and event-precise fill confirmation. Paper-trade it risk-free against [demo.kalshi.co](https://demo.kalshi.co) with `KALSHI_DEMO=1`. See "Kalshi configuration" above.
 
 **Control Tower shows "Offline"?** Check: (1) DRADIS running? (2) `curl http://localhost:9000/api/health`? (3) Docker — same `dradis-net` network?
 

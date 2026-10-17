@@ -558,6 +558,7 @@ export default function SquadronDetailView({ squadron, onBack, onOpenMarket }: P
                   // named one market and the viper cards another.
                   market={status?.strategy_markets[`${squadron.id}:${v.statusKey}`]}
                   status={statusByStrategy.get(v.strategyName)}
+                  marketClass={squadron.market_class}
                 />
               ))}
             </div>

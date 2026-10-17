@@ -143,6 +143,12 @@ pub struct ConfigFieldSchema {
     /// the post-pass at the end of `config_schema()` from the field's group, so
     /// a field cannot declare a scope that contradicts where it renders.
     pub scope: ConfigScope,
+    /// The market classes this field means anything on, or `None` for every
+    /// class. A viper card on a squadron of another class leaves the field out:
+    /// FairValue's sports lane has no meaning on a crypto squadron, and showing
+    /// it there (production, 2026-10-17) reads as a switch the operator should
+    /// understand when it is one they can safely ignore.
+    pub market_classes: Option<&'static [&'static str]>,
 }
 
 impl ConfigFieldSchema {
@@ -162,8 +168,10 @@ impl ConfigFieldSchema {
             // Placeholder; the post-pass at the end of `config_schema()` resolves
             // it from the group so the two can never disagree.
             scope: ConfigScope::Squadron,
+            market_classes: None,
         }
     }
+    fn classes(mut self, classes: &'static [&'static str]) -> Self { self.market_classes = Some(classes); self }
     fn range(mut self, min: f64, max: f64) -> Self { self.min = Some(min); self.max = Some(max); self }
     fn min(mut self, min: f64) -> Self { self.min = Some(min); self }
     fn step(mut self, step: f64) -> Self { self.step = Some(step); self }
@@ -1184,17 +1192,17 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(sports, None, "sports_ledger_enabled", "Enabled", "bool", false,
             "Record the sportsbook consensus against the venue's prices for every matched sports moneyline, and each market's resolution. This fills the bookmaker board every sports Viper reads, and the sports squadron is only deployed onto a game the board can price: with this off there is no sports squadron. While on, it owns The Odds API budget. Enable it on ONE DRADIS instance per Odds API key: each instance budgets as if it had the whole quota."));
         v.push(F::new("FairValue", None, "enable_sports_fairvalue", "Sports Lane", "bool", false,
-            "Let FairValue price a sports moneyline from the bookmaker consensus instead of its crypto model, which needs a strike, an oracle and a volatility estimate a game does not have. Needs the Sports Line Ledger on and an Odds API key: without a line the viper simply idles. Off by default because the favorite-side hypothesis is still gathering its sample."));
+            "Let FairValue price a sports moneyline from the bookmaker consensus instead of its crypto model, which needs a strike, an oracle and a volatility estimate a game does not have. Needs the Sports Line Ledger on and an Odds API key: without a line the viper simply idles. Off by default because the favorite-side hypothesis is still gathering its sample.").classes(&["sports"]));
         v.push(F::new("FairValue", Some("enable_sports_fairvalue"), "sports_fairvalue_min_edge", "Sports Min Edge", "price", true,
-            "Smallest consensus-minus-ask gap FairValue will enter a sports market on. Polymarket sits AT consensus pre-game on average (mean gap under a cent), so a small number here does not mean more trades, it means acting on noise."));
+            "Smallest consensus-minus-ask gap FairValue will enter a sports market on. Polymarket sits AT consensus pre-game on average (mean gap under a cent), so a small number here does not mean more trades, it means acting on noise.").classes(&["sports"]));
         v.push(F::new("Sports Lines", None, "sports_line_max_age_secs", "Max Line Age", "int", true,
             "A board line older than this is not acted on by any consumer. The odds are read on a snapshot schedule, not continuously, so a line minutes old describes a different game state."));
         v.push(F::new("Sports Lines", None, "sports_line_min_books", "Min Books", "int", true,
             "Fewest bookmakers behind a consensus a consumer will act on. A two-book consensus is one book's opinion plus a de-vig artifact: books quoting identical odds de-vig differently because their overrounds differ."));
         v.push(F::new("Maker", Some("enable_maker"), "sports_maker_max_dispersion", "Sports Max Dispersion", "price", true,
-            "Maker will not quote a game whose books disagree by more than this (highest minus lowest book probability). A wide line is a soft line: the books themselves do not know the price, so a passive quote is likelier to be picked off than filled."));
+            "Maker will not quote a game whose books disagree by more than this (highest minus lowest book probability). A wide line is a soft line: the books themselves do not know the price, so a passive quote is likelier to be picked off than filled.").classes(&["sports"]));
         v.push(F::new("FairValue", Some("enable_sports_fairvalue"), "sports_fairvalue_min_consensus", "Sports Favorite Floor", "price", true,
-            "Smallest bookmaker consensus a sports FairValue entry will buy. The pre-registered hypothesis is favorite-side only (0.55 and above); the longshot side is its declared negative control, and the de-vig method inflates consensus exactly there, so cheap outcomes show an 'edge' that is an artifact. Setting this below 0.55 trades outside the hypothesis the evidence is being gathered for."));
+            "Smallest bookmaker consensus a sports FairValue entry will buy. The pre-registered hypothesis is favorite-side only (0.55 and above); the longshot side is its declared negative control, and the de-vig method inflates consensus exactly there, so cheap outcomes show an 'edge' that is an artifact. Setting this below 0.55 trades outside the hypothesis the evidence is being gathered for.").classes(&["sports"]));
         // ── Bookline (sports, maker-first, ghost-only) ────────────────────────
         // MUST equal the Control Tower card name in `VIPER_DEFS`: both ViperCard and
         // the advanced modal filter on `group === viper.name`, so "Bookline Viper"
@@ -1329,11 +1337,11 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              a claim the sample cannot support. Thirty is defensible; ten is not.")
             .min(1.0).step(1.0));
         v.push(F::new("FairValue", Some("enable_sports_fairvalue"), "sports_fairvalue_max_dispersion", "Sports Max Dispersion", "price", true,
-            "Widest book disagreement (highest minus lowest book probability) a sports FairValue entry will accept. A wide line is a soft line: if the books do not agree what the game is worth, neither does the consensus derived from them."));
+            "Widest book disagreement (highest minus lowest book probability) a sports FairValue entry will accept. A wide line is a soft line: if the books do not agree what the game is worth, neither does the consensus derived from them.").classes(&["sports"]));
         v.push(F::new("FairValue", Some("enable_sports_fairvalue"), "sports_fairvalue_settle_hold", "Sports Hold To Settlement", "bool", true,
-            "Hold a sports position to settlement rather than stopping it out on price. The evidence being gathered is for a hold-to-settlement thesis, so a percentage stop measures a different strategy: a 0.70 favorite dipping to 0.60 on one bad drive is a 14% mark against a position the thesis says to hold. The catastrophic floor stays armed as insurance against a stale line."));
+            "Hold a sports position to settlement rather than stopping it out on price. The evidence being gathered is for a hold-to-settlement thesis, so a percentage stop measures a different strategy: a 0.70 favorite dipping to 0.60 on one bad drive is a 14% mark against a position the thesis says to hold. The catastrophic floor stays armed as insurance against a stale line.").classes(&["sports"]));
         v.push(F::new("FairValue", Some("enable_sports_fairvalue"), "sports_fairvalue_catastrophic_armed", "Sports Catastrophic Floor", "bool", true,
-            "Keep the catastrophic floor armed on a sports position. The hypothesis being measured is hold-to-settlement with no stop at all, so a run that means to reproduce it exactly can disarm even this. Left on by default: a line that goes stale mid-game is the case the floor exists for."));
+            "Keep the catastrophic floor armed on a sports position. The hypothesis being measured is hold-to-settlement with no stop at all, so a run that means to reproduce it exactly can disarm even this. Left on by default: a line that goes stale mid-game is the case the floor exists for.").classes(&["sports"]));
         v.push(F::new(sports, None, "sports_ledger_leagues", "Leagues", "string", true,
             "Comma-separated code=sport_key pairs mapping Polymarket's league code (Gamma /sports, e.g. mlb, fl1) to The Odds API sport key (e.g. baseball_mlb). Discovery is free; only snapshots cost credits. ⚠️ Not validated — an unknown code or key simply matches no games."));
         v.push(F::new(sports, None, "sports_ledger_snapshot_offsets_mins", "Snapshot Offsets", "string", true,
@@ -1785,3 +1793,28 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod market_class_tests {
+    use super::*;
+
+    /// A sports-only field on a viper card is scoped to sports squadrons, so a
+    /// crypto squadron's card does not offer it. Instance-level sports settings
+    /// (the Deployment group, the Sports Raptor card) are not viper-card fields
+    /// and stay unscoped.
+    #[test]
+    fn sports_only_viper_fields_are_scoped_to_sports_squadrons() {
+        let viper_groups = ["FairValue", "Maker", "Arbitrage", "Momentum", "Time Decay", "Basis", "GBoost", "TrendReversal", "Convergence", "Bookline"];
+        for f in config_schema() {
+            let sportsy = f.key.starts_with("sports_") || f.key == "enable_sports_fairvalue";
+            if sportsy && viper_groups.contains(&f.group) {
+                assert_eq!(f.market_classes, Some(&["sports"][..]), "{} in group {} should be sports-only", f.key, f.group);
+            }
+        }
+        let lane = config_schema().into_iter().find(|f| f.key == "enable_sports_fairvalue").unwrap();
+        assert_eq!(lane.market_classes, Some(&["sports"][..]));
+        let crypto = config_schema().into_iter().find(|f| f.key == "fairvalue_entry_window_secs").unwrap();
+        assert_eq!(crypto.market_classes, None, "a field with no class list renders everywhere");
+    }
+}
+

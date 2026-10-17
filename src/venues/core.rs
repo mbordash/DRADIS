@@ -821,3 +821,52 @@ mod leg_book_tests {
         assert_eq!(no.mirrored(), yes, "mirroring twice is the identity");
     }
 }
+
+// ── Resolution hook ───────────────────────────────────────────────────────────
+//
+// A viper that simulates trades (GBoost's shadow lane) needs the venue's own
+// settlement for a leg once its market has closed, and vipers never hold a venue
+// handle: the orchestrator is venue-neutral by construction. Each venue's runner
+// installs one resolver at startup and the viper asks through it. Until
+// 2026-10-17 the shadow lane asked Polymarket's Gamma directly, keyed by a
+// condition id that only that venue has, so on Kalshi every simulated trade sat
+// unresolved and was written off unscored after a day.
+
+/// The venue's answer for one leg: `market_ref` is the venue's market handle as
+/// the viper recorded it (the condition id on Polymarket International, unused
+/// elsewhere), `leg` the token.
+pub type ResolverFuture = std::pin::Pin<Box<dyn std::future::Future<Output = TokenResolution> + Send>>;
+pub type Resolver = std::sync::Arc<dyn Fn(String, MarketId) -> ResolverFuture + Send + Sync>;
+
+static RESOLVER: std::sync::OnceLock<Resolver> = std::sync::OnceLock::new();
+
+/// Install this build's resolver. The first installer wins; a later call is a
+/// no-op, so a venue runner that restarts does not replace a working hook.
+pub fn install_resolver(resolver: Resolver) {
+    let _ = RESOLVER.set(resolver);
+}
+
+/// Ask the venue what `leg` settled at. `None` when no resolver is installed:
+/// the caller treats that as "not resolved yet", which is the honest reading of
+/// an unanswered question (B43), never as a price.
+pub async fn resolve_leg(market_ref: &str, leg: &MarketId) -> Option<TokenResolution> {
+    let r = RESOLVER.get()?.clone();
+    Some(r(market_ref.to_string(), leg.clone()).await)
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    use super::*;
+
+    /// With no resolver installed the answer is `None`, not a price. (The
+    /// registry is process-wide, so this test must not install one.)
+    #[tokio::test]
+    async fn no_resolver_means_no_answer() {
+        // Another test in this process may have installed one; only assert the
+        // shape of the answer when none has.
+        if RESOLVER.get().is_none() {
+            assert!(resolve_leg("cid", &MarketId::new("t")).await.is_none());
+        }
+    }
+}
+

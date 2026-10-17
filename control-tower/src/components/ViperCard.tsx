@@ -17,6 +17,7 @@
 // with this program. If not, see <https://www.gnu.org/licenses/>.
 
 import { useState, useCallback } from 'react';
+import { fieldAppliesTo } from '@/lib/fieldScope';
 import useSWR from 'swr';
 import type { DynamicConfig, ViperDef, ConfigFieldSchema, FieldType } from '@/lib/types';
 import { toDisplay, fromDisplay, fieldUnit, NO_MARKET_LABEL } from '@/lib/types';
@@ -277,9 +278,12 @@ interface Props {
   market?: string;
   /** This viper's row from /api/vipers/status, if the engine has evaluated it. */
   status?: ViperStatusRow;
+  /** The squadron's market class (crypto, sports, politics). Fields the schema
+   *  scopes to other classes are left off this card; unknown shows everything. */
+  marketClass?: string | null;
 }
 
-export default function ViperCard({ viper, config, onPatch, market, status }: Props) {
+export default function ViperCard({ viper, config, onPatch, market, status, marketClass }: Props) {
   const [toggling, setToggling] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const enabled  = config[viper.enableKey] as boolean;
@@ -292,12 +296,12 @@ export default function ViperCard({ viper, config, onPatch, market, status }: Pr
     revalidateOnFocus: false,
   });
   const basicFields = schema.filter(
-    f => f.group === viper.name && !f.advanced && f.type !== 'bool',
+    f => f.group === viper.name && !f.advanced && f.type !== 'bool' && fieldAppliesTo(f, marketClass),
   );
   // Bools too, minus the card's own on/off switch, which is rendered in the
   // header. Without this they appear nowhere in the UI at all.
   const basicBools = schema.filter(
-    f => f.group === viper.name && !f.advanced && f.type === 'bool' && f.key !== viper.enableKey,
+    f => f.group === viper.name && !f.advanced && f.type === 'bool' && f.key !== viper.enableKey && fieldAppliesTo(f, marketClass),
   );
 
   const [toggleErr, setToggleErr] = useState<string | null>(null);
@@ -502,6 +506,7 @@ export default function ViperCard({ viper, config, onPatch, market, status }: Pr
           onPatch={onPatch}
           onClose={() => setShowAdvanced(false)}
           enabled={enabled}
+          marketClass={marketClass}
         />
       )}
     </div>

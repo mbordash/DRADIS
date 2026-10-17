@@ -17,6 +17,7 @@
 // with this program. If not, see <https://www.gnu.org/licenses/>.
 
 import { useState, useCallback, useEffect } from 'react';
+import { fieldAppliesTo } from '@/lib/fieldScope';
 import useSWR from 'swr';
 import type { DynamicConfig, ConfigFieldSchema } from '@/lib/types';
 import { getConfigSchema, refusalText } from '@/lib/api';
@@ -189,9 +190,11 @@ interface Props {
   onPatch:   (patch: Partial<DynamicConfig>) => Promise<void>;
   onClose:   () => void;
   enabled:   boolean;
+  /** The squadron's market class; fields scoped to other classes are left out. */
+  marketClass?: string | null;
 }
 
-export default function AdvancedConfigModal({ viperName, config, onPatch, onClose, enabled }: Props) {
+export default function AdvancedConfigModal({ viperName, config, onPatch, onClose, enabled, marketClass }: Props) {
   const { data: schema = [], isLoading, error } = useSWR('config-schema', getConfigSchema, {
     revalidateOnFocus: false,
   });
@@ -203,7 +206,7 @@ export default function AdvancedConfigModal({ viperName, config, onPatch, onClos
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
 
-  const fields = schema.filter(f => f.group === viperName && f.advanced);
+  const fields = schema.filter(f => f.group === viperName && f.advanced && fieldAppliesTo(f, marketClass));
 
   return (
     <div

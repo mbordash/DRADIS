@@ -110,22 +110,44 @@ pub const KALSHI_ASSET: &str = "kalshi";
 /// Runtime venue identity persisted on every trade and entry row.
 pub const KALSHI_VENUE: &str = "kalshi";
 
-/// Market cadence derived from the series ticker suffix.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Market cadence: from the market's own open and close when the venue
+/// publishes both (`from_window`), else from the series ticker (`from_ticker`).
+///
+/// The ticker alone misread Kalshi's `KXBTCD` series as daily. Kalshi lists it
+/// as "Bitcoin price Above/below, hourly": one-hour markets on a strike ladder,
+/// opened each hour, beside a 25-hour daily on the same series. The hour-shaped
+/// Vipers (GBoost, Momentum, Time Decay, Convergence) are trained for exactly
+/// that window, and until 2026-10-17 never saw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Cadence {
+    /// One-hour markets (`KXBTCD`'s hourly above/below listings).
+    Hourly,
     /// 15-minute markets (`KXBTC15M`).
     FifteenMin,
-    /// Daily markets (`KXBTCD`).
+    /// Daily markets (`KXBTCD`'s daily listing).
     Daily,
 }
 
 impl Cadence {
     /// The window length this cadence's markets trade over, in seconds.
     pub fn window_secs(self) -> i64 {
-        match self { Self::FifteenMin => 900, Self::Daily => 86_400 }
+        match self { Self::Hourly => 3600, Self::FifteenMin => 900, Self::Daily => 86_400 }
     }
 
-    /// Infer cadence from a market ticker string.
+    /// Cadence from the published window length, with a little slack for a
+    /// venue that opens a market a few seconds off the clock. Anything between
+    /// the three shapes is `None`: better unclassified than misfiled.
+    pub fn from_window(window_secs: i64) -> Option<Self> {
+        match window_secs {
+            840..=960 => Some(Self::FifteenMin),
+            3_480..=3_720 => Some(Self::Hourly),
+            s if s >= 72_000 => Some(Self::Daily),
+            _ => None,
+        }
+    }
+
+    /// Infer cadence from a market ticker string, for a market whose open time
+    /// the venue did not publish.
     fn from_ticker(ticker: &str) -> Option<Self> {
         let t = ticker.to_ascii_uppercase();
         if t.contains("15M") { return Some(Self::FifteenMin); }
@@ -133,11 +155,18 @@ impl Cadence {
         None
     }
 
+    /// Which cadence the hour-shaped Vipers want first: the one-hour market, then
+    /// the 15-minute one, then whatever is left.
+    fn primary_rank(this: Option<Self>) -> u8 {
+        match this { Some(Self::Hourly) => 0, Some(Self::FifteenMin) => 1, Some(Self::Daily) => 2, None => 3 }
+    }
+
     /// Maximum time-to-close for this cadence. Markets further out are
     /// filtered from discovery — they're either far-future listings (demo)
     /// or long-dated events where intraday strategies don't apply.
     fn max_close_secs(self) -> i64 {
         match self {
+            Self::Hourly     => MAX_CLOSE_SHORT_SECS,
             Self::FifteenMin => MAX_CLOSE_SHORT_SECS,
             Self::Daily      => MAX_CLOSE_DAILY_SECS,
         }
@@ -159,6 +188,17 @@ pub struct KalshiPair {
     pub underlying: &'static str,
     pub strike: Option<Decimal>,
     pub cadence: Option<Cadence>,
+    /// Close minus open as the venue published them; `None` when it did not
+    /// publish an open. This, not the cadence, is what `MarketConfig::window_secs`
+    /// carries, so a model that scores one window length reads the real one.
+    pub window_secs: Option<i64>,
+}
+
+/// Close minus open, when both are published and the order makes sense.
+fn window_of(m: &KalshiMarket) -> Option<i64> {
+    let (open, close) = (m.open_time_utc()?, m.close_time_utc()?);
+    let secs = (close - open).num_seconds();
+    (secs > 0).then_some(secs)
 }
 
 fn pair_from_market(m: &KalshiMarket) -> Option<KalshiPair> {
@@ -177,7 +217,8 @@ fn pair_from_market(m: &KalshiMarket) -> Option<KalshiPair> {
             .unwrap_or(0.0),
         strike: m.strike().and_then(|s| Decimal::try_from(s).ok()),
         ticker: m.ticker.clone(),
-        cadence: Cadence::from_ticker(&m.ticker),
+        cadence: window_of(m).and_then(Cadence::from_window).or_else(|| Cadence::from_ticker(&m.ticker)),
+        window_secs: window_of(m),
         question,
         underlying,
     })
@@ -205,7 +246,8 @@ fn pair_from_market_untethered(m: &KalshiMarket) -> KalshiPair {
             .unwrap_or(0.0),
         strike: m.strike().and_then(|s| Decimal::try_from(s).ok()),
         ticker: m.ticker.clone(),
-        cadence: Cadence::from_ticker(&m.ticker),
+        cadence: window_of(m).and_then(Cadence::from_window).or_else(|| Cadence::from_ticker(&m.ticker)),
+        window_secs: window_of(m),
         question,
         // Empty is the marker for "no crypto underlying". Every crypto-specific
         // path in the trade loop checks this rather than the market class, so a
@@ -888,32 +930,10 @@ async fn select_market(
                     .collect::<Vec<_>>().join(", ")
             );
 
-            // Split by cadence: prefer short-cadence (15M) as primary, daily as maker.
-            let (short, daily): (Vec<_>, Vec<_>) = pairs.into_iter()
-                .partition(|p| p.cadence == Some(Cadence::FifteenMin));
-
-            let apply_filter = |candidates: Vec<KalshiPair>| -> Option<KalshiPair> {
-                match filter {
-                    Some(f) => {
-                        let fl = f.to_lowercase();
-                        candidates.into_iter().find(|p| {
-                            p.ticker.to_lowercase().contains(&fl)
-                                || p.question.to_lowercase().contains(&fl)
-                        })
-                    }
-                    None => candidates.into_iter().next(),
-                }
-            };
-
-            // Primary: prefer 15M, fall back to daily.
-            let primary = apply_filter(short.clone())
-                .or_else(|| apply_filter(daily.clone()));
+            let primary = choose_primary(&pairs, filter.as_deref());
 
             if let Some(p) = primary {
-                // Maker: pick the best daily market with the same underlying
-                // (skip the primary if it's already daily to avoid self-reference).
-                let maker = daily.into_iter()
-                    .find(|d| d.underlying == p.underlying && d.ticker != p.ticker);
+                let maker = choose_maker(&pairs, &p);
 
                 info!(
                     "🎯 Kalshi primary: \"{}\" [{}] {:?} close={:?} strike={:?}",
@@ -933,6 +953,52 @@ async fn select_market(
             return None;
         }
     }
+}
+
+/// The market the hour-shaped Vipers fly: the hottest market of the best
+/// cadence on the board (one-hour first, then 15-minute, then daily), narrowed by
+/// the operator's ticker/title filter when one is set.
+///
+/// `pairs` arrive hottest-first from `discover_pairs`, so within a cadence the
+/// first match is the busiest strike of the ladder.
+fn choose_primary(pairs: &[KalshiPair], filter: Option<&str>) -> Option<KalshiPair> {
+    let matches = |p: &KalshiPair| match filter {
+        Some(f) => {
+            let fl = f.to_lowercase();
+            p.ticker.to_lowercase().contains(&fl) || p.question.to_lowercase().contains(&fl)
+        }
+        None => true,
+    };
+    pairs.iter()
+        .filter(|p| matches(p))
+        .min_by_key(|p| Cadence::primary_rank(p.cadence))
+        .and_then(|best| {
+            // The hottest of the chosen cadence, not merely the first to rank.
+            pairs.iter().find(|p| matches(p) && p.cadence == best.cadence)
+        })
+        .cloned()
+}
+
+/// The daily market the Window/Daily Vipers rest orders on: the hottest daily
+/// with the primary's underlying that is not the primary itself.
+fn choose_maker(pairs: &[KalshiPair], primary: &KalshiPair) -> Option<KalshiPair> {
+    pairs.iter()
+        .find(|d| d.cadence == Some(Cadence::Daily) && d.underlying == primary.underlying && d.ticker != primary.ticker)
+        .cloned()
+}
+
+/// Should the loop leave `current` for `best`, the candidate `choose_primary`
+/// picked from a fresh scan that excluded `current`?
+///
+/// A better cadence always wins: a one-hour market appearing while the loop
+/// flies a 15-minute one is the market the hour-shaped Vipers exist for. Within
+/// the same cadence the old rule holds: only a clearly hotter market, by
+/// `ROTATION_VOLUME_THRESHOLD` contracts, is worth the churn of moving.
+fn should_rotate(current: &KalshiPair, best: &KalshiPair) -> bool {
+    let (cur, new) = (Cadence::primary_rank(current.cadence), Cadence::primary_rank(best.cadence));
+    if new < cur { return true; }
+    if new > cur { return false; }
+    best.volume > current.volume + ROTATION_VOLUME_THRESHOLD
 }
 
 // ─── Single-market session ───────────────────────────────────────────────────
@@ -1106,7 +1172,7 @@ async fn trade_one_market(
         market_name: pair.question.clone(),
         market_close_time: pair.close_time,
         strike_price: pair.strike,
-        window_secs: pair.cadence.map(Cadence::window_secs),
+        window_secs: pair.window_secs,
         is_neg_risk: false,
         condition_id: String::new(),
         yes_fee_bps: KALSHI_FEE_BPS as u32,
@@ -1120,7 +1186,7 @@ async fn trade_one_market(
         market_name: mp.question.clone(),
         market_close_time: mp.close_time,
         strike_price: mp.strike,
-        window_secs: mp.cadence.map(Cadence::window_secs),
+        window_secs: mp.window_secs,
         is_neg_risk: false,
         condition_id: String::new(),
         yes_fee_bps: KALSHI_FEE_BPS as u32,
@@ -1134,7 +1200,8 @@ async fn trade_one_market(
     if pair.is_crypto() {
         publish_raptor_health(raptor_health_tx, pair.underlying, true);
     }
-    // Map each viper to its preferred venue: "Hourly" vipers → primary (15M),
+    // Map each viper to its preferred venue: "Hourly" vipers → primary (the
+    // one-hour market when the board has one, else the 15-minute one),
     // "Window/Daily" vipers → maker (daily), mirroring the intl/US patrol logic.
     let maker_name = maker_pair.as_ref().map(|mp| mp.question.as_str()).unwrap_or(&pair.question);
     markets_tx.send_modify(|map| {
@@ -1241,11 +1308,11 @@ async fn trade_one_market(
                 }
                 let mut candidates = discover_pairs(venue, series).await;
                 candidates.retain(|p| p.ticker != pair.ticker);
-                if let Some(best) = candidates.first() {
-                    if best.volume > pair.volume + ROTATION_VOLUME_THRESHOLD {
+                if let Some(best) = choose_primary(&candidates, None).filter(|b| should_rotate(&pair, b)) {
+                    {
                         info!(
-                            "🔍 Hotter Kalshi market: \"{}\" vol={:.0} > \"{}\" vol={:.0} + {:.0} — rotating",
-                            best.question, best.volume, pair.question, pair.volume, ROTATION_VOLUME_THRESHOLD
+                            "🔍 Better Kalshi market: \"{}\" {:?} vol={:.0} over \"{}\" {:?} vol={:.0} (threshold {:.0} within a cadence) — rotating",
+                            best.question, best.cadence, best.volume, pair.question, pair.cadence, pair.volume, ROTATION_VOLUME_THRESHOLD
                         );
                         lifecycle.cancel_all(venue.as_ref()).await;
                         // A rotation is not an ending — the same squadron is
@@ -2368,7 +2435,7 @@ fn register_kalshi_squadron(
         // operator-config persistence key (same rationale as the US wings).
         market_close_time: None,
         strike_price: pair.strike,
-        window_secs: pair.cadence.map(Cadence::window_secs),
+        window_secs: pair.window_secs,
         is_neg_risk: false,
         condition_id: String::new(),
         yes_fee_bps: KALSHI_FEE_BPS as u32,
@@ -2741,3 +2808,87 @@ async fn release_swept_positions(positions: &Arc<Mutex<PositionMap>>) {
         }
     }
 }
+
+#[cfg(test)]
+mod hourly_market_tests {
+    use super::*;
+
+    fn market(ticker: &str, open: &str, close: &str) -> KalshiMarket {
+        KalshiMarket {
+            ticker: ticker.into(), title: "Bitcoin price on Oct 17, 2026?".into(),
+            status: "active".into(), strike_type: "greater".into(), floor_strike: Some(91_299.99),
+            open_time: open.into(), close_time: close.into(),
+            ..KalshiMarket::default()
+        }
+    }
+
+    fn pair(ticker: &str, cadence: Option<Cadence>, volume: f64) -> KalshiPair {
+        KalshiPair {
+            ticker: ticker.into(), question: ticker.into(),
+            long: MarketId::new(format!("{ticker}#yes")), short: MarketId::new(format!("{ticker}#no")),
+            close_time: None, volume, underlying: "btc", strike: None, cadence,
+            window_secs: cadence.map(Cadence::window_secs),
+        }
+    }
+
+    /// Kalshi's `KXBTCD` series carries both a one-hour and a 25-hour listing.
+    /// The published window tells them apart; the ticker alone called both daily.
+    #[test]
+    fn the_published_window_classifies_the_kxbtcd_series() {
+        let hourly = pair_from_market(&market("KXBTCD-26OCT1719-T91299.99", "2026-10-17T22:00:00Z", "2026-10-17T23:00:00Z")).unwrap();
+        assert_eq!(hourly.cadence, Some(Cadence::Hourly));
+        assert_eq!(hourly.window_secs, Some(3600));
+        let daily = pair_from_market(&market("KXBTCD-26OCT1817-T91249.99", "2026-10-17T20:00:00Z", "2026-10-18T21:00:00Z")).unwrap();
+        assert_eq!(daily.cadence, Some(Cadence::Daily));
+        assert_eq!(daily.window_secs, Some(90_000));
+        let quarter = pair_from_market(&market("KXBTC15M-26OCT171830-30", "2026-10-17T22:15:00Z", "2026-10-17T22:30:00Z")).unwrap();
+        assert_eq!(quarter.cadence, Some(Cadence::FifteenMin));
+        // No published open: the ticker decides, and the window is unknown (B43).
+        let blind = pair_from_market(&market("KXBTCD-28JAN1222-T99799.99", "", "2026-01-28T22:00:00Z")).unwrap();
+        assert_eq!(blind.cadence, Some(Cadence::Daily));
+        assert_eq!(blind.window_secs, None);
+    }
+
+    /// Odd windows stay unclassified rather than being forced into a shape.
+    #[test]
+    fn a_window_between_shapes_is_unclassified() {
+        assert_eq!(Cadence::from_window(900), Some(Cadence::FifteenMin));
+        assert_eq!(Cadence::from_window(3600), Some(Cadence::Hourly));
+        assert_eq!(Cadence::from_window(86_400), Some(Cadence::Daily));
+        assert_eq!(Cadence::from_window(7200), None);
+    }
+
+    /// The one-hour market is the primary when the board has one, however hot the
+    /// 15-minute market is; without one the 15-minute market is, as before.
+    #[test]
+    fn the_hourly_market_is_primary_when_listed() {
+        let board = vec![
+            pair("KXBTC15M-A", Some(Cadence::FifteenMin), 50_000.0),
+            pair("KXBTCD-DAILY", Some(Cadence::Daily), 20_000.0),
+            pair("KXBTCD-HOUR-T81500", Some(Cadence::Hourly), 900.0),
+            pair("KXBTCD-HOUR-T81000", Some(Cadence::Hourly), 300.0),
+        ];
+        let p = choose_primary(&board, None).unwrap();
+        assert_eq!(p.ticker, "KXBTCD-HOUR-T81500", "the hottest strike of the hourly ladder");
+        assert_eq!(choose_maker(&board, &p).unwrap().ticker, "KXBTCD-DAILY");
+        let no_hourly: Vec<_> = board.iter().filter(|p| p.cadence != Some(Cadence::Hourly)).cloned().collect();
+        assert_eq!(choose_primary(&no_hourly, None).unwrap().ticker, "KXBTC15M-A");
+        // The operator's filter still narrows the field.
+        assert_eq!(choose_primary(&board, Some("daily")).unwrap().ticker, "KXBTCD-DAILY");
+    }
+
+    /// A better cadence rotates at once; the same cadence rotates only for a
+    /// clearly hotter market; a worse cadence never does.
+    #[test]
+    fn rotation_prefers_cadence_then_volume() {
+        let quarter = pair("KXBTC15M-A", Some(Cadence::FifteenMin), 50_000.0);
+        let hour = pair("KXBTCD-HOUR", Some(Cadence::Hourly), 100.0);
+        assert!(should_rotate(&quarter, &hour), "an hourly market appearing is the move the hour-shaped Vipers wait for");
+        assert!(!should_rotate(&hour, &quarter), "never back to the 15-minute market while an hourly is on the board");
+        let hotter_hour = pair("KXBTCD-HOUR-2", Some(Cadence::Hourly), 100.0 + ROTATION_VOLUME_THRESHOLD + 1.0);
+        let warmer_hour = pair("KXBTCD-HOUR-3", Some(Cadence::Hourly), 100.0 + ROTATION_VOLUME_THRESHOLD - 1.0);
+        assert!(should_rotate(&hour, &hotter_hour));
+        assert!(!should_rotate(&hour, &warmer_hour));
+    }
+}
+

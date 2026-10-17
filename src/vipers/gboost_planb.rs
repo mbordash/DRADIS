@@ -1735,7 +1735,7 @@ async fn sweep_shadow_exits(ctx: &StrategyContext, fee_rate: f64) {
         // Past its market's close, ask the venue what it resolved to.
         //
         // Spawned rather than awaited here. `evaluate_exit` runs inside the
-        // orchestrator's 500ms per-strategy timeout, and a Gamma call is allowed
+        // orchestrator's 500ms per-strategy timeout, and a venue call is allowed
         // five seconds; awaiting it inline would drop BOTH this viper's futures
         // for that tick, and if the tick were a decision minute the minute is
         // already marked decided, so it would be consumed with neither a live nor
@@ -1753,14 +1753,18 @@ async fn sweep_shadow_exits(ctx: &StrategyContext, fee_rate: f64) {
             if due {
                 let (asset_c, cid, token) = (asset.clone(), t.condition_id.clone(), t.token_id.clone());
                 tokio::spawn(async move {
-                    let got = crate::raptors::sports_ledger::settled_prices_for_market(
-                        http(), &cid, std::slice::from_ref(&token),
-                    ).await;
-                    if let Some(px) = got.get(&token).copied() {
-                        let mut out = lock(&globals(&asset_c).shadow_resolved);
-                        out.insert(token, px);
-                        // Bounded: one entry per token that has ever resolved.
-                        if out.len() > 512 { out.clear(); }
+                    // Through the venue's installed resolver (`venues::core::resolve_leg`),
+                    // so this lane settles the same way on every venue; `cid` is the
+                    // market handle Polymarket International's resolver keys on and the
+                    // others ignore. Anything but a final price is "not yet".
+                    let got = crate::venues::core::resolve_leg(&cid, &crate::venues::core::MarketId::new(&token)).await;
+                    if let Some(crate::venues::core::TokenResolution::Resolved(px)) = got {
+                        if let Some(px) = px.to_f64() {
+                            let mut out = lock(&globals(&asset_c).shadow_resolved);
+                            out.insert(token, px);
+                            // Bounded: one entry per token that has ever resolved.
+                            if out.len() > 512 { out.clear(); }
+                        }
                     }
                 });
             }
@@ -3052,24 +3056,27 @@ mod shadow_promotion_tests {
     /// The card answers the operator's only question, with the numbers.
     #[test]
     fn the_card_names_the_lane_and_what_is_missing() {
+        // A model stamped for this build's own venue, so the lane is decided by
+        // the record on every venue build.
+        let here = crate::venues::ledger_venue();
         let thin = ShadowStats { trades: 12, mean_ret: 0.008, lower_bound: -0.021, win: 0.58 };
-        let line = lane_line(None, true, &thin, 40, 0.53, dec!(4.0), dec!(1.0));
+        let line = lane_line(Some(here), true, &thin, 40, 0.53, dec!(4.0), dec!(1.0));
         assert!(line.starts_with("SHADOW"), "{line}");
         assert!(line.contains("shadow record 12 of 40 trades"), "it must name the missing number: {line}");
 
         let earned = ShadowStats { trades: 44, mean_ret: 0.026, lower_bound: 0.004, win: 0.57 };
-        let line = lane_line(None, true, &earned, 40, 0.53, dec!(4.0), dec!(1.0));
+        let line = lane_line(Some(here), true, &earned, 40, 0.53, dec!(4.0), dec!(1.0));
         assert!(line.starts_with("LIVE at the full stake $4.00"), "{line}");
         assert!(line.contains("+2.60%"), "{line}");
 
         // Promoted on a positive mean alone: live, at the probation stake, and the card says why.
         let probation = ShadowStats { trades: 44, mean_ret: 0.008, lower_bound: -0.012, win: 0.55 };
-        let line = lane_line(None, true, &probation, 40, 0.53, dec!(4.0), dec!(1.0));
+        let line = lane_line(Some(here), true, &probation, 40, 0.53, dec!(4.0), dec!(1.0));
         assert!(line.starts_with("LIVE at the probation stake $1.00"), "{line}");
         assert!(line.contains("lower bound is not yet above zero"), "{line}");
 
         // A model that never cleared the gate says so, however good the record.
-        let line = lane_line(None, false, &earned, 40, 0.53, dec!(4.0), dec!(1.0));
+        let line = lane_line(Some(here), false, &earned, 40, 0.53, dec!(4.0), dec!(1.0));
         assert!(line.starts_with("SHADOW") && line.contains("holdout gate"), "{line}");
     }
 
