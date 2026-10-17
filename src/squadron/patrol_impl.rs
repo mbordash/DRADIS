@@ -1367,7 +1367,7 @@ impl Squadron {
                         live_hourly_strike(&ctx.market_rx, &hourly_condition_id, hourly_strike_price);
                     // Part of every PositionKey the vipers build this tick.
                     let hourly_market_config_for_ctx = MarketConfig {
-                        yes_token: hourly_yes_token.clone(), no_token: hourly_no_token.clone(), market_name: hourly_market_name.clone(), market_close_time: hourly_market_close_time, strike_price: hourly_strike_price, is_neg_risk: hourly_is_neg_risk, condition_id: hourly_condition_id.clone(), yes_fee_bps: hourly_yes_fee_rate, no_fee_bps: hourly_no_fee_rate,
+                        yes_token: hourly_yes_token.clone(), no_token: hourly_no_token.clone(), market_name: hourly_market_name.clone(), market_close_time: hourly_market_close_time, strike_price: hourly_strike_price, window_secs: crate::helpers::time::window_secs_from_question(&hourly_market_name), is_neg_risk: hourly_is_neg_risk, condition_id: hourly_condition_id.clone(), yes_fee_bps: hourly_yes_fee_rate, no_fee_bps: hourly_no_fee_rate,
                     };
 
                     let maker_market_config_for_ctx = maker_market_config.clone();

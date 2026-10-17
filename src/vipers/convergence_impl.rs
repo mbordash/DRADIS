@@ -1006,7 +1006,7 @@ mod tests {
             yes_token: MarketId::new("h-yes"), no_token: MarketId::new("h-no"),
             market_name: "Bitcoin Up or Down - September 9, 12PM ET".to_string(),
             market_close_time: Some(Utc::now() + chrono::Duration::hours(1)),
-            strike_price: Some(dec!(65000)), is_neg_risk: false,
+            strike_price: Some(dec!(65000)), window_secs: Some(3600), is_neg_risk: false,
             condition_id: "cid-hourly".to_string(), yes_fee_bps: 0, no_fee_bps: 0,
         }
     }

@@ -1148,7 +1148,7 @@ mod squadron_identity_tests {
             yes_token: MarketId::new("y"), no_token: MarketId::new("n"),
             market_name: "Test market".to_string(),
             market_close_time: close,
-            strike_price: None, is_neg_risk: false,
+            strike_price: None, window_secs: None, is_neg_risk: false,
             condition_id: String::new(), yes_fee_bps: 0, no_fee_bps: 0,
         }
     }

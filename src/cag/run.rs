@@ -399,6 +399,7 @@ where
             // real value here; adama.rs does too, and says so at line 142.
             market_close_time: hourly_market_close_time,
             strike_price:      hourly_strike_price,
+            window_secs:       crate::helpers::time::window_secs_from_question(&hourly_market_name),
             is_neg_risk:       hourly_is_neg_risk,
             condition_id:      hourly_condition_id.clone(),
             yes_fee_bps:       hourly_yes_fee_rate,
@@ -503,6 +504,7 @@ where
                 market_name: mk.name.clone(),
                 market_close_time: mk.close_time,
                 strike_price: mk.strike_price,
+                window_secs: crate::helpers::time::window_secs_from_question(&mk.name),
                 is_neg_risk: mk_neg_risk,
                 condition_id: mk.condition_id.clone(),
                 yes_fee_bps: mk_yes_fee,

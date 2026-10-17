@@ -147,6 +147,7 @@ where
             // cannot make the same squadron register under two ids.
             market_close_time,
             strike_price: None,
+            window_secs: None,
             is_neg_risk: false,
             condition_id: market_id.to_string(),
             // These used to be literal zeros, which told every fee-aware gate

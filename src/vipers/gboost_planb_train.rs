@@ -754,6 +754,7 @@ pub fn build_market_rows(
         // The same function the viper scores with, on the same series shape.
         let dv = crate::vipers::gboost_planb::deriv_features_at(derivs.0, derivs.1, t);
         let inputs = DecisionInputs {
+            strike: None,
             w,
             t,
             bars,

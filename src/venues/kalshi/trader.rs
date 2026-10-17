@@ -120,6 +120,11 @@ pub enum Cadence {
 }
 
 impl Cadence {
+    /// The window length this cadence's markets trade over, in seconds.
+    pub fn window_secs(self) -> i64 {
+        match self { Self::FifteenMin => 900, Self::Daily => 86_400 }
+    }
+
     /// Infer cadence from a market ticker string.
     fn from_ticker(ticker: &str) -> Option<Self> {
         let t = ticker.to_ascii_uppercase();
@@ -1101,6 +1106,7 @@ async fn trade_one_market(
         market_name: pair.question.clone(),
         market_close_time: pair.close_time,
         strike_price: pair.strike,
+        window_secs: pair.cadence.map(Cadence::window_secs),
         is_neg_risk: false,
         condition_id: String::new(),
         yes_fee_bps: KALSHI_FEE_BPS as u32,
@@ -1114,6 +1120,7 @@ async fn trade_one_market(
         market_name: mp.question.clone(),
         market_close_time: mp.close_time,
         strike_price: mp.strike,
+        window_secs: mp.cadence.map(Cadence::window_secs),
         is_neg_risk: false,
         condition_id: String::new(),
         yes_fee_bps: KALSHI_FEE_BPS as u32,
@@ -2361,6 +2368,7 @@ fn register_kalshi_squadron(
         // operator-config persistence key (same rationale as the US wings).
         market_close_time: None,
         strike_price: pair.strike,
+        window_secs: pair.cadence.map(Cadence::window_secs),
         is_neg_risk: false,
         condition_id: String::new(),
         yes_fee_bps: KALSHI_FEE_BPS as u32,

@@ -2475,7 +2475,7 @@ mod tests {
             yes_token: MarketId::new(yes), no_token: MarketId::new(no),
             market_name: name.to_string(),
             market_close_time: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
-            strike_price: Some(dec!(65000)), is_neg_risk: false,
+            strike_price: Some(dec!(65000)), window_secs: Some(3600), is_neg_risk: false,
             condition_id: cid.to_string(), yes_fee_bps: 0, no_fee_bps: 0,
         }
     }

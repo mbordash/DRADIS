@@ -1010,6 +1010,13 @@ pub struct MarketConfig {
     pub market_close_time: Option<DateTime<Utc>>,
     /// Strike price (if applicable)
     pub strike_price: Option<Decimal>,
+    /// Length of the market's trading window in seconds, from the venue's own
+    /// market data: 3600 for an hourly market, 900 for a Kalshi 15-minute one,
+    /// 86 400 for a daily one. `None` when the venue does not say (honest state,
+    /// B43). A model trained on one window length reads this before scoring
+    /// (`gboost_planb::shape_gate`), so the shape check names the market, never
+    /// the venue.
+    pub window_secs: Option<i64>,
     /// Whether the market uses negative risk pricing
     pub is_neg_risk: bool,
     /// Polymarket condition ID (bytes32 hex) — required for on-chain merge operations.
@@ -1219,6 +1226,7 @@ mod tests {
             market_name: "t".into(),
             market_close_time: secs.map(|s| Utc::now() + ChronoDuration::seconds(s)),
             strike_price: None,
+            window_secs: None,
             is_neg_risk: false,
             condition_id: String::new(),
             yes_fee_bps: 0,

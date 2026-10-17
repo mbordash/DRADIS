@@ -184,9 +184,14 @@ ASSETS=kalshi                            # keep the dashboard pool tidy (data in
 ```
 
 > **Kalshi status:** the loop (`src/venues/kalshi/trader.rs`) is **crypto-first** —
-> it discovers the hottest open market across the configured series (15-minute and
-> hourly BTC/ETH by default), classifies it via the shared taxonomy, and flies **all
-> nine crypto Vipers** with the full Raptor intelligence stack. Order books stream over the
+> it discovers the open markets across the configured series (15-minute and
+> daily BTC/ETH by default), flies the highest-volume 15-minute market as the
+> primary with a daily market on the same coin beside it for the slower Vipers,
+> classifies both via the shared taxonomy, and runs all nine crypto Vipers with the
+> full Raptor intelligence stack. GBoost scores only one-hour markets, the shape its
+> model is trained on, so on the default 15-minute and daily series it idles and
+> says so; on an hourly series it scores, and a model stamped for another venue
+> trades the shadow lane until one stamped for Kalshi passes the holdout. Order books stream over the
 > authenticated WebSocket (`orderbook_delta` with sequence-gap recovery) and fills
 > confirm event-precisely via the private `fill` channel. Kalshi's quadratic taker
 > fee (max 1.75¢/contract at P=0.50) is priced into Viper edge thresholds. Positions
@@ -538,6 +543,7 @@ DRADIS ships with a real-time web dashboard called **Control Tower** built on Ne
 | **Markets**        | Browse the venue's live markets, open one and see its book beside the engine's own read of it: every Viper's verdict, the FairValue model reading, the bookmaker line. **Take the Helm** from there |
 | **Trade Log**      | Last N completed trades with strategy, side, entry/exit prices, shares, P&L, exit reason         |
 | **CAG Registry**   | Active squadrons with market, state, deployed time, and **+ Deploy** button                      |
+| **Console**        | The engine's recent log, filtered by level, with **Copy visible** and a **Support bundle** button that saves one text file (version, venue, squadrons, every Viper's holding reason and refusal ledger, the live risk knobs, the log) to attach to a support request. It reads no credentials |
 | **AI Actions**     | Full audit trail of LLM-proposed config changes — status lifecycle, delta %, tier, outcome score — with inline apply/reject for pending proposals |
 | **Setup**          | Admin-gated credential management — venue keys, RPC, Alpaca, Telegram — with test-connection buttons, one-click engine restart, and the **AI Autonomy** panel (tier selector, kill switch, circuit-breaker reset) |
 
@@ -974,7 +980,7 @@ setup for why write-capable tools are gated behind future work.
 
 **Does DRADIS support the US Polymarket API?** Yes.  Polymarket's **US platform** is a separate, custodial, CFTC-regulated exchange with web2 auth (API key / secret / session token) and string/UUID market IDs. We have **venue abstraction** so a build targets one venue via a Cargo feature flag (`intl_clob` default, `us_retail`, `kalshi`) — single-venue per binary, so the US deployment carries none of the Polygon crypto weight and stays inside its own regulatory/network footprint. Start a US build with `VENUE=us ./start-local.sh`.
 
-**What about Kalshi?** Fully supported. Build with `--features kalshi` (or `VENUE=kalshi ./start-local.sh`) — RSA-PSS signed REST + WebSocket, crypto-first trading loop over Kalshi's 15-minute and hourly BTC/ETH series, all nine crypto Vipers with the full Raptor stack, and event-precise fill confirmation. Paper-trade it risk-free against [demo.kalshi.co](https://demo.kalshi.co) with `KALSHI_DEMO=1`. See "Kalshi configuration" above.
+**What about Kalshi?** Fully supported. Build with `--features kalshi` (or `VENUE=kalshi ./start-local.sh`) — RSA-PSS signed REST + WebSocket, crypto-first trading loop over Kalshi's 15-minute and daily BTC/ETH series, all nine crypto Vipers with the full Raptor stack (GBoost scores one-hour markets only, see above), and event-precise fill confirmation. Paper-trade it risk-free against [demo.kalshi.co](https://demo.kalshi.co) with `KALSHI_DEMO=1`. See "Kalshi configuration" above.
 
 **Control Tower shows "Offline"?** Check: (1) DRADIS running? (2) `curl http://localhost:9000/api/health`? (3) Docker — same `dradis-net` network?
 

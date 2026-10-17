@@ -23,11 +23,18 @@
  * socket, no file access) on a short poll. Built for AMI operators without
  * SSH: confirm the engine is alive, watch activity, and copy a snippet to
  * paste into a GitHub Issue.
+ *
+ * The Support bundle button saves one text file with the version, venue,
+ * squadrons, every Viper's holding reason and refusal ledger, the live risk
+ * knobs and this log ring, for a support request. See `lib/supportBundle.ts`
+ * for what it gathers and why none of it is a credential.
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import useSWR from 'swr';
 import { getLogs } from '@/lib/api';
+import { buildSupportBundle, saveTextFile } from '@/lib/supportBundle';
+import { DEMO_MODE } from '@/lib/demo';
 
 type Level = 'all' | 'info' | 'warn' | 'error';
 
@@ -49,6 +56,7 @@ export default function ConsolePage() {
   const [level, setLevel] = useState<Level>('all');
   const [follow, setFollow] = useState(true);
   const [copied, setCopied] = useState(false);
+  const [bundle, setBundle] = useState<'idle' | 'building' | 'saved' | 'failed'>('idle');
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const { data, error, isLoading } = useSWR(['logs', tail], () => getLogs(tail), {
@@ -75,6 +83,18 @@ export default function ConsolePage() {
     } catch {
       /* clipboard unavailable (http origin) — ignore */
     }
+  };
+
+  const downloadBundle = async () => {
+    setBundle('building');
+    try {
+      const b = await buildSupportBundle();
+      saveTextFile(b.filename, b.text);
+      setBundle('saved');
+    } catch {
+      setBundle('failed');
+    }
+    setTimeout(() => setBundle('idle'), 3000);
   };
 
   const pill = (active: boolean) =>
@@ -113,6 +133,17 @@ export default function ConsolePage() {
         <button className={pill(false)} onClick={copyVisible}>
           {copied ? '✓ Copied' : '⧉ Copy visible'}
         </button>
+        {/* Hidden on the public demo: a bundle of the demo box helps nobody. */}
+        {!DEMO_MODE && (
+          <button
+            className={pill(false)}
+            onClick={downloadBundle}
+            disabled={bundle === 'building'}
+            title="Save one text file with the version, venue, squadrons, every Viper's holding reason, the risk knobs and this log, to attach to a support request. No credentials."
+          >
+            {bundle === 'building' ? '… Building bundle' : bundle === 'saved' ? '✓ Bundle saved' : bundle === 'failed' ? '✗ Bundle failed' : '⬇ Support bundle'}
+          </button>
+        )}
       </div>
 
       {/* ── Log pane ────────────────────────────────────────────────────────── */}

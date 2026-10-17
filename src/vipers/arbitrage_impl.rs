@@ -46,6 +46,13 @@ use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams, PositionKey};
 use crate::vipers::is_drawdown_limit_hit;
 use crate::venues::core::TimeInForce;
+
+/// How long the intl pair arbiter waits for the second leg before it repairs a
+/// one-sided fill (`helpers::balance::MAX_WAIT_SECS_WINDOW`, an intl-only module).
+/// Mirrored here as a plain number so this viper reads the same on every venue
+/// without selecting on a feature; `arbiter_window_matches_the_intl_arbiter`
+/// holds the two together on the build that has both.
+const ARBITER_WAIT_SECS: i64 = 600;
 use tracing::{debug, info};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -591,12 +598,7 @@ impl Strategy for ArbitrageStrategyImpl {
         };
         if let Some((pos, token, bid, fee_bps, leg)) = single_leg {
             let age_secs = (chrono::Utc::now() - pos.opened_at).num_seconds();
-            #[cfg(feature = "intl_clob")]
-            let arbiter_window =
-                crate::helpers::balance::MAX_WAIT_SECS_WINDOW + 60; // grace margin
-            // helpers::balance is intl-only; mirror MAX_WAIT_SECS_WINDOW for US builds.
-            #[cfg(not(feature = "intl_clob"))]
-            let arbiter_window = 600 + 60;
+            let arbiter_window = ARBITER_WAIT_SECS + 60; // grace margin
             // Ghost fills count as confirmed, so the naked-leg flatten is
             // exercised in simulation instead of silently never firing — this is
             // the safety net for a one-sided arb, and it should be observable.
@@ -641,4 +643,14 @@ impl Strategy for ArbitrageStrategyImpl {
 /// Profit = 1.00 − YES_bid − NO_bid ≥ profit_threshold.
 fn is_maker_arb_profitable(yes_bid: Decimal, no_bid: Decimal, profit_threshold: Decimal) -> bool {
     (dec!(1.0) - yes_bid - no_bid) >= profit_threshold
+}
+
+#[cfg(test)]
+mod arbiter_window_tests {
+    /// The mirrored constant must track the intl arbiter's own wait.
+    #[cfg(feature = "intl_clob")]
+    #[test]
+    fn arbiter_window_matches_the_intl_arbiter() {
+        assert_eq!(super::ARBITER_WAIT_SECS, crate::helpers::balance::MAX_WAIT_SECS_WINDOW);
+    }
 }

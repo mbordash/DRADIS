@@ -48,7 +48,13 @@
 //! # What a model file must say about itself
 //!
 //! Beyond the layout, input names and calibration, the loader reads the venue the
-//! model was trained for and refuses another venue's; the plan its labels were built
+//! model was trained for: another venue's model serves the shadow lane only
+//! (`venue_blocks_live`), so a model earns real money on a venue exactly as it does
+//! on its own, through this instance's record. The viper itself names no venue: it
+//! scores any market whose window is the one-hour shape it was trained on
+//! (`shape_gate`, from `MarketConfig::window_secs`) and takes the strike from the
+//! market when the venue publishes one (`MarketConfig::strike_price`), else from
+//! the window's opening bar as an Up or Down market defines it; the plan its labels were built
 //! with (`plan_tp`, `plan_sl`, `plan_min_ask`, `plan_max_ask`, or the first model's
 //! `label=B_aggr20`), which the viper compares with the configured plan and idles on
 //! a mismatch until the pipeline retrains; and its provenance, shown on the card.
@@ -87,14 +93,17 @@ use crate::helpers::volatility::norm_cdf;
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{OrderParams, PositionKey, StrategySignal, StrategyStatus};
 use crate::venues::core::TimeInForce;
+use crate::state::MarketConfig;
 use crate::vipers::is_drawdown_limit_hit;
 
 pub const STRATEGY_NAME: &str = "GboostStrategy";
 
-/// The venue every plan-B model is trained for. Polymarket International's hourly
+/// The venue the plan-B trainer stamps into every model it writes: Polymarket
+/// International's hourly
 /// markets, prices, prints and fees are what the rows describe; a model stamped for
-/// another venue is refused, and an unstamped one (the first production model) is
-/// taken to be this venue's, which it was.
+/// another venue serves the shadow lane only (`venue_blocks_live`), and an
+/// unstamped one (the first production model) is taken to be this venue's, which
+/// it was.
 pub const TRAINED_VENUE: &str = "polymarket-intl";
 
 /// Column index of `funding`, the one input whose availability differs by instance.
@@ -395,6 +404,20 @@ pub fn shadow_stats(returns: &[(i64, f64)]) -> ShadowStats {
 /// reason rather than a bool is deliberate — the card and the log have to be
 /// able to say which number is missing, or an operator cannot tell a viper that
 /// is working from one that is stuck.
+/// Why a model trained on another venue may not trade real money here, or `None`.
+///
+/// `trained` is the model's `venue` stamp (`None` for the unstamped first
+/// production model, which was `TRAINED_VENUE`'s); `here` is this build's ledger
+/// venue. The model still scores and the shadow lane still records, so the
+/// instance builds the record a venue-stamped successor is judged by; what it
+/// may not do is buy on evidence gathered on a different fee schedule and book.
+pub fn venue_blocks_live(trained: Option<&str>, here: &str) -> Option<String> {
+    let trained = trained.unwrap_or(TRAINED_VENUE);
+    (trained != here).then(|| format!(
+        "the model is validated on {trained}; this venue is {here}, so it trades the shadow lane only until a model stamped for {here} passes the holdout"
+    ))
+}
+
 pub fn shadow_blocks_live(
     gate_passed: bool,
     rec: &ShadowStats,
@@ -450,8 +473,13 @@ pub fn rows_under_rule(rows: &[(i64, f64, f64, f64)], plan: &crate::vipers::gboo
 
 /// Everything one decision minute needs.
 pub struct DecisionInputs<'a> {
-    /// Hourly window start (the strike is this minute's bar open).
+    /// Hourly window start. On an Up or Down market the strike is this minute's
+    /// bar open; a venue that publishes the strike supplies it in `strike`.
     pub w: i64,
+    /// The market's own strike, when the venue publishes one (Kalshi, and the
+    /// intl squadron once it has fetched the window open). `None` falls back to
+    /// the bar opening at `w`, the Up or Down definition the model was trained on.
+    pub strike: Option<f64>,
     /// Decision time: a minute boundary inside the window.
     pub t: i64,
     /// Closed bars, any order; must include the 61 ending with the one opening at `t - 60`.
@@ -566,7 +594,10 @@ pub fn build_features(inp: &DecisionInputs) -> std::result::Result<[[f64; N_FEAT
             None => return Err(FeatureGap::MissingBars),
         }
     }
-    let strike = by_open.get(&inp.w).ok_or(FeatureGap::MissingStrikeBar)?.open;
+    let strike = match inp.strike {
+        Some(k) => k,
+        None => by_open.get(&inp.w).ok_or(FeatureGap::MissingStrikeBar)?.open,
+    };
     let (mid_up, mid_dn) = match (inp.mid_now[0], inp.mid_now[1]) {
         (Some(a), Some(b)) => (a, b),
         _ => return Err(FeatureGap::MissingMid),
@@ -914,6 +945,11 @@ pub struct PlanBModel {
     /// model could never be promoted by its own evidence, however good. One that
     /// recorded no holdout either stays in the shadow lane.
     pub gate_passed: bool,
+    /// The venue the model's rows, labels and fees describe (`venue` stamp).
+    /// `None` on the first production model, which predates the stamp and was
+    /// Polymarket International's. Compared with this build's ledger venue by
+    /// `venue_blocks_live`: a mismatch keeps the model in the shadow lane.
+    pub trained_venue: Option<String>,
 }
 
 /// The gate's verdict on a model that was written before the verdict was stamped,
@@ -981,11 +1017,10 @@ pub fn load_model(path: &std::path::Path) -> std::result::Result<PlanBModel, Str
     if meta("feature_names").as_deref() != Some(FEATURE_NAMES.join(",").as_str()) {
         return Err("model's feature_names do not match this build's inputs".to_string());
     }
-    if let Some(v) = meta("venue") {
-        if v != TRAINED_VENUE {
-            return Err(format!("model was trained for venue '{v}', not {TRAINED_VENUE}; plan B trades only Polymarket International"));
-        }
-    }
+    // The venue stamp is read, not enforced: a model from another venue loads and
+    // scores, and `venue_blocks_live` keeps it in the shadow lane until a model
+    // stamped for this venue earns the live lane.
+    let trained_venue = meta("venue");
     let num = |key: &str| meta(key).and_then(|s| s.parse::<f64>().ok()).filter(|v| v.is_finite());
     let platt_a = num("platt_a").ok_or("model has no usable platt_a")?;
     let platt_b = num("platt_b").ok_or("model has no usable platt_b")?;
@@ -1064,7 +1099,7 @@ pub fn load_model(path: &std::path::Path) -> std::result::Result<PlanBModel, Str
             num("holdout_win"),
         ),
     };
-    Ok(PlanBModel { booster, platt_a, platt_b, version, trees, zeroed, form, residual_shrink, plan, posture, entry_rule, trained_by, created_at, calibrated_through, holdout_summary, gate_passed })
+    Ok(PlanBModel { booster, platt_a, platt_b, version, trees, zeroed, form, residual_shrink, plan, posture, entry_rule, trained_by, created_at, calibrated_through, holdout_summary, gate_passed, trained_venue })
 }
 
 impl PlanBModel {
@@ -1233,12 +1268,12 @@ pub fn model_path(asset: &str) -> PathBuf {
 /// spending my money, and if not, why not — so the line answers it with the
 /// numbers rather than a status word. A viper that is working towards a
 /// promotion and one that is stuck look identical without them.
-pub fn lane_line(gate_passed: bool, rec: &ShadowStats, min_trades: usize, min_win: f64, full: Decimal, probation: Decimal) -> String {
+pub fn lane_line(trained_venue: Option<&str>, gate_passed: bool, rec: &ShadowStats, min_trades: usize, min_win: f64, full: Decimal, probation: Decimal) -> String {
     let numbers = format!(
         "record {} trades, {:+.2}% per trade, 90% lower bound {:+.2}%, win {:.3}",
         rec.trades, rec.mean_ret * 100.0, rec.lower_bound * 100.0, rec.win,
     );
-    match shadow_blocks_live(gate_passed, rec, min_trades, min_win) {
+    match venue_blocks_live(trained_venue, crate::venues::ledger_venue()).or_else(|| shadow_blocks_live(gate_passed, rec, min_trades, min_win)) {
         Some(why) => format!("SHADOW — trading simulated, not real money: {why} ({numbers})"),
         None => match live_stake(rec, full, probation) {
             (stake, "probation") => format!(
@@ -1582,18 +1617,22 @@ fn ensure_minute_data(
     (d.bars_t == Some(t)).then(|| (d.bars.clone(), funding, derivs))
 }
 
-/// Why plan B does not trade on this build's venue, or `None` on the venue it was
-/// validated for.
+/// Why plan B does not score this market, or `None` for the shape it was trained on.
 ///
-/// Plan B's rows, labels and fees describe Polymarket International's hourly markets,
-/// and its training pipeline fetches that venue's history. No model has been validated
-/// on Kalshi's or Polymarket US's markets, so on those builds the viper idles and says
-/// so, whatever model file happens to be on disk.
-pub fn venue_gate() -> Option<&'static str> {
-    #[cfg(feature = "intl_clob")]
-    { None }
-    #[cfg(not(feature = "intl_clob"))]
-    { Some("plan B is validated on Polymarket International BTC hourly markets only; it does not trade on this venue") }
+/// The model's rows describe one-hour windows: its time-to-close, its minute index
+/// and its path-since-open features all assume `w = close − 3600`. A market with
+/// another window (Kalshi's 15-minute and daily series, Polymarket's daily Up or
+/// Down) would be scored on inputs the model never saw, so it is refused by shape,
+/// with the number; one whose venue does not say how long its window is (B43:
+/// `window_secs` is `None`) is refused as unknown rather than assumed hourly.
+/// This replaced a `#[cfg]` on the venue (removed 2026-10-17): the viper names
+/// markets, never venues, and a Kalshi hourly market would pass.
+pub fn shape_gate(market: &MarketConfig) -> Option<String> {
+    match market.window_secs {
+        Some(3600) => None,
+        Some(secs) => Some(format!("the model is trained on one-hour windows; this market's window is {secs} s")),
+        None => Some("the market's window length is unknown; the model is trained on one-hour windows".to_string()),
+    }
 }
 
 fn fmt_features(v: &[f64; N_FEATURES]) -> String {
@@ -1813,8 +1852,8 @@ impl Strategy for GboostPlanBStrategy {
             idle("session drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }
-        if let Some(why) = venue_gate() {
-            idle(why);
+        if let Some(why) = shape_gate(&ctx.market) {
+            idle(&why);
             return Ok(StrategySignal::NoSignal);
         }
         if !ctx.crypto_filter.eq_ignore_ascii_case("btc") {
@@ -1844,7 +1883,7 @@ impl Strategy for GboostPlanBStrategy {
                         let plan_now = crate::vipers::gboost_planb_train::Plan::from_config(dc, plan_fee_rate());
                         let rec = shadow_record_for(&ctx.crypto_filter, &m.version, &plan_now).await;
                         Some(lane_line(
-                            m.gate_passed, &rec, dc.gboost_planb_shadow_min_trades.max(0) as usize, f(dc.gboost_planb_shadow_min_win_rate),
+                            m.trained_venue.as_deref(), m.gate_passed, &rec, dc.gboost_planb_shadow_min_trades.max(0) as usize, f(dc.gboost_planb_shadow_min_win_rate),
                             dc.gboost_planb_trade_size_usdc, dc.gboost_planb_probation_trade_size_usdc,
                         ))
                     }
@@ -1943,6 +1982,7 @@ impl Strategy for GboostPlanBStrategy {
         }
         let inputs = DecisionInputs {
             w, t, bars: &bars, mid_now, mid_m1, mid_m5, ask, funding,
+            strike: market.strike_price.and_then(|k| k.to_f64()).filter(|k| *k > 0.0),
             oi_d5: derivs.oi_d5, oi_d30: derivs.oi_d30, tlsr: derivs.tlsr, tlsr15: derivs.tlsr15,
         };
         let features = match build_features(&inputs) {
@@ -2047,7 +2087,8 @@ impl Strategy for GboostPlanBStrategy {
         let record = shadow_record_for(&ctx.crypto_filter, &model.version, &plan_now).await;
         let min_trades = dc.gboost_planb_shadow_min_trades.max(0) as usize;
         let min_win = f(dc.gboost_planb_shadow_min_win_rate);
-        let lane_block = shadow_blocks_live(model.gate_passed, &record, min_trades, min_win);
+        let lane_block = venue_blocks_live(model.trained_venue.as_deref(), crate::venues::ledger_venue())
+            .or_else(|| shadow_blocks_live(model.gate_passed, &record, min_trades, min_win));
         let (stake, tier) = match &lane_block {
             Some(_) => (dc.gboost_planb_trade_size_usdc, "simulated"),
             None => live_stake(&record, dc.gboost_planb_trade_size_usdc, dc.gboost_planb_probation_trade_size_usdc),
@@ -2181,11 +2222,11 @@ impl Strategy for GboostPlanBStrategy {
         // map is locked, because the sweep awaits a database read and, for a
         // market that has closed, the venue — neither of which should be done
         // while the patrol tick is waiting on the lock.
-        // Gated exactly as the entry path is. Without the venue and asset checks
+        // Gated exactly as the entry path is. Without the shape and asset checks
         // `ensure_model` would look for a model on every ETH and SOL squadron and
-        // on the other two venues, and warn every ten minutes that a file the
-        // BTC-only pipeline was never going to write is missing.
-        if dc.enable_gboost && venue_gate().is_none() && ctx.crypto_filter.eq_ignore_ascii_case("btc") {
+        // on every market of another window length, and warn every ten minutes
+        // that a file the BTC-only pipeline was never going to write is missing.
+        if dc.enable_gboost && shape_gate(&ctx.market).is_none() && ctx.crypto_filter.eq_ignore_ascii_case("btc") {
             sweep_shadow_exits(ctx, plan_fee_rate()).await;
         }
         let positions = ctx.positions.lock().await;
@@ -2411,6 +2452,7 @@ mod tests {
             }).collect();
             let pair = |k: &str| [opt(&fixture["mids"][k][0]), opt(&fixture["mids"][k][1])];
             let inputs = DecisionInputs {
+                strike: None,
                 w: fixture["W"].as_i64().unwrap(),
                 t: fixture["t"].as_i64().unwrap(),
                 bars: &bars,
@@ -2449,7 +2491,7 @@ mod tests {
     fn missing_funding_is_missing_until_a_model_zeroes_it() {
         let bars: Vec<Bar> = (0..61).map(|i| Bar { open_s: 3600 + 60 * i, open: 1.0, high: 1.0, low: 1.0, close: 1.0 }).collect();
         let f = build_features(&DecisionInputs {
-            w: 3600 + 30 * 60, t: 3600 + 61 * 60, bars: &bars, mid_now: [Some(0.5), Some(0.5)], mid_m1: [None; 2], mid_m5: [None; 2], ask: [0.5, 0.5], funding: None, oi_d5: None, oi_d30: None, tlsr: None, tlsr15: None,
+            strike: None, w: 3600 + 30 * 60, t: 3600 + 61 * 60, bars: &bars, mid_now: [Some(0.5), Some(0.5)], mid_m1: [None; 2], mid_m5: [None; 2], ask: [0.5, 0.5], funding: None, oi_d5: None, oi_d30: None, tlsr: None, tlsr15: None,
         }).unwrap();
         assert!(f[0][22].is_nan() && f[1][22].is_nan());
         assert!((23..=26).all(|j| f[0][j].is_nan()));
@@ -2469,7 +2511,7 @@ mod tests {
             let matrix = Matrix::new(&data, 4, 2);
             let mut b = PerpetualBooster::default().set_iteration_limit(Some(1)).set_num_threads(Some(1));
             b.fit(&matrix, &[0.0, 1.0, 0.0, 1.0], None, None).unwrap();
-            PlanBModel { booster: b, platt_a: 1.0, platt_b: 0.0, version: "t".into(), trees: 1, zeroed: vec![23, 24, 25, 26], form: TRAINED_FORM, residual_shrink: 1.0, plan, posture: Some("gates".to_string()), entry_rule, trained_by: None, created_at: None, calibrated_through: None, holdout_summary: None, gate_passed: true }
+            PlanBModel { booster: b, platt_a: 1.0, platt_b: 0.0, version: "t".into(), trees: 1, zeroed: vec![23, 24, 25, 26], form: TRAINED_FORM, residual_shrink: 1.0, plan, posture: Some("gates".to_string()), entry_rule, trained_by: None, created_at: None, calibrated_through: None, holdout_summary: None, gate_passed: true, trained_venue: None }
         };
         let m = |plan: Option<[f64; 4]>| m_with(plan, Some("e2".to_string()));
         assert!(m(Some(REFERENCE_PLAN)).plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "gates", TRAINED_FORM).is_none());
@@ -2533,14 +2575,14 @@ mod tests {
     fn missing_history_or_mids_are_reported_not_guessed() {
         let bars: Vec<Bar> = (0..61).map(|i| Bar { open_s: 3600 + 60 * i, open: 1.0, high: 1.0, low: 1.0, close: 1.0 }).collect();
         let base = |bars: &[Bar]| build_features(&DecisionInputs {
-            w: 7200, t: 3600 + 61 * 60, bars, mid_now: [Some(0.5), Some(0.5)], mid_m1: [None; 2], mid_m5: [None; 2], ask: [0.5, 0.5], funding: Some(0.0), oi_d5: None, oi_d30: None, tlsr: None, tlsr15: None,
+            strike: None, w: 7200, t: 3600 + 61 * 60, bars, mid_now: [Some(0.5), Some(0.5)], mid_m1: [None; 2], mid_m5: [None; 2], ask: [0.5, 0.5], funding: Some(0.0), oi_d5: None, oi_d30: None, tlsr: None, tlsr15: None,
         });
         assert_eq!(base(&bars[1..]).unwrap_err(), FeatureGap::MissingBars);
         let mut with_strike = bars.clone();
         with_strike.retain(|b| b.open_s != 7200);
         assert_eq!(base(&with_strike).unwrap_err(), FeatureGap::MissingBars);
         let ok = build_features(&DecisionInputs {
-            w: 3600 + 30 * 60, t: 3600 + 61 * 60, bars: &bars, mid_now: [Some(0.5), None], mid_m1: [None; 2], mid_m5: [None; 2], ask: [0.5, 0.5], funding: Some(0.0), oi_d5: None, oi_d30: None, tlsr: None, tlsr15: None,
+            strike: None, w: 3600 + 30 * 60, t: 3600 + 61 * 60, bars: &bars, mid_now: [Some(0.5), None], mid_m1: [None; 2], mid_m5: [None; 2], ask: [0.5, 0.5], funding: Some(0.0), oi_d5: None, oi_d30: None, tlsr: None, tlsr15: None,
         });
         assert_eq!(ok.unwrap_err(), FeatureGap::MissingMid);
     }
@@ -3011,23 +3053,23 @@ mod shadow_promotion_tests {
     #[test]
     fn the_card_names_the_lane_and_what_is_missing() {
         let thin = ShadowStats { trades: 12, mean_ret: 0.008, lower_bound: -0.021, win: 0.58 };
-        let line = lane_line(true, &thin, 40, 0.53, dec!(4.0), dec!(1.0));
+        let line = lane_line(None, true, &thin, 40, 0.53, dec!(4.0), dec!(1.0));
         assert!(line.starts_with("SHADOW"), "{line}");
         assert!(line.contains("shadow record 12 of 40 trades"), "it must name the missing number: {line}");
 
         let earned = ShadowStats { trades: 44, mean_ret: 0.026, lower_bound: 0.004, win: 0.57 };
-        let line = lane_line(true, &earned, 40, 0.53, dec!(4.0), dec!(1.0));
+        let line = lane_line(None, true, &earned, 40, 0.53, dec!(4.0), dec!(1.0));
         assert!(line.starts_with("LIVE at the full stake $4.00"), "{line}");
         assert!(line.contains("+2.60%"), "{line}");
 
         // Promoted on a positive mean alone: live, at the probation stake, and the card says why.
         let probation = ShadowStats { trades: 44, mean_ret: 0.008, lower_bound: -0.012, win: 0.55 };
-        let line = lane_line(true, &probation, 40, 0.53, dec!(4.0), dec!(1.0));
+        let line = lane_line(None, true, &probation, 40, 0.53, dec!(4.0), dec!(1.0));
         assert!(line.starts_with("LIVE at the probation stake $1.00"), "{line}");
         assert!(line.contains("lower bound is not yet above zero"), "{line}");
 
         // A model that never cleared the gate says so, however good the record.
-        let line = lane_line(false, &earned, 40, 0.53, dec!(4.0), dec!(1.0));
+        let line = lane_line(None, false, &earned, 40, 0.53, dec!(4.0), dec!(1.0));
         assert!(line.starts_with("SHADOW") && line.contains("holdout gate"), "{line}");
     }
 
@@ -3111,7 +3153,7 @@ mod shadow_promotion_tests {
         let matrix = Matrix::new(&data, 4, 2);
         let mut b = PerpetualBooster::default().set_objective(Objective::SquaredLoss).set_iteration_limit(Some(1)).set_num_threads(Some(1));
         b.fit(&matrix, &[0.2, 0.2, 0.2, 0.2], None, None).unwrap();
-        let model = |b: PerpetualBooster, shrink: f64| PlanBModel { booster: b, platt_a: 1.0, platt_b: 0.0, version: "r".into(), trees: 1, zeroed: vec![23, 24, 25, 26], form: ModelForm::ResidualMid, residual_shrink: shrink, plan: None, posture: Some("settlement".into()), entry_rule: Some("e2".into()), trained_by: None, created_at: None, calibrated_through: None, holdout_summary: None, gate_passed: false };
+        let model = |b: PerpetualBooster, shrink: f64| PlanBModel { booster: b, platt_a: 1.0, platt_b: 0.0, version: "r".into(), trees: 1, zeroed: vec![23, 24, 25, 26], form: ModelForm::ResidualMid, residual_shrink: shrink, plan: None, posture: Some("settlement".into()), entry_rule: Some("e2".into()), trained_by: None, created_at: None, calibrated_through: None, holdout_summary: None, gate_passed: false, trained_venue: None };
         let mut row = [0.0f64; N_FEATURES];
         row[MID_COLUMN] = 0.37;
         let (raw, p) = model(b.clone(), 1.0).predict(&[row])[0];
@@ -3175,4 +3217,62 @@ mod shadow_promotion_tests {
                 "positive skill over the base rate with negative skill over the market fails");
     }
 
+}
+
+#[cfg(test)]
+mod venue_neutral_tests {
+    use super::{build_features, shape_gate, venue_blocks_live, Bar, DecisionInputs, TRAINED_VENUE};
+    use crate::state::MarketConfig;
+    use crate::venues::core::MarketId;
+
+    fn market(window_secs: Option<i64>) -> MarketConfig {
+        MarketConfig {
+            yes_token: MarketId::new("y"), no_token: MarketId::new("n"), market_name: "m".into(),
+            market_close_time: None, strike_price: None, window_secs, is_neg_risk: false,
+            condition_id: String::new(), yes_fee_bps: 0, no_fee_bps: 0,
+        }
+    }
+
+    /// The gate names the market's shape, never the venue: an hourly market passes
+    /// wherever it trades, a 15-minute or daily one is refused with its length, and
+    /// a market whose venue does not say is refused as unknown, not assumed hourly.
+    #[test]
+    fn the_shape_gate_reads_the_window_not_the_venue() {
+        assert_eq!(shape_gate(&market(Some(3600))), None);
+        assert_eq!(shape_gate(&market(Some(900))).as_deref(), Some("the model is trained on one-hour windows; this market's window is 900 s"));
+        assert!(shape_gate(&market(Some(86_400))).unwrap().contains("86400 s"));
+        assert!(shape_gate(&market(None)).unwrap().contains("unknown"));
+    }
+
+    /// A venue that publishes the strike supplies it; the features move with it.
+    /// Without one, the strike is the window's opening bar, as an Up or Down market
+    /// defines it, and the two agree when the published strike is that open.
+    #[test]
+    fn a_published_strike_replaces_the_window_open() {
+        let bars: Vec<Bar> = (0..61).map(|i| Bar { open_s: 3600 + 60 * i, open: 100.0, high: 101.0, low: 99.0, close: 100.5 }).collect();
+        let inputs = |strike: Option<f64>| DecisionInputs {
+            strike, w: 3600 + 30 * 60, t: 3600 + 61 * 60, bars: &bars, mid_now: [Some(0.5), Some(0.5)],
+            mid_m1: [None; 2], mid_m5: [None; 2], ask: [0.5, 0.5], funding: Some(0.0),
+            oi_d5: None, oi_d30: None, tlsr: None, tlsr15: None,
+        };
+        let from_open = build_features(&inputs(None)).unwrap();
+        let same = build_features(&inputs(Some(100.0))).unwrap();
+        let higher = build_features(&inputs(Some(120.0))).unwrap();
+        // NaN-aware: the funding and derivatives columns are NaN here, and NaN != NaN.
+        let same_reading = |a: &[[f64; super::N_FEATURES]; 2], b: &[[f64; super::N_FEATURES]; 2]| a.iter().flatten().zip(b.iter().flatten()).all(|(x, y)| x == y || (x.is_nan() && y.is_nan()));
+        assert!(same_reading(&from_open, &same), "a published strike equal to the window open is the same reading");
+        assert!(!same_reading(&from_open, &higher), "a strike above the open changes the reading");
+    }
+
+    /// The venue stamp is a lane rule, not a refusal: the model on its own venue
+    /// may go live, an unstamped model is the trained venue's, and a model from
+    /// another venue stays in the shadow lane with both venues named.
+    #[test]
+    fn another_venues_model_trades_the_shadow_lane_only() {
+        assert_eq!(venue_blocks_live(Some(TRAINED_VENUE), TRAINED_VENUE), None);
+        assert_eq!(venue_blocks_live(None, TRAINED_VENUE), None);
+        let why = venue_blocks_live(Some(TRAINED_VENUE), "kalshi").expect("blocked");
+        assert!(why.contains("polymarket-intl") && why.contains("kalshi") && why.contains("shadow lane"), "{why}");
+        assert!(venue_blocks_live(None, "kalshi").is_some(), "an unstamped model is the trained venue's, not every venue's");
+    }
 }

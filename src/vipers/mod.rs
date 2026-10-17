@@ -333,7 +333,7 @@ mod venue_resolution_tests {
             yes_token: MarketId::new(yes), no_token: MarketId::new(no),
             market_name: name.to_string(),
             market_close_time: Some(Utc::now() + chrono::Duration::hours(1)),
-            strike_price: None, is_neg_risk: false,
+            strike_price: None, window_secs: None, is_neg_risk: false,
             condition_id: "cid".to_string(), yes_fee_bps: 0, no_fee_bps: 0,
         }
     }
@@ -430,3 +430,30 @@ mod venue_resolution_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod venue_agnostic_guard {
+    /// Only `src/venues/mod.rs` may select on a venue feature. A viper that does
+    /// is venue-specific by construction, which is how GBoost came to refuse
+    /// Kalshi outright until 2026-10-17. Test modules are exempt (they may need
+    /// a venue's fixtures), so only the code before each file's first
+    /// `#[cfg(test)]` is scanned.
+    #[test]
+    fn no_viper_selects_on_a_venue_feature() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vipers");
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("src/vipers is readable") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") { continue; }
+            let src = std::fs::read_to_string(&path).expect("viper source is readable");
+            let code = src.split("#[cfg(test)]").next().unwrap_or("");
+            for (i, line) in code.lines().enumerate() {
+                if line.contains("#[cfg(feature") || line.contains("#[cfg(not(feature") {
+                    offenders.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "vipers must not select on a venue feature:\n{}", offenders.join("\n"));
+    }
+}
+

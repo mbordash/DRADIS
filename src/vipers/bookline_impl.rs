@@ -1163,7 +1163,7 @@ mod shadow_sweep_tests {
             yes_token: MarketId::new(YES), no_token: MarketId::new(NO),
             market_name: "wnba-min-nyl".to_string(),
             market_close_time: Some(Utc::now() + chrono::Duration::hours(4)),
-            strike_price: None, is_neg_risk: false,
+            strike_price: None, window_secs: None, is_neg_risk: false,
             condition_id: CID.to_string(), yes_fee_bps: 0, no_fee_bps: 0,
         }
     }

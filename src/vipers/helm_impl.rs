@@ -816,7 +816,7 @@ mod tests {
                 yes_token: MarketId::new("helm-yes"), no_token: MarketId::new("helm-no"),
                 market_name: "Bitcoin Up or Down - October 2, 3PM ET".to_string(),
                 market_close_time: Some(Utc::now() + CDuration::minutes(50)),
-                strike_price: None, is_neg_risk: false,
+                strike_price: None, window_secs: None, is_neg_risk: false,
                 condition_id: "0xhelm".to_string(), yes_fee_bps: 0, no_fee_bps: 0,
             },
             snapshot: MarketSnapshot {

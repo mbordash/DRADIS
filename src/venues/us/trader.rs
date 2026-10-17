@@ -1238,6 +1238,7 @@ async fn trade_one_market(
         market_name: pair.question.clone(),
         market_close_time: pair.close_time,
         strike_price,
+        window_secs: crate::helpers::time::window_secs_from_question(&pair.question),
         is_neg_risk: false,
         condition_id: String::new(),
         yes_fee_bps: fee_bps,
@@ -1254,6 +1255,7 @@ async fn trade_one_market(
             market_name: mk.question.clone(),
             market_close_time: mk.close_time,
             strike_price,
+            window_secs: crate::helpers::time::window_secs_from_question(&mk.question),
             is_neg_risk: false,
             condition_id: String::new(),
             yes_fee_bps: fee_bps,
@@ -2805,6 +2807,7 @@ fn register_us_squadron(
         // config. The trading loop's own market_cfg carries the real close.
         market_close_time: None,
         strike_price,
+        window_secs: crate::helpers::time::window_secs_from_question(&pair.question),
         is_neg_risk: false,
         condition_id: String::new(),
         yes_fee_bps: fee_bps,

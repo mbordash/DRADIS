@@ -251,6 +251,15 @@ pub fn venue_name() -> &'static str { "us_retail" }
 #[cfg(feature = "kalshi")]
 pub fn venue_name() -> &'static str { "kalshi" }
 
+/// The venue label this build's trades are filed under, and the one a trained
+/// model's `venue` stamp is compared against (`gboost_planb::venue_blocks_live`).
+#[cfg(feature = "intl_clob")]
+pub fn ledger_venue() -> &'static str { crate::venues::intl::INTL_VENUE }
+#[cfg(feature = "us_retail")]
+pub fn ledger_venue() -> &'static str { "polymarket-us" }
+#[cfg(feature = "kalshi")]
+pub fn ledger_venue() -> &'static str { "kalshi" }
+
 /// How this build's loop carries a Helm take-profit to the book. See
 /// `helpers::helm::TakeProfitLeg` for what each answer costs.
 ///

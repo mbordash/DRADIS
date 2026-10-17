@@ -149,6 +149,17 @@ pub fn daily_window_reference_time(close_time: DateTime<Utc>) -> Option<DateTime
 /// Polymarket's hourly markets name a clock time ("Bitcoin Up or Down - October
 /// 8, 12PM ET"); the daily ones name only a date ("Bitcoin Up or Down on
 /// October 8?"). The window start, and so the strike, is the close minus this.
+/// The window length of a market whose question says what it is, else `None`.
+///
+/// Polymarket's "Up or Down" markets are the only ones whose text fixes the
+/// window (`up_down_window_secs`). A strike market ("Will Bitcoin be above
+/// $X on ...") says nothing about when it opened, and this returns `None`
+/// rather than a guess: `MarketConfig::window_secs` is read by a model that
+/// must not score a window of a length it was never trained on.
+pub fn window_secs_from_question(question: &str) -> Option<i64> {
+    question.to_ascii_lowercase().contains("up or down").then(|| up_down_window_secs(question))
+}
+
 pub fn up_down_window_secs(question: &str) -> i64 {
     static CLOCK: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let clock = CLOCK.get_or_init(|| Regex::new(r"(?i)\b\d{1,2}(:\d{2})?\s?(AM|PM)\b").expect("clock-time regex"));
