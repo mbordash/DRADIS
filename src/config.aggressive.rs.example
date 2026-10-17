@@ -1640,6 +1640,15 @@ pub const TIME_DECAY_MAX_ENTRY_PRICE: Decimal = dec!(0.46);
 /// templates; see `MOMENTUM_STOP_LOSS_CEILING`.
 pub const TIME_DECAY_MAX_ENTRY_PRICE_CEILING: Decimal = dec!(0.50);
 pub const TIME_DECAY_MIN_ENTRY_PRICE: Decimal = dec!(0.32);
+/// Highest implied theta, `1 − (yes_bid + no_bid)`, an entry will believe, and
+/// the widest spread either leg may show. The thesis harvests the last cents of
+/// convergence on one settled two-sided book: an hourly book's bids sum to about
+/// 0.99 with a cent or two of spread per leg. A bigger gap is not theta, it is
+/// two quotes caught mid flip or torn from different book states; on 2026-10-17
+/// such a tick (0.42 / 0.44, 14 cents of "theta") filled one leg and the
+/// lone-leg stop sold it. Identical across the profile templates: a sanity
+/// bound on the book, not a risk posture.
+pub const TIME_DECAY_MAX_NET_THETA: Decimal = dec!(0.05);
 
 /// OBI gate: block entry when the order book is heavily one-sided.
 pub const TIME_DECAY_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.20);

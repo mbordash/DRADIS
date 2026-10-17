@@ -403,6 +403,7 @@ fn default_time_decay_max_slow_drift_pct()         -> Decimal { config::TIME_DEC
 fn default_time_decay_iv_stop_tighten_multiplier() -> Decimal { config::TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER }
 fn default_time_decay_min_hold_secs()              -> i64     { config::TIME_DECAY_MIN_HOLD_SECS              }
 fn default_time_decay_lone_leg_stop_pct()          -> Decimal { config::TIME_DECAY_LONE_LEG_STOP_LOSS_PERCENT }
+fn default_time_decay_max_net_theta()              -> Decimal { config::TIME_DECAY_MAX_NET_THETA              }
 
 fn default_gboost_planb_trade_size_usdc()   -> Decimal { config::GBOOST_PLANB_TRADE_SIZE_USDC           }
 fn default_gboost_planb_margin()            -> Decimal { config::GBOOST_PLANB_MARGIN                    }
@@ -566,6 +567,10 @@ pub struct DynamicConfig {
     /// is not range-checked, as with every knob.
     #[serde(default = "default_time_decay_lone_leg_stop_pct")]
     pub time_decay_lone_leg_stop_pct:          Decimal,
+    /// Book-settled gate: the most implied theta (and per-leg spread) an
+    /// entry will believe; see `config::TIME_DECAY_MAX_NET_THETA`.
+    #[serde(default = "default_time_decay_max_net_theta")]
+    pub time_decay_max_net_theta:              Decimal,
 
     // ── Momentum Viper ────────────────────────────────────────────────────────
     pub momentum_min_trade_size_usdc:  Decimal,
@@ -1455,6 +1460,7 @@ impl Default for DynamicConfig {
             time_decay_iv_stop_tighten_multiplier: config::TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER,
             time_decay_min_hold_secs:              config::TIME_DECAY_MIN_HOLD_SECS,
             time_decay_lone_leg_stop_pct:          config::TIME_DECAY_LONE_LEG_STOP_LOSS_PERCENT,
+            time_decay_max_net_theta:              config::TIME_DECAY_MAX_NET_THETA,
 
             momentum_min_trade_size_usdc:  config::MOMENTUM_MIN_TRADE_SIZE_USDC,
             momentum_max_trade_size_usdc:  config::MOMENTUM_MAX_TRADE_SIZE_USDC,

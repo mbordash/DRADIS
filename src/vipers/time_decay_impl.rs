@@ -57,6 +57,17 @@
 ///   On 2026-10-01 the Arbitrage rule sold such a leg 8s after it filled, as a
 ///   taker, for a loss that was 63% fee on a one-cent move.
 ///
+/// ── Book-Settled Gate ────────────────────────────────────────────────────────
+///   The two bids must come from one settled two-sided book. An hourly book's
+///   bids sum to about 0.99 with a cent or two of spread per leg, so the implied
+///   theta `1 − (yes_bid + no_bid)` is a few cents at most. Entry is refused when
+///   it exceeds TIME_DECAY_MAX_NET_THETA, or when either leg's own spread does
+///   (`book_settled`). A bigger gap is not theta: the quotes were caught mid flip
+///   or torn from different book states. 2026-10-17 00:44:59 ET: spot sat on the
+///   strike, the book flipped 15 cents a minute, one tick read 0.42 / 0.44 (14
+///   cents of "theta"), the YES leg filled as the book swung through it, the NO
+///   bid never could, and the lone-leg stop sold at 0.37.
+///
 /// ── Oracle Volatility Gate ───────────────────────────────────────────────────
 ///   Blocks entry when oracle signals active repricing or sustained trend:
 ///   - |velocity_5s| > TIME_DECAY_MAX_FAST_VELOCITY_* (active move in progress)
@@ -148,6 +159,26 @@ pub fn lone_leg_decision(
 /// maker's trackers — patrol rebuilds every strategy object on each market
 /// rotation, which would reset per-instance state every hour and turn a throttled
 /// line into an hourly repeat.
+/// Is the snapshot one settled two-sided book, or two legs caught mid flip?
+///
+/// `Err` names the gate reason. Rejects when the implied theta
+/// `1 − (yes_bid + no_bid)` exceeds `max_net_theta`, or when either leg's own
+/// spread does. A leg with no ask on record (`0`) is not spread-checked: zero
+/// means "not quoted", never "free" (B43).
+pub fn book_settled(
+    yes_bid: Decimal, no_bid: Decimal, yes_ask: Decimal, no_ask: Decimal, max_net_theta: Decimal,
+) -> Result<(), &'static str> {
+    if dec!(1) - (yes_bid + no_bid) > max_net_theta {
+        return Err("book in transition (implied theta above cap)");
+    }
+    for (bid, ask) in [(yes_bid, yes_ask), (no_bid, no_ask)] {
+        if ask > Decimal::ZERO && ask - bid > max_net_theta {
+            return Err("book in transition (leg spread above cap)");
+        }
+    }
+    Ok(())
+}
+
 fn time_decay_gate_log_state()
     -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>
 {
@@ -297,6 +328,14 @@ impl Strategy for TimeDecayStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── Book-settled gate ─────────────────────────────────────────────────
+        // Both bids are in the band; now they must be from one settled book,
+        // not two legs caught mid flip (the 2026-10-17 entry, see the header).
+        if let Err(reason) = book_settled(yes_bid, no_bid, snap.yes_ask, snap.no_ask, dc.time_decay_max_net_theta) {
+            idle(reason);
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // ── Pre-entry convergence check ───────────────────────────────────────
         if yes_bid + no_bid >= dc.time_decay_convergence_exit_bid {
             idle("already converged (no theta left)");
@@ -331,7 +370,10 @@ impl Strategy for TimeDecayStrategyImpl {
                 "viper": "TimeDecay",
                 "yes_bid": yes_bid.to_string(),
                 "no_bid": no_bid.to_string(),
+                "yes_ask": snap.yes_ask.to_string(),
+                "no_ask": snap.no_ask.to_string(),
                 "combined_bid": combined_bid.to_string(),
+                "max_net_theta": dc.time_decay_max_net_theta.to_string(),
                 "net_theta": net.to_string(),
                 "pair_shares": pair_shares.to_string(),
                 "trade_size": trade_size.to_string(),
@@ -647,5 +689,54 @@ mod lone_leg_tests {
     fn min_hold_and_an_empty_book_both_hold() {
         assert_eq!(lone_leg_decision(dec!(0.45), dec!(0.30), dec!(0.10), false, dec!(0.5), 60, 120), LoneLegDecision::Hold);
         assert_eq!(lone_leg_decision(dec!(0.45), dec!(0), dec!(0.10), false, dec!(0.5), 300, 120), LoneLegDecision::Hold);
+    }
+}
+
+#[cfg(test)]
+mod book_settled_tests {
+    use super::book_settled;
+    use rust_decimal_macros::dec;
+
+    const CAP: rust_decimal::Decimal = dec!(0.05);
+
+    /// The 2026-10-17 00:44:59 ET tick: both bids inside the band, 14 cents of
+    /// "theta" because the two legs were read mid flip. The gate that was missing.
+    #[test]
+    fn the_production_tick_is_a_book_in_transition() {
+        assert_eq!(
+            book_settled(dec!(0.42), dec!(0.44), dec!(0.43), dec!(0.58), CAP),
+            Err("book in transition (implied theta above cap)"),
+        );
+    }
+
+    /// A balanced hourly book one cent wide on each leg is the trade the header
+    /// describes: one cent of theta, both legs quoted.
+    #[test]
+    fn a_settled_balanced_book_passes() {
+        assert_eq!(book_settled(dec!(0.49), dec!(0.50), dec!(0.50), dec!(0.51), CAP), Ok(()));
+    }
+
+    /// Theta exactly at the cap is believed; one tick more is not.
+    #[test]
+    fn the_cap_is_inclusive() {
+        assert_eq!(book_settled(dec!(0.47), dec!(0.48), dec!(0.48), dec!(0.49), CAP), Ok(()));
+        assert!(book_settled(dec!(0.47), dec!(0.47), dec!(0.48), dec!(0.48), CAP).is_err());
+    }
+
+    /// Bids that sum sensibly can still hide a torn leg: a YES ask ten cents
+    /// above its bid is not a resting two-sided quote.
+    #[test]
+    fn a_wide_leg_spread_is_rejected_even_when_the_bid_sum_looks_fine() {
+        assert_eq!(
+            book_settled(dec!(0.48), dec!(0.49), dec!(0.58), dec!(0.50), CAP),
+            Err("book in transition (leg spread above cap)"),
+        );
+    }
+
+    /// No ask on record is "not quoted", not a zero-width spread and not an
+    /// infinite one; only the bid sum is judged.
+    #[test]
+    fn a_missing_ask_is_not_spread_checked() {
+        assert_eq!(book_settled(dec!(0.49), dec!(0.50), dec!(0), dec!(0), CAP), Ok(()));
     }
 }

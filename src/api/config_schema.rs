@@ -272,6 +272,8 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "When a leg whose partner bid has not filled is sold: exit when its bid is this far below its own entry (0.10 = 10%); otherwise it is held toward settlement while the partner bid keeps resting. This does not cap the loss: a lone leg can lose its full notional at any setting, so this chooses when a partial loss is realized (each stop pays a taker fee), not how large it can get. Floor 0.05 is about one taker fee at a 0.45 entry; below it the stop fires on noise.").range(0.05, 0.25).step(0.01));
         v.push(F::new(g, e, "time_decay_max_entry_price", "Max Entry", "price", false,
             "Highest price the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "time_decay_max_net_theta", "Max Implied Theta", "price", false,
+            "Highest implied theta, 1 − (YES bid + NO bid), an entry will believe; also the widest spread either leg may show. A settled hourly book sums to about 0.99 with a cent or two of spread per leg. A bigger gap is not theta: the two quotes were caught mid flip or torn from different book states, which is how the 2026-10-17 lone-leg loss was entered (0.42 / 0.44, 14 cents of \"theta\"). Lower is stricter.").range(0.0, 0.5).step(0.005));
         // Advanced
         v.push(F::new(g, e, "time_decay_min_entry_price", "Min Entry", "price", true,
             "Lowest price the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
