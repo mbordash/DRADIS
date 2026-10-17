@@ -752,6 +752,11 @@ async fn get_status() -> Response {
         "llm_enabled": llm_enabled,
         "app_version": env!("CARGO_PKG_VERSION"),
         "restart_pending": false,
+        // Where this session's global config came from. "seeded" means the
+        // primary shard was new (a venue switch) and the knobs were inherited
+        // from another shard, with ghost mode and the Helm switches at their
+        // defaults; the Control Tower shows a notice until the operator saves.
+        "config_origin": crate::helpers::dynamic_config::config_origin(),
     })).into_response()
 }
 

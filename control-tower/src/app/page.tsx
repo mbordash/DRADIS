@@ -34,6 +34,7 @@ import AiActionsPage   from '@/components/AiActionsPage';
 import ConsolePage     from '@/components/ConsolePage';
 import AlphaGate       from '@/components/AlphaGate';
 import VenueGate       from '@/components/VenueGate';
+import SeededConfigNotice from '@/components/SeededConfigNotice';
 import ErrorBoundary   from '@/components/ErrorBoundary';
 import Footer          from '@/components/Footer';
 import { ViperHealthStrip } from '@/components/ViperHealthStrip';
@@ -824,6 +825,7 @@ export default function DashboardPage() {
       <div className="min-h-screen bg-[#0a0a12]">
         {venueGate}
         {alphaGate}
+        <SeededConfigNotice origin={setupStatus?.config_origin} onReview={() => navigate('setup')} />
         <header className="sticky top-0 z-10 border-b border-[#1e1e32] bg-[#0a0a12]/90 backdrop-blur-sm px-6 py-3">
           <div className="max-w-7xl mx-auto relative flex items-center justify-between gap-4">
             {/* Logo + nav */}
@@ -879,6 +881,7 @@ export default function DashboardPage() {
     <div className="min-h-screen bg-[#0a0a12]">
       {venueGate}
         {alphaGate}
+      <SeededConfigNotice origin={setupStatus?.config_origin} onReview={() => navigate('setup')} />
       {/* ── Header ─────────────────────────────────────────────────────────── */}
       <header className="sticky top-0 z-10 border-b border-[#1e1e32] bg-[#0a0a12]/90 backdrop-blur-sm px-6 py-3">
         <div className="max-w-7xl mx-auto relative flex items-center justify-between gap-4">

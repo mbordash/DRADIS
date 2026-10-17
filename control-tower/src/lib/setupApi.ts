@@ -66,7 +66,20 @@ export interface SetupStatus {
   /** ENABLE_LLM_ADVISOR — the advisor loop is gated on this. */
   llm_enabled?: boolean;
   app_version: string;
+  /**
+   * Where this session's global config came from. `seeded` means the primary
+   * database shard was new (a venue switch) and the knobs were inherited from
+   * another shard's row, with the instance-level keys in `kept_default` (ghost
+   * mode, the Helm switches) left at their compiled defaults. Absent on engines
+   * older than 1.4.0.
+   */
+  config_origin?: ConfigOrigin;
 }
+
+export type ConfigOrigin =
+  | { kind: 'shard' }
+  | { kind: 'defaults' }
+  | { kind: 'seeded'; source: string; kept_default: string[] };
 
 export interface CredentialInfo {
   key: string;

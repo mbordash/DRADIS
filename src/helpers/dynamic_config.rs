@@ -54,6 +54,7 @@ use std::collections::HashMap;
 
 use crate::config;
 use crate::helpers::db;
+use sqlx::{sqlite::SqlitePoolOptions, Row};
 
 /// Registry of the LIVE, in-memory config handle for each running squadron,
 /// keyed by squadron id.  Each squadron's patrol loop reads its config every
@@ -1728,6 +1729,131 @@ impl Default for DynamicConfig {
 
 const DB_KEY: &str = "dynamic_config";
 
+// ── Config origin: where this session's global row came from ─────────────────
+//
+// 2026-10-17: production switched venue from Polymarket International to Kalshi.
+// A Kalshi build's primary shard is a new file, so the engine came up on the
+// compiled template: ghost mode on, the sports ledger off, every knob the
+// operator had set gone, and nothing said so. Config describes the instance, not
+// the shard, so a fresh primary shard now inherits the newest sibling shard's
+// row, less the instance-level keys, and the origin is reported to Setup.
+
+/// Where this session's global `DynamicConfig` came from.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConfigOrigin {
+    /// The primary shard had its own row: the normal case.
+    Shard,
+    /// No row in any shard: the compiled defaults, as on a first install.
+    Defaults,
+    /// The primary shard was new, and a sibling shard in the same directory
+    /// (another venue's, or another asset's) had a row: its values, with the
+    /// instance-level keys in `kept_default` left at the compiled defaults.
+    Seeded { source: String, kept_default: Vec<&'static str> },
+}
+
+static CONFIG_ORIGIN: OnceLock<Mutex<ConfigOrigin>> = OnceLock::new();
+
+fn origin_cell() -> &'static Mutex<ConfigOrigin> {
+    CONFIG_ORIGIN.get_or_init(|| Mutex::new(ConfigOrigin::Defaults))
+}
+
+/// Where this session's global config came from (`GET /api/setup/status`).
+pub fn config_origin() -> ConfigOrigin {
+    origin_cell().lock().map(|g| g.clone()).unwrap_or(ConfigOrigin::Defaults)
+}
+
+fn set_config_origin(origin: ConfigOrigin) {
+    if let Ok(mut g) = origin_cell().lock() { *g = origin; }
+}
+
+/// One shard file's global row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardRow {
+    pub path: String,
+    /// RFC 3339, so lexical order is time order.
+    pub updated_at: String,
+    pub json: String,
+}
+
+/// The most recently written row, or `None` when there is none.
+pub fn newest_row(rows: Vec<ShardRow>) -> Option<ShardRow> {
+    rows.into_iter().max_by(|a, b| a.updated_at.cmp(&b.updated_at))
+}
+
+/// Put a seeded config's instance-level fields (`GLOBAL_SEMANTICS_KEYS`) back to
+/// the compiled defaults, returning the keys that changed.
+///
+/// These describe the instance rather than the strategy posture: ghost mode on a
+/// venue that has never traded is the right starting state, and switching it off
+/// is a deliberate act per venue; the Helm live switch and the intent cap are
+/// the same kind of decision. Everything else (risk knobs, viper switches, the
+/// sports ledger, GBoost training) is what the operator meant to keep.
+pub fn keep_instance_level_defaults(cfg: &mut DynamicConfig) -> Vec<&'static str> {
+    let d = DynamicConfig::default();
+    let mut kept = Vec::new();
+    if cfg.ghost_mode != d.ghost_mode { cfg.ghost_mode = d.ghost_mode; kept.push("ghost_mode"); }
+    if cfg.book_apply_price_changes != d.book_apply_price_changes { cfg.book_apply_price_changes = d.book_apply_price_changes; kept.push("book_apply_price_changes"); }
+    if cfg.helm_enabled != d.helm_enabled { cfg.helm_enabled = d.helm_enabled; kept.push("helm_enabled"); }
+    if cfg.helm_live_enabled != d.helm_live_enabled { cfg.helm_live_enabled = d.helm_live_enabled; kept.push("helm_live_enabled"); }
+    if cfg.helm_max_open_intents != d.helm_max_open_intents { cfg.helm_max_open_intents = d.helm_max_open_intents; kept.push("helm_max_open_intents"); }
+    kept
+}
+
+/// The global row of one shard file, opened read-only; `None` when the file is
+/// not a DRADIS database or holds no row.
+async fn read_global_row(path: &std::path::Path) -> Option<ShardRow> {
+    let url = format!("sqlite://{}?mode=ro", path.display());
+    let pool = SqlitePoolOptions::new().max_connections(1).connect(&url).await.ok()?;
+    let row = sqlx::query("SELECT value, updated_at FROM config WHERE key = ?")
+        .bind(DB_KEY)
+        .fetch_optional(&pool)
+        .await
+        .ok()
+        .flatten();
+    let out = row.and_then(|r| {
+        let json: String = r.try_get(0).ok()?;
+        let updated_at: String = r.try_get(1).ok()?;
+        Some(ShardRow { path: path.display().to_string(), updated_at, json })
+    });
+    pool.close().await;
+    out
+}
+
+/// Global rows of every other `*-dradis.db` in the primary shard's directory.
+async fn sibling_rows(primary: &std::path::Path) -> Vec<ShardRow> {
+    let Some(dir) = primary.parent() else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut rows = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == primary { continue; }
+        let is_shard = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with("-dradis.db"));
+        if !is_shard { continue; }
+        if let Some(row) = read_global_row(&path).await { rows.push(row); }
+    }
+    rows
+}
+
+/// A seeded config for a primary shard with no row of its own: the newest sibling
+/// shard's row, parsed, with the instance-level keys back at the compiled
+/// defaults. `None` when no sibling has a row, or the newest one does not parse
+/// (a row from another build whose fields this one does not know), in which case
+/// the caller falls back to the defaults as before.
+pub async fn seed_from_siblings(primary: &std::path::Path) -> Option<(DynamicConfig, String, Vec<&'static str>)> {
+    let row = newest_row(sibling_rows(primary).await)?;
+    match serde_json::from_str::<DynamicConfig>(&row.json) {
+        Ok(mut cfg) => {
+            let kept = keep_instance_level_defaults(&mut cfg);
+            Some((cfg, row.path, kept))
+        }
+        Err(e) => {
+            warn!("⚠️  Sibling shard {} has a DynamicConfig row this build cannot read ({}) — not seeding from it", row.path, e);
+            None
+        }
+    }
+}
+
 /// Read-only / demo mode flag, mirroring the API server's `DRADIS_READ_ONLY` gate.
 ///
 /// In demo mode the persisted DynamicConfig (global + squadron-scoped) is bypassed
@@ -2076,6 +2202,7 @@ impl DynamicConfig {
                             ).await;
                         }
 
+                        set_config_origin(ConfigOrigin::Shard);
                         return Arc::new(cfg);
                     }
                     Err(e) => {
@@ -2083,9 +2210,27 @@ impl DynamicConfig {
                     }
                 }
             } else {
+                // A new primary shard: a venue switch, or a first install. The
+                // config describes the instance, so look for another shard's
+                // row before falling back to the template.
+                let primary = pool.connect_options().get_filename().to_path_buf();
+                if let Some((mut cfg, source, kept)) = seed_from_siblings(&primary).await {
+                    warn_ceiling_clamps("seeded config", &apply_build_caps(&mut cfg));
+                    warn!(
+                        "⚙️  No DynamicConfig in {} — seeded from {} (the newest sibling shard). \
+                         Instance-level keys left at the compiled defaults: {:?}. Review Setup before trading.",
+                        primary.display(), source, kept,
+                    );
+                    let cfg = Arc::new(cfg);
+                    cfg.save_as("seeded_from_shard").await;
+                    db::record_config_change(pool, "seeded_from_shard", "seeded_from", None, &source).await;
+                    set_config_origin(ConfigOrigin::Seeded { source, kept_default: kept });
+                    return cfg;
+                }
                 info!("⚙️  No DynamicConfig in DB — using compile-time defaults");
             }
         }
+        set_config_origin(ConfigOrigin::Defaults);
         let cfg = Arc::new(DynamicConfig::default());
         cfg.save_as("startup_dynamic").await;
         cfg
@@ -2094,6 +2239,13 @@ impl DynamicConfig {
     /// Persist current values as a JSON blob under DB_KEY.
     /// Also appends to config_history with the provided `changed_by` provenance tag.
     async fn save_as(&self, changed_by: &str) {
+        // A save by anyone but the loader means the operator (or the advisor)
+        // has looked at the config: the "seeded" notice has done its job.
+        if !matches!(changed_by, "startup_dynamic" | "seeded_from_shard")
+            && matches!(config_origin(), ConfigOrigin::Seeded { .. })
+        {
+            set_config_origin(ConfigOrigin::Shard);
+        }
         if let Some(pool) = db::pool() {
             match serde_json::to_string(self) {
                 Ok(new_json) => {
@@ -2966,3 +3118,104 @@ mod exit_retry_cooldown_tests {
         assert!(dc.strategy_enabled("NoSuchStrategy"), "unknown names run, as in the executor");
     }
 }
+
+#[cfg(test)]
+mod seeding_tests {
+    use super::*;
+
+    fn row(path: &str, at: &str, json: &str) -> ShardRow {
+        ShardRow { path: path.into(), updated_at: at.into(), json: json.into() }
+    }
+
+    /// The row written last wins, whichever shard it is in; no rows is no seed.
+    #[test]
+    fn the_newest_sibling_row_wins() {
+        let rows = vec![
+            row("logs/btc-dradis.db", "2026-10-17T12:00:00+00:00", "a"),
+            row("logs/sports-dradis.db", "2026-10-17T16:30:00+00:00", "b"),
+            row("logs/politics-dradis.db", "2026-10-16T09:00:00+00:00", "c"),
+        ];
+        assert_eq!(newest_row(rows).unwrap().json, "b");
+        assert!(newest_row(Vec::new()).is_none());
+    }
+
+    /// Risk knobs travel; the instance-level switches do not. Ghost mode on a
+    /// venue that has never traded stays on until the operator turns it off.
+    #[test]
+    fn instance_level_keys_stay_at_the_compiled_defaults() {
+        let mut cfg = DynamicConfig::default();
+        cfg.ghost_mode = !cfg.ghost_mode;
+        cfg.helm_live_enabled = !cfg.helm_live_enabled;
+        cfg.time_decay_max_entry_price = Decimal::new(50, 2);
+        let kept = keep_instance_level_defaults(&mut cfg);
+        assert_eq!(kept, vec!["ghost_mode", "helm_live_enabled"]);
+        let d = DynamicConfig::default();
+        assert_eq!(cfg.ghost_mode, d.ghost_mode);
+        assert_eq!(cfg.helm_live_enabled, d.helm_live_enabled);
+        assert_eq!(cfg.time_decay_max_entry_price, Decimal::new(50, 2), "a risk knob is kept");
+        assert!(keep_instance_level_defaults(&mut DynamicConfig::default()).is_empty(), "defaults change nothing");
+    }
+
+    async fn shard_with_row(dir: &std::path::Path, name: &str, json: &str, updated_at: &str) {
+        let path = dir.join(name);
+        let pool = SqlitePoolOptions::new().max_connections(1)
+            .connect(&format!("sqlite://{}?mode=rwc", path.display())).await.unwrap();
+        db::init_schema(&pool).await.unwrap();
+        sqlx::query("INSERT INTO config (key, value, updated_at) VALUES (?, ?, ?)")
+            .bind(DB_KEY).bind(json).bind(updated_at).execute(&pool).await.unwrap();
+        pool.close().await;
+    }
+
+    /// The production shape: an intl shard with the operator's knobs beside a new
+    /// Kalshi shard with none. The Kalshi shard inherits the knobs, not ghost
+    /// mode; an older sibling and a non-shard file in the directory are ignored.
+    #[tokio::test]
+    async fn a_new_primary_shard_is_seeded_from_the_newest_sibling() {
+        let dir = std::env::temp_dir().join(format!("dradis-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut newer = DynamicConfig::default();
+        newer.ghost_mode = false;
+        newer.time_decay_max_entry_price = Decimal::new(50, 2);
+        newer.sports_ledger_enabled = true;
+        let mut older = DynamicConfig::default();
+        older.time_decay_max_entry_price = Decimal::new(40, 2);
+        shard_with_row(&dir, "btc-dradis.db", &serde_json::to_string(&newer).unwrap(), "2026-10-17T16:00:00+00:00").await;
+        shard_with_row(&dir, "sports-dradis.db", &serde_json::to_string(&older).unwrap(), "2026-10-10T16:00:00+00:00").await;
+        std::fs::write(dir.join("notes.db"), b"not a shard").unwrap();
+        let primary = dir.join("kalshi-dradis.db");
+
+        let (cfg, source, kept) = seed_from_siblings(&primary).await.expect("seeded");
+        assert!(source.ends_with("btc-dradis.db"), "{source}");
+        assert_eq!(cfg.time_decay_max_entry_price, Decimal::new(50, 2));
+        assert!(cfg.sports_ledger_enabled, "the sports ledger switch travels");
+        assert_eq!(cfg.ghost_mode, DynamicConfig::default().ghost_mode, "ghost mode does not");
+        assert_eq!(kept, vec!["ghost_mode"]);
+
+        // A newest row this build cannot parse is not a seed: defaults instead.
+        shard_with_row(&dir, "eth-dradis.db", "{\"not\": \"a config\"}", "2026-10-18T00:00:00+00:00").await;
+        assert!(seed_from_siblings(&primary).await.is_none());
+
+        // An empty directory seeds nothing.
+        let empty = std::env::temp_dir().join(format!("dradis-seed-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&empty);
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(seed_from_siblings(&empty.join("kalshi-dradis.db")).await.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// The origin serializes for Setup with the kind tagged and the source named.
+    #[test]
+    fn the_origin_names_its_source_for_setup() {
+        let o = ConfigOrigin::Seeded { source: "logs/btc-dradis.db".into(), kept_default: vec!["ghost_mode"] };
+        let v = serde_json::to_value(&o).unwrap();
+        assert_eq!(v["kind"], "seeded");
+        assert_eq!(v["source"], "logs/btc-dradis.db");
+        assert_eq!(v["kept_default"][0], "ghost_mode");
+        assert_eq!(serde_json::to_value(ConfigOrigin::Shard).unwrap()["kind"], "shard");
+    }
+}
+

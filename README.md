@@ -545,7 +545,7 @@ DRADIS ships with a real-time web dashboard called **Control Tower** built on Ne
 | **CAG Registry**   | Active squadrons with market, state, deployed time, and **+ Deploy** button                      |
 | **Console**        | The engine's recent log, filtered by level, with **Copy visible** and a **Support bundle** button that saves one text file (version, venue, squadrons, every Viper's holding reason and refusal ledger, the live risk knobs, the log) to attach to a support request. It reads no credentials |
 | **AI Actions**     | Full audit trail of LLM-proposed config changes — status lifecycle, delta %, tier, outcome score — with inline apply/reject for pending proposals |
-| **Setup**          | Admin-gated credential management — venue keys, RPC, Alpaca, Telegram — with test-connection buttons, one-click engine restart, and the **AI Autonomy** panel (tier selector, kill switch, circuit-breaker reset) |
+| **Setup**          | Admin-gated credential management — venue keys, RPC, Alpaca, Telegram — with test-connection buttons, one-click engine restart, and the **AI Autonomy** panel (tier selector, kill switch, circuit-breaker reset) Switching venue gives the engine a new database shard; since 1.4.0 the new shard inherits the settings from the newest existing shard (ghost mode and the Helm switches start at their defaults) and a notice says so until the first save |
 
 ### Markets — the venue's picture beside the engine's
 
