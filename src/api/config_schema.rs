@@ -1178,11 +1178,11 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         // guard rail these fields have.
         v.push(F::new(sports, e, "sports_odds_regions", "Sports Regions", "string", true,
             "Comma-separated bookmaker regions for the odds query: us, us2, uk, eu, au. ⚠️ Not validated — an unrecognized region returns no bookmakers."));
-        // The ledger's fields sit in "Global", not "Raptor Polling": Setup renders
-        // Raptor Polling only through each raptor card's hardcoded text selectors,
-        // which cannot save a switch or a number. "Global" is Setup's Engine card.
+        // The ledger's fields sit in the "Sports Raptor" group, which Setup renders
+        // on The Odds API card: this switch and any other basic field on the card
+        // face, the advanced ones behind a collapsed link (`RaptorSettings`).
         v.push(F::new(sports, None, "sports_ledger_enabled", "Enabled", "bool", false,
-            "Record the sportsbook consensus against Polymarket prices for every matched sports moneyline, and each market's resolution. Research data for the sports spike's go/no-go statistics; nothing trades from it. While on, it owns The Odds API budget and it owns the Odds API budget. Enable it on ONE DRADIS instance per Odds API key: each instance budgets as if it had the whole quota."));
+            "Record the sportsbook consensus against the venue's prices for every matched sports moneyline, and each market's resolution. This fills the bookmaker board every sports Viper reads, and the sports squadron is only deployed onto a game the board can price: with this off there is no sports squadron. While on, it owns The Odds API budget. Enable it on ONE DRADIS instance per Odds API key: each instance budgets as if it had the whole quota."));
         v.push(F::new("FairValue", None, "enable_sports_fairvalue", "Sports Lane", "bool", false,
             "Let FairValue price a sports moneyline from the bookmaker consensus instead of its crypto model, which needs a strike, an oracle and a volatility estimate a game does not have. Needs the Sports Line Ledger on and an Odds API key: without a line the viper simply idles. Off by default because the favorite-side hypothesis is still gathering its sample."));
         v.push(F::new("FairValue", Some("enable_sports_fairvalue"), "sports_fairvalue_min_edge", "Sports Min Edge", "price", true,

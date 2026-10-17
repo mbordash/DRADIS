@@ -1010,24 +1010,42 @@ function RaptorSettings({
   const shown = new Set([raptor.poll_field, ...raptor.selector_fields].filter(Boolean) as string[]);
   const fields = schema.filter(f => f.group === raptor.settings_group && !shown.has(f.key));
   if (fields.length === 0) return null;
+  // A raptor's basic switches stay on the card face. The Sports Raptor's
+  // "Enabled" is the one switch that decides whether a sports squadron can
+  // exist at all (the seeder refuses a game the bookmaker board cannot price),
+  // and it sat behind this collapsed link until 2026-10-17, when an operator
+  // with the card open in front of him reported there was no such switch.
+  const basic = fields.filter(f => !f.advanced);
+  const advanced = fields.filter(f => f.advanced);
 
   return (
-    <div className="border-t border-[#1e1e32] pt-3">
-      <button
-        type="button"
-        onClick={() => setOpen(o => !o)}
-        className="text-[11px] font-mono text-gray-500 hover:text-gray-300 transition-colors"
-      >
-        {open ? '▾' : '▸'} {fields.length} setting{fields.length === 1 ? '' : 's'}
-      </button>
-      {open && (
-        <div className="mt-3 space-y-3">
-          {!config
-            ? <p className="text-[11px] font-mono text-gray-600">Loading…</p>
-            : fields.map(f => (
-                <AdvancedRow key={f.key} field={f} config={config} onPatch={patch} disabled={false} />
-              ))}
-        </div>
+    <div className="border-t border-[#1e1e32] pt-3 space-y-3">
+      {basic.length > 0 && (
+        !config
+          ? <p className="text-[11px] font-mono text-gray-600">Loading…</p>
+          : basic.map(f => (
+              <AdvancedRow key={f.key} field={f} config={config} onPatch={patch} disabled={false} />
+            ))
+      )}
+      {advanced.length > 0 && (
+        <>
+          <button
+            type="button"
+            onClick={() => setOpen(o => !o)}
+            className="text-[11px] font-mono text-gray-500 hover:text-gray-300 transition-colors"
+          >
+            {open ? '▾' : '▸'} {advanced.length} advanced setting{advanced.length === 1 ? '' : 's'}
+          </button>
+          {open && (
+            <div className="mt-3 space-y-3">
+              {!config
+                ? <p className="text-[11px] font-mono text-gray-600">Loading…</p>
+                : advanced.map(f => (
+                    <AdvancedRow key={f.key} field={f} config={config} onPatch={patch} disabled={false} />
+                  ))}
+            </div>
+          )}
+        </>
       )}
     </div>
   );
