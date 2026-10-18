@@ -4066,3 +4066,20 @@ mod venue_store_tests {
     }
 }
 
+#[cfg(test)]
+mod squadron_plan_tests {
+    use super::*;
+
+    /// The pipeline finds the asset's squadron through the live config registry,
+    /// which every venue loop now registers into; the id and a plan come back.
+    #[test]
+    fn a_registered_btc_squadron_gives_the_pipeline_its_plan() {
+        let handle = std::sync::Arc::new(std::sync::RwLock::new(crate::helpers::dynamic_config::DynamicConfig::default()));
+        crate::helpers::dynamic_config::register_squadron_config_handle("btc-open", handle);
+        let (id, plan) = squadron_plan("btc").expect("a registered btc squadron");
+        assert!(id == "btc" || id.starts_with("btc-"), "{id}");
+        assert!(plan.tp > 0.0 && plan.sl > 0.0, "a plan built from the squadron's own knobs");
+        assert!(squadron_plan("no-such-asset").is_none());
+    }
+}
+

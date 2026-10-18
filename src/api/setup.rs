@@ -1635,15 +1635,16 @@ async fn list_profiles() -> Response {
 
 /// Every squadron a config write should reach: live handles UNION persisted rows.
 ///
-/// `registered_squadron_ids()` alone covers only the intl venue — the Kalshi and
-/// Polymarket US traders never call `register_squadron_config_handle`, so the
-/// registry is permanently empty on those builds. Anything scoped to the
-/// registry therefore reported success over zero squadrons there, which is how
-/// the profile picker came to silently do nothing on two of the three venues
-/// this product sells.
+/// `registered_squadron_ids()` alone covered only the intl venue until
+/// 2026-10-17: the Kalshi and Polymarket US traders did not register a live
+/// handle, so the registry was empty on those builds and anything scoped to it
+/// reported success over zero squadrons, which is how the profile picker came
+/// to silently do nothing on two of the three venues this product sells. All
+/// three loops register now; the union with the persisted rows stays, because a
+/// row can exist for a squadron that is not flying this minute.
 ///
-/// Those traders reload their config from the DB every ~30s, so the persisted
-/// row is what reaches them; intl additionally gets a live handle push.
+/// The Kalshi and US traders also reload their config from the DB every ~30s,
+/// so the persisted row reaches them even without the live push.
 async fn config_write_targets() -> Vec<String> {
     let mut ids = crate::helpers::dynamic_config::registered_squadron_ids();
     if let Some(pool) = crate::helpers::db::pool() {

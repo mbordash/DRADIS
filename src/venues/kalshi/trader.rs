@@ -1254,6 +1254,14 @@ async fn trade_one_market(
     let mut available_collateral = starting;
     let mut session_pnl = Decimal::ZERO;
     let mut dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;
+    // The squadron's live config handle, as the intl patrol registers one. Work
+    // that runs beside the squadron reads it (`squadron_config_snapshot`): the
+    // GBoost training pipeline takes its plan from here, and a Control Tower
+    // PATCH lands in it at once. Until 2026-10-17 this loop never registered,
+    // so on this venue the pipeline waited for a BTC squadron that was flying,
+    // and the profile picker reported success over zero squadrons (`config_write_targets`).
+    let live_cfg: Arc<std::sync::RwLock<DynamicConfig>> = Arc::new(std::sync::RwLock::new((*dyn_cfg).clone()));
+    crate::helpers::dynamic_config::register_squadron_config_handle(&squadron_id, Arc::clone(&live_cfg));
     // See `TradeScope::ghost`: the ledger records whether a trade was real.
     scope.ghost = crate::config::GHOST_MODE || dyn_cfg.ghost_mode;
     if let Some(p) = &pool {
@@ -1303,6 +1311,7 @@ async fn trade_one_market(
                 }
                 release_swept_positions(&positions).await;
                 dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;
+                if let Ok(mut live) = live_cfg.write() { *live = (*dyn_cfg).clone(); }
                 // Track a mid-session mode flip in the filing scope too.
                 scope.ghost = crate::config::GHOST_MODE || dyn_cfg.ghost_mode;
                 continue;
