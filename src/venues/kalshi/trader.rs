@@ -38,6 +38,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
 use tokio::sync::{watch, Mutex};
 use tokio::time::Instant;
@@ -1197,6 +1198,17 @@ async fn trade_one_market(
     let _fill_listener = lifecycle.spawn_fill_listener(Arc::clone(venue), Arc::clone(&positions));
     let market_started_at = Utc::now();
 
+    // GBoost plan B's training store for this venue is written live: Kalshi
+    // publishes no price history, so a one-hour BTC market is recorded while it
+    // is flown (mids once a minute, the tape at the close) and settled by the
+    // pipeline afterwards. See `vipers::gboost_planb_record`.
+    let mut recorder = match (pair.cadence, pair.underlying, pair.close_time) {
+        (Some(Cadence::Hourly), "btc", Some(close)) => Some(crate::vipers::gboost_planb_record::HourlyRecorder::new(
+            &pair.ticker, pair.long.as_str(), pair.short.as_str(), close.timestamp(), pair.strike.and_then(|k| k.to_f64()),
+        )),
+        _ => None,
+    };
+
     if pair.is_crypto() {
         publish_raptor_health(raptor_health_tx, pair.underlying, true);
     }
@@ -1361,6 +1373,19 @@ async fn trade_one_market(
         match market_cfg.phase(Utc::now(), MARKET_RTB_WINDOW_SECS) {
             MarketPhase::Closed => {
                 info!("🏁 Kalshi market \"{}\" reached close — standing down to rotate", market_cfg.market_name);
+                if let Some(r) = recorder.take() {
+                    let prints = venue.recent_prints(&pair.long, 1000).await.ok().flatten().unwrap_or_default();
+                    let (w, samples, ticker) = (r.window_start(), r.samples(), r.ticker().to_string());
+                    let rec = r.finish(&prints);
+                    let dir = crate::vipers::gboost_planb_train::DataDir::new("btc");
+                    match crate::vipers::gboost_planb_record::write_record(&dir, w, &rec) {
+                        Ok(path) => info!(
+                            "📼 Recorded hourly market {ticker} for GBoost training: {samples} minute(s) of mids, {} print(s), outcome pending settlement → {}",
+                            rec.tape.len(), path.display(),
+                        ),
+                        Err(e) => warn!("📼 Could not write the hourly market record for {ticker}: {e}"),
+                    }
+                }
                 // cancel_all cancels RESTING ORDERS; it does not sell inventory.
                 // A squadron trades two markets at once — the hot primary that
                 // rotates every 15-30 minutes, and a longer-lived daily maker
@@ -1409,6 +1434,10 @@ async fn trade_one_market(
         let Some(snapshot) = build_snapshot(&hub, &pair.ticker, &raptors, &market_cfg).await else {
             continue;
         };
+        if let Some(r) = recorder.as_mut() {
+            let mid = |bid: Decimal, ask: Decimal| (bid > Decimal::ZERO && ask > Decimal::ZERO).then(|| ((bid + ask) / dec!(2)).to_f64()).flatten();
+            r.sample(Utc::now().timestamp(), mid(snapshot.yes_bid, snapshot.yes_ask), mid(snapshot.no_bid, snapshot.no_ask));
+        }
 
         // Build maker snapshot from the daily market (if available).
         let (mk_market, mk_snapshot) = match (&maker_cfg, &maker_pair) {

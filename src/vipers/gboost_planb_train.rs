@@ -260,6 +260,11 @@ pub struct MarketRecord {
     pub tape: Vec<Print>,
     #[serde(default)]
     pub hist: HashMap<String, Vec<HistPoint>>,
+    /// The market's own strike, when the venue publishes one (a Kalshi ladder
+    /// level). Absent on Polymarket's Up or Down markets, whose strike is the
+    /// window's opening bar, which the row builder then uses.
+    #[serde(default)]
+    pub strike: Option<f64>,
 }
 
 impl MarketRecord {
@@ -754,7 +759,7 @@ pub fn build_market_rows(
         // The same function the viper scores with, on the same series shape.
         let dv = crate::vipers::gboost_planb::deriv_features_at(derivs.0, derivs.1, t);
         let inputs = DecisionInputs {
-            strike: None,
+            strike: rec.strike,
             w,
             t,
             bars,
@@ -1666,7 +1671,7 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
         ("model_version", version.clone()),
         ("trained_by", "dradis-engine".into()),
         ("engine_version", env!("CARGO_PKG_VERSION").into()),
-        ("venue", TRAINED_VENUE.into()),
+        ("venue", crate::venues::ledger_venue().into()),
         ("asset", inputs.asset.to_ascii_lowercase()),
         ("label", inputs.plan.label()),
         ("model_form", TRAINED_FORM.stamp().to_string()),
@@ -2035,6 +2040,7 @@ async fn fetch_market(w: i64, now: i64) -> Result<Fetched, String> {
         end_date: m["endDate"].as_str().map(str::to_string),
         tape: Vec::new(),
         hist: HashMap::new(),
+        strike: None,
     };
     if rec.up_won().is_none() && now < w + 3600 + UNRESOLVED_GIVE_UP_SECS {
         return Ok(Fetched::NotResolved);
@@ -2352,6 +2358,10 @@ pub fn status_line(asset: &str) -> Option<String> {
         ),
         "training" => "training and validating a candidate model".to_string(),
         "catching_up" => "fetching newly resolved markets".to_string(),
+        "recording" => format!(
+            "recording this venue's hourly markets for training: {} of {} settled (the venue publishes no history to backfill from)",
+            st.backfill_done, st.backfill_total,
+        ),
         "waiting_for_squadron" => "training waits for a BTC squadron (the plan knobs come from it)".to_string(),
         "disabled" => "in-engine training is off".to_string(),
         "memory_too_small" => st.memory_refusal.clone().unwrap_or_else(|| "training refused: too little memory".to_string()),
@@ -2561,6 +2571,47 @@ async fn catch_up(asset: &str, dir: &DataDir, knobs: &TrainingKnobs, now: i64) -
     });
     let mut unresolved = 0usize;
     let mut fetched_this_pass = 0usize;
+    if !has_public_history() {
+        // This venue publishes no history: the records on disk were written live
+        // by the venue loop's recorder (`gboost_planb_record`), one per hourly
+        // market it flew, and windows with no record are hours it did not fly.
+        // The only thing left to fetch is each closed market's settlement, and
+        // that comes from the venue through its installed resolver.
+        let now_s = Utc::now().timestamp();
+        for &w in &windows {
+            let path = dir.market(w);
+            let Ok(mut rec) = read_json::<MarketRecord>(&path) else { continue };
+            if rec.missing || rec.up_won().is_some() { continue; }
+            if now_s < w + 3600 + RESOLUTION_GRACE_SECS { unresolved += 1; continue; }
+            let Some(tok) = rec.tokens.first().cloned() else { continue };
+            match crate::venues::core::resolve_leg("", &crate::venues::core::MarketId::new(&tok)).await {
+                Some(crate::venues::core::TokenResolution::Resolved(px)) => {
+                    rec.outcome_prices = Some(crate::vipers::gboost_planb_record::outcome_prices(px >= rust_decimal::Decimal::new(5, 1)));
+                    if let Err(e) = write_json_atomically(&path, &rec) {
+                        warn!("GBoost plan-B pipeline [{asset}]: cannot write market {w}: {e}");
+                        update_status(asset, |s| s.note_error("write", format!("cannot write market {w}: {e}")));
+                        break;
+                    }
+                    fetched_this_pass += 1;
+                }
+                // A market the venue never settles is written off unscored, as the
+                // fetcher writes one Gamma never flips: a row with no outcome is not
+                // a row with a guessed one.
+                _ if now_s > w + 3600 + UNRESOLVED_GIVE_UP_SECS => {
+                    rec.missing = true;
+                    missing += 1;
+                    let _ = write_json_atomically(&path, &rec);
+                }
+                _ => unresolved += 1,
+            }
+        }
+        if fetched_this_pass > 0 {
+            info!("GBoost plan-B pipeline [{asset}]: {fetched_this_pass} recorded market(s) settled; {done} window(s) on disk of {total} in the training window");
+        }
+        update_status(asset, |s| { s.backfill_done = done; s.backfill_missing = missing; s.backfill_unresolved = unresolved; s.phase = "recording".into(); });
+        // Nothing to backfill: the store is as complete as the hours this instance flew.
+        return true;
+    }
     for w in todo {
         // The operator can stop a long backfill from the Control Tower.
         if !training_knobs().enabled { break; }
@@ -2602,6 +2653,28 @@ async fn catch_up(asset: &str, dir: &DataDir, knobs: &TrainingKnobs, now: i64) -
     done + unresolved >= total
 }
 
+/// Does this build's venue publish the history the fetcher backfills from?
+/// Polymarket International does (Gamma, the data API, the CLOB); the others do
+/// not, and their store is written live by the venue loop's recorder.
+pub fn has_public_history() -> bool {
+    crate::venues::ledger_venue() == TRAINED_VENUE
+}
+
+/// How many settled recorded markets a venue without public history needs on disk
+/// before a training cycle is worth running. A week of hourly markets: fewer
+/// gives the holdout nothing to judge and the gate would refuse every candidate.
+pub const MIN_RECORDED_MARKETS: usize = 7 * 24;
+
+/// Settled records in `dir`'s training window.
+pub fn settled_records(dir: &DataDir, from: i64) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir.markets()) else { return 0 };
+    entries.flatten().filter(|e| {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(w) = name.strip_suffix(".json").and_then(|s| s.parse::<i64>().ok()) else { return false };
+        w >= from && read_json::<MarketRecord>(&e.path()).ok().is_some_and(|r| !r.missing && r.up_won().is_some())
+    }).count()
+}
+
 /// The pipeline for one asset. Runs forever; supervised by `main.rs`.
 pub async fn run_pipeline(asset: String) {
     let asset = asset.to_ascii_lowercase();
@@ -2637,6 +2710,21 @@ pub async fn run_pipeline(asset: String) {
         update_status(&asset, |s| s.squadron_id = Some(squadron_id.clone()));
         let now = Utc::now().timestamp();
         let complete = catch_up(&asset, &dir, &knobs, now).await;
+        if !has_public_history() {
+            let settled = settled_records(&dir, floor_hour(now) - knobs.window_days * 86400);
+            if settled < MIN_RECORDED_MARKETS {
+                // Status, not an error: the store fills one hourly market at a time
+                // and the card says how far along it is (`status_line`).
+                update_status(&asset, |s| {
+                    s.phase = "recording".into();
+                    s.next_train_at = None;
+                    s.backfill_done = settled;
+                    s.backfill_total = MIN_RECORDED_MARKETS;
+                });
+                tokio::time::sleep(Duration::from_secs(CATCHUP_INTERVAL_SECS)).await;
+                continue;
+            }
+        }
 
         let plan_changed = last_cycle.as_ref().and_then(|c| c.plan).is_some_and(|p| p != plan)
             || form_changed(last_cycle.as_ref());

@@ -195,7 +195,10 @@ ASSETS=kalshi                            # keep the dashboard pool tidy (data in
 > the shape its model is trained on, so it idles and says so between hourly
 > listings; a model stamped for another venue trades the shadow lane, settling
 > through the venue's own resolution, until one stamped for Kalshi passes the
-> holdout. Order books stream over the
+> holdout. Kalshi publishes no price history, so the training store is written
+> live: every one-hour BTC market the loop flies is recorded (mids once a minute,
+> the tape at the close, the venue's settlement afterwards) and the pipeline
+> trains from those records once a week of them has settled. Order books stream over the
 > authenticated WebSocket (`orderbook_delta` with sequence-gap recovery) and fills
 > confirm event-precisely via the private `fill` channel. Kalshi's quadratic taker
 > fee (max 1.75¢/contract at P=0.50) is priced into Viper edge thresholds. Positions

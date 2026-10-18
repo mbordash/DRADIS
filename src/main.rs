@@ -766,6 +766,13 @@ async fn run() -> Result<()> {
                 ).await {
                     tracing::warn!("⚠️ Kalshi DB pool init failed (dashboard disabled): {e}");
                 }
+                // GBoost plan-B training pipeline for the BTC squadron. On this venue
+                // it trains from the hourly markets the loop records live (Kalshi
+                // publishes no history to backfill from) and stamps its models for
+                // this venue, so a model can earn the live lane here on its own record.
+                spawn_supervised("gboost-planb-pipeline", move || {
+                    dradis::vipers::gboost_planb_train::run_pipeline("btc".to_string())
+                });
                 let cancel = tokio_util::sync::CancellationToken::new();
                 dradis::venues::kalshi::trader::run_kalshi_trader(
                     venue,
