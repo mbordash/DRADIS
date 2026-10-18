@@ -294,8 +294,22 @@ pub struct DataDir {
 }
 
 impl DataDir {
+    /// The store for `asset` on this build's venue.
+    ///
+    /// Polymarket International keeps the original path, which is also where an
+    /// instance's migrated history lives. A venue that records its own markets
+    /// gets a directory of its own under its ledger name, so its rows are that
+    /// venue's books and settlements and nothing else: an instance that moved
+    /// from Polymarket to Kalshi carries months of Polymarket records, and a
+    /// "Kalshi-trained" model must not be fitted on them.
     pub fn new(asset: &str) -> Self {
-        Self { root: PathBuf::from(format!("logs/gboost_planb/{}", asset.to_ascii_lowercase())) }
+        let asset = asset.to_ascii_lowercase();
+        let root = if has_public_history() {
+            format!("logs/gboost_planb/{asset}")
+        } else {
+            format!("logs/gboost_planb/{}/{asset}", crate::venues::ledger_venue())
+        };
+        Self { root: PathBuf::from(root) }
     }
     /// A store at an explicit path, for reading one that was copied off an
     /// instance rather than the one this process writes.
@@ -2673,13 +2687,15 @@ pub fn has_public_history() -> bool {
 /// gives the holdout nothing to judge and the gate would refuse every candidate.
 pub const MIN_RECORDED_MARKETS: usize = 7 * 24;
 
-/// Settled records in `dir`'s training window.
+/// Settled records this venue's loop recorded, in `dir`'s training window. Only
+/// live-recorded records count: a fetched record in the directory would be another
+/// venue's history and is not evidence about this one.
 pub fn settled_records(dir: &DataDir, from: i64) -> usize {
     let Ok(entries) = std::fs::read_dir(dir.markets()) else { return 0 };
     entries.flatten().filter(|e| {
         let name = e.file_name().to_string_lossy().into_owned();
         let Some(w) = name.strip_suffix(".json").and_then(|s| s.parse::<i64>().ok()) else { return false };
-        w >= from && read_json::<MarketRecord>(&e.path()).ok().is_some_and(|r| !r.missing && r.up_won().is_some())
+        w >= from && read_json::<MarketRecord>(&e.path()).ok().is_some_and(|r| r.recorded_live && !r.missing && r.up_won().is_some())
     }).count()
 }
 
@@ -4014,3 +4030,39 @@ mod metrics_tests {
         assert!(d.oi.windows(2).all(|w| w[1].0 > w[0].0));
     }
 }
+
+#[cfg(test)]
+mod venue_store_tests {
+    use super::*;
+
+    /// The store lives under the venue's name wherever the venue records its own
+    /// markets, and at the original path on the venue with public history.
+    #[test]
+    fn the_store_is_the_venues_own_where_it_records() {
+        let dir = DataDir::new("BTC");
+        let expected = if has_public_history() {
+            PathBuf::from("logs/gboost_planb/btc")
+        } else {
+            PathBuf::from(format!("logs/gboost_planb/{}/btc", crate::venues::ledger_venue()))
+        };
+        assert_eq!(dir.root, expected);
+    }
+
+    /// Only live-recorded, settled records count toward the training threshold.
+    #[test]
+    fn only_recorded_settled_markets_count() {
+        let dir = DataDir::at(std::env::temp_dir().join(format!("dradis-store-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&dir.root);
+        std::fs::create_dir_all(dir.markets()).unwrap();
+        let mut rec = MarketRecord { recorded_live: true, outcome_prices: Some("[\"1\",\"0\"]".into()), ..Default::default() };
+        write_json_atomically(&dir.market(7200), &rec).unwrap();          // recorded and settled: counts
+        rec.outcome_prices = None;
+        write_json_atomically(&dir.market(10_800), &rec).unwrap();        // recorded, unsettled: not yet
+        rec.outcome_prices = Some("[\"0\",\"1\"]".into()); rec.recorded_live = false;
+        write_json_atomically(&dir.market(14_400), &rec).unwrap();        // fetched elsewhere: never
+        assert_eq!(settled_records(&dir, 0), 1);
+        assert_eq!(settled_records(&dir, 7201), 0, "the window bound applies");
+        let _ = std::fs::remove_dir_all(&dir.root);
+    }
+}
+
