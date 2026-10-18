@@ -577,6 +577,9 @@ pub fn leg_book_from_fp(book: &OrderbookFp, is_yes: bool) -> crate::venues::core
 pub struct TradesResponse {
     #[serde(default)]
     pub trades: Vec<KalshiTrade>,
+    /// Pagination cursor for the next page; empty or absent on the last one.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

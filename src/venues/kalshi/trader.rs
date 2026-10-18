@@ -1383,8 +1383,12 @@ async fn trade_one_market(
             MarketPhase::Closed => {
                 info!("🏁 Kalshi market \"{}\" reached close — standing down to rotate", market_cfg.market_name);
                 if let Some(r) = recorder.take() {
-                    let prints = venue.recent_prints(&pair.long, 1000).await.ok().flatten().unwrap_or_default();
                     let (w, samples, ticker) = (r.window_start(), r.samples(), r.ticker().to_string());
+                    // The whole hour's tape, paged; one page covered nine minutes.
+                    let prints = match venue.trades_between(&pair.ticker, w, w + 3600).await {
+                        Ok(p) => p,
+                        Err(e) => { warn!("📼 Could not fetch the hour's prints for {ticker}: {e}; recording the mids alone"); Vec::new() }
+                    };
                     let rec = r.finish(&prints);
                     let dir = crate::vipers::gboost_planb_train::DataDir::new("btc");
                     match crate::vipers::gboost_planb_record::write_record(&dir, w, &rec) {

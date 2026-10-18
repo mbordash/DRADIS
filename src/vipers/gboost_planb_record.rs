@@ -215,6 +215,26 @@ mod tests {
         assert!(build_market_rows(w, &fetched, &bars, &[], (&[], &[]), &plan).is_empty(), "a fetched market with no prints is dead");
     }
 
+    /// An hour whose book was two-sided for only part of it trains on that part;
+    /// a fetched history that sparse would be a dead market and build nothing.
+    #[test]
+    fn a_sparse_recorded_hour_trains_on_the_minutes_it_has() {
+        let w = 1_792_000_800i64;
+        let mut r = HourlyRecorder::new("KXBTCD-T", "k#yes", "k#no", w + 3600, Some(100.0));
+        for m in 20..32 { r.sample(w + 60 * m + 1, Some(0.50 + m as f64 * 0.002), Some(0.50 - m as f64 * 0.002)); }
+        let mut rec = r.finish(&[]);
+        rec.outcome_prices = Some(outcome_prices(true));
+        let bars: Vec<Bar> = ((w - 62 * 60)..(w + 3600)).step_by(60)
+            .map(|o| { let px = 100.0 + ((o - w) as f64) / 36_000.0; Bar { open_s: o, open: px, high: px + 0.1, low: px - 0.1, close: px + 0.01 } })
+            .collect();
+        let plan = Plan::from_config(&DynamicConfig::default(), 0.07);
+        let rows = build_market_rows(w, &rec, &bars, &[], (&[], &[]), &plan);
+        assert!(!rows.is_empty(), "the two-sided minutes train");
+        assert!(rows.iter().all(|row| (21..=35).contains(&row.k)), "only minutes with a fresh mid: {:?}", rows.iter().map(|r| r.k).collect::<Vec<_>>());
+        let mut fetched = rec.clone(); fetched.recorded_live = false;
+        assert!(build_market_rows(w, &fetched, &bars, &[], (&[], &[]), &plan).is_empty());
+    }
+
     /// A full hour recorded live, settled, trains: the row builder accepts the
     /// record exactly as it accepts a fetched one, and uses the market's strike.
     #[test]

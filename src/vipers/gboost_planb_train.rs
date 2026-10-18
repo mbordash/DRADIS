@@ -133,6 +133,9 @@ const MIN_PRINT_SHARES: f64 = 5.0;
 const MID_STALE_SECS: i64 = 180;
 /// Price-history points each side needs before a market is used.
 const MIN_HIST_POINTS: usize = 20;
+/// The floor for a live-recorded hour: its gaps are minutes with no two-sided
+/// book, not a dead market, and the row builder skips those minutes itself.
+const MIN_RECORDED_HIST_POINTS: usize = 5;
 /// Tape pages fetched per market (the harness cap).
 const TAPE_PAGE: usize = 1000;
 const TAPE_MAX_OFFSET: usize = 9000;
@@ -706,7 +709,12 @@ pub fn build_market_rows(
         v.sort_by_key(|x| x.0);
         hist[side] = v;
     }
-    if hist[0].len() < MIN_HIST_POINTS || hist[1].len() < MIN_HIST_POINTS {
+    // A fetched history this sparse is a dead market. A recorded hour is sparse
+    // when the book was one-sided for most of it (a deep in-the-money hour has no
+    // NO bids, so no mid); the minutes it does have are real and `history_mid_at`
+    // refuses a stale one, so it trains on those.
+    let min_hist = if rec.recorded_live { MIN_RECORDED_HIST_POINTS } else { MIN_HIST_POINTS };
+    if hist[0].len() < min_hist || hist[1].len() < min_hist {
         return out;
     }
     let mid_at = |side: usize, t: i64| history_mid_at(&hist[side], t);
@@ -2472,6 +2480,14 @@ async fn catch_up(asset: &str, dir: &DataDir, knobs: &TrainingKnobs, now: i64) -
     let last_resolved = floor_hour(now - 3600 - RESOLUTION_GRACE_SECS);
     let _ = std::fs::create_dir_all(dir.markets());
     let _ = std::fs::create_dir_all(dir.klines());
+    if !has_public_history() {
+        // Say so from the first pass: the bars and funding below take minutes to
+        // fetch and the card would otherwise keep the previous phase's text.
+        update_status(asset, |s| {
+            s.phase = "recording".into();
+            if s.backfill_total == 0 { s.backfill_total = MIN_RECORDED_MARKETS; }
+        });
+    }
 
     // Funding first: cheap, and every row wants it.
     let mut funding: Vec<(i64, f64)> = read_json(&dir.funding()).unwrap_or_default();

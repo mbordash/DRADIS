@@ -370,6 +370,33 @@ impl Execution for KalshiVenue {
     }
 }
 
+/// Pages of the trades endpoint the recorder will walk for one hour. A busy
+/// hourly market prints well over the single page `recent_prints` returns
+/// (1,000 prints covered the last nine minutes of the first recorded hour).
+const TRADES_MAX_PAGES: usize = 40;
+
+impl KalshiVenue {
+    /// Every print of `ticker` between `min_ts` and `max_ts` (unix seconds), walking
+    /// the endpoint's cursor, oldest first. For the hourly market recorder: the
+    /// Execution trait's `recent_prints` is one page, which is not an hour.
+    pub async fn trades_between(&self, ticker: &str, min_ts: i64, max_ts: i64) -> Result<Vec<crate::venues::core::TapePrint>> {
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..TRADES_MAX_PAGES {
+            let mut url = format!("/markets/trades?ticker={ticker}&limit=1000&min_ts={min_ts}&max_ts={max_ts}");
+            if let Some(c) = cursor.as_deref().filter(|c| !c.is_empty()) { url.push_str(&format!("&cursor={c}")); }
+            let resp: crate::venues::kalshi::types::TradesResponse = self.get_json(&url).await?;
+            out.extend(resp.trades.iter().filter_map(crate::venues::kalshi::types::print_from_trade));
+            match resp.cursor.filter(|c| !c.is_empty()) {
+                Some(c) if !resp.trades.is_empty() => cursor = Some(c),
+                _ => break,
+            }
+        }
+        out.sort_by(|a, b| a.at.cmp(&b.at));
+        Ok(out)
+    }
+}
+
 /// Random v4-style UUID for client_order_id idempotency (no new dep — derived
 /// from two `getrandom`-backed u64s via the `rsa` crate's rand_core).
 fn uuid_v4() -> String {
