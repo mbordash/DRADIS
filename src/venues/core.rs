@@ -430,6 +430,14 @@ pub struct CollateralPool {
     pub balance: Decimal,
 }
 
+/// One line of a rebalancing target: the share of sweepable collateral a pool
+/// should hold. See [`Execution::collateral_allocation`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AllocationTarget {
+    pub pool_id: String,
+    pub percent: u8,
+}
+
 /// A venue-neutral snapshot of a resting/working order, as reported by the venue.
 ///
 /// This is the input the shared `OrderLifecycle` manager consumes (alongside
@@ -528,6 +536,28 @@ pub trait Execution: Send + Sync {
     /// or the venue did not say which pool the market belongs to.
     async fn collateral_pool_for(&self, _market: &MarketId) -> Result<Option<CollateralPool>> {
         Ok(None)
+    }
+
+    /// Move `amount` of collateral from one pool to another, an operator
+    /// action from the Control Tower. `idempotency_key` is a UUID the venue may
+    /// use to refuse a repeat, so a retried request cannot move the money
+    /// twice. Returns the venue's transfer id. Single-pool venues have nothing
+    /// to move between and say so.
+    async fn move_collateral(&self, _from: &str, _to: &str, _amount: Decimal, _idempotency_key: &str) -> Result<String> {
+        anyhow::bail!("this venue keeps one wallet; there are no pools to move collateral between")
+    }
+
+    /// The venue's standing target for how collateral is spread across pools,
+    /// when the venue rebalances automatically. `Ok(None)` when the venue has
+    /// no such feature; an empty list when it does but nothing is set.
+    async fn collateral_allocation(&self) -> Result<Option<Vec<AllocationTarget>>> {
+        Ok(None)
+    }
+
+    /// Replace the venue's rebalancing target. Percentages total 100; an empty
+    /// list turns automatic rebalancing off.
+    async fn set_collateral_allocation(&self, _targets: &[AllocationTarget]) -> Result<()> {
+        anyhow::bail!("this venue keeps one wallet and does not rebalance between pools")
     }
 
     /// Currently held positions, as reported by the venue.

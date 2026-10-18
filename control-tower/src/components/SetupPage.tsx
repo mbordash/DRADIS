@@ -37,14 +37,17 @@ import {
   getAutonomy, putAutonomy,
   exportBundle, importBundle,
   getProfiles, applyProfile, ConfigProfile,
+  postCollateralTransfer, getCollateralAllocation, putCollateralAllocation, AllocationTarget,
   getAdminToken, clearAdminToken, SetupApiError,
   MigrationStatus, MigrationManifest, RestoreNeedsOverwrite,
   getMigrationStatus, prepareMigration, resumeTrading, requestArchiveTicket, archiveDownloadUrl,
   uploadMigrationArchive, applyStagedRestore, discardStagedRestore,
 } from '@/lib/setupApi';
 import { useConfirm } from '@/components/ConfirmDialog';
+import { DEMO_MODE } from '@/lib/demo';
 import useSWR, { useSWRConfig } from 'swr';
 import { getConfig, patchConfig, getConfigSchema, getStatus, getCollateralPools } from '@/lib/api';
+import type { CollateralPool } from '@/lib/types';
 import { AdvancedRow } from '@/components/AdvancedConfigModal';
 import type { DynamicConfig, ConfigFieldSchema } from '@/lib/types';
 
@@ -266,7 +269,7 @@ const btnCls = (variant: 'primary' | 'ghost' | 'danger' = 'ghost') =>
  * answered: an empty table would read as "no money".
  */
 function CollateralPoolsCard() {
-  const { data } = useSWR('collateral-pools', getCollateralPools, { refreshInterval: 30_000, revalidateOnFocus: false });
+  const { data, mutate } = useSWR('collateral-pools', getCollateralPools, { refreshInterval: 30_000, revalidateOnFocus: false });
   if (!data) return null;
   if (data.pools === null) {
     // An outage must not look like a single wallet.
@@ -279,16 +282,18 @@ function CollateralPoolsCard() {
   if (!data.split) return null;
   const starved = data.pools.filter(p => p.in_use && Number(p.balance) <= 0);
   return (
-    <div className="card p-4 border border-[#1e1e32] bg-[#0d0d1a]">
-      <h3 className="text-sm font-mono text-gray-200">💰 Collateral by exchange shard</h3>
-      <p className="text-xs text-gray-500 mt-1">
-        The venue keeps a separate balance per exchange shard and an order can only spend the
-        balance of the shard its market trades on. Crypto markets trade on shard 2, sports on
-        shard 3, politics and everything else on shard 0. API orders do not move funds between
-        shards; move them in your venue account, or with <code>scripts/kalshi_shards.py</code> from
-        the DRADIS repository. Shards marked in use fund a deployed squadron&apos;s market.
-      </p>
-      <table className="w-full text-xs font-mono mt-3">
+    <div className="card p-4 border border-[#1e1e32] bg-[#0d0d1a] space-y-3">
+      <div>
+        <h3 className="text-sm font-mono text-gray-200">💰 Collateral by exchange shard</h3>
+        <p className="text-xs text-gray-500 mt-1">
+          The venue keeps a separate balance per exchange shard and an order can only spend the
+          balance of the shard its market trades on. Crypto markets trade on shard 2, sports on
+          shard 3, politics and everything else on shard 0. A deposit lands on shard 0, and API
+          orders do not move funds between shards. Shards marked in use fund a deployed
+          squadron&apos;s market.
+        </p>
+      </div>
+      <table className="w-full text-xs font-mono">
         <tbody>
           {data.pools.map(p => {
             const empty = Number(p.balance) <= 0;
@@ -303,11 +308,172 @@ function CollateralPoolsCard() {
         </tbody>
       </table>
       {starved.length > 0 && (
-        <p className="text-xs text-amber-400 mt-2">
+        <p className="text-xs text-amber-400">
           Unfunded and in use: {starved.map(p => p.label).join(', ')}. The squadron on those
           markets has every buy refused until the shard holds a balance.
         </p>
       )}
+      {!DEMO_MODE && (
+        <>
+          <MoveFundsForm pools={data.pools} onDone={() => mutate()} />
+          <AllocationForm pools={data.pools} />
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Move a dollar amount between two pools, confirmed, through the engine's admin session. */
+function MoveFundsForm({ pools, onDone }: { pools: CollateralPool[]; onDone: () => void }) {
+  const [confirm, confirmDialog] = useConfirm();
+  const [from, setFrom] = useState(pools[0]?.id ?? '');
+  const [to, setTo] = useState(pools.find(p => p.id !== pools[0]?.id)?.id ?? '');
+  const [amount, setAmount] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+  const label = (id: string) => pools.find(p => p.id === id)?.label ?? id;
+  const valid = from && to && from !== to && Number(amount) > 0;
+
+  const submit = async () => {
+    if (!valid) return;
+    const ok = await confirm({
+      title: `Move $${Number(amount).toFixed(2)}?`,
+      tone: 'danger',
+      confirmLabel: 'Move funds',
+      body: (
+        <p>
+          From <span className="text-gray-200 font-mono">{label(from)}</span> to{' '}
+          <span className="text-gray-200 font-mono">{label(to)}</span>. The venue processes the
+          transfer in a few seconds; the balances above refresh when it lands.
+        </p>
+      ),
+    });
+    if (!ok) return;
+    setBusy(true); setNote(null);
+    try {
+      const r = await postCollateralTransfer(from, to, amount);
+      setNote({ kind: 'ok', text: `Transfer ${r.transfer_id} accepted; $${Number(r.amount).toFixed(2)} is on its way to ${label(r.to)}.` });
+      setAmount('');
+      setTimeout(onDone, 4000);
+    } catch (e) {
+      const msg = e instanceof SetupApiError && e.status === 401
+        ? 'Log in with the Setup password above to move funds.'
+        : e instanceof Error ? e.message : 'Transfer failed.';
+      setNote({ kind: 'err', text: msg });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="border-t border-[#1e1e32] pt-3">
+      {confirmDialog}
+      <h4 className="text-xs font-mono text-gray-300">Move funds between shards</h4>
+      <div className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_8rem_auto] gap-2 mt-2 items-center">
+        <select className={inputCls} value={from} onChange={e => setFrom(e.target.value)} aria-label="From pool">
+          {pools.map(p => <option key={p.id} value={p.id}>{p.label} (${Number(p.balance).toFixed(2)})</option>)}
+        </select>
+        <select className={inputCls} value={to} onChange={e => setTo(e.target.value)} aria-label="To pool">
+          {pools.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
+        </select>
+        <input className={inputCls} inputMode="decimal" placeholder="Dollars" value={amount}
+               onChange={e => setAmount(e.target.value.replace(/[^0-9.]/g, ''))} aria-label="Amount in dollars" />
+        <button type="button" disabled={!valid || busy} onClick={submit}
+                className="px-3 py-2 rounded-lg text-xs font-mono bg-indigo-600/80 hover:bg-indigo-600 text-white disabled:opacity-40 disabled:cursor-not-allowed">
+          {busy ? 'Moving…' : 'Move'}
+        </button>
+      </div>
+      {note && <p className={`text-xs mt-2 ${note.kind === 'ok' ? 'text-emerald-400' : 'text-rose-400'}`}>{note.text}</p>}
+    </div>
+  );
+}
+
+/**
+ * The venue's automatic rebalancing target: what share of sweepable balance
+ * each shard should hold. Kalshi rebalances toward it every ten seconds and
+ * leaves the collateral behind resting orders where it is. Empty means off.
+ */
+function AllocationForm({ pools }: { pools: CollateralPool[] }) {
+  const [confirm, confirmDialog] = useConfirm();
+  const { data, mutate } = useSWR('collateral-allocation', getCollateralAllocation, { revalidateOnFocus: false });
+  const [draft, setDraft] = useState<Record<string, string> | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+  if (!data || !data.supported || data.targets === null) return null;
+  const current: Record<string, string> = Object.fromEntries(pools.map(p => [p.id, String(data.targets!.find(t => t.pool_id === p.id)?.percent ?? 0)]));
+  const values = draft ?? current;
+  const total = pools.reduce((sum, p) => sum + (Number(values[p.id]) || 0), 0);
+  const on = data.targets.length > 0;
+  const dirty = draft !== null && pools.some(p => values[p.id] !== current[p.id]);
+
+  const save = async (targets: AllocationTarget[]) => {
+    const turningOff = targets.length === 0;
+    const ok = await confirm({
+      title: turningOff ? 'Turn automatic rebalancing off?' : 'Set automatic rebalancing?',
+      tone: 'danger',
+      confirmLabel: turningOff ? 'Turn off' : 'Set target',
+      body: turningOff
+        ? <p>Balances stay where they are until you move them by hand.</p>
+        : (
+          <p>
+            The venue will move sweepable balance every few seconds toward{' '}
+            {targets.map(t => `${pools.find(p => p.id === t.pool_id)?.label ?? t.pool_id} ${t.percent}%`).join(', ')}.
+            Collateral behind resting orders is left in place.
+          </p>
+        ),
+    });
+    if (!ok) return;
+    setBusy(true); setNote(null);
+    try {
+      const r = await putCollateralAllocation(targets);
+      mutate(r, { revalidate: false });
+      setDraft(null);
+      setNote({ kind: 'ok', text: turningOff ? 'Automatic rebalancing is off.' : 'Target set; the venue rebalances toward it every few seconds.' });
+    } catch (e) {
+      const msg = e instanceof SetupApiError && e.status === 401
+        ? 'Log in with the Setup password above to change the allocation.'
+        : e instanceof Error ? e.message : 'Could not set the allocation.';
+      setNote({ kind: 'err', text: msg });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="border-t border-[#1e1e32] pt-3">
+      {confirmDialog}
+      <div className="flex items-baseline justify-between">
+        <h4 className="text-xs font-mono text-gray-300">Automatic rebalancing</h4>
+        <span className={`text-[10px] font-mono ${on ? 'text-emerald-400' : 'text-gray-500'}`}>{on ? 'on' : 'off'}</span>
+      </div>
+      <p className="text-xs text-gray-500 mt-1">
+        Target share of your balance per shard; the venue moves funds toward it every few seconds
+        and leaves collateral behind resting orders in place. Percentages must total 100.
+      </p>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-2">
+        {pools.map(p => (
+          <label key={p.id} className="text-[11px] font-mono text-gray-400">
+            <span className="block truncate" title={p.label}>{p.label}</span>
+            <input className={inputCls} inputMode="numeric" value={values[p.id]}
+                   onChange={e => setDraft({ ...values, [p.id]: e.target.value.replace(/[^0-9]/g, '') })} aria-label={`${p.label} percent`} />
+          </label>
+        ))}
+      </div>
+      <div className="flex items-center gap-3 mt-2">
+        <span className={`text-xs font-mono ${total === 100 ? 'text-gray-400' : 'text-amber-400'}`}>total {total}%</span>
+        <button type="button" disabled={busy || !dirty || total !== 100}
+                onClick={() => save(pools.map(p => ({ pool_id: p.id, percent: Number(values[p.id]) || 0 })).filter(t => t.percent > 0))}
+                className="px-3 py-1.5 rounded-lg text-xs font-mono bg-indigo-600/80 hover:bg-indigo-600 text-white disabled:opacity-40 disabled:cursor-not-allowed">
+          {busy ? 'Saving…' : 'Set target'}
+        </button>
+        {on && (
+          <button type="button" disabled={busy} onClick={() => save([])}
+                  className="px-3 py-1.5 rounded-lg text-xs font-mono border border-[#1e1e32] text-gray-300 hover:border-rose-500/50 disabled:opacity-40">
+            Turn off
+          </button>
+        )}
+      </div>
+      {note && <p className={`text-xs mt-2 ${note.kind === 'ok' ? 'text-emerald-400' : 'text-rose-400'}`}>{note.text}</p>}
     </div>
   );
 }

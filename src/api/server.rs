@@ -4740,10 +4740,18 @@ pub async fn run_api_server(
         .layer(axum::middleware::from_fn_with_state(state.clone(), enforce_read_only))
         .with_state(state.clone());
 
+    // Operator funding actions (moving collateral between a venue's pools):
+    // admin-gated like Setup, and they need the venue, so they carry the state.
+    let funding_routes = crate::api::funding::admin_routes()
+        .layer(axum::middleware::from_fn_with_state(state.clone(), require_api_key))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), enforce_read_only))
+        .with_state(state.clone());
+
     let app = public_routes
         .merge(protected_routes)
         .merge(setup_routes)
         .merge(migration_routes)
+        .merge(funding_routes)
         // Permissive CORS (outer layer — runs first, handles OPTIONS pre-flight
         // before the API-key middleware is reached).
         .layer(CorsLayer::permissive());

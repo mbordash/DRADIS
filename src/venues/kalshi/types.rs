@@ -272,6 +272,62 @@ pub struct IndexedBalance {
     pub balance: String,
 }
 
+/// Body of `POST /portfolio/intra_exchange_instance_transfer`: move `amount`
+/// dollars of event-contract collateral between two exchange shards. Kalshi
+/// counts the amount in centicents (one ten-thousandth of a dollar) and refuses
+/// a repeat of an accepted `client_transfer_id` on the same route.
+pub fn transfer_body(from_shard: i64, to_shard: i64, amount: Decimal, client_transfer_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "source": "event_contract",
+        "destination": "event_contract",
+        "source_exchange_shard": from_shard,
+        "destination_exchange_shard": to_shard,
+        "amount": centicents(amount),
+        "client_transfer_id": client_transfer_id,
+    })
+}
+
+/// Dollars to Kalshi's transfer unit, rounded to the nearest centicent.
+pub fn centicents(dollars: Decimal) -> i64 {
+    (dollars * Decimal::from(10_000)).round().to_string().parse().unwrap_or(0)
+}
+
+/// `GET /portfolio/intra_exchange_instance_transfer`'s acknowledgement.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TransferResponse {
+    #[serde(default)]
+    pub transfer_id: String,
+}
+
+/// `GET /portfolio/target_balance_allocation`: how Kalshi spreads sweepable
+/// balance across shards every ten seconds, when a target is set.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AllocationResponse {
+    #[serde(default)]
+    pub allocations: Vec<ShardAllocation>,
+    #[serde(default)]
+    pub resting_margin_reservation: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ShardAllocation {
+    #[serde(default)]
+    pub exchange_index: i64,
+    #[serde(default)]
+    pub percent: i64,
+}
+
+/// Body of `POST /portfolio/target_balance_allocation`. Kalshi requires the
+/// percentages to total 100; an empty list disables rebalancing. The margin
+/// reservation stays at Kalshi's default (`sum`: collateral behind every
+/// resting order is left where it is).
+pub fn allocation_body(targets: &[(i64, u8)]) -> serde_json::Value {
+    serde_json::json!({
+        "allocations": targets.iter().map(|(i, p)| serde_json::json!({"exchange_index": i, "percent": p})).collect::<Vec<_>>(),
+        "resting_margin_reservation": "sum",
+    })
+}
+
 /// What Kalshi opens on each exchange shard (docs: Series Shard Assignments).
 pub fn shard_label(index: i64) -> String {
     let what = match index {
@@ -509,6 +565,33 @@ mod tests {
         assert_eq!(b.shard_dollars(2), Some(dec!(30.0000)));
         assert_eq!(b.shard_dollars(3), Some(dec!(0)));
         assert_eq!(b.dollars(), dec!(42.3268));
+    }
+
+    /// Kalshi counts transfers in centicents; a dollar amount must land there
+    /// exactly, with the idempotency id and both shards in the body.
+    #[test]
+    fn a_transfer_body_counts_dollars_in_centicents() {
+        assert_eq!(centicents(dec!(30)), 300_000);
+        assert_eq!(centicents(dec!(12.50)), 125_000);
+        assert_eq!(centicents(dec!(0.0001)), 1);
+        let b = transfer_body(0, 2, dec!(30), "id-1");
+        assert_eq!(b["amount"], 300_000);
+        assert_eq!(b["source_exchange_shard"], 0);
+        assert_eq!(b["destination_exchange_shard"], 2);
+        assert_eq!(b["client_transfer_id"], "id-1");
+        assert_eq!(b["source"], "event_contract");
+    }
+
+    /// The allocation body lists one entry per shard and keeps Kalshi's default
+    /// margin reservation; an empty target turns rebalancing off.
+    #[test]
+    fn an_allocation_body_lists_shards_with_their_percentages() {
+        let b = allocation_body(&[(0, 20), (2, 60), (3, 20)]);
+        assert_eq!(b["allocations"].as_array().unwrap().len(), 3);
+        assert_eq!(b["allocations"][1]["exchange_index"], 2);
+        assert_eq!(b["allocations"][1]["percent"], 60);
+        assert_eq!(b["resting_margin_reservation"], "sum");
+        assert_eq!(allocation_body(&[])["allocations"].as_array().unwrap().len(), 0);
     }
 
     /// A subaccount-restricted key gets no breakdown; the wallet is one pool

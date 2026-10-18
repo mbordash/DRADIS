@@ -20,4 +20,5 @@ pub mod setup;
 pub mod migration;
 pub mod helm;
 pub mod markets;
+pub mod funding;
 

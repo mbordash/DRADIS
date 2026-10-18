@@ -276,6 +276,51 @@ impl Execution for KalshiVenue {
         Ok(self.balance().await?.pools())
     }
 
+    async fn move_collateral(&self, from: &str, to: &str, amount: Decimal, idempotency_key: &str) -> Result<String> {
+        let shard = |id: &str| id.parse::<i64>().with_context(|| format!("pool id {id:?} is not a Kalshi exchange shard index"));
+        let (from_shard, to_shard) = (shard(from)?, shard(to)?);
+        if from_shard == to_shard {
+            anyhow::bail!("source and destination are the same shard");
+        }
+        if amount <= Decimal::ZERO {
+            anyhow::bail!("amount must be positive");
+        }
+        let body = types::transfer_body(from_shard, to_shard, amount, idempotency_key);
+        let resp: types::TransferResponse = self
+            .post_json("/portfolio/intra_exchange_instance_transfer", &body)
+            .await?;
+        // Kalshi processes the transfer asynchronously; the next reading must
+        // come from the venue rather than the cache.
+        self.invalidate_balance().await;
+        Ok(resp.transfer_id)
+    }
+
+    async fn collateral_allocation(&self) -> Result<Option<Vec<crate::venues::core::AllocationTarget>>> {
+        let resp: types::AllocationResponse = self.get_json("/portfolio/target_balance_allocation").await?;
+        Ok(Some(
+            resp.allocations
+                .into_iter()
+                .map(|a| crate::venues::core::AllocationTarget {
+                    pool_id: a.exchange_index.to_string(),
+                    percent: a.percent.clamp(0, 100) as u8,
+                })
+                .collect(),
+        ))
+    }
+
+    async fn set_collateral_allocation(&self, targets: &[crate::venues::core::AllocationTarget]) -> Result<()> {
+        let mut shards = Vec::with_capacity(targets.len());
+        for t in targets {
+            let idx = t.pool_id.parse::<i64>().with_context(|| format!("pool id {:?} is not a Kalshi exchange shard index", t.pool_id))?;
+            shards.push((idx, t.percent));
+        }
+        let _: serde_json::Value = self
+            .post_json("/portfolio/target_balance_allocation", &types::allocation_body(&shards))
+            .await?;
+        self.invalidate_balance().await;
+        Ok(())
+    }
+
     /// The shard pool `market` spends from. `None` when Kalshi gave no
     /// breakdown or never said which shard the market trades on; the caller
     /// then falls back to the whole wallet, as before shards existed.

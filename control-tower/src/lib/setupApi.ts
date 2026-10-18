@@ -299,6 +299,41 @@ export function restartEngine(): Promise<{ ok: boolean; message: string }> {
   return request('/api/setup/restart', { method: 'POST' });
 }
 
+// ── Collateral pools (venues that split their wallet, e.g. Kalshi shards) ────
+
+export interface CollateralTransferResult {
+  transfer_id: string;
+  from: string;
+  to: string;
+  amount: string;
+}
+
+/** Move `amount` dollars of collateral from one pool to another. Admin session; the engine logs it. */
+export function postCollateralTransfer(from: string, to: string, amount: string): Promise<CollateralTransferResult> {
+  return request('/api/venue/collateral-pools/transfer', { method: 'POST', body: JSON.stringify({ from, to, amount }) });
+}
+
+export interface AllocationTarget {
+  pool_id: string;
+  percent: number;
+}
+
+export interface CollateralAllocation {
+  /** False when the venue has no automatic rebalancing. */
+  supported: boolean;
+  /** The standing target; empty when rebalancing is off; null when unsupported. */
+  targets: AllocationTarget[] | null;
+}
+
+export function getCollateralAllocation(): Promise<CollateralAllocation> {
+  return request('/api/venue/collateral-pools/allocation');
+}
+
+/** Replace the rebalancing target. Percentages total 100; an empty list turns it off. */
+export function putCollateralAllocation(targets: AllocationTarget[]): Promise<CollateralAllocation> {
+  return request('/api/venue/collateral-pools/allocation', { method: 'PUT', body: JSON.stringify({ targets }) });
+}
+
 /**
  * Select which venue binary the engine runs next.
  *

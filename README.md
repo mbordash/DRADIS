@@ -183,12 +183,12 @@ demo credentials are separate from production.
 sports on shard 3, politics and everything else on shard 0. The Kalshi app moves
 collateral between shards as you trade; API orders do not, so a deposit sitting on
 shard 0 leaves every crypto order rejected with `insufficient_shard_balance`. The
-Setup tab shows the balance per shard and names any unfunded one; the engine
+Setup tab shows the balance per shard, marks the shards your deployed squadrons
+spend from, and lets you move funds between them or set Kalshi's automatic
+rebalancing target, each behind the admin session with a confirmation. The engine
 refuses an order its shard cannot cover and says so on the Viper's card instead of
-retrying. Move funds in your Kalshi account, or from the instance with
-`scripts/kalshi_shards.py` (`balance`, `transfer`, or `set-allocation` for Kalshi's
-automatic rebalancing); the script reads the engine's own credentials and sends
-nothing without `--yes`.
+retrying. For a headless instance, `scripts/kalshi_shards.py` does the same from
+the shell with the engine's own credentials and sends nothing without `--yes`.
 
 ```bash
 KALSHI_API_KEY_ID=<key-id-uuid>          # from account settings (REQUIRED)
