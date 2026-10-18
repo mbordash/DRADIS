@@ -260,6 +260,24 @@ pub fn ledger_venue() -> &'static str { "polymarket-us" }
 #[cfg(feature = "kalshi")]
 pub fn ledger_venue() -> &'static str { "kalshi" }
 
+/// The currency this venue's crypto markets settle in, which is the currency
+/// every spot level and bar the engine compares against a strike must be in.
+///
+/// Binance quotes in USDT, and USDT is not a dollar (it traded at $0.9987 on
+/// 2026-10-18, about $100 of BTC). Polymarket's "Up or Down" markets resolve
+/// on the Binance BTC/USDT candle by rule, so the quote asset IS their
+/// settlement currency. Kalshi's crypto series resolve on CF Benchmarks'
+/// real-time indices, quoted in dollars. Polymarket US's settlement index has
+/// not been confirmed from the venue's rules; it keeps the quote asset until
+/// it is, rather than guess. Consumers: the price raptor (the oracle level),
+/// GBoost's live bars and its kline store (`gboost_planb_train`).
+#[cfg(feature = "intl_clob")]
+pub fn settlement_denomination() -> crate::raptors::price::MarkDenomination { crate::raptors::price::MarkDenomination::QuoteAsset }
+#[cfg(feature = "us_retail")]
+pub fn settlement_denomination() -> crate::raptors::price::MarkDenomination { crate::raptors::price::MarkDenomination::QuoteAsset }
+#[cfg(feature = "kalshi")]
+pub fn settlement_denomination() -> crate::raptors::price::MarkDenomination { crate::raptors::price::MarkDenomination::Usd }
+
 /// How this build's loop carries a Helm take-profit to the book. See
 /// `helpers::helm::TakeProfitLeg` for what each answer costs.
 ///

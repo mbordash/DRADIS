@@ -1663,6 +1663,7 @@ impl Squadron {
                     let ctx = StrategyContext {
                         squadron_id: squadron_id.clone(),
                         market_class: Some(market_class_for_ctx.clone()),
+                        has_price_feed: self.raptors.has_price_feed,
                         market: hourly_market_config_for_ctx.clone(),
                         snapshot: hourly_snapshot.clone(),
                         positions: Arc::clone(&positions),

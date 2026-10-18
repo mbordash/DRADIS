@@ -261,6 +261,17 @@ impl Strategy for TimeDecayStrategyImpl {
         }
 
         // ── Oracle Volatility Gate ────────────────────────────────────────────
+        // On a crypto market an oracle of 0 is "unknown" (the raptor publishes
+        // 0 for the level AND the rates when it has no level to give, see
+        // `raptors::price::publish_level`), not a quiet underlying: with the
+        // thresholds below scaled by the oracle, zeros would pass both tests
+        // and the bid would rest with no volatility check at all. A squadron
+        // with no price feed at all (`has_price_feed`) is not held: its oracle
+        // has always been 0 and this gate is not what protects it.
+        if ctx.has_price_feed && ctx.market_class.as_deref() == Some("crypto") && ctx.snapshot.oracle_price <= Decimal::ZERO {
+            idle("oracle price unknown (price raptor not connected)");
+            return Ok(StrategySignal::NoSignal);
+        }
         let (max_fast_vel, max_slow_drift) = TimeDecayStrategy::iv_thresholds(ctx.snapshot.oracle_price, dc.time_decay_max_fast_velocity_pct, dc.time_decay_max_slow_drift_pct);
         if ctx.snapshot.velocity.abs() > max_fast_vel {
             idle("underlying moving too fast");

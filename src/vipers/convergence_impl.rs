@@ -1051,6 +1051,7 @@ mod tests {
     fn ctx(snapshot: MarketSnapshot, dc: DynamicConfig) -> StrategyContext {
         StrategyContext {
             market_class: None,
+            has_price_feed: true,
             squadron_id: "btc-open".to_string(),
             market: market(),
             snapshot,

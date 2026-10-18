@@ -57,6 +57,17 @@ pub struct StrategyContext {
     /// position that is still open. `None` on the venue paths that build a
     /// context without a classified squadron.
     pub market_class: Option<String>,
+    /// Does this squadron have a live price feed behind `snapshot.oracle_price`?
+    ///
+    /// `SquadronRaptors::has_price_feed`: false for the placeholder channels a
+    /// venue hands a squadron it spawned no raptor stack for (an Adama-deployed
+    /// market on Polymarket International, the US general wing), whose oracle
+    /// reads 0 for the squadron's whole life. With a feed, an oracle of 0 is
+    /// "unknown right now" (the raptor withholds its level and rates when it
+    /// cannot price them, `raptors::price::publish_level`) and a viper that
+    /// scales its gates by the oracle must hold; without one, 0 is simply what
+    /// this squadron has always had and the same viper trades as it always did.
+    pub has_price_feed: bool,
     /// Timestamp when the bot started trading the current market.
     /// Used by strategies to enforce a minimum market maturation period before entry.
     pub market_started_at: DateTime<Utc>,

@@ -1195,6 +1195,7 @@ mod shadow_sweep_tests {
         dc.bookline_enabled = enabled;
         StrategyContext {
             market_class: Some("sports".to_string()),
+            has_price_feed: false,
             squadron_id: "sports-open".to_string(),
             market: market(),
             snapshot: snap(),

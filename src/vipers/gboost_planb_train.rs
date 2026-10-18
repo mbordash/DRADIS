@@ -385,6 +385,30 @@ struct KlineDay {
     complete: bool,
     /// `[open_s, open, high, low, close]`
     bars: Vec<[f64; 5]>,
+    /// Currency of the bars: `"usdt"` (Binance's quote asset) or `"usd"`
+    /// (restated through USDC/USDT, `gboost_planb::bars_to_usd`). Files written
+    /// before 2026-10-18 have no field and are USDT.
+    #[serde(default)]
+    denomination: String,
+}
+
+/// The tag the venue's kline days must carry (`venues::settlement_denomination`).
+pub fn expected_kline_denomination() -> &'static str {
+    kline_denomination_tag(crate::venues::settlement_denomination())
+}
+
+/// The store's tag for a denomination.
+pub fn kline_denomination_tag(d: crate::raptors::price::MarkDenomination) -> &'static str {
+    match d {
+        crate::raptors::price::MarkDenomination::QuoteAsset => "usdt",
+        crate::raptors::price::MarkDenomination::Usd => "usd",
+    }
+}
+
+/// Is a stored day in the currency this venue trains in? A missing tag is USDT.
+fn kline_day_matches(d: &KlineDay, expected: &str) -> bool {
+    let have = if d.denomination.is_empty() { "usdt" } else { d.denomination.as_str() };
+    have == expected
 }
 
 /// Every 1-minute close in an asset's kline store, keyed by bar open time.
@@ -398,6 +422,13 @@ pub fn read_kline_closes(dir: &DataDir) -> HashMap<i64, f64> {
     if let Ok(entries) = std::fs::read_dir(dir.klines()) {
         for e in entries.flatten() {
             if let Ok(day) = read_json::<KlineDay>(&e.path()) {
+                // Deliberately NOT filtered by `denomination`: the σ profile is
+                // built from minute-to-minute returns, where a 13 bp step at one
+                // day boundary between a USDT day and a USD day is a single
+                // outlier, while filtering would leave the profile with almost
+                // no days on the deploy day a Kalshi store is being restated
+                // (it is rebuilt once a day) and FairValue without its
+                // event-hour σ inflation until the next rebuild.
                 for b in bars_from_day(&day) { out.insert(b.open_s, b.close); }
             }
         }
@@ -1530,9 +1561,13 @@ pub fn load_rows(inputs: &CycleInputs) -> Result<(Vec<TrainingRow>, usize, Optio
     let funding: Vec<(i64, f64)> = read_json::<Vec<(i64, f64)>>(&inputs.dir.funding()).unwrap_or_default();
     let (deriv_oi, deriv_tl) = load_metrics(&inputs.dir);
     let mut bars: HashMap<i64, Bar> = HashMap::new();
+    let expected = expected_kline_denomination();
     if let Ok(entries) = std::fs::read_dir(inputs.dir.klines()) {
         for e in entries.flatten() {
             if let Ok(day) = read_json::<KlineDay>(&e.path()) {
+                // A day in the other currency is not training data for this venue;
+                // `catch_up` refetches it in the right one.
+                if !kline_day_matches(&day, expected) { continue; }
                 for b in bars_from_day(&day) { bars.insert(b.open_s, b); }
             }
         }
@@ -1701,6 +1736,9 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
         ("trained_by", "dradis-engine".into()),
         ("engine_version", env!("CARGO_PKG_VERSION").into()),
         ("venue", crate::venues::ledger_venue().into()),
+        // Currency of the bars the rows were built from; a model is served
+        // live only on bars in the same currency (`gboost_planb::denomination_blocks_live`).
+        ("denomination", expected_kline_denomination().into()),
         ("asset", inputs.asset.to_ascii_lowercase()),
         ("label", inputs.plan.label()),
         ("model_form", TRAINED_FORM.stamp().to_string()),
@@ -2097,16 +2135,15 @@ async fn fetch_market(w: i64, now: i64) -> Result<Fetched, String> {
     Ok(Fetched::Record(rec))
 }
 
-async fn fetch_klines_day(day: chrono::NaiveDate, now: i64) -> Result<KlineDay, String> {
-    let start = day.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc().timestamp();
-    let end = start + 86400;
-    let mut bars: Vec<[f64; 5]> = Vec::with_capacity(1440);
+/// One UTC day of closed 1-minute bars for `symbol`, paged.
+async fn fetch_symbol_day(symbol: &str, start: i64, end: i64, now: i64) -> Result<Vec<Bar>, String> {
+    let mut bars: Vec<Bar> = Vec::with_capacity(1440);
     let mut cursor = start;
     let mut last_err = String::new();
     'outer: while cursor < end && cursor < now {
         let mut got = None;
         for host in KLINE_HOSTS {
-            let url = format!("{host}/api/v3/klines?symbol=BTCUSDT&interval=1m&startTime={}&endTime={}&limit=1000", cursor * 1000, end * 1000 - 1);
+            let url = format!("{host}/api/v3/klines?symbol={symbol}&interval=1m&startTime={}&endTime={}&limit=1000", cursor * 1000, end * 1000 - 1);
             match get_json(&url).await.and_then(|v| crate::vipers::gboost_planb::parse_klines(&v)) {
                 Ok(b) => { got = Some(b); break; }
                 Err(e) => last_err = format!("{host}: {e}"),
@@ -2117,18 +2154,49 @@ async fn fetch_klines_day(day: chrono::NaiveDate, now: i64) -> Result<KlineDay, 
         let last_open = b.last().map(|x| x.open_s).unwrap_or(cursor);
         for x in &b {
             // Only closed bars: the bar opening in the current minute is still forming.
-            if x.open_s + 60 <= now { bars.push([x.open_s as f64, x.open, x.high, x.low, x.close]); }
+            if x.open_s + 60 <= now { bars.push(*x); }
         }
         if last_open + 60 <= cursor { break; }
         cursor = last_open + 60;
     }
-    bars.sort_by(|a, b| a[0].total_cmp(&b[0]));
-    bars.dedup_by(|a, b| a[0] == b[0]);
+    bars.sort_by_key(|b| b.open_s);
+    bars.dedup_by_key(|b| b.open_s);
+    Ok(bars)
+}
+
+/// A day of BTC bars in the venue's settlement currency, as the store keeps
+/// them. On a dollar venue the day's USDC/USDT bars are fetched too and the
+/// BTC bars restated (`gboost_planb::bars_to_usd`), the same way the viper
+/// restates its live bars, so a training row and a live decision minute see
+/// the same numbers.
+async fn fetch_klines_day(day: chrono::NaiveDate, now: i64) -> Result<KlineDay, String> {
+    let start = day.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc().timestamp();
+    let end = start + 86400;
+    let denomination = crate::venues::settlement_denomination();
+    let mut bars = fetch_symbol_day("BTCUSDT", start, end, now).await?;
+    if denomination == crate::raptors::price::MarkDenomination::Usd {
+        // Factor bars from before the day too, so its first minute has the
+        // same median window the viper's live fetch gives every bar.
+        let lead = (crate::vipers::gboost_planb::BAR_FACTOR_MEDIAN_BARS as i64 * 60).max(crate::vipers::gboost_planb::BAR_FACTOR_MAX_GAP_SECS);
+        let factors = fetch_symbol_day("USDCUSDT", start - lead, end, now)
+            .await.map_err(|e| format!("USDC/USDT bars: {e}"))?;
+        let (usd, skipped) = crate::vipers::gboost_planb::bars_to_usd(&bars, &factors);
+        if skipped > 0 {
+            warn!("GBoost plan-B pipeline: {skipped} BTC bar(s) on {day} had no USDC/USDT factor and were left out of the store");
+        }
+        bars = usd;
+    }
+    let bars: Vec<[f64; 5]> = bars.iter().map(|x| [x.open_s as f64, x.open, x.high, x.low, x.close]).collect();
     // A day is complete with all 1,440 bars, or once it is a full day old: a bar Binance
     // never published (an exchange pause) will not appear later, and refetching forever
     // would only spend requests. Rows across the gap are skipped by the builder.
     let settled = end <= now - 86400;
-    Ok(KlineDay { day: day.to_string(), complete: bars.len() >= 1440 || settled, bars })
+    Ok(KlineDay {
+        day: day.to_string(),
+        complete: bars.len() >= 1440 || settled,
+        bars,
+        denomination: kline_denomination_tag(denomination).to_string(),
+    })
 }
 
 /// Settled funding history from `since` (exclusive), through whichever host answers.
@@ -2517,8 +2585,12 @@ async fn catch_up(asset: &str, dir: &DataDir, knobs: &TrainingKnobs, now: i64) -
     while day <= today {
         let path = dir.kline_day(day);
         let have: Option<KlineDay> = read_json(&path).ok();
+        let expected = expected_kline_denomination();
         let refetch = match &have {
             None => true,
+            // A day stored in the other currency (every Kalshi day before
+            // 2026-10-18 is USDT) is fetched again and restated.
+            Some(d) if !kline_day_matches(d, expected) => true,
             Some(d) => !d.complete && day < today || (day == today && d.bars.last().map(|b| b[0] as i64 + 120 <= now).unwrap_or(true)),
         };
         if refetch {
@@ -3539,7 +3611,7 @@ mod tests {
             let r: Vec<serde_json::Value> = serde_json::from_str(line).unwrap();
             let open_s = r[0].as_i64().unwrap() / 1000;
             let f = |i: usize| r[i].as_str().unwrap().parse::<f64>().unwrap();
-            let d = days.entry(utc_day(open_s)).or_insert_with(|| KlineDay { day: utc_day(open_s).to_string(), complete: true, bars: Vec::new() });
+            let d = days.entry(utc_day(open_s)).or_insert_with(|| KlineDay { day: utc_day(open_s).to_string(), complete: true, bars: Vec::new(), denomination: expected_kline_denomination().to_string() });
             d.bars.push([open_s as f64, f(1), f(2), f(3), f(4)]);
         }
         for (day, d) in &days { write_json_atomically(&dir.kline_day(*day), d).unwrap(); }
@@ -4099,3 +4171,21 @@ mod squadron_plan_tests {
     }
 }
 
+#[cfg(test)]
+mod kline_denomination_tests {
+    use super::*;
+
+    /// A day file written before the tag existed is USDT; a tagged day matches
+    /// only its own tag.
+    #[test]
+    fn an_untagged_kline_day_is_usdt() {
+        let legacy = KlineDay { day: "2026-10-01".into(), complete: true, bars: Vec::new(), denomination: String::new() };
+        assert!(kline_day_matches(&legacy, "usdt"));
+        assert!(!kline_day_matches(&legacy, "usd"));
+        let usd = KlineDay { denomination: "usd".into(), ..legacy.clone() };
+        assert!(kline_day_matches(&usd, "usd"));
+        assert!(!kline_day_matches(&usd, "usdt"));
+        assert_eq!(kline_denomination_tag(crate::raptors::price::MarkDenomination::QuoteAsset), "usdt");
+        assert_eq!(kline_denomination_tag(crate::raptors::price::MarkDenomination::Usd), "usd");
+    }
+}

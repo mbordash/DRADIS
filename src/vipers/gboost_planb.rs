@@ -85,7 +85,7 @@ use perpetual::{Matrix, PerpetualBooster};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, RoundingStrategy};
 use rust_decimal_macros::dec;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config;
 use crate::helpers::price::ceil_to_tick_size;
@@ -415,6 +415,21 @@ pub fn venue_blocks_live(trained: Option<&str>, here: &str) -> Option<String> {
     let trained = trained.unwrap_or(TRAINED_VENUE);
     (trained != here).then(|| format!(
         "the model is validated on {trained}; this venue is {here}, so it trades the shadow lane only until a model stamped for {here} passes the holdout"
+    ))
+}
+
+/// Why a model trained on bars in another currency may not trade real money
+/// here, or `None`. `trained` is the model's `denomination` stamp (`None` for
+/// a model from before the stamp, whose rows were Binance USDT bars); `here`
+/// is the currency this venue's bars are in (`gboost_planb_train::expected_kline_denomination`).
+/// A USDT-trained model served dollar bars would see every distance-to-strike
+/// feature shifted by the USDT basis (13 bp on 2026-10-18, about 0.7σ of `z`);
+/// it still scores and records, in the shadow lane, until a model trained on
+/// this venue's own restated store takes over.
+pub fn denomination_blocks_live(trained: Option<&str>, here: &str) -> Option<String> {
+    let trained = trained.unwrap_or("usdt");
+    (trained != here).then(|| format!(
+        "the model was trained on {trained} bars; this venue's bars are in {here}, so it trades the shadow lane only until a model trained on them passes the holdout"
     ))
 }
 
@@ -950,6 +965,11 @@ pub struct PlanBModel {
     /// Polymarket International's. Compared with this build's ledger venue by
     /// `venue_blocks_live`: a mismatch keeps the model in the shadow lane.
     pub trained_venue: Option<String>,
+    /// The `denomination` stamp: currency of the bars the rows were built from
+    /// (`None` before 2026-10-18 = USDT). Loading does not enforce it; the lane
+    /// decision does: a mismatch keeps the model in the shadow lane
+    /// (`denomination_blocks_live`).
+    pub trained_denomination: Option<String>,
 }
 
 /// The gate's verdict on a model that was written before the verdict was stamped,
@@ -1021,6 +1041,7 @@ pub fn load_model(path: &std::path::Path) -> std::result::Result<PlanBModel, Str
     // scores, and `venue_blocks_live` keeps it in the shadow lane until a model
     // stamped for this venue earns the live lane.
     let trained_venue = meta("venue");
+    let trained_denomination = meta("denomination");
     let num = |key: &str| meta(key).and_then(|s| s.parse::<f64>().ok()).filter(|v| v.is_finite());
     let platt_a = num("platt_a").ok_or("model has no usable platt_a")?;
     let platt_b = num("platt_b").ok_or("model has no usable platt_b")?;
@@ -1099,7 +1120,7 @@ pub fn load_model(path: &std::path::Path) -> std::result::Result<PlanBModel, Str
             num("holdout_win"),
         ),
     };
-    Ok(PlanBModel { booster, platt_a, platt_b, version, trees, zeroed, form, residual_shrink, plan, posture, entry_rule, trained_by, created_at, calibrated_through, holdout_summary, gate_passed, trained_venue })
+    Ok(PlanBModel { booster, platt_a, platt_b, version, trees, zeroed, form, residual_shrink, plan, posture, entry_rule, trained_by, created_at, calibrated_through, holdout_summary, gate_passed, trained_venue, trained_denomination })
 }
 
 impl PlanBModel {
@@ -1283,12 +1304,15 @@ pub fn model_path(asset: &str) -> PathBuf {
 /// spending my money, and if not, why not — so the line answers it with the
 /// numbers rather than a status word. A viper that is working towards a
 /// promotion and one that is stuck look identical without them.
-pub fn lane_line(trained_venue: Option<&str>, gate_passed: bool, rec: &ShadowStats, min_trades: usize, min_win: f64, full: Decimal, probation: Decimal) -> String {
+pub fn lane_line(trained_venue: Option<&str>, trained_denomination: Option<&str>, gate_passed: bool, rec: &ShadowStats, min_trades: usize, min_win: f64, full: Decimal, probation: Decimal) -> String {
     let numbers = format!(
         "record {} trades, {:+.2}% per trade, 90% lower bound {:+.2}%, win {:.3}",
         rec.trades, rec.mean_ret * 100.0, rec.lower_bound * 100.0, rec.win,
     );
-    match venue_blocks_live(trained_venue, crate::venues::ledger_venue()).or_else(|| shadow_blocks_live(gate_passed, rec, min_trades, min_win)) {
+    match venue_blocks_live(trained_venue, crate::venues::ledger_venue())
+        .or_else(|| denomination_blocks_live(trained_denomination, crate::vipers::gboost_planb_train::expected_kline_denomination()))
+        .or_else(|| shadow_blocks_live(gate_passed, rec, min_trades, min_win))
+    {
         Some(why) => format!("SHADOW — trading simulated, not real money: {why} ({numbers})"),
         None => match live_stake(rec, full, probation) {
             (stake, "probation") => format!(
@@ -1421,17 +1445,95 @@ async fn get_json(url: &str) -> std::result::Result<serde_json::Value, String> {
     resp.json::<serde_json::Value>().await.map_err(|e| e.to_string())
 }
 
-async fn fetch_bars() -> std::result::Result<Vec<Bar>, String> {
+/// The USDC/USDT closes a bar's conversion factor is the median of: the last
+/// this many factor bars at or before the bar's minute (fifteen minutes when
+/// Binance published every minute; across a gap in the factor series the
+/// window reaches further back, the newest bar still within
+/// [`BAR_FACTOR_MAX_GAP_SECS`]). USDC/USDT ticks in 1 bp steps, against about
+/// 3 bp of BTC one-minute return σ at the floor; dividing each bar by its own
+/// minute's print would add that tick noise to every volatility feature
+/// (`rv15`, `sig_min`, the σ profile). The median follows a real move within
+/// minutes and ignores a print.
+pub const BAR_FACTOR_MEDIAN_BARS: usize = 15;
+
+/// Longest a BTC minute may sit after the newest USDC/USDT bar available to it
+/// and still be converted. USDT's dollar price moves in basis points per hour.
+pub const BAR_FACTOR_MAX_GAP_SECS: i64 = 900;
+
+/// Restate Binance BTC/USDT bars in dollars, USDC standing for the dollar:
+/// each bar's prices divided by the median USDC/USDT close of the
+/// [`BAR_FACTOR_MEDIAN_BARS`] factor bars at or before its minute, the newest
+/// of them within [`BAR_FACTOR_MAX_GAP_SECS`].
+///
+/// Why: on a venue that settles on a dollar index (Kalshi, CF Benchmarks) the
+/// strike is in dollars, and the model's distance-to-strike features (`sdist`,
+/// `z_side`, `frac_above_side`) compared USDT bars with it. On 2026-10-18 USDT
+/// traded at $0.9987, a 13 bp basis, about 0.7σ of `z` at the σ floor over
+/// thirty minutes: the same bias that cost FairValue a trade that morning, in
+/// the model's inputs and in every Kalshi training row. The trainer converts
+/// its kline store with this same function, so live and training rows agree.
+///
+/// A bar with no usable factor is LEFT OUT (the count is returned), never
+/// published in the wrong currency and never a reason to drop the bars that
+/// do have one: the row builder already skips minutes across a bar gap, and
+/// the viper already waits for the decision minute's own bar.
+pub fn bars_to_usd(bars: &[Bar], factors: &[Bar]) -> (Vec<Bar>, usize) {
+    let mut f: Vec<(i64, f64)> = factors.iter().filter(|b| b.close > 0.0).map(|b| (b.open_s, b.close)).collect();
+    f.sort_by_key(|x| x.0);
+    let mut out = Vec::with_capacity(bars.len());
+    let mut skipped = 0usize;
+    for b in bars {
+        let Some(factor) = bar_factor(&f, b.open_s) else { skipped += 1; continue };
+        out.push(Bar { open_s: b.open_s, open: b.open / factor, high: b.high / factor, low: b.low / factor, close: b.close / factor });
+    }
+    (out, skipped)
+}
+
+/// The conversion factor for the minute opening at `open_s` from sorted
+/// `(open_s, close)` factor bars, or `None` when the newest bar at or before
+/// it is missing or older than [`BAR_FACTOR_MAX_GAP_SECS`].
+fn bar_factor(sorted: &[(i64, f64)], open_s: i64) -> Option<f64> {
+    let end = sorted.partition_point(|x| x.0 <= open_s);
+    let &(newest_at, _) = end.checked_sub(1).and_then(|i| sorted.get(i))?;
+    if open_s - newest_at > BAR_FACTOR_MAX_GAP_SECS { return None; }
+    let start = end.saturating_sub(BAR_FACTOR_MEDIAN_BARS);
+    let mut window: Vec<f64> = sorted[start..end].iter().map(|x| x.1).collect();
+    window.sort_by(|a, b| a.total_cmp(b));
+    let n = window.len();
+    Some(if n % 2 == 1 { window[n / 2] } else { (window[n / 2 - 1] + window[n / 2]) / 2.0 })
+}
+
+async fn fetch_symbol_bars(symbol: &str, limit: usize) -> std::result::Result<Vec<Bar>, String> {
     // The data mirror is Binance's official public market-data host; it serves the same
     // klines and answers where the main host is blocked (HTTP 451 from the US).
     let mut last = String::new();
     for host in ["https://api.binance.com", "https://data-api.binance.vision"] {
-        match get_json(&format!("{host}/api/v3/klines?symbol=BTCUSDT&interval=1m&limit={KLINES_LIMIT}")).await {
+        match get_json(&format!("{host}/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}")).await {
             Ok(v) => return parse_klines(&v),
             Err(e) => last = format!("{host}: {e}"),
         }
     }
     Err(last)
+}
+
+/// The bars the model scores on, in the venue's settlement currency
+/// (`venues::settlement_denomination`; see [`bars_to_usd`]). The factor fetch
+/// reaches [`BAR_FACTOR_MEDIAN_BARS`] further back so the oldest BTC bar has
+/// its full median window, as the trainer's stored days do.
+async fn fetch_bars() -> std::result::Result<Vec<Bar>, String> {
+    let bars = fetch_symbol_bars("BTCUSDT", KLINES_LIMIT as usize).await?;
+    match crate::venues::settlement_denomination() {
+        crate::raptors::price::MarkDenomination::QuoteAsset => Ok(bars),
+        crate::raptors::price::MarkDenomination::Usd => {
+            let factors = fetch_symbol_bars("USDCUSDT", KLINES_LIMIT as usize + BAR_FACTOR_MEDIAN_BARS)
+                .await.map_err(|e| format!("USDC/USDT bars: {e}"))?;
+            let (usd, skipped) = bars_to_usd(&bars, &factors);
+            if skipped > 0 {
+                debug!("GBoost plan-B: {skipped} BTC bar(s) had no USDC/USDT factor and were left out");
+            }
+            Ok(usd)
+        }
+    }
 }
 
 async fn fetch_funding() -> std::result::Result<(f64, i64), String> {
@@ -1964,7 +2066,7 @@ impl Strategy for GboostPlanBStrategy {
                         let plan_now = crate::vipers::gboost_planb_train::Plan::from_config(dc, plan_fee_rate());
                         let rec = shadow_record_for(&asset, &m.version, &plan_now).await;
                         Some(lane_line(
-                            m.trained_venue.as_deref(), m.gate_passed, &rec, dc.gboost_planb_shadow_min_trades.max(0) as usize, f(dc.gboost_planb_shadow_min_win_rate),
+                            m.trained_venue.as_deref(), m.trained_denomination.as_deref(), m.gate_passed, &rec, dc.gboost_planb_shadow_min_trades.max(0) as usize, f(dc.gboost_planb_shadow_min_win_rate),
                             dc.gboost_planb_trade_size_usdc, dc.gboost_planb_probation_trade_size_usdc,
                         ))
                     }
@@ -2175,6 +2277,7 @@ impl Strategy for GboostPlanBStrategy {
         let min_trades = dc.gboost_planb_shadow_min_trades.max(0) as usize;
         let min_win = f(dc.gboost_planb_shadow_min_win_rate);
         let lane_block = venue_blocks_live(model.trained_venue.as_deref(), crate::venues::ledger_venue())
+            .or_else(|| denomination_blocks_live(model.trained_denomination.as_deref(), crate::vipers::gboost_planb_train::expected_kline_denomination()))
             .or_else(|| shadow_blocks_live(model.gate_passed, &record, min_trades, min_win));
         let (stake, tier) = match &lane_block {
             Some(_) => (dc.gboost_planb_trade_size_usdc, "simulated"),
@@ -2599,7 +2702,7 @@ mod tests {
             let matrix = Matrix::new(&data, 4, 2);
             let mut b = PerpetualBooster::default().set_iteration_limit(Some(1)).set_num_threads(Some(1));
             b.fit(&matrix, &[0.0, 1.0, 0.0, 1.0], None, None).unwrap();
-            PlanBModel { booster: b, platt_a: 1.0, platt_b: 0.0, version: "t".into(), trees: 1, zeroed: vec![23, 24, 25, 26], form: TRAINED_FORM, residual_shrink: 1.0, plan, posture: Some("gates".to_string()), entry_rule, trained_by: None, created_at: None, calibrated_through: None, holdout_summary: None, gate_passed: true, trained_venue: None }
+            PlanBModel { booster: b, platt_a: 1.0, platt_b: 0.0, version: "t".into(), trees: 1, zeroed: vec![23, 24, 25, 26], form: TRAINED_FORM, residual_shrink: 1.0, plan, posture: Some("gates".to_string()), entry_rule, trained_by: None, created_at: None, calibrated_through: None, holdout_summary: None, gate_passed: true, trained_venue: None, trained_denomination: None }
         };
         let m = |plan: Option<[f64; 4]>| m_with(plan, Some("e2".to_string()));
         assert!(m(Some(REFERENCE_PLAN)).plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "gates", TRAINED_FORM).is_none());
@@ -3144,23 +3247,23 @@ mod shadow_promotion_tests {
         // the record on every venue build.
         let here = crate::venues::ledger_venue();
         let thin = ShadowStats { trades: 12, mean_ret: 0.008, lower_bound: -0.021, win: 0.58 };
-        let line = lane_line(Some(here), true, &thin, 40, 0.53, dec!(4.0), dec!(1.0));
+        let line = lane_line(Some(here), Some(crate::vipers::gboost_planb_train::expected_kline_denomination()), true, &thin, 40, 0.53, dec!(4.0), dec!(1.0));
         assert!(line.starts_with("SHADOW"), "{line}");
         assert!(line.contains("shadow record 12 of 40 trades"), "it must name the missing number: {line}");
 
         let earned = ShadowStats { trades: 44, mean_ret: 0.026, lower_bound: 0.004, win: 0.57 };
-        let line = lane_line(Some(here), true, &earned, 40, 0.53, dec!(4.0), dec!(1.0));
+        let line = lane_line(Some(here), Some(crate::vipers::gboost_planb_train::expected_kline_denomination()), true, &earned, 40, 0.53, dec!(4.0), dec!(1.0));
         assert!(line.starts_with("LIVE at the full stake $4.00"), "{line}");
         assert!(line.contains("+2.60%"), "{line}");
 
         // Promoted on a positive mean alone: live, at the probation stake, and the card says why.
         let probation = ShadowStats { trades: 44, mean_ret: 0.008, lower_bound: -0.012, win: 0.55 };
-        let line = lane_line(Some(here), true, &probation, 40, 0.53, dec!(4.0), dec!(1.0));
+        let line = lane_line(Some(here), Some(crate::vipers::gboost_planb_train::expected_kline_denomination()), true, &probation, 40, 0.53, dec!(4.0), dec!(1.0));
         assert!(line.starts_with("LIVE at the probation stake $1.00"), "{line}");
         assert!(line.contains("lower bound is not yet above zero"), "{line}");
 
         // A model that never cleared the gate says so, however good the record.
-        let line = lane_line(Some(here), false, &earned, 40, 0.53, dec!(4.0), dec!(1.0));
+        let line = lane_line(Some(here), Some(crate::vipers::gboost_planb_train::expected_kline_denomination()), false, &earned, 40, 0.53, dec!(4.0), dec!(1.0));
         assert!(line.starts_with("SHADOW") && line.contains("holdout gate"), "{line}");
     }
 
@@ -3244,7 +3347,7 @@ mod shadow_promotion_tests {
         let matrix = Matrix::new(&data, 4, 2);
         let mut b = PerpetualBooster::default().set_objective(Objective::SquaredLoss).set_iteration_limit(Some(1)).set_num_threads(Some(1));
         b.fit(&matrix, &[0.2, 0.2, 0.2, 0.2], None, None).unwrap();
-        let model = |b: PerpetualBooster, shrink: f64| PlanBModel { booster: b, platt_a: 1.0, platt_b: 0.0, version: "r".into(), trees: 1, zeroed: vec![23, 24, 25, 26], form: ModelForm::ResidualMid, residual_shrink: shrink, plan: None, posture: Some("settlement".into()), entry_rule: Some("e2".into()), trained_by: None, created_at: None, calibrated_through: None, holdout_summary: None, gate_passed: false, trained_venue: None };
+        let model = |b: PerpetualBooster, shrink: f64| PlanBModel { booster: b, platt_a: 1.0, platt_b: 0.0, version: "r".into(), trees: 1, zeroed: vec![23, 24, 25, 26], form: ModelForm::ResidualMid, residual_shrink: shrink, plan: None, posture: Some("settlement".into()), entry_rule: Some("e2".into()), trained_by: None, created_at: None, calibrated_through: None, holdout_summary: None, gate_passed: false, trained_venue: None, trained_denomination: None };
         let mut row = [0.0f64; N_FEATURES];
         row[MID_COLUMN] = 0.37;
         let (raw, p) = model(b.clone(), 1.0).predict(&[row])[0];
@@ -3312,7 +3415,7 @@ mod shadow_promotion_tests {
 
 #[cfg(test)]
 mod venue_neutral_tests {
-    use super::{build_features, shape_gate, venue_blocks_live, Bar, DecisionInputs, TRAINED_VENUE};
+    use super::{build_features, denomination_blocks_live, shape_gate, venue_blocks_live, Bar, DecisionInputs, TRAINED_VENUE};
     use crate::state::MarketConfig;
     use crate::venues::core::MarketId;
 
@@ -3365,6 +3468,12 @@ mod venue_neutral_tests {
         let why = venue_blocks_live(Some(TRAINED_VENUE), "kalshi").expect("blocked");
         assert!(why.contains("polymarket-intl") && why.contains("kalshi") && why.contains("shadow lane"), "{why}");
         assert!(venue_blocks_live(None, "kalshi").is_some(), "an unstamped model is the trained venue's, not every venue's");
+        // The currency stamp works the same way: unstamped means USDT bars.
+        assert_eq!(denomination_blocks_live(Some("usdt"), "usdt"), None);
+        assert_eq!(denomination_blocks_live(None, "usdt"), None);
+        assert_eq!(denomination_blocks_live(Some("usd"), "usd"), None);
+        assert!(denomination_blocks_live(None, "usd").expect("blocked").contains("trained on usdt bars"));
+        assert!(denomination_blocks_live(Some("usd"), "usdt").is_some());
     }
 }
 
@@ -3411,3 +3520,64 @@ mod live_mids_tests {
     }
 }
 
+#[cfg(test)]
+mod bars_to_usd_tests {
+    use super::*;
+
+    fn bar(open_s: i64, px: f64) -> Bar { Bar { open_s, open: px, high: px + 10.0, low: px - 10.0, close: px } }
+
+    /// 2026-10-18 16:48Z: BTC/USDT closed 81,083.53 while USDC/USDT was 1.0013;
+    /// the dollar close sits below the $80,999.99 strike that the USDT close
+    /// was $83 above. Every price of the bar is divided by the same factor.
+    #[test]
+    fn bars_are_restated_in_dollars_by_the_same_minute_factor() {
+        let bars = vec![bar(1_792_000_080, 81_083.53)];
+        let factors = vec![Bar { open_s: 1_792_000_080, open: 1.0013, high: 1.0014, low: 1.0012, close: 1.0013 }];
+        let (usd, skipped) = bars_to_usd(&bars, &factors);
+        assert_eq!(skipped, 0);
+        assert!((usd[0].close - 80_978.26).abs() < 0.01, "{}", usd[0].close);
+        assert!(usd[0].close < 80_999.99);
+        assert!((usd[0].high - (81_093.53 / 1.0013)).abs() < 0.01);
+        assert!((usd[0].low - (81_073.53 / 1.0013)).abs() < 0.01);
+        // At par the bars are unchanged.
+        let (par, _) = bars_to_usd(&bars, &[bar(1_792_000_080, 1.0)]);
+        assert_eq!(par[0].close, 81_083.53);
+    }
+
+    /// The factor is the median of the last fifteen factor closes, so one
+    /// 1 bp tick in USDC/USDT does not move the converted bar, while a level
+    /// that has genuinely shifted for most of the window does.
+    #[test]
+    fn the_factor_is_a_fifteen_minute_median_that_ignores_one_tick() {
+        let mut factors: Vec<Bar> = (0..20).map(|i| bar(i * 60, 1.0013)).collect();
+        factors[19].close = 1.0014; // the newest minute ticks up 1 bp
+        let (usd, _) = bars_to_usd(&[bar(19 * 60, 81_083.53)], &factors);
+        assert!((usd[0].close - 81_083.53 / 1.0013).abs() < 0.01, "one tick is ignored: {}", usd[0].close);
+        for b in factors.iter_mut().skip(10) { b.close = 1.0040; } // ten of the fifteen now sit at the new level
+        let (usd, _) = bars_to_usd(&[bar(19 * 60, 81_083.53)], &factors);
+        assert!((usd[0].close - 81_083.53 / 1.0040).abs() < 0.01, "a sustained shift is followed: {}", usd[0].close);
+        // With fewer than fifteen bars available the median is over what there is.
+        let (usd, _) = bars_to_usd(&[bar(60, 81_000.0)], &[bar(0, 1.0), bar(60, 1.0)]);
+        assert_eq!(usd[0].close, 81_000.0);
+    }
+
+    /// A minute with no factor bar of its own takes the nearest earlier one,
+    /// within the gap limit; a bar beyond it, or with none before, is left out
+    /// and counted, and the bars that do have a factor are still returned.
+    #[test]
+    fn a_bar_without_a_factor_is_left_out_not_guessed_and_not_fatal() {
+        let bars = vec![bar(600, 81_000.0), bar(660, 81_000.0)];
+        let factors = vec![bar(600, 1.0), bar(0, 1.0)];
+        let (usd, skipped) = bars_to_usd(&bars, &factors);
+        assert_eq!((usd.len(), skipped), (2, 0));
+        assert_eq!(usd[1].close, 81_000.0, "660 reuses the bar at 600");
+        let far = bar(600 + BAR_FACTOR_MAX_GAP_SECS + 60, 81_000.0);
+        let (usd, skipped) = bars_to_usd(&[bars[0], far], &factors);
+        assert_eq!((usd.len(), skipped), (1, 1), "the far bar is dropped, the near one kept");
+        assert_eq!(usd[0].open_s, 600);
+        let (usd, skipped) = bars_to_usd(&[bar(0, 81_000.0)], &[bar(60, 1.0)]);
+        assert_eq!((usd.len(), skipped), (0, 1), "no factor at or before the bar");
+        let (usd, skipped) = bars_to_usd(&bars, &[]);
+        assert_eq!((usd.len(), skipped), (0, 2));
+    }
+}

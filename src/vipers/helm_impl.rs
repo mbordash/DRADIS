@@ -811,6 +811,7 @@ mod tests {
     fn ctx() -> StrategyContext {
         StrategyContext {
             market_class: Some(KIND.to_string()),
+            has_price_feed: true,
             squadron_id: "helm-open-trial".to_string(),
             market: MarketConfig {
                 yes_token: MarketId::new("helm-yes"), no_token: MarketId::new("helm-no"),

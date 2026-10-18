@@ -760,6 +760,20 @@ impl Strategy for MakerStrategyImpl {
         let market = ctx.maker_market.as_ref().unwrap_or(&ctx.market);
         let snapshot = ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot);
 
+        // ── Oracle known? ─────────────────────────────────────────────────────
+        // On a crypto market an oracle of 0 is "unknown": the price raptor
+        // publishes 0 for the level and for every rate when it has no level to
+        // give (`raptors::price::publish_level`). Zeros would read below as a
+        // calm underlying with no velocity bias and no drift pull, and the
+        // quote would rest with neither protection. Sports and politics
+        // markets have no oracle and never reach this gate, and neither does
+        // a squadron that was never given a price feed (`has_price_feed`):
+        // its oracle has always read 0 and it trades as it always did.
+        if ctx.has_price_feed && ctx.market_class.as_deref() == Some("crypto") && snapshot.oracle_price <= dec!(0) {
+            self.log_gate(&ctx.crypto_filter, "oracle_unknown", "oracle price unknown (price raptor not connected); not quoting").await;
+            return Ok(StrategySignal::NoSignal);
+        }
+
 
         // ── Market maturation gate ────────────────────────────────────────────
         // Age is measured from when THIS maker market was first observed (keyed on

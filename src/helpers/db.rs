@@ -4405,6 +4405,96 @@ pub async fn asset_owning_token(token_id: &str) -> Option<String> {
     owners.into_iter().next()
 }
 
+/// Does ANY open-positions row already claim `token_id`?
+///
+/// A venue's `positions()` answers for the whole account, while each squadron's
+/// dashboard sweep attributes holdings from its own guard map alone, and that
+/// map is created fresh on every market rotation and every restart. So a
+/// holding the account genuinely owns through a viper looked unowned to any
+/// sweep whose map did not hold it: another squadron's (three Kalshi squadrons
+/// shared one account from 2026-10-18, and each adopted the others' fills as
+/// "ChainAdopted" rows of its own), or the owning squadron's own first sweep
+/// after a rotation while the leg was still held. The duplicate rows went
+/// stale when the viper sold, were booked ten minutes later as $0 off-strategy
+/// exits with a "correct by hand" warning, and, had the position settled on
+/// the exchange instead, would have booked the settlement again (the dedupe
+/// matches on the market NAME, and an adopted row carries the ticker).
+///
+/// The rule is therefore: a holding is an orphan only when NO row in any
+/// database claims the token, whatever its squadron or strategy. Rows with an
+/// empty `squadron_id` predate squadrons and still claim. Ghost rows do not: a
+/// simulated position holds nothing on the venue.
+///
+/// `Err` is "could not tell", which the caller must treat as "do not adopt":
+/// a missed adoption is retried on the next sweep thirty seconds later, a
+/// duplicate is a wrong ledger row.
+pub async fn open_row_claims_token_in(pool: &SqlitePool, token_id: &str) -> Result<bool, sqlx::Error> {
+    let found: Option<(i64,)> = sqlx::query_as(
+        "SELECT 1 FROM open_positions WHERE token_id = ? AND ghost_mode = 0 LIMIT 1",
+    )
+    .bind(token_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(found.is_some())
+}
+
+/// [`open_row_claims_token_in`] across every registered pool: the squadrons
+/// sharing an account may file to different database files.
+pub async fn open_row_claims_token(token_id: &str) -> Result<bool, sqlx::Error> {
+    for pool in all_pools() {
+        if open_row_claims_token_in(&pool, token_id).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// How long a holding must stay unclaimed before a sweep adopts it.
+///
+/// The owner writes its open-positions row AFTER the fill returns (guard,
+/// lifecycle, entry ledger, then the row), and another squadron's sweep whose
+/// `positions()` call lands inside that window sees an unclaimed holding. A
+/// genuine orphan (prior session, manual trade) is still there a minute later;
+/// a fresh fill has its row by then.
+pub const UNCLAIMED_ADOPT_GRACE_SECS: u64 = 60;
+
+static UNCLAIMED_SINCE: OnceLock<std::sync::Mutex<std::collections::HashMap<(String, String), std::time::Instant>>> =
+    OnceLock::new();
+
+fn unclaimed_since() -> &'static std::sync::Mutex<std::collections::HashMap<(String, String), std::time::Instant>> {
+    UNCLAIMED_SINCE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Pure rule behind [`unclaimed_holding_adoptable`]: the holding is adoptable
+/// once it has been unclaimed for `grace`; returns the moment to remember.
+pub fn adoption_due(first_seen: Option<std::time::Instant>, now: std::time::Instant, grace: std::time::Duration) -> (bool, std::time::Instant) {
+    match first_seen {
+        Some(t) => (now.saturating_duration_since(t) >= grace, t),
+        None => (false, now),
+    }
+}
+
+/// Note that `squadron_id`'s sweep found `token_id` unclaimed now; true once
+/// it has been unclaimed for [`UNCLAIMED_ADOPT_GRACE_SECS`].
+pub fn unclaimed_holding_adoptable(squadron_id: &str, token_id: &str) -> bool {
+    let now = std::time::Instant::now();
+    let mut map = match unclaimed_since().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let key = (squadron_id.to_string(), token_id.to_string());
+    let (due, since) = adoption_due(map.get(&key).copied(), now, std::time::Duration::from_secs(UNCLAIMED_ADOPT_GRACE_SECS));
+    map.insert(key, since);
+    due
+}
+
+/// Forget an unclaimed sighting: the holding is now claimed, adopted, or gone.
+pub fn forget_unclaimed_holding(squadron_id: &str, token_id: &str) {
+    if let Ok(mut map) = unclaimed_since().lock() {
+        map.remove(&(squadron_id.to_string(), token_id.to_string()));
+    }
+}
+
 pub async fn confirmed_open_positions(pool: &SqlitePool) -> Vec<(String, String)> {
     sqlx::query_as::<_, (String, String)>(
         "SELECT token_id, ts FROM open_positions
@@ -7290,6 +7380,60 @@ mod reconcile_tests {
     }
 
     fn dec_of(s: &str) -> Decimal { s.parse().unwrap() }
+
+    /// The 2026-10-18 duplicate: btc-open's FairValue holds a Kalshi leg. Any
+    /// sweep (another squadron's, or btc-open's own after a rotation emptied
+    /// its guard map) must see the leg as claimed; the other leg, and a token
+    /// only a ghost row holds, are unclaimed; a pre-squadron row still claims.
+    #[tokio::test]
+    async fn a_leg_any_open_row_holds_is_not_an_orphan() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::crypto("kalshi", "kalshi", "btc");
+        let leg = "KXBTCD-26OCT1813-T80999.99#yes";
+        record_open_position_with_status(&pool, &scope, "btc-open", "FairValueStrategy", leg,
+            "Bitcoin price on Oct 18, 2026? — $81,000 or above", "YES", dec_of("0.4145"), dec_of("9.15"), false, "confirmed").await;
+        assert!(open_row_claims_token_in(&pool, leg).await.unwrap(), "sports-open's sweep must leave btc-open's leg alone");
+        assert!(!open_row_claims_token_in(&pool, "KXBTCD-26OCT1813-T80999.99#no").await.unwrap(), "the other leg is unclaimed");
+
+        record_open_position_with_status(&pool, &scope, "", "MakerStrategy", "legacy#yes", "legacy", "YES",
+            dec_of("0.50"), dec_of("1"), false, "confirmed").await;
+        assert!(open_row_claims_token_in(&pool, "legacy#yes").await.unwrap(), "a pre-squadron row still claims");
+        record_open_position_with_status(&pool, &scope, "eth-open", "MakerStrategy", "ghost#yes", "ghost", "YES",
+            dec_of("0.50"), dec_of("1"), true, "confirmed").await;
+        assert!(!open_row_claims_token_in(&pool, "ghost#yes").await.unwrap(), "a ghost row holds nothing on the venue");
+    }
+
+    /// The process-wide sighting map: the first call for a holding is never
+    /// adoptable, a forgotten holding starts over, and keys are per squadron
+    /// and token.
+    #[test]
+    fn the_unclaimed_sighting_map_starts_every_holding_on_a_fresh_grace() {
+        let (sq, tok) = ("test-sq-grace", "KX-GRACE#yes");
+        forget_unclaimed_holding(sq, tok);
+        assert!(!unclaimed_holding_adoptable(sq, tok), "first sighting");
+        assert!(!unclaimed_holding_adoptable(sq, tok), "still inside the grace");
+        assert!(!unclaimed_holding_adoptable("another-sq", tok), "another squadron's own clock");
+        forget_unclaimed_holding(sq, tok);
+        forget_unclaimed_holding("another-sq", tok);
+        assert!(!unclaimed_holding_adoptable(sq, tok), "forgotten: a fresh first sighting");
+        forget_unclaimed_holding(sq, tok);
+    }
+
+    /// A holding first seen unclaimed is adopted only once it has stayed so
+    /// for the grace period; the first sighting is remembered, not reset.
+    #[test]
+    fn an_unclaimed_holding_is_adopted_only_after_the_grace() {
+        let now = std::time::Instant::now();
+        let grace = std::time::Duration::from_secs(UNCLAIMED_ADOPT_GRACE_SECS);
+        let (due, since) = adoption_due(None, now, grace);
+        assert!(!due); assert_eq!(since, now);
+        let later = now + std::time::Duration::from_secs(UNCLAIMED_ADOPT_GRACE_SECS - 1);
+        let (due, since) = adoption_due(Some(now), later, grace);
+        assert!(!due); assert_eq!(since, now);
+        let later = now + grace;
+        let (due, _) = adoption_due(Some(now), later, grace);
+        assert!(due);
+    }
 
     async fn mem_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()

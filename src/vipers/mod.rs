@@ -362,6 +362,7 @@ mod venue_resolution_tests {
     fn ctx(maker: Option<MarketConfig>) -> StrategyContext {
         StrategyContext {
             market_class: None,
+            has_price_feed: true,
             squadron_id: "btc-open".to_string(),
             market: market("h-yes", "h-no", "Hourly"),
             snapshot: snap(dec!(0.40)),

@@ -1051,8 +1051,12 @@ async fn run() -> Result<()> {
             let asset_c = asset.clone();
             let health = Arc::clone(&raptor_health_tx);
             spawn_supervised("price-raptor", move || {
+                // Polymarket's "Up or Down" markets resolve on the Binance
+                // BTC/USDT one-minute candle by rule, so the level is published
+                // in that pair's quote asset. See `venues::settlement_denomination`.
                 dradis::raptors::price::run_price_raptor(
-                    asset_c.clone(), oracle_tx.clone(), velocity_tx.clone(), drift_tx.clone(),
+                    asset_c.clone(), dradis::venues::settlement_denomination(),
+                    oracle_tx.clone(), velocity_tx.clone(), drift_tx.clone(),
                     Arc::clone(&health),
                 )
             });

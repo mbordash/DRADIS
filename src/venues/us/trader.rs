@@ -326,8 +326,14 @@ fn raptor_stack_for(
         let asset = underlying.to_string();
         let health = Arc::clone(raptor_health_tx);
         spawn_supervised("us-price-raptor", move || {
+            // Published in the Binance quote asset (USDT), as before. Which
+            // index Polymarket US settles its crypto markets on has not been
+            // confirmed from the venue's rules; until it is, the level stays
+            // what it was rather than guessing a currency. See
+            // `venues::settlement_denomination` for what the choice is about.
             crate::raptors::price::run_price_raptor(
-                asset.clone(), oracle_tx.clone(), velocity_tx.clone(), drift_tx.clone(),
+                asset.clone(), crate::venues::settlement_denomination(),
+                oracle_tx.clone(), velocity_tx.clone(), drift_tx.clone(),
                 Arc::clone(&health),
             )
         });
@@ -1618,6 +1624,9 @@ async fn trade_one_market(
 
         let ctx = StrategyContext {
             market_class: Some(market_class_for_ctx.clone()),
+            // The crypto wing gets a raptor stack; every other wing has none,
+            // and its oracle has always read 0.
+            has_price_feed: raptors.is_some(),
             market: market_cfg.clone(),
             snapshot: snapshot.clone(),
             positions: positions.clone(),
@@ -2686,11 +2695,36 @@ async fn sync_dashboard(
                 ).await;
                 db::confirm_position_status(pool, strategy, sym).await;
             }
-            None => {
-                db::record_adopted_position(
-                    pool, &adopt_scope, squadron_id, "ChainAdopted", sym, sym, side_label(sym), p.avg_price, p.shares,
-                ).await;
-            }
+            // `positions()` is the whole account; this map is one squadron,
+            // rebuilt on every rotation. A holding some row already claims
+            // (another squadron's viper, or this squadron's own before the
+            // rotation) is not an orphan: adopting it wrote duplicate
+            // "ChainAdopted" rows for every fill once three squadrons shared
+            // the account (2026-10-18), each later booked as a $0 off-strategy
+            // exit, and each a second settlement booking had the position gone
+            // to settlement. A holding no row claims waits out a short grace
+            // before adoption, because the owner's row lands after its fill.
+            // See `db::open_row_claims_token`.
+            None => match db::open_row_claims_token(sym).await {
+                Ok(true) => {
+                    db::forget_unclaimed_holding(squadron_id, sym);
+                    debug!("US dashboard sync [{squadron_id}]: {sym} is already an open-positions row — not adopting");
+                }
+                Ok(false) if db::unclaimed_holding_adoptable(squadron_id, sym) => {
+                    db::forget_unclaimed_holding(squadron_id, sym);
+                    db::record_adopted_position(
+                        pool, &adopt_scope, squadron_id, "ChainAdopted", sym, sym, side_label(sym), p.avg_price, p.shares,
+                    ).await;
+                }
+                Ok(false) => {
+                    debug!("US dashboard sync [{squadron_id}]: {sym} unclaimed — adopting if still so after {}s", db::UNCLAIMED_ADOPT_GRACE_SECS);
+                }
+                // Could not tell: a duplicate row is worse than a thirty-second
+                // delay, so adopt nothing this pass.
+                Err(e) => {
+                    warn!("US dashboard sync [{squadron_id}]: open-row lookup for {sym} failed — not adopting this pass: {e}");
+                }
+            },
         }
         positions_value += p.shares * p.avg_price;
     }

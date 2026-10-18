@@ -3872,6 +3872,7 @@ mod entry_book_tests {
     fn ctx(hourly: MarketSnapshot, maker: MarketSnapshot) -> StrategyContext {
         StrategyContext {
             market_class: None,
+            has_price_feed: true,
             squadron_id: "btc-open".to_string(),
             market: market("h-yes", "h-no", "Bitcoin Up or Down - September 2, 5PM ET", "cid-hourly"),
             snapshot: hourly,

@@ -22,7 +22,7 @@
 ///
 /// │ Channel        │ Type                           │ Description                        │
 /// │────────────────│────────────────────────────────│────────────────────────────────────│
-/// │ oracle_tx      │ Decimal                        │ Current spot price                 │
+/// │ oracle_tx      │ Decimal                        │ Spot level, venue currency (0=unknown) │
 /// │ velocity_tx    │ (Decimal, Decimal, Decimal)    │ (5s velocity, 1s velocity, accel)  │
 /// │ drift_tx       │ (Decimal, Decimal, Decimal)    │ (60m drift, 10m drift, hist_vol)   │
 ///
@@ -33,6 +33,12 @@
 ///     keepalive pings reset the 30s timer but ticker text has silently stopped
 ///
 /// Consumers should treat a `dec!(0)` oracle price as "not yet connected".
+///
+/// The oracle LEVEL is published in the currency the venue settles in
+/// ([`MarkDenomination`]); the rates (velocity, acceleration, drift, realized
+/// vol) are always differences over the raw Binance series, where a stablecoin
+/// basis cancels and its tick noise would otherwise be added to a one-second
+/// velocity.
 use std::str::FromStr;
 use std::collections::HashMap;
 
@@ -132,11 +138,235 @@ pub fn short_window_start(
 /// How often an unusable short-window anchor is written to the log.
 const SHORT_WINDOW_GAP_LOG_SECS: u64 = 60;
 
+/// The currency of the published oracle level.
+///
+/// Binance quotes BTC in USDT, and USDT is not a dollar: on 2026-10-18 it traded
+/// at $0.9987, so BTC/USDT read about $100 above the dollar price of bitcoin.
+/// A market that settles on a DOLLAR index (Kalshi's crypto series resolve on
+/// CF Benchmarks' real-time indices, quoted in USD) was then compared against a
+/// mark in the wrong currency: FairValue saw BTC/USDT $83 above an $81,000
+/// strike with eleven minutes left, priced YES at 0.79 against a $0.42 ask, and
+/// bought. Coinbase BTC-USD never crossed the strike; the market settled NO and
+/// the "edge" was the USDT discount. The venue that spawns the raptor says
+/// which currency its markets settle in; the raptor publishes the level in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkDenomination {
+    /// The Binance quote asset as traded (BTC/USDT). Right for a market whose
+    /// rules settle on that very pair: Polymarket's "Up or Down" markets resolve
+    /// on the Binance BTC/USDT one-minute candle.
+    QuoteAsset,
+    /// US dollars: BTC/USDT divided by USDC/USDT from the same Binance feed.
+    /// USDC is taken as the dollar; its own basis is a few basis points and the
+    /// alternative is a second vendor for the spot level.
+    Usd,
+}
+
+/// Longest a USDC/USDT quote may stand in for the current one. USDT's dollar
+/// price moves in basis points per hour, so a quote this old is still the
+/// right factor to within a dollar or two of BTC; past it the USD level is
+/// unknown and the oracle says so (`dec!(0)`) rather than publish a stale
+/// conversion as a fresh mark.
+pub const BASIS_MAX_AGE_SECS: u64 = 900;
+
+/// Sanity bounds on a USDC/USDT print. A quote outside this band is a bad tick
+/// or a broken stablecoin, and either way not a conversion factor. This band
+/// alone still admits a single print that would move the BTC level by a
+/// thousand dollars; [`BASIS_MAX_JUMP`] is what stops that.
+const USDC_USDT_SANE: (Decimal, Decimal) = (dec!(0.90), dec!(1.10));
+
+/// Largest move a single print may make against the factor in force, as a
+/// fraction (30 basis points, about $240 of BTC at $81,000). USDT's dollar
+/// price moves in basis points per hour, so one print further away than this
+/// is a bad tick and is refused. A real break in the peg is a run of such
+/// prints: once they have been refused for [`BASIS_REGIME_CONFIRM_SECS`]
+/// without a single print landing back inside the band, the move is taken as
+/// real and the next print that agrees with the run (within this same
+/// fraction of the run's first print) is accepted as the new regime. Until
+/// then the factor in force stays published. The run survives a reconnect of
+/// the feed, so the lag on a peg move is normally two minutes; a feed that is
+/// down for the whole move is bounded by [`BASIS_MAX_AGE_SECS`], after which
+/// the level is withheld and the first in-band print is accepted.
+pub const BASIS_MAX_JUMP: Decimal = dec!(0.003);
+
+/// How long prints must keep disagreeing with the factor in force before the
+/// disagreement is believed (see [`BASIS_MAX_JUMP`]).
+pub const BASIS_REGIME_CONFIRM_SECS: u64 = 120;
+
+/// The current run of jump-refused in-band prints: when it began and the
+/// dollars-per-USDT factor of its first print, which later prints must agree
+/// with to confirm it.
+pub type RefusedRun = Option<(Instant, Decimal)>;
+
+/// Decide whether a USDC/USDT print replaces the factor in force. `Some(f)` is
+/// the new dollars-per-USDT factor; `None` keeps what is there. `run` is the
+/// current run of refused prints ([`RefusedRun`], `None` when the last print
+/// was accepted).
+pub fn accept_basis_print(
+    usdc_usdt_last: Decimal,
+    in_force: Option<(Instant, Decimal)>,
+    run: RefusedRun,
+    now: Instant,
+    max_age: Duration,
+) -> Option<Decimal> {
+    let factor = usd_per_quote(usdc_usdt_last)?;
+    match in_force {
+        Some((at, prev)) if now.saturating_duration_since(at) <= max_age && prev > Decimal::ZERO => {
+            let jump = ((factor - prev) / prev).abs();
+            if jump <= BASIS_MAX_JUMP {
+                return Some(factor);
+            }
+            let confirmed = run.is_some_and(|(since, first)| {
+                now.saturating_duration_since(since) >= Duration::from_secs(BASIS_REGIME_CONFIRM_SECS)
+                    && first > Decimal::ZERO
+                    && ((factor - first) / first).abs() <= BASIS_MAX_JUMP
+            });
+            if confirmed { Some(factor) } else { None }
+        }
+        _ => Some(factor),
+    }
+}
+
+/// The level to publish for one tick: the raw price for a quote-asset venue,
+/// the dollar conversion ([`usd_mark`]) for a dollar venue. `None` means the
+/// level is unknown this tick and EVERYTHING the raptor publishes for it must
+/// read as "not connected" (level 0, rates 0): a zero level beside a live
+/// velocity turns every `oracle_threshold(pct, oracle)` into zero, and
+/// Momentum's gates then pass on any downward tick.
+pub fn publish_level(
+    denomination: MarkDenomination,
+    price: Decimal,
+    basis: Option<(Instant, Decimal)>,
+    now: Instant,
+    max_age: Duration,
+) -> Option<Decimal> {
+    match denomination {
+        MarkDenomination::QuoteAsset => Some(price),
+        MarkDenomination::Usd => usd_mark(price, basis, now, max_age),
+    }
+}
+
+/// How often a withheld USD level is written to the log.
+const BASIS_GAP_LOG_SECS: u64 = 60;
+
+/// Dollars per one unit of the quote asset, from the last USDC/USDT print.
+/// `None` for a print outside [`USDC_USDT_SANE`] or at zero.
+pub fn usd_per_quote(usdc_usdt_last: Decimal) -> Option<Decimal> {
+    let (lo, hi) = USDC_USDT_SANE;
+    if usdc_usdt_last <= Decimal::ZERO || usdc_usdt_last < lo || usdc_usdt_last > hi {
+        return None;
+    }
+    Some(dec!(1) / usdc_usdt_last)
+}
+
+/// The oracle level in dollars: the quote-asset price times the most recent
+/// dollars-per-quote factor, provided that factor is no older than `max_age`.
+/// `None` when no factor has arrived yet or the last one has gone stale; the
+/// caller publishes "not connected" for that tick rather than a guess.
+pub fn usd_mark(
+    quote_price: Decimal,
+    basis: Option<(Instant, Decimal)>,
+    now: Instant,
+    max_age: Duration,
+) -> Option<Decimal> {
+    let (at, factor) = basis?;
+    if now.saturating_duration_since(at) > max_age {
+        return None;
+    }
+    Some((quote_price * factor).round_dp(2))
+}
+
+/// USDC/USDT ticker feed: publishes `(when, dollars per USDT)` on every print
+/// that passes [`usd_per_quote`]. Same host rotation and stall handling as the
+/// price stream. A disconnect leaves the last factor in place with its own
+/// timestamp; [`usd_mark`] ages it out, so nothing here ever clears it to a
+/// value that could be mistaken for a fresh quote.
+async fn run_stablecoin_basis_feed(basis_tx: watch::Sender<Option<(Instant, Decimal)>>) {
+    // Returns when the raptor that owns the receiver is gone, so a restarted
+    // raptor does not leave the old feed's socket open beside its new one.
+    let ws_urls = [
+        "wss://stream.binance.com:9443/ws/usdcusdt@ticker".to_string(),
+        "wss://data-stream.binance.vision/ws/usdcusdt@ticker".to_string(),
+    ];
+    let mut ws_url_idx = 0usize;
+    let mut announced = false;
+    // The run of prints refused for jumping away from the factor in force
+    // (`accept_basis_print`); kept across reconnects so a stall in the middle
+    // of a peg move does not restart the confirmation clock. Cleared by any
+    // accepted print.
+    let mut refused_run: RefusedRun = None;
+    loop {
+        if basis_tx.is_closed() {
+            info!(" Price Raptor: USDC/USDT basis feed closing — its raptor is gone");
+            return;
+        }
+        let url_str = &ws_urls[ws_url_idx];
+        let conn = tokio_timeout(Duration::from_secs(20), connect_async(url_str)).await;
+        let mut connected = false;
+        if let Ok(Ok((mut ws_stream, _))) = conn {
+            connected = true;
+            info!(" Price Raptor: USDC/USDT basis feed connected via {url_str}");
+            let mut last_tick = Instant::now();
+            'ws: loop {
+                if basis_tx.is_closed() {
+                    break 'ws;
+                }
+                if last_tick.elapsed() >= Duration::from_secs(60) {
+                    warn!("⚠️ Price Raptor: no USDC/USDT tick in 60s — reconnecting the basis feed");
+                    break 'ws;
+                }
+                match tokio_timeout(Duration::from_secs(30), ws_stream.next()).await {
+                    Ok(Some(Ok(Message::Text(text)))) => {
+                        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+                        let Some(last) = v.get("c").and_then(|p| p.as_str()).and_then(|s| Decimal::from_str(s).ok()) else { continue };
+                        last_tick = Instant::now();
+                        let in_force = *basis_tx.borrow();
+                        match accept_basis_print(last, in_force, refused_run, last_tick, Duration::from_secs(BASIS_MAX_AGE_SECS)) {
+                            Some(factor) => {
+                                if !announced {
+                                    announced = true;
+                                    info!(" Price Raptor: USD mark active — 1 USDT = ${factor:.4} (USDC/USDT {last})");
+                                } else if let Some((since, _)) = refused_run {
+                                    info!(" Price Raptor: USDC/USDT regime change accepted after {}s of disagreeing prints — 1 USDT = ${factor:.4} (USDC/USDT {last})",
+                                          last_tick.saturating_duration_since(since).as_secs());
+                                }
+                                refused_run = None;
+                                let _ = basis_tx.send(Some((last_tick, factor)));
+                            }
+                            None => {
+                                if let (Some(f), None) = (usd_per_quote(last), refused_run) {
+                                    refused_run = Some((last_tick, f));
+                                }
+                                warn!(
+                                    "⚠️ Price Raptor: refused USDC/USDT print {last} as a conversion factor (outside sane bounds, or more than {}% from the factor in force); keeping the previous one",
+                                    BASIS_MAX_JUMP * dec!(100),
+                                );
+                            }
+                        }
+                    }
+                    Ok(Some(Ok(_))) => {}
+                    Ok(None) | Ok(Some(Err(_))) => break 'ws,
+                    Err(_) => {
+                        warn!("⚠️ Price Raptor: no USDC/USDT message in 30s — reconnecting the basis feed");
+                        break 'ws;
+                    }
+                }
+            }
+        }
+        warn!("⚠️ Price Raptor: USDC/USDT basis feed disconnected. Reconnecting in 5s...");
+        if !connected {
+            ws_url_idx = (ws_url_idx + 1) % ws_urls.len();
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
 pub async fn run_price_raptor(
     crypto_filter: String,
+    // Currency of the published oracle level; see [`MarkDenomination`].
+    denomination: MarkDenomination,
     oracle_tx: watch::Sender<Decimal>,
     velocity_tx: watch::Sender<(Decimal, Decimal, Decimal)>,
-    // Sends (drift_60m, drift_10m, hist_vol) — drift values are raw USD Decimal;
+    // Sends (drift_60m, drift_10m, hist_vol) — drift values are raw quote-asset (USDT) Decimal;
     // hist_vol is the normalized [0,1] 60-min realized-vol (canonical flatness measure).
     // drift_10m fills the 5s–60m temporal gap for GBoost feature [18].
     drift_tx: watch::Sender<(Decimal, Decimal, Decimal)>,
@@ -166,6 +396,29 @@ pub async fn run_price_raptor(
         .unwrap_or_else(Instant::now);
     // Throttle for the short-window gap warning; seeded in the past likewise.
     let mut last_gap_log = last_vol_log;
+    // Throttle for the withheld-USD-level warning; seeded in the past likewise.
+    let mut last_basis_gap_log = last_vol_log;
+
+    // Dollars per USDT, from its own stream, only when the venue settles in
+    // dollars. `None` until the first good print.
+    let (basis_tx, basis_rx) = watch::channel::<Option<(Instant, Decimal)>>(None);
+    if denomination == MarkDenomination::Usd {
+        // Supervised like the raptor itself: a panic restarts the feed, a
+        // clean return (the raptor is gone) ends it.
+        tokio::spawn(async move {
+            loop {
+                match tokio::spawn(run_stablecoin_basis_feed(basis_tx.clone())).await {
+                    Ok(()) => return,
+                    Err(e) => {
+                        warn!("⚠️ Price Raptor: USDC/USDT basis feed task died ({e}); restarting in 5s");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        });
+    } else {
+        drop(basis_tx);
+    }
 
     loop {
         // Bounded connect: an unbounded `connect_async().await` can hang forever on a
@@ -204,7 +457,31 @@ pub async fn run_price_raptor(
                                     if let Ok(price) = Decimal::from_str(price_str) {
                                         let now = Instant::now();
                                         last_price_tick = now; // reset staleness clock
-                                        let _ = oracle_tx.send(price);
+                                        // The LEVEL goes out in the venue's settlement currency;
+                                        // every rate below stays on the raw series (see the
+                                        // module doc). `dec!(0)` is the documented "not
+                                        // connected" value: a dollar level with no fresh
+                                        // conversion factor is unknown, not the USDT price.
+                                        let level = publish_level(
+                                            denomination, price, *basis_rx.borrow(), now, Duration::from_secs(BASIS_MAX_AGE_SECS),
+                                        );
+                                        if level.is_none()
+                                            && now.duration_since(last_basis_gap_log).as_secs() >= BASIS_GAP_LOG_SECS
+                                        {
+                                            last_basis_gap_log = now;
+                                            let age = basis_rx.borrow().map(|(at, _)| now.saturating_duration_since(at).as_secs());
+                                            match age {
+                                                Some(a) => warn!(
+                                                    "⚠️ Price Raptor [{}]: USD level withheld — last USDC/USDT quote is {a}s old (limit {}s); oracle and rates read 0 (not connected) until the basis feed returns",
+                                                    crypto_filter.to_uppercase(), BASIS_MAX_AGE_SECS,
+                                                ),
+                                                None => warn!(
+                                                    "⚠️ Price Raptor [{}]: USD level withheld — no USDC/USDT quote yet; oracle and rates read 0 (not connected) until the first print",
+                                                    crypto_filter.to_uppercase(),
+                                                ),
+                                            }
+                                        }
+                                        let _ = oracle_tx.send(level.unwrap_or(Decimal::ZERO));
                                         price_history.push_back((now, price));
 
                                         // Trim entries older than the primary window (5s)
@@ -250,6 +527,13 @@ pub async fn run_price_raptor(
                                         // Acceleration: rate of change of velocity
                                         let acceleration = velocity_5s - prev_velocity;
                                         prev_velocity = velocity_5s;
+                                        // Rates go out only beside a level (see `publish_level`);
+                                        // the histories keep filling so they resume at once.
+                                        let (velocity_5s, velocity_1s, acceleration) = if level.is_some() {
+                                            (velocity_5s, velocity_1s, acceleration)
+                                        } else {
+                                            (dec!(0), dec!(0), dec!(0))
+                                        };
                                         let _ = velocity_tx.send((velocity_5s, velocity_1s, acceleration));
 
                                         // 60-minute drift
@@ -308,13 +592,22 @@ pub async fn run_price_raptor(
                                             Decimal::from_f64_retain(normalized_hist_vol(&prices)).map(|d| d.round_dp(10)).unwrap_or(dec!(0))
                                         };
 
+                                        let (drift_60m, drift_10m, hist_vol_norm) = if level.is_some() {
+                                            (drift_60m, drift_10m, hist_vol_norm)
+                                        } else {
+                                            (dec!(0), dec!(0), dec!(0))
+                                        };
                                         let _ = drift_tx.send((drift_60m, drift_10m, hist_vol_norm));
 
                                         // Mirror the latest signal snapshot into the shared
                                         // raptor-health map so GET /api/telemetry can graph it.
                                         raptor_health_tx.send_modify(|map| {
                                             let h = map.entry(crypto_filter.clone()).or_default();
-                                            h.oracle_price = price;
+                                            h.oracle_price = level.unwrap_or(Decimal::ZERO);
+                                            // A live socket with no publishable level is not a
+                                            // connected price feed from the consumer's side, and
+                                            // nothing below is being published either.
+                                            h.price_connected = level.is_some();
                                             h.velocity_5s  = velocity_5s;
                                             h.velocity_1s  = velocity_1s;
                                             h.velocity_1s_anchor_ms = anchor_age_ms;
@@ -335,12 +628,20 @@ pub async fn run_price_raptor(
                                                 .map(|(_, p)| p.to_f64().unwrap_or(0.0))
                                                 .collect();
                                             if prices.len() >= 5 {
+                                                let basis_note = match denomination {
+                                                    MarkDenomination::QuoteAsset => String::new(),
+                                                    MarkDenomination::Usd => match *basis_rx.borrow() {
+                                                        Some((at, f)) => format!(" | usd/usdt={f:.4} ({}s old)", now.saturating_duration_since(at).as_secs()),
+                                                        None => " | usd/usdt=unknown".to_string(),
+                                                    },
+                                                };
                                                 info!(
-                                                    " [{}] 60m realized-vol: hist_vol={:.4} (norm 0-1) | range={:.3}% | samples={}",
+                                                    " [{}] 60m realized-vol: hist_vol={:.4} (norm 0-1) | range={:.3}% | samples={}{}",
                                                     crypto_filter.to_uppercase(),
                                                     normalized_hist_vol(&prices),
                                                     range_pct(&prices),
                                                     prices.len(),
+                                                    basis_note,
                                                 );
                                             }
                                         }
@@ -470,7 +771,7 @@ mod live_binance_tests {
         let (velocity_tx, mut velocity_rx) = watch::channel((dec!(0), dec!(0), dec!(0)));
         let (drift_tx, _drift_rx) = watch::channel((dec!(0), dec!(0), dec!(0)));
         let health = Arc::new(watch::channel(HashMap::new()).0);
-        let raptor = tokio::spawn(run_price_raptor("btc".into(), oracle_tx, velocity_tx, drift_tx, health));
+        let raptor = tokio::spawn(run_price_raptor("btc".into(), MarkDenomination::QuoteAsset, oracle_tx, velocity_tx, drift_tx, health));
 
         let mut prev_price: Option<Decimal> = None;
         let mut prev_at: Option<Instant> = None;
@@ -505,5 +806,112 @@ mod live_binance_tests {
         assert!(checked >= 10, "only {checked} ticks received; Binance unreachable from here?");
         assert!(moved >= 3, "price moved on only {moved} of {checked} ticks; rerun in a livelier tape");
         assert_eq!(zero_on_move, 0, "1s velocity read 0.00 on {zero_on_move} of {moved} ticks where the price moved");
+    }
+}
+
+#[cfg(test)]
+mod usd_mark_tests {
+    use super::*;
+
+    /// 2026-10-18, 12:48 ET: Binance BTC/USDT 81,083.53 while USDC/USDT printed
+    /// 1.0013. The dollar level is below the $80,999.99 strike that the USDT
+    /// level was $83 above.
+    #[test]
+    fn the_dollar_level_is_the_quote_price_divided_by_usdc_usdt() {
+        let factor = usd_per_quote(dec!(1.0013)).expect("sane print");
+        let now = Instant::now();
+        let level = usd_mark(dec!(81083.53), Some((now, factor)), now, Duration::from_secs(900)).unwrap();
+        assert!(level < dec!(80999.99), "{level} should sit below the strike");
+        assert!(level > dec!(80950), "{level} is about $105 under the USDT quote, not more");
+        // At par the level is the quote price.
+        assert_eq!(usd_mark(dec!(81083.53), Some((now, usd_per_quote(dec!(1)).unwrap())), now, Duration::from_secs(900)), Some(dec!(81083.53)));
+    }
+
+    /// A zero or absurd USDC/USDT print is not a conversion factor.
+    #[test]
+    fn insane_or_zero_basis_prints_are_refused() {
+        assert_eq!(usd_per_quote(Decimal::ZERO), None);
+        assert_eq!(usd_per_quote(dec!(-1)), None);
+        assert_eq!(usd_per_quote(dec!(0.5)), None);
+        assert_eq!(usd_per_quote(dec!(1.2)), None);
+        assert!(usd_per_quote(dec!(0.95)).is_some());
+        assert!(usd_per_quote(dec!(1.05)).is_some());
+    }
+
+    /// No basis yet, or a basis past its age limit, withholds the level: the
+    /// caller publishes 0 (not connected) rather than a stale conversion.
+    #[test]
+    fn a_missing_or_stale_basis_withholds_the_level() {
+        let now = Instant::now();
+        let max = Duration::from_secs(BASIS_MAX_AGE_SECS);
+        assert_eq!(usd_mark(dec!(81000), None, now, max), None);
+        let fresh = now - Duration::from_secs(BASIS_MAX_AGE_SECS - 1);
+        assert!(usd_mark(dec!(81000), Some((fresh, dec!(0.9987))), now, max).is_some());
+        let stale = now - Duration::from_secs(BASIS_MAX_AGE_SECS + 1);
+        assert_eq!(usd_mark(dec!(81000), Some((stale, dec!(0.9987))), now, max), None);
+    }
+
+    /// A quote-asset venue publishes the raw price whatever the basis says; a
+    /// dollar venue publishes the conversion or nothing.
+    #[test]
+    fn the_quote_asset_venue_publishes_the_raw_price() {
+        let now = Instant::now();
+        let max = Duration::from_secs(BASIS_MAX_AGE_SECS);
+        assert_eq!(publish_level(MarkDenomination::QuoteAsset, dec!(81083.53), None, now, max), Some(dec!(81083.53)));
+        assert_eq!(publish_level(MarkDenomination::QuoteAsset, dec!(81083.53), Some((now, dec!(0.9987))), now, max), Some(dec!(81083.53)));
+        assert_eq!(publish_level(MarkDenomination::Usd, dec!(81083.53), None, now, max), None);
+        assert_eq!(publish_level(MarkDenomination::Usd, dec!(81083.53), Some((now, dec!(0.9987))), now, max), Some(dec!(80978.12)));
+    }
+
+    /// The sane band is inclusive at both edges.
+    #[test]
+    fn the_sane_band_edges_are_accepted() {
+        assert_eq!(usd_per_quote(dec!(0.90)), Some(dec!(1) / dec!(0.90)));
+        assert_eq!(usd_per_quote(dec!(1.10)), Some(dec!(1) / dec!(1.10)));
+        assert_eq!(usd_per_quote(dec!(0.8999)), None);
+        assert_eq!(usd_per_quote(dec!(1.1001)), None);
+    }
+
+    /// One print may not move the factor more than 30 bp while the factor in
+    /// force is fresh: a 1.02 print beside a 1.0013 regime (about $1,500 of
+    /// BTC) is refused, a 1.0014 print is taken. With no factor, or a stale
+    /// one, the first in-band print is accepted as the new regime.
+    #[test]
+    fn a_print_far_from_the_factor_in_force_is_refused_until_it_ages_out() {
+        let now = Instant::now();
+        let max = Duration::from_secs(BASIS_MAX_AGE_SECS);
+        let in_force = Some((now, usd_per_quote(dec!(1.0013)).unwrap()));
+        assert_eq!(accept_basis_print(dec!(1.02), in_force, None, now, max), None);
+        assert_eq!(accept_basis_print(dec!(0.98), in_force, None, now, max), None);
+        assert_eq!(accept_basis_print(dec!(1.0014), in_force, None, now, max), usd_per_quote(dec!(1.0014)));
+        assert_eq!(accept_basis_print(dec!(1.0040), in_force, None, now, max), usd_per_quote(dec!(1.0040)));
+        assert_eq!(accept_basis_print(dec!(1.02), None, None, now, max), usd_per_quote(dec!(1.02)));
+        let stale = Some((now - Duration::from_secs(BASIS_MAX_AGE_SECS + 1), usd_per_quote(dec!(1.0013)).unwrap()));
+        assert_eq!(accept_basis_print(dec!(1.02), stale, None, now, max), usd_per_quote(dec!(1.02)));
+        // Out of band is refused regardless.
+        assert_eq!(accept_basis_print(dec!(1.2), None, None, now, max), None);
+    }
+
+    /// A real peg move is a run of far prints. While the run is younger than
+    /// the confirmation window the factor in force stands; once prints have
+    /// disagreed for the whole window the next one is accepted, so a wrong
+    /// rate is never held for the full age limit.
+    #[test]
+    fn a_sustained_run_of_far_prints_is_accepted_as_a_new_regime() {
+        let now = Instant::now();
+        let max = Duration::from_secs(BASIS_MAX_AGE_SECS);
+        let in_force = Some((now, usd_per_quote(dec!(1.0013)).unwrap()));
+        let first = usd_per_quote(dec!(1.02)).unwrap();
+        let young = Some((now - Duration::from_secs(BASIS_REGIME_CONFIRM_SECS - 1), first));
+        assert_eq!(accept_basis_print(dec!(1.02), in_force, young, now, max), None);
+        let confirmed = Some((now - Duration::from_secs(BASIS_REGIME_CONFIRM_SECS), first));
+        assert_eq!(accept_basis_print(dec!(1.02), in_force, confirmed, now, max), usd_per_quote(dec!(1.02)));
+        assert_eq!(accept_basis_print(dec!(1.0215), in_force, confirmed, now, max), usd_per_quote(dec!(1.0215)), "agrees with the run within 30 bp");
+        // The confirming print must agree with the run: a stray print at the
+        // confirmation moment is not the new regime.
+        assert_eq!(accept_basis_print(dec!(1.05), in_force, confirmed, now, max), None);
+        assert_eq!(accept_basis_print(dec!(0.98), in_force, confirmed, now, max), None);
+        // An out-of-band print is still never a factor, run or no run.
+        assert_eq!(accept_basis_print(dec!(1.2), in_force, confirmed, now, max), None);
     }
 }
