@@ -879,6 +879,71 @@ async fn get_vipers_status(Query(q): Query<AssetQuery>) -> Response {
     Json(crate::helpers::viper_status::snapshot(q.asset.as_deref())).into_response()
 }
 
+/// GET /api/venue/collateral-pools
+///
+/// The venue's collateral, pool by pool. One pool on a single-wallet venue;
+/// one per exchange shard on Kalshi, where an order can only spend the balance
+/// of the shard its market trades on and an empty shard rejects every order
+/// for its markets. `pools` is `null` while no venue session exists yet (the
+/// engine is still starting), never an empty list that would read as "no money".
+#[derive(Debug, Serialize)]
+pub struct CollateralPoolRow {
+    #[serde(flatten)]
+    pub pool: crate::venues::core::CollateralPool,
+    /// A deployed squadron's market spends from this pool, so an empty one is
+    /// a problem now rather than a shard the operator never trades.
+    pub in_use: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CollateralPoolsResponse {
+    pub pools: Option<Vec<CollateralPoolRow>>,
+    /// True when the venue keeps more than one pool, so the Control Tower
+    /// shows the table; a single wallet has nothing to break down.
+    pub split: bool,
+    /// Why `pools` is null, when it is.
+    pub unavailable: Option<String>,
+    pub as_of: chrono::DateTime<chrono::Utc>,
+}
+
+async fn get_collateral_pools(State(s): State<ApiState>) -> Response {
+    let now = chrono::Utc::now();
+    let Some(session) = s.cag.session() else {
+        return Json(CollateralPoolsResponse {
+            pools: None, split: false,
+            unavailable: Some("no venue session is registered yet; the engine is still starting".into()),
+            as_of: now,
+        }).into_response();
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(10), crate::venues::core::Execution::collateral_pools(session.venue.as_ref())).await {
+        Ok(Ok(pools)) => {
+            let split = pools.len() > 1;
+            // Pools a deployed squadron spends from, by the market each flies.
+            let mut in_use = std::collections::HashSet::new();
+            if split {
+                for sq in s.cag.list_squadrons() {
+                    let Some(m) = sq.market_id.as_deref() else { continue };
+                    let market = crate::venues::core::MarketId::new(m);
+                    if let Ok(Ok(Some(p))) = tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        crate::venues::core::Execution::collateral_pool_for(session.venue.as_ref(), &market),
+                    ).await {
+                        in_use.insert(p.id);
+                    }
+                }
+            }
+            let rows = pools.into_iter().map(|pool| CollateralPoolRow { in_use: in_use.contains(&pool.id), pool }).collect();
+            Json(CollateralPoolsResponse { pools: Some(rows), split, unavailable: None, as_of: now }).into_response()
+        }
+        Ok(Err(e)) => Json(CollateralPoolsResponse {
+            pools: None, split: false, unavailable: Some(format!("balance query failed: {e}")), as_of: now,
+        }).into_response(),
+        Err(_) => Json(CollateralPoolsResponse {
+            pools: None, split: false, unavailable: Some("balance query timed out".into()), as_of: now,
+        }).into_response(),
+    }
+}
+
 /// GET /api/bookline/record
 ///
 /// Bookline's simulated record, one summary PER LANE and never summed. The
@@ -4598,6 +4663,7 @@ pub async fn run_api_server(
         .route("/api/trades",                get(get_trades))
         .route("/api/trades/stats",          get(get_trade_stats))
         .route("/api/venue-income",          get(get_venue_income))
+        .route("/api/venue/collateral-pools", get(get_collateral_pools))
         .route("/api/trades/export",         get(export_trades))
         .route("/api/logs",                  get(get_logs))
         .route("/api/latency",               get(get_latency))

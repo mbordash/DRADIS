@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License along
 // with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import type { DynamicConfig, ConfigFieldSchema, PnlSnapshotRow, TradeRow, TradeStats, OpenPositionRow, LlmRecommendationRow, LlmActionRow, ViperDef, StatusResponse, PortfolioValue, VenueIncome, PositionQuote, SquadronSummary, TelemetrySnapshot, TelemetrySample } from './types';
+import type { DynamicConfig, ConfigFieldSchema, PnlSnapshotRow, TradeRow, TradeStats, OpenPositionRow, LlmRecommendationRow, LlmActionRow, ViperDef, StatusResponse, PortfolioValue, CollateralPoolsResponse, VenueIncome, PositionQuote, SquadronSummary, TelemetrySnapshot, TelemetrySample } from './types';
 
 // In development, NEXT_PUBLIC_API_URL=http://localhost:9000 (set in .env.local)
 // hits the DRADIS API directly.
@@ -300,6 +300,12 @@ export async function getVenueIncome(): Promise<VenueIncome> {
 export async function getPortfolioValue(): Promise<PortfolioValue> {
   const res = await fetch(`${BASE}/api/portfolio`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`GET /api/portfolio → ${res.status}`);
+  return res.json();
+}
+
+export async function getCollateralPools(): Promise<CollateralPoolsResponse> {
+  const res = await fetch(`${BASE}/api/venue/collateral-pools`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/venue/collateral-pools → ${res.status}`);
   return res.json();
 }
 

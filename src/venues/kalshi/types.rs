@@ -81,6 +81,12 @@ pub struct MarketResponse {
 pub struct KalshiMarket {
     #[serde(default)]
     pub ticker: String,
+    /// Exchange shard this market trades on. Kalshi runs separate matching
+    /// engines per category (0 default, 1 combos, 2 crypto and commodities,
+    /// 3 sports) and each keeps its own balance; a market never migrates.
+    /// Absent on older responses, hence `Option`.
+    #[serde(default)]
+    pub exchange_index: Option<i64>,
     #[serde(default)]
     pub event_ticker: String,
     #[serde(default)]
@@ -245,11 +251,37 @@ impl OrderbookFp {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct BalanceResponse {
     /// Available balance in fixed-point dollars (string) — V2 shape; older
-    /// deployments return integer cents in `balance`.
+    /// deployments return integer cents in `balance`. Summed over every
+    /// exchange shard unless the request named one.
     #[serde(default)]
     pub balance_dollars: String,
     #[serde(default)]
     pub balance: Option<i64>,
+    /// Balance per exchange shard. Omitted for subaccount-restricted API keys.
+    #[serde(default)]
+    pub balance_breakdown: Option<Vec<IndexedBalance>>,
+}
+
+/// One exchange shard's balance, as `GET /portfolio/balance` lists it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct IndexedBalance {
+    #[serde(default)]
+    pub exchange_index: i64,
+    /// Fixed-point dollars (string), unlike the top-level `balance` in cents.
+    #[serde(default)]
+    pub balance: String,
+}
+
+/// What Kalshi opens on each exchange shard (docs: Series Shard Assignments).
+pub fn shard_label(index: i64) -> String {
+    let what = match index {
+        0 => "default",
+        1 => "combos",
+        2 => "crypto and commodities",
+        3 => "sports",
+        _ => "other",
+    };
+    format!("{what} (shard {index})")
 }
 
 impl BalanceResponse {
@@ -261,6 +293,44 @@ impl BalanceResponse {
         self.balance
             .map(|c| Decimal::new(c, 2))
             .unwrap_or_default()
+    }
+
+    /// The per-shard pools, or the whole wallet as one pool when Kalshi gave
+    /// no breakdown (a subaccount-restricted key). Shards Kalshi opens markets
+    /// on (0 through 3) always appear, at zero when the account holds nothing
+    /// there, so an unfunded shard is visible rather than merely missing.
+    pub fn pools(&self) -> Vec<crate::venues::core::CollateralPool> {
+        let Some(rows) = self.balance_breakdown.as_ref() else {
+            return vec![crate::venues::core::CollateralPool {
+                id: "wallet".into(),
+                label: "wallet".into(),
+                balance: self.dollars(),
+            }];
+        };
+        let mut by_index: std::collections::BTreeMap<i64, Decimal> =
+            (0..=3).map(|i| (i, Decimal::ZERO)).collect();
+        for r in rows {
+            *by_index.entry(r.exchange_index).or_default() += fp(&r.balance).unwrap_or_default();
+        }
+        by_index
+            .into_iter()
+            .map(|(i, balance)| crate::venues::core::CollateralPool {
+                id: i.to_string(),
+                label: shard_label(i),
+                balance,
+            })
+            .collect()
+    }
+
+    /// Balance of one shard, if Kalshi broke the balance down.
+    pub fn shard_dollars(&self, index: i64) -> Option<Decimal> {
+        let rows = self.balance_breakdown.as_ref()?;
+        Some(
+            rows.iter()
+                .filter(|r| r.exchange_index == index)
+                .map(|r| fp(&r.balance).unwrap_or_default())
+                .sum(),
+        )
     }
 }
 
@@ -423,6 +493,45 @@ mod tests {
     use super::*;
     use rust_decimal_macros::dec;
 
+    /// The balance Kalshi reports is the sum over every exchange shard, so the
+    /// pools must come from the breakdown, with the shards Kalshi opens markets
+    /// on present at zero when the account has never funded them.
+    #[test]
+    fn pools_come_from_the_shard_breakdown_and_show_unfunded_shards_at_zero() {
+        let b: BalanceResponse = serde_json::from_str(
+            r#"{"balance":4232,"balance_dollars":"42.3268","portfolio_value":0,
+                "balance_breakdown":[{"exchange_index":0,"balance":"12.3268"},{"exchange_index":2,"balance":"30.0000"}]}"#,
+        ).unwrap();
+        let pools = b.pools();
+        let by_id: Vec<(&str, Decimal)> = pools.iter().map(|p| (p.id.as_str(), p.balance)).collect();
+        assert_eq!(by_id, vec![("0", dec!(12.3268)), ("1", dec!(0)), ("2", dec!(30.0000)), ("3", dec!(0))]);
+        assert_eq!(pools[2].label, "crypto and commodities (shard 2)");
+        assert_eq!(b.shard_dollars(2), Some(dec!(30.0000)));
+        assert_eq!(b.shard_dollars(3), Some(dec!(0)));
+        assert_eq!(b.dollars(), dec!(42.3268));
+    }
+
+    /// A subaccount-restricted key gets no breakdown; the wallet is one pool
+    /// and no shard balance can be claimed.
+    #[test]
+    fn without_a_breakdown_the_wallet_is_one_pool() {
+        let b: BalanceResponse = serde_json::from_str(r#"{"balance_dollars":"42.3268"}"#).unwrap();
+        let pools = b.pools();
+        assert_eq!(pools.len(), 1);
+        assert_eq!((pools[0].id.as_str(), pools[0].balance), ("wallet", dec!(42.3268)));
+        assert_eq!(b.shard_dollars(2), None);
+    }
+
+    /// A market response names its shard; older responses without the field
+    /// still parse, with the shard unknown rather than guessed as 0.
+    #[test]
+    fn a_market_carries_its_exchange_index_when_kalshi_sends_one() {
+        let m: KalshiMarket = serde_json::from_str(r#"{"ticker":"KXBTCD-26OCT1810-T81999.99","exchange_index":2}"#).unwrap();
+        assert_eq!(m.exchange_index, Some(2));
+        let m: KalshiMarket = serde_json::from_str(r#"{"ticker":"KXBTCD-26OCT1810-T81999.99"}"#).unwrap();
+        assert_eq!(m.exchange_index, None);
+    }
+
     #[test]
     fn orderbook_best_levels() {
         let book = OrderbookFp {
@@ -446,11 +555,13 @@ mod tests {
         let b = BalanceResponse {
             balance_dollars: "120.5000".into(),
             balance: Some(999),
+            balance_breakdown: None,
         };
         assert_eq!(b.dollars(), dec!(120.5000));
         let legacy = BalanceResponse {
             balance_dollars: String::new(),
             balance: Some(12050),
+            balance_breakdown: None,
         };
         assert_eq!(legacy.dollars(), dec!(120.50));
     }

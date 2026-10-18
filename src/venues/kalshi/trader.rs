@@ -1175,7 +1175,10 @@ async fn trade_one_market(
         strike_price: pair.strike,
         window_secs: pair.window_secs,
         is_neg_risk: false,
-        condition_id: String::new(),
+        // Kalshi's market id is the ticker. The CAG publishes it as the
+        // squadron's `market_id`, which readers that join markets to squadrons
+        // (collateral pools in use, the Markets page) rely on.
+        condition_id: pair.ticker.clone(),
         yes_fee_bps: KALSHI_FEE_BPS as u32,
         no_fee_bps: KALSHI_FEE_BPS as u32,
     };
@@ -1411,7 +1414,7 @@ async fn trade_one_market(
                 lifecycle.cancel_all(venue.as_ref()).await;
                 flatten_before_stand_down(
                     &squadron_id, venue, &hub, &pool, &scope, &positions, &lifecycle,
-                    &market_cfg, maker_cfg.as_ref(), maker_pair.as_ref(), &raptors, starting,
+                    &market_cfg, maker_cfg.as_ref(), maker_pair.as_ref(), &raptors, status_scope, starting,
                     dyn_cfg.ghost_mode,
                 ).await;
                 // Its market closed, but the squadron itself continues onto
@@ -1561,7 +1564,7 @@ async fn trade_one_market(
             if winding_down && signal.opens_exposure() {
                 continue;
             }
-            if dispatch_signal(&squadron_id, venue.as_ref(), &pool, &scope, &positions, &lifecycle, &strategy_name, &signal, starting).await {
+            if dispatch_signal(&squadron_id, venue.as_ref(), &pool, &scope, &positions, &lifecycle, &strategy_name, status_scope, &signal, starting).await {
                 acted = true;
             }
         }
@@ -1600,6 +1603,7 @@ async fn flatten_before_stand_down(
     maker_cfg: Option<&MarketConfig>,
     maker_pair: Option<&KalshiPair>,
     raptors: &CryptoRaptors,
+    status_scope: &str,
     starting: Decimal,
     ghost: bool,
 ) {
@@ -1671,7 +1675,7 @@ async fn flatten_before_stand_down(
             // Each leg is flattened on its own; pairing here would double-exit.
             exit_pair: false,
         };
-        dispatch_signal(squadron_id, venue.as_ref(), pool, scope, positions, lifecycle, &strategy, &signal, starting).await;
+        dispatch_signal(squadron_id, venue.as_ref(), pool, scope, positions, lifecycle, &strategy, status_scope, &signal, starting).await;
     }
 }
 
@@ -1854,6 +1858,9 @@ async fn dispatch_signal(
     positions: &Arc<Mutex<PositionMap>>,
     lifecycle: &OrderLifecycle,
     strategy_name: &str,
+    // Viper-status registry key for this squadron (the crypto underlying or the
+    // market class), so a venue-side refusal shows on the viper's card.
+    status_scope: &str,
     signal: &StrategySignal,
     starting: Decimal,
 ) -> bool {
@@ -1879,6 +1886,12 @@ async fn dispatch_signal(
                 record_entry(squadron_id, pool, scope, strategy_name, pp, &gb).await;
                 return true;
             }
+            // Both legs spend from the same market's pool.
+            let cost = params.price * params.shares + pp.price * pp.shares;
+            if let Err(refusal) = funding_preflight(venue, positions, squadron_id, &params.token_id, cost).await {
+                refusal.report(strategy_name, status_scope, &params.token_id);
+                return false;
+            }
             let legs = [
                 order_params_to_intent(params, Side::Buy),
                 order_params_to_intent(pp, Side::Buy),
@@ -1896,11 +1909,16 @@ async fn dispatch_signal(
                     if let Some(p) = pool { sync_dashboard(squadron_id, venue, p, positions, starting).await; }
                     true
                 }
-                Err(e) => { warn!("[{strategy_name}] atomic entry failed: {e}"); false }
+                Err(e) => {
+                    if !note_unfunded_rejection(venue, &e, strategy_name, status_scope, &params.token_id).await {
+                        warn!("[{strategy_name}] atomic entry failed: {e}");
+                    }
+                    false
+                }
             }
         }
         StrategySignal::Entry { params, pair_params: None } => {
-            dispatch_single(squadron_id, venue, pool, scope, positions, lifecycle, strategy_name, params, Side::Buy, starting)
+            dispatch_single(squadron_id, venue, pool, scope, positions, lifecycle, strategy_name, status_scope, params, Side::Buy, starting)
                 .await
                 .is_some()
         }
@@ -1932,7 +1950,7 @@ async fn dispatch_signal(
                     }
                     continue;
                 }
-                if dispatch_single(squadron_id, venue, pool, scope, positions, lifecycle, strategy_name, q, Side::Buy, starting)
+                if dispatch_single(squadron_id, venue, pool, scope, positions, lifecycle, strategy_name, status_scope, q, Side::Buy, starting)
                     .await
                     .is_some()
                 {
@@ -2011,7 +2029,7 @@ async fn dispatch_signal(
                 .await
                 .get(&PositionKey::new(squadron_id, strategy_name, params.token_id.clone()))
                 .map(|p| (p.avg_entry, p.shares, p.entry_fee));
-            let exit_fill = dispatch_single(squadron_id, venue, pool, scope, positions, lifecycle, strategy_name, params, Side::Sell, starting).await;
+            let exit_fill = dispatch_single(squadron_id, venue, pool, scope, positions, lifecycle, strategy_name, status_scope, params, Side::Sell, starting).await;
             let Some(exit_fill) = exit_fill else {
                 // Nothing traded — we still own it. Dropping the position here is
                 // what abandoned a live stop-loss to expire worthless on
@@ -2103,6 +2121,7 @@ async fn dispatch_single(
     positions: &Arc<Mutex<PositionMap>>,
     lifecycle: &OrderLifecycle,
     strategy_name: &str,
+    status_scope: &str,
     params: &OrderParams,
     side: Side,
     starting: Decimal,
@@ -2129,6 +2148,16 @@ async fn dispatch_single(
         }
         return Some(ghost);
     }
+    // Funding pre-flight: refuse a buy the market's exchange shard cannot cover,
+    // on the viper's own card, instead of letting the venue reject it every
+    // tick (3,239 identical rejections on 2026-10-18). Exits spend nothing.
+    if matches!(side, Side::Buy) {
+        let cost = params.price * params.shares;
+        if let Err(refusal) = funding_preflight(venue, positions, squadron_id, &params.token_id, cost).await {
+            refusal.report(strategy_name, status_scope, &params.token_id);
+            return None;
+        }
+    }
     match venue.place_order(order_params_to_intent(params, side)).await {
         Ok(f) => {
             // A 2xx is not a fill. Kalshi answers 200 with `fill_count: 0` for an
@@ -2154,8 +2183,158 @@ async fn dispatch_single(
             if let Some(p) = pool { sync_dashboard(squadron_id, venue, p, positions, starting).await; }
             Some(f)
         }
-        Err(e) => { warn!("[{strategy_name}] {side:?} order failed: {e}"); None }
+        Err(e) => {
+            if !note_unfunded_rejection(venue, &e, strategy_name, status_scope, &params.token_id).await {
+                warn!("[{strategy_name}] {side:?} order failed: {e}");
+            }
+            None
+        }
     }
+}
+
+/// Kalshi's rejection code for an order on an exchange shard the account has
+/// not funded (`"Exchange user not found"` in its details).
+const UNFUNDED_POOL_ERROR_CODE: &str = "insufficient_shard_balance";
+/// How long buys on a pool pause after the venue rejects one as unfunded. The
+/// pause clears early the moment a balance reading shows the pool funded.
+const FUNDING_PAUSE_SECS: u64 = 300;
+/// How often a refused buy repeats its warning and its card refusal while the
+/// condition persists: one line per interval, not one per tick.
+const FUNDING_REPORT_SECS: u64 = 30;
+
+/// Why a buy was refused for funding, and whether this is the tick that says so.
+struct FundingRefusal {
+    reason: String,
+    /// False while the last report for this pool is younger than
+    /// [`FUNDING_REPORT_SECS`]; the card keeps the earlier reason.
+    report: bool,
+}
+
+impl FundingRefusal {
+    fn report(&self, strategy_name: &str, status_scope: &str, token: &MarketId) {
+        if self.report {
+            warn!("💰 [{strategy_name}] {token} — {}", self.reason);
+            crate::helpers::viper_status::report_reason(status_scope, strategy_name, &self.reason);
+        }
+    }
+}
+
+#[derive(Default)]
+struct FundingPause {
+    /// Set after the venue itself rejected an order on this pool.
+    until: Option<Instant>,
+    last_report: Option<Instant>,
+}
+
+/// Per collateral pool (an exchange shard), never per market: one pool funds
+/// every market on it, and one rejection says the same about all of them.
+fn funding_pauses() -> &'static std::sync::Mutex<HashMap<String, FundingPause>> {
+    static P: std::sync::OnceLock<std::sync::Mutex<HashMap<String, FundingPause>>> = std::sync::OnceLock::new();
+    P.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn funding_pause_active(pool_id: &str) -> bool {
+    let m = funding_pauses().lock().unwrap_or_else(|p| p.into_inner());
+    m.get(pool_id).and_then(|p| p.until).is_some_and(|u| Instant::now() < u)
+}
+
+fn arm_funding_pause(pool_id: &str) {
+    let mut m = funding_pauses().lock().unwrap_or_else(|p| p.into_inner());
+    m.entry(pool_id.to_string()).or_default().until = Some(Instant::now() + Duration::from_secs(FUNDING_PAUSE_SECS));
+}
+
+fn clear_funding_pause(pool_id: &str) {
+    let mut m = funding_pauses().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(p) = m.get_mut(pool_id) { p.until = None; }
+}
+
+/// True once per [`FUNDING_REPORT_SECS`] for a pool, and records the report.
+fn funding_report_due(pool_id: &str) -> bool {
+    let mut m = funding_pauses().lock().unwrap_or_else(|p| p.into_inner());
+    let p = m.entry(pool_id.to_string()).or_default();
+    let due = p.last_report.is_none_or(|t| t.elapsed() >= Duration::from_secs(FUNDING_REPORT_SECS));
+    if due { p.last_report = Some(Instant::now()); }
+    due
+}
+
+/// Does this squadron hold the other leg of `token`\'s market? Kalshi nets YES
+/// against NO in one market, so buying the opposite leg of a holding reduces
+/// exposure and needs no collateral; the pre-flight must not refuse it.
+async fn holds_opposite_leg(positions: &Arc<Mutex<PositionMap>>, squadron_id: &str, token: &MarketId) -> bool {
+    let (ticker, is_yes) = super::split_market_id(token.as_str());
+    let opposite = leg_id(&ticker, !is_yes);
+    let map = positions.lock().await;
+    map.iter().any(|(k, p)| k.squadron == squadron_id && k.market.as_str() == opposite && p.shares > Decimal::ZERO)
+}
+
+/// May a buy costing `cost` on `token` go to the venue?
+///
+/// Fails open: an unknown shard, a missing breakdown or a failed balance read
+/// all let the order through, as before shards existed. Refuses only when the
+/// venue\'s own figure for the market\'s pool cannot cover the order, or the
+/// venue rejected an order on that pool within [`FUNDING_PAUSE_SECS`] and the
+/// pool still cannot cover this one. A refusal here never arms a pause: the
+/// check is cheap (a cached reading) and one oversized order must not stop a
+/// smaller one from another viper.
+async fn funding_preflight(
+    venue: &KalshiVenue,
+    positions: &Arc<Mutex<PositionMap>>,
+    squadron_id: &str,
+    token: &MarketId,
+    cost: Decimal,
+) -> Result<(), FundingRefusal> {
+    if holds_opposite_leg(positions, squadron_id, token).await {
+        return Ok(());
+    }
+    let Ok(Some(pool)) = venue.collateral_pool_for(token).await else { return Ok(()) };
+    if pool.balance >= cost {
+        if funding_pause_active(&pool.id) {
+            // The operator moved funds since the rejection: trade again now.
+            clear_funding_pause(&pool.id);
+            info!("💰 the {} pool is funded again (${:.2}); buys resume", pool.label, pool.balance);
+        }
+        return Ok(());
+    }
+    let reason = if funding_pause_active(&pool.id) {
+        format!(
+            "venue funding: the venue rejected an order on the {} pool (${:.2} there); buys on it pause up to {}s and resume as soon as a balance reading covers them",
+            pool.label, pool.balance, FUNDING_PAUSE_SECS
+        )
+    } else {
+        format!(
+            "venue funding: the {} pool holds ${:.2} and this order needs ${:.2}; move funds to it (the venue does not move them for API orders)",
+            pool.label, pool.balance, cost
+        )
+    };
+    Err(FundingRefusal { reason, report: funding_report_due(&pool.id) })
+}
+
+/// If `err` is the venue\'s unfunded-shard rejection, pause buys on that pool,
+/// say so once, and return true; false leaves the caller to log the error.
+async fn note_unfunded_rejection(
+    venue: &KalshiVenue,
+    err: &anyhow::Error,
+    strategy_name: &str,
+    status_scope: &str,
+    token: &MarketId,
+) -> bool {
+    if !err.to_string().contains(UNFUNDED_POOL_ERROR_CODE) {
+        return false;
+    }
+    let (ticker, _) = super::split_market_id(token.as_str());
+    let (pool_id, label) = match venue.collateral_pool_for(token).await {
+        Ok(Some(p)) => (p.id, p.label),
+        _ => (format!("market:{ticker}"), format!("pool of {ticker}")),
+    };
+    arm_funding_pause(&pool_id);
+    let reason = format!(
+        "venue funding: the venue rejected the order ({UNFUNDED_POOL_ERROR_CODE}) — the {label} holds no balance it can spend; move funds to it and buys resume within {FUNDING_PAUSE_SECS}s"
+    );
+    if funding_report_due(&pool_id) {
+        warn!("💰 [{strategy_name}] {token} — {reason}");
+        crate::helpers::viper_status::report_reason(status_scope, strategy_name, &reason);
+    }
+    true
 }
 
 /// Persist a new position to `entries` + `open_positions`.

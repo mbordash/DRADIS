@@ -419,6 +419,17 @@ mod probe_gate_tests {
 
 // ─── Order-lifecycle primitives (Option C foundation) ───────────────────────
 
+
+/// One pool of spendable collateral; see [`Execution::collateral_pools`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct CollateralPool {
+    /// Venue-stable identifier (`"wallet"`, or a Kalshi shard index as text).
+    pub id: String,
+    /// Operator-facing name, e.g. `"crypto and commodities (shard 2)"`.
+    pub label: String,
+    pub balance: Decimal,
+}
+
 /// A venue-neutral snapshot of a resting/working order, as reported by the venue.
 ///
 /// This is the input the shared `OrderLifecycle` manager consumes (alongside
@@ -496,6 +507,28 @@ pub trait Execution: Send + Sync {
 
     /// Available collateral (settlement currency) in venue units.
     async fn collateral(&self) -> Result<Decimal>;
+
+    /// The venue's collateral, pool by pool.
+    ///
+    /// Most venues hold one wallet and report one pool. Kalshi runs several
+    /// matching engines ("exchange shards") and keeps a separate balance on each;
+    /// an order can only spend the balance of the shard its market lives on,
+    /// and the API does not move money between them. The default reports the
+    /// whole wallet as one pool, so callers can render every venue the same way.
+    async fn collateral_pools(&self) -> Result<Vec<CollateralPool>> {
+        Ok(vec![CollateralPool {
+            id: "wallet".into(),
+            label: "wallet".into(),
+            balance: self.collateral().await?,
+        }])
+    }
+
+    /// The pool an order on `market` would spend from, when the venue keeps
+    /// more than one. `None` means the whole wallet applies (single-pool venues)
+    /// or the venue did not say which pool the market belongs to.
+    async fn collateral_pool_for(&self, _market: &MarketId) -> Result<Option<CollateralPool>> {
+        Ok(None)
+    }
 
     /// Currently held positions, as reported by the venue.
     async fn positions(&self) -> Result<Vec<Position>>;

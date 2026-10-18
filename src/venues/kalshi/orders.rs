@@ -29,7 +29,7 @@
 //! Endpoint: `POST /portfolio/events/orders` (the legacy `/portfolio/orders`
 //! is deprecated).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 
@@ -66,7 +66,45 @@ fn tif_str(tif: TimeInForce) -> &'static str {
     }
 }
 
+/// Pages of resting orders searched when a cancel's ticker is unknown.
+const LOOKUP_MAX_PAGES: usize = 10;
+
+/// Path of the V2 cancel. With a ticker Kalshi auto-routes to the shard the
+/// market lives on; without one the request goes to shard 0.
+fn cancel_path(order_id: &str, ticker: Option<&str>) -> String {
+    match ticker {
+        Some(t) => format!("/portfolio/events/orders/{order_id}?market_ticker={t}"),
+        None => format!("/portfolio/events/orders/{order_id}"),
+    }
+}
+
 impl KalshiVenue {
+    /// Find the ticker of a resting order this process never placed or listed
+    /// (one adopted from a previous run). The resting-orders list spans every
+    /// shard, so a hit is remembered for the cancel that follows. `Ok(None)`
+    /// means the order rests nowhere; `Err` means Kalshi could not be asked,
+    /// which is not the same thing and must not route a cancel blind.
+    async fn lookup_order_ticker(&self, order_id: &str) -> Result<Option<String>> {
+        let mut cursor = String::new();
+        for _page in 0..LOOKUP_MAX_PAGES {
+            let path = if cursor.is_empty() {
+                "/portfolio/orders?status=resting&limit=200".to_string()
+            } else {
+                format!("/portfolio/orders?status=resting&limit=200&cursor={cursor}")
+            };
+            let resp: types::OrdersResponse = self.get_json(&path).await?;
+            if let Some(o) = resp.orders.iter().find(|o| o.order_id == order_id) {
+                self.order_tickers.insert(order_id.to_string(), o.ticker.clone());
+                return Ok(Some(o.ticker.clone()));
+            }
+            if resp.cursor.is_empty() || resp.orders.is_empty() {
+                break;
+            }
+            cursor = resp.cursor;
+        }
+        Ok(None)
+    }
+
     async fn place_one(&self, intent: &OrderIntent) -> Result<Fill> {
         let (ticker, side, price) = map_intent(intent);
         // Kalshi counts are submitted at 2dp, so this — not the raw intent
@@ -96,6 +134,9 @@ impl KalshiVenue {
             .post_json("/portfolio/events/orders", &body)
             .await?;
         let o = types::order_from_response(&raw);
+        if !o.order_id.is_empty() {
+            self.order_tickers.insert(o.order_id.clone(), ticker.clone());
+        }
         if o.order_id.is_empty() {
             tracing::warn!(
                 "⚠️ Kalshi order response carried no order_id — cancel/lifecycle tracking \
@@ -127,7 +168,12 @@ impl KalshiVenue {
                 "⚠️ Kalshi partial/zero fill: {} {:?} {} — requested {:.2}, filled {:.2}",
                 intent.market.as_str(), intent.side, ticker, requested, filled,
             );
+        } else if !o.order_id.is_empty() {
+            // Nothing rests, so nothing will be cancelled: keep the map to resting orders.
+            self.order_tickers.remove(&o.order_id);
         }
+        // Money moved; the next balance reading must come from the venue.
+        self.invalidate_balance().await;
         // Book the price Kalshi actually traded at, not the limit we asked for.
         // `average_fill_price` is quoted on the YES book for both legs, so the
         // NO leg needs the complement. Guard against the convention flipping
@@ -192,15 +238,56 @@ impl Execution for KalshiVenue {
     }
 
     async fn cancel(&self, id: OrderId) -> Result<()> {
+        // Kalshi routes a cancel to an exchange shard by market ticker; the
+        // order id alone goes to shard 0 and misses any order resting on the
+        // crypto or sports shard. Use the ticker remembered at placement, else
+        // look the order up across all shards before giving up on routing.
+        let ticker = match self.order_tickers.get(&id.0).map(|t| t.clone()) {
+            Some(t) => Some(t),
+            None => self.lookup_order_ticker(&id.0).await.with_context(|| format!(
+                "Kalshi cancel {}: ticker unknown and the resting-orders lookup failed, \
+                 so the cancel cannot be routed to its exchange shard",
+                id.0
+            ))?,
+        };
+        if ticker.is_none() {
+            // Not resting on any shard: filled or already gone. The bare cancel
+            // goes to shard 0 and reports whatever Kalshi knows about the id.
+            tracing::warn!(
+                "⚠️ Kalshi cancel {}: order rests on no exchange shard; sending the cancel unrouted",
+                id.0
+            );
+        }
         let _: serde_json::Value = self
-            .delete_json(&format!("/portfolio/events/orders/{}", id.0))
+            .delete_json(&cancel_path(&id.0, ticker.as_deref()))
             .await?;
+        self.order_tickers.remove(&id.0);
+        self.invalidate_balance().await;
         Ok(())
     }
 
     async fn collateral(&self) -> Result<Decimal> {
-        let resp: types::BalanceResponse = self.get_json("/portfolio/balance").await?;
+        // Never cached: this figure is booked into P&L snapshots right after fills.
+        let resp = self.balance_fresh().await?;
         Ok(resp.dollars())
+    }
+
+    async fn collateral_pools(&self) -> Result<Vec<crate::venues::core::CollateralPool>> {
+        Ok(self.balance().await?.pools())
+    }
+
+    /// The shard pool `market` spends from. `None` when Kalshi gave no
+    /// breakdown or never said which shard the market trades on; the caller
+    /// then falls back to the whole wallet, as before shards existed.
+    async fn collateral_pool_for(&self, market: &MarketId) -> Result<Option<crate::venues::core::CollateralPool>> {
+        let (ticker, _) = split_market_id(market.as_str());
+        let Some(idx) = self.shard_of(&ticker).await else { return Ok(None) };
+        let balance = self.balance().await?;
+        Ok(balance.shard_dollars(idx).map(|b| crate::venues::core::CollateralPool {
+            id: idx.to_string(),
+            label: types::shard_label(idx),
+            balance: b,
+        }))
     }
 
     async fn positions(&self) -> Result<Vec<Position>> {
@@ -235,6 +322,7 @@ impl Execution for KalshiVenue {
             .await?;
         let mut out = Vec::new();
         for o in resp.orders {
+            self.order_tickers.insert(o.order_id.clone(), o.ticker.clone());
             let total = o.requested_count().unwrap_or_default();
             let filled = o.filled_count().unwrap_or_default();
             let price = types::fp(&o.price_dollars).unwrap_or_default();
@@ -447,6 +535,24 @@ mod tests {
         // Sell NO @ 0.70 → bid (buy YES) at 0.30
         let (_, s, p) = map_intent(&intent("KX-1#no", Side::Sell, dec!(0.70)));
         assert_eq!((s, p), ("bid", dec!(0.30)));
+    }
+
+    /// A cancel must carry the market ticker: Kalshi routes requests to an
+    /// exchange shard by ticker, and an order id alone lands on shard 0 where a
+    /// crypto or sports order never rested.
+    #[test]
+    fn a_cancel_carries_the_market_ticker_so_kalshi_routes_it_to_the_right_shard() {
+        assert_eq!(
+            cancel_path("abc-1", Some("KXBTCD-26OCT1810-T81999.99")),
+            "/portfolio/events/orders/abc-1?market_ticker=KXBTCD-26OCT1810-T81999.99"
+        );
+    }
+
+    /// Without a ticker the path is the bare V2 cancel, which Kalshi sends to
+    /// shard 0; the caller logs that the routing is a guess.
+    #[test]
+    fn a_cancel_without_a_known_ticker_falls_back_to_the_bare_path() {
+        assert_eq!(cancel_path("abc-1", None), "/portfolio/events/orders/abc-1");
     }
 
     #[test]

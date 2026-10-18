@@ -178,6 +178,18 @@ account settings (Key ID + downloadable RSA private key PEM, shown once).
 is a full paper-trading environment with play money and the same live crypto markets;
 demo credentials are separate from production.
 
+**Fund the right exchange shard.** Kalshi runs separate matching engines
+("exchange shards") and keeps a balance on each: crypto markets trade on shard 2,
+sports on shard 3, politics and everything else on shard 0. The Kalshi app moves
+collateral between shards as you trade; API orders do not, so a deposit sitting on
+shard 0 leaves every crypto order rejected with `insufficient_shard_balance`. The
+Setup tab shows the balance per shard and names any unfunded one; the engine
+refuses an order its shard cannot cover and says so on the Viper's card instead of
+retrying. Move funds in your Kalshi account, or from the instance with
+`scripts/kalshi_shards.py` (`balance`, `transfer`, or `set-allocation` for Kalshi's
+automatic rebalancing); the script reads the engine's own credentials and sends
+nothing without `--yes`.
+
 ```bash
 KALSHI_API_KEY_ID=<key-id-uuid>          # from account settings (REQUIRED)
 KALSHI_PRIVATE_KEY_PATH=data/kalshi-key.pem  # downloaded PEM (REQUIRED; or KALSHI_PRIVATE_KEY=<pem contents>)

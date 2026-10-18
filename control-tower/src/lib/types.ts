@@ -643,6 +643,27 @@ export interface StatusResponse {
   dark_market_feeds?: { market: string; dark_for_secs: number }[];
 }
 
+
+/** One pool of spendable collateral. A single-wallet venue reports one; Kalshi reports one per exchange shard. */
+export interface CollateralPool {
+  /** Venue-stable id: `wallet`, or a Kalshi shard index as text. */
+  id: string;
+  /** Operator-facing name, e.g. `crypto and commodities (shard 2)`. */
+  label: string;
+  balance: string; // Decimal string
+  /** A deployed squadron's market spends from this pool. */
+  in_use: boolean;
+}
+
+/** GET /api/venue/collateral-pools. `pools` is null while the venue has not answered (see the B43 note on unknowns). */
+export interface CollateralPoolsResponse {
+  pools: CollateralPool[] | null;
+  /** True when the venue keeps more than one pool; a single wallet has nothing to break down. */
+  split: boolean;
+  unavailable: string | null;
+  as_of: string;
+}
+
 /** Portfolio value response from /api/portfolio — cash + open positions at live prices. */
 /**
  * GET /api/portfolio.

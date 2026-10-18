@@ -44,7 +44,7 @@ import {
 } from '@/lib/setupApi';
 import { useConfirm } from '@/components/ConfirmDialog';
 import useSWR, { useSWRConfig } from 'swr';
-import { getConfig, patchConfig, getConfigSchema, getStatus } from '@/lib/api';
+import { getConfig, patchConfig, getConfigSchema, getStatus, getCollateralPools } from '@/lib/api';
 import { AdvancedRow } from '@/components/AdvancedConfigModal';
 import type { DynamicConfig, ConfigFieldSchema } from '@/lib/types';
 
@@ -250,6 +250,67 @@ const btnCls = (variant: 'primary' | 'ghost' | 'danger' = 'ghost') =>
     variant === 'danger'  && 'bg-rose-500/10 border-rose-500/30 text-rose-300 hover:bg-rose-500/20',
     variant === 'ghost'   && 'bg-[#13131f] border-[#1e1e32] text-gray-400 hover:border-gray-600 hover:text-gray-200',
   ].filter(Boolean).join(' ');
+
+// ── Collateral pools (venues that keep more than one balance) ─────────────────
+
+/**
+ * Per-pool balances for a venue that splits its wallet.
+ *
+ * Kalshi runs separate matching engines ("exchange shards") and keeps a balance
+ * on each: crypto markets trade on shard 2, sports on shard 3, everything else
+ * on shard 0. An order can only spend its own shard's balance, and the API does
+ * not move money between shards (the Kalshi app does). An unfunded shard
+ * rejects every order for its markets, which is invisible from the total.
+ *
+ * Renders nothing on a single-wallet venue, and nothing while the venue has not
+ * answered: an empty table would read as "no money".
+ */
+function CollateralPoolsCard() {
+  const { data } = useSWR('collateral-pools', getCollateralPools, { refreshInterval: 30_000, revalidateOnFocus: false });
+  if (!data) return null;
+  if (data.pools === null) {
+    // An outage must not look like a single wallet.
+    return (
+      <p className="text-xs text-gray-500">
+        Collateral by pool: {data.unavailable ?? 'unavailable'}.
+      </p>
+    );
+  }
+  if (!data.split) return null;
+  const starved = data.pools.filter(p => p.in_use && Number(p.balance) <= 0);
+  return (
+    <div className="card p-4 border border-[#1e1e32] bg-[#0d0d1a]">
+      <h3 className="text-sm font-mono text-gray-200">💰 Collateral by exchange shard</h3>
+      <p className="text-xs text-gray-500 mt-1">
+        The venue keeps a separate balance per exchange shard and an order can only spend the
+        balance of the shard its market trades on. Crypto markets trade on shard 2, sports on
+        shard 3, politics and everything else on shard 0. API orders do not move funds between
+        shards; move them in your venue account, or with <code>scripts/kalshi_shards.py</code> from
+        the DRADIS repository. Shards marked in use fund a deployed squadron&apos;s market.
+      </p>
+      <table className="w-full text-xs font-mono mt-3">
+        <tbody>
+          {data.pools.map(p => {
+            const empty = Number(p.balance) <= 0;
+            const tone = p.in_use && empty ? 'text-amber-400' : empty ? 'text-gray-500' : 'text-gray-100';
+            return (
+              <tr key={p.id} className="border-t border-[#1e1e32]">
+                <td className="py-1 text-gray-300">{p.label}{p.in_use && <span className="ml-2 text-[10px] text-gray-500">in use</span>}</td>
+                <td className={`py-1 text-right ${tone}`}>${Number(p.balance).toFixed(2)}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      {starved.length > 0 && (
+        <p className="text-xs text-amber-400 mt-2">
+          Unfunded and in use: {starved.map(p => p.label).join(', ')}. The squadron on those
+          markets has every buy refused until the shard holds a balance.
+        </p>
+      )}
+    </div>
+  );
+}
 
 // ── Venue selector (multi-venue AMI only) ────────────────────────────────────
 
@@ -2285,6 +2346,8 @@ export default function SetupPage() {
         status={status}
         onSwitched={text => { setNotice({ kind: 'ok', text }); loadStatus(); }}
       />
+
+      <CollateralPoolsCard />
 
       {creds ? (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">

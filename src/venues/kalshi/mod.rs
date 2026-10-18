@@ -95,7 +95,33 @@ pub struct KalshiVenue {
     /// Venue-lifetime fill fan-out; [`crate::venues::core::Execution::subscribe_fills`]
     /// hands out receivers, [`Self::start_fill_feed`] pumps it from the WS.
     pub(crate) fills_tx: tokio::sync::broadcast::Sender<crate::venues::core::FillEvent>,
+    /// Order id → market ticker for every order this venue placed or listed.
+    ///
+    /// Kalshi runs several matching engines ("exchange shards") and routes a
+    /// request to one by market ticker; an order id alone lands on shard 0.
+    /// A cancel sent without the ticker therefore cannot find an order resting
+    /// on the crypto or sports shard, so the venue remembers each order's
+    /// ticker and sends it along (`Execution::cancel`).
+    pub(crate) order_tickers: dashmap::DashMap<String, String>,
+    /// Market ticker → exchange shard, filled from every market listing this
+    /// venue fetches. A market never changes shard, so the entry never expires.
+    /// [`UNKNOWN_SHARD`] records a market Kalshi returned without the field, so
+    /// it is not fetched again before every order.
+    pub(crate) market_shards: dashmap::DashMap<String, i64>,
+    /// Last balance response and when it was fetched. The balance endpoint is
+    /// rate-limited to one call per second and the pre-trade funding check
+    /// reads it on every order, so reads within [`BALANCE_CACHE_SECS`] share one.
+    pub(crate) balance_cache: tokio::sync::Mutex<Option<(std::time::Instant, types::BalanceResponse)>>,
 }
+
+/// How long a balance reading serves repeat callers before Kalshi is asked again.
+const BALANCE_CACHE_SECS: u64 = 10;
+/// Bound on one balance request. The cache lock is held across it so concurrent
+/// callers share a single reading; without a bound one stalled connection would
+/// hold every buy in the process.
+const BALANCE_FETCH_TIMEOUT_SECS: u64 = 3;
+/// Sentinel in `market_shards` for a market Kalshi listed without `exchange_index`.
+const UNKNOWN_SHARD: i64 = -1;
 
 impl KalshiVenue {
     /// Construct from environment (key id + private key + demo flag).
@@ -115,6 +141,9 @@ impl KalshiVenue {
             base_url: base,
             api_root,
             fills_tx: tokio::sync::broadcast::channel(256).0,
+            order_tickers: dashmap::DashMap::new(),
+            market_shards: dashmap::DashMap::new(),
+            balance_cache: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -223,6 +252,7 @@ impl KalshiVenue {
             };
             let resp: types::MarketsResponse = self.get_json(&path).await?;
             let n = resp.markets.len();
+            self.note_market_shards(&resp.markets);
             out.extend(resp.markets);
             if resp.cursor.is_empty() || n == 0 {
                 break;
@@ -230,6 +260,66 @@ impl KalshiVenue {
             cursor = resp.cursor;
         }
         Ok(out)
+    }
+
+    /// Remember which exchange shard each listed market trades on.
+    pub(crate) fn note_market_shards(&self, markets: &[types::KalshiMarket]) {
+        for m in markets {
+            if let Some(idx) = m.exchange_index {
+                self.market_shards.insert(m.ticker.clone(), idx);
+            }
+        }
+    }
+
+    /// Exchange shard of `ticker`: from the listings seen so far, else one
+    /// market fetch. `None` when Kalshi does not say.
+    pub(crate) async fn shard_of(&self, ticker: &str) -> Option<i64> {
+        if let Some(idx) = self.market_shards.get(ticker) {
+            return (*idx != UNKNOWN_SHARD).then_some(*idx);
+        }
+        let m = self.market(ticker).await.ok()?;
+        self.market_shards.insert(ticker.to_string(), m.exchange_index.unwrap_or(UNKNOWN_SHARD));
+        m.exchange_index
+    }
+
+    /// The account balance, served from a reading at most [`BALANCE_CACHE_SECS`]
+    /// old. For the pre-trade funding check and the pools endpoint, which read
+    /// on every order; anything that books money uses [`Self::balance_fresh`].
+    /// The sum spans every exchange shard; see `BalanceResponse::pools`.
+    pub(crate) async fn balance(&self) -> anyhow::Result<types::BalanceResponse> {
+        let mut cache = self.balance_cache.lock().await;
+        if let Some((at, resp)) = cache.as_ref() {
+            if at.elapsed() < std::time::Duration::from_secs(BALANCE_CACHE_SECS) {
+                return Ok(resp.clone());
+            }
+        }
+        self.fetch_balance_into(&mut cache).await
+    }
+
+    /// A balance reading taken now, never served from the cache. The P&L
+    /// snapshot after a fill must see the cash the fill moved, or the entry
+    /// cost is counted twice (cash not yet debited, position already held).
+    /// Refreshes the cache for the readers that may use it.
+    pub(crate) async fn balance_fresh(&self) -> anyhow::Result<types::BalanceResponse> {
+        let mut cache = self.balance_cache.lock().await;
+        self.fetch_balance_into(&mut cache).await
+    }
+
+    async fn fetch_balance_into(
+        &self,
+        cache: &mut Option<(std::time::Instant, types::BalanceResponse)>,
+    ) -> anyhow::Result<types::BalanceResponse> {
+        let fetch = self.get_json::<types::BalanceResponse>("/portfolio/balance");
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(BALANCE_FETCH_TIMEOUT_SECS), fetch)
+            .await
+            .map_err(|_| anyhow::anyhow!("Kalshi GET /portfolio/balance timed out after {BALANCE_FETCH_TIMEOUT_SECS}s"))??;
+        *cache = Some((std::time::Instant::now(), resp.clone()));
+        Ok(resp)
+    }
+
+    /// Forget the cached balance: a fill or a cancel has moved money.
+    pub(crate) async fn invalidate_balance(&self) {
+        *self.balance_cache.lock().await = None;
     }
 
     /// Every open market under the given Kalshi categories, paged.
@@ -262,6 +352,7 @@ impl KalshiVenue {
                 if !wanted.iter().any(|w| ev.category.eq_ignore_ascii_case(w)) {
                     continue;
                 }
+                self.note_market_shards(&ev.markets);
                 for m in ev.markets {
                     out.push((ev.category.clone(), m));
                 }
