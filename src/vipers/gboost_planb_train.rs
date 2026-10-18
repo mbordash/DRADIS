@@ -265,6 +265,13 @@ pub struct MarketRecord {
     /// window's opening bar, which the row builder then uses.
     #[serde(default)]
     pub strike: Option<f64>,
+    /// Written live by a venue loop's recorder (`gboost_planb_record`) rather than
+    /// fetched from public history. Such a record may carry no tape when the venue
+    /// publishes no prints (Polymarket US); its rows then take their entry from the
+    /// first mid after the decision minute plus half a spread, the fetched rows' own
+    /// fallback. A FETCHED record with no tape is a dead market and builds nothing.
+    #[serde(default)]
+    pub recorded_live: bool,
 }
 
 impl MarketRecord {
@@ -665,7 +672,7 @@ pub fn build_market_rows(
     plan: &Plan,
 ) -> Vec<TrainingRow> {
     let mut out = Vec::new();
-    if rec.missing || rec.tape.is_empty() {
+    if rec.missing || (rec.tape.is_empty() && !rec.recorded_live) {
         return out;
     }
     let Some(up_won) = rec.up_won() else { return out };
@@ -2041,6 +2048,7 @@ async fn fetch_market(w: i64, now: i64) -> Result<Fetched, String> {
         tape: Vec::new(),
         hist: HashMap::new(),
         strike: None,
+        recorded_live: false,
     };
     if rec.up_won().is_none() && now < w + 3600 + UNRESOLVED_GIVE_UP_SECS {
         return Ok(Fetched::NotResolved);

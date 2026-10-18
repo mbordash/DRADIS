@@ -48,6 +48,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
 use tokio::sync::{watch, Mutex};
 use tokio::time::Instant;
@@ -971,6 +972,11 @@ struct UsMarketSelection {
     maker: Option<super::markets::UsMarketPair>,
 }
 
+/// Ordering of short-dated markets for the primary slot: one-hour first.
+fn hourly_rank(window_secs: Option<i64>) -> u8 {
+    match window_secs { Some(3600) => 0, Some(_) => 1, None => 2 }
+}
+
 async fn select_market(
     venue: &Arc<UsRetailVenue>,
     filter: &Option<String>,
@@ -1037,8 +1043,12 @@ async fn select_market(
                     let secs_to_close = |m: &super::markets::UsMarketPair| {
                         m.close_time.map(|c| (c - now).num_seconds())
                     };
-                    let (short, long): (Vec<_>, Vec<_>) = tradeable.into_iter()
+                    let (mut short, long): (Vec<_>, Vec<_>) = tradeable.into_iter()
                         .partition(|m| secs_to_close(m).is_some_and(|s| s <= MAX_CLOSE_SHORT_SECS));
+                    // Among the short-dated markets the one-hour shape comes first,
+                    // the shape the hour-trained Vipers (GBoost, Momentum, Time Decay)
+                    // exist for; a stable sort keeps discovery's order within a shape.
+                    short.sort_by_key(|m| hourly_rank(crate::helpers::time::window_secs_from_question(&m.question)));
 
                     let apply_filter = |candidates: Vec<super::markets::UsMarketPair>| {
                         match filter {
@@ -1243,6 +1253,16 @@ async fn trade_one_market(
         condition_id: String::new(),
         yes_fee_bps: fee_bps,
         no_fee_bps: fee_bps,
+    };
+    // GBoost plan B's training store for this venue is written live: Polymarket
+    // US publishes neither prints nor price history, so a one-hour BTC market is
+    // recorded while it is flown (mids once a minute) and settled by the pipeline
+    // afterwards. See `vipers::gboost_planb_record`.
+    let mut recorder = match (market_cfg.window_secs, detected_underlying.as_deref(), pair.close_time) {
+        (Some(3600), Some("btc"), Some(close)) => Some(crate::vipers::gboost_planb_record::HourlyRecorder::new(
+            &pair.slug, pair.long.as_str(), pair.short.as_str(), close.timestamp(), strike_price.and_then(|k| k.to_f64()),
+        )),
+        _ => None,
     };
     // Secondary market the Window/Daily vipers quote on. Its own close time
     // matters: it is typically hours later than the primary's, which is the
@@ -1453,6 +1473,20 @@ async fn trade_one_market(
         match market_cfg.phase(Utc::now(), MARKET_RTB_WINDOW_SECS) {
             MarketPhase::Closed => {
                 info!("🏁 US market \"{}\" reached close — standing down to rotate", market_cfg.market_name);
+                if let Some(r) = recorder.take() {
+                    // This venue publishes no prints; the trait default answers None and the record's tape stays empty.
+                    let prints = venue.recent_prints(&pair.long, 1000).await.ok().flatten().unwrap_or_default();
+                    let (w, samples, ticker) = (r.window_start(), r.samples(), r.ticker().to_string());
+                    let rec = r.finish(&prints);
+                    let dir = crate::vipers::gboost_planb_train::DataDir::new("btc");
+                    match crate::vipers::gboost_planb_record::write_record(&dir, w, &rec) {
+                        Ok(path) => info!(
+                            "📼 Recorded hourly market {ticker} for GBoost training: {samples} minute(s) of mids, {} print(s), outcome pending settlement → {}",
+                            rec.tape.len(), path.display(),
+                        ),
+                        Err(e) => warn!("📼 Could not write the hourly market record for {ticker}: {e}"),
+                    }
+                }
                 // cancel_all cancels RESTING ORDERS; it does not sell inventory.
                 // Now that this wing trades a secondary market whose close is
                 // hours later than the primary's, tearing down here would leave
@@ -1499,6 +1533,10 @@ async fn trade_one_market(
         // general wing's raptor fields stay zero — its order-book vipers
         // (arbitrage/maker) don't read them.
         let snapshot = build_snapshot(&long_rx, raptors.as_ref(), &market_cfg);
+        if let Some(r) = recorder.as_mut() {
+            let mid = |bid: Decimal, ask: Decimal| (bid > Decimal::ZERO && ask > Decimal::ZERO).then(|| ((bid + ask) / dec!(2)).to_f64()).flatten();
+            r.sample(Utc::now().timestamp(), mid(snapshot.yes_bid, snapshot.yes_ask), mid(snapshot.no_bid, snapshot.no_ask));
+        }
 
         // Maker snapshot from the secondary market's own feed. Falls back to the
         // primary when there is no secondary, or when its book has not arrived

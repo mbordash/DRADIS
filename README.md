@@ -162,7 +162,12 @@ ASSETS=us                          # keep the dashboard pool tidy (US data lives
 > reconcile via `OrderLifecycle`. Open positions and portfolio P&L appear in the Control Tower under the **`us`**
 > asset selector. The Control Tower API stays live on `:9000` regardless. A second
 > **crypto wing** (`us-crypto` asset) hunts crypto-class markets with the full Raptor
-> stack, so all nine crypto Vipers fly on them.
+> stack, so all nine crypto Vipers fly on them; among short-dated markets it takes the
+> one-hour shape first. GBoost works here as it does on Kalshi: it scores one-hour BTC
+> markets, keys its model on the market's underlying, reads the market's own mids from
+> the book it streams (this venue publishes neither prints nor history), and records
+> every one-hour market it flies so the pipeline can train a model stamped for this
+> venue once a week of them has settled.
 
 ### Kalshi configuration (`.env`)
 

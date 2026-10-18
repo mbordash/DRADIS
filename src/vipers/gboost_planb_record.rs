@@ -122,6 +122,7 @@ impl HourlyRecorder {
             tape,
             hist,
             strike: self.strike,
+            recorded_live: true,
         }
     }
 }
@@ -193,6 +194,25 @@ mod tests {
         assert_eq!(up.up_won(), Some(true));
         let mut dn = rec.clone(); dn.outcome_prices = Some(outcome_prices(false));
         assert_eq!(dn.up_won(), Some(false));
+    }
+
+    /// A venue with no public prints (Polymarket US) records an empty tape; the
+    /// rows still build from the mids, where a fetched record with no tape is a
+    /// dead market and builds nothing.
+    #[test]
+    fn a_recorded_hour_without_prints_still_trains() {
+        let w = 1_792_000_800i64;
+        let mut r = HourlyRecorder::new("btc-up-or-down", "u", "d", w + 3600, None);
+        for m in 0..60 { r.sample(w + 60 * m + 1, Some(0.50 + m as f64 * 0.002), Some(0.50 - m as f64 * 0.002)); }
+        let mut rec = r.finish(&[]);
+        rec.outcome_prices = Some(outcome_prices(true));
+        let bars: Vec<Bar> = ((w - 62 * 60)..(w + 3600)).step_by(60)
+            .map(|o| { let px = 100.0 + ((o - w) as f64) / 36_000.0; Bar { open_s: o, open: px, high: px + 0.1, low: px - 0.1, close: px + 0.01 } })
+            .collect();
+        let plan = Plan::from_config(&DynamicConfig::default(), 0.07);
+        assert!(!build_market_rows(w, &rec, &bars, &[], (&[], &[]), &plan).is_empty(), "recorded mids are enough");
+        let mut fetched = rec.clone(); fetched.recorded_live = false;
+        assert!(build_market_rows(w, &fetched, &bars, &[], (&[], &[]), &plan).is_empty(), "a fetched market with no prints is dead");
     }
 
     /// A full hour recorded live, settled, trains: the row builder accepts the

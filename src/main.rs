@@ -690,6 +690,13 @@ async fn run() -> Result<()> {
                 ).await {
                     tracing::warn!("⚠️ US crypto DB pool init failed (crypto wing dashboard disabled): {e}");
                 }
+                // GBoost plan-B training pipeline for the crypto wing's BTC markets,
+                // trained from the hourly markets the wing records live (this venue
+                // publishes no history) and stamped for this venue. Keyed `btc`: the
+                // wing's `btc` pool alias routes the shadow record to its own shard.
+                spawn_supervised("gboost-planb-pipeline", move || {
+                    dradis::vipers::gboost_planb_train::run_pipeline("btc".to_string())
+                });
                 // Retire simulated positions left by an earlier session, on the
                 // shards that actually hold them.
                 //

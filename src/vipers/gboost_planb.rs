@@ -1213,11 +1213,26 @@ struct HistorySlot {
     fetching: Option<(String, i64)>,
 }
 
+/// The market's own mids as this instance saw them, one sample per minute from the
+/// book it streams: the price history for a venue that publishes none.
+///
+/// Sampled by the same rule the recorder uses for the training rows (the first
+/// tick of each minute, both legs two-sided, never a zero), so on such a venue the
+/// live features and the training features read the same series by construction,
+/// which is what [B46] asks of the Polymarket history on the venue that has one.
+#[derive(Default)]
+struct LiveMids {
+    series: [Vec<(i64, f64)>; 2],
+    last_minute: Option<i64>,
+}
+
 #[derive(Default)]
 struct PlanBGlobals {
     model: StdMutex<ModelSlot>,
     data: StdMutex<MinuteData>,
     history: StdMutex<HistorySlot>,
+    /// Per market (`market_key`), on venues without public history.
+    live_mids: StdMutex<HashMap<String, LiveMids>>,
     decided: StdMutex<HashSet<(String, i64)>>,
     attempted: StdMutex<HashSet<(String, usize)>>,
     below_minimum_noted: StdMutex<HashSet<String>>,
@@ -1635,6 +1650,58 @@ pub fn shape_gate(market: &MarketConfig) -> Option<String> {
     }
 }
 
+/// The asset plan B keys its model file, data store, globals and shadow record on:
+/// the market's underlying, read from its title, else the squadron's registry name.
+///
+/// Those were one string until 2026-10-17, which held on Polymarket International
+/// and Kalshi (both register the BTC squadron as `btc`) and failed silently on
+/// Polymarket US, whose crypto wing registers as `us-crypto`: the viper looked for
+/// a `us-crypto` model nobody would ever train. The registry name stays what the
+/// Viper card and the gate log are keyed by (`ctx.crypto_filter`); this is the
+/// model's name for the same market.
+pub fn planb_asset(ctx: &StrategyContext) -> String {
+    crate::helpers::market_title::infer_asset_from_title(&ctx.market.market_name)
+        .map(str::to_string)
+        .unwrap_or_else(|| ctx.crypto_filter.to_ascii_lowercase())
+}
+
+/// The key plan B files a market under: its condition id where the venue has one
+/// (Polymarket International), else its YES leg id, which Kalshi and Polymarket US
+/// make unique per market. An empty condition id used to key every market of
+/// those venues as one, so one shadow trade would have blocked all the rest.
+pub fn market_key(market: &MarketConfig) -> String {
+    if market.condition_id.is_empty() { market.yes_token.as_str().to_string() } else { market.condition_id.clone() }
+}
+
+/// Record both legs' mids for the minute containing `now_s`, once per minute.
+/// `yes` and `no` are each leg's (bid, ask); a one-sided leg contributes nothing.
+fn sample_live_mids(g: &'static PlanBGlobals, key: &str, now_s: i64, yes: (Decimal, Decimal), no: (Decimal, Decimal)) {
+    let mid = |(bid, ask): (Decimal, Decimal)| (bid > Decimal::ZERO && ask > Decimal::ZERO).then(|| ((bid + ask) / dec!(2)).to_f64()).flatten();
+    let (Some(y), Some(n)) = (mid(yes), mid(no)) else { return };
+    if !(y > 0.0 && y < 1.0 && n > 0.0 && n < 1.0) { return; }
+    let minute = now_s.div_euclid(60) * 60;
+    let mut all = lock(&g.live_mids);
+    let m = all.entry(key.to_string()).or_default();
+    if m.last_minute == Some(minute) { return; }
+    m.series[0].push((now_s, y));
+    m.series[1].push((now_s, n));
+    m.last_minute = Some(minute);
+    // Bounded: the window plus the lookback is all a decision ever reads.
+    for side in &mut m.series {
+        if side.len() > 180 { side.drain(..side.len() - 180); }
+    }
+    if all.len() > 64 {
+        // Markets this instance has moved on from; keep the newest few.
+        let stale: Vec<String> = all.iter().filter(|(k, _)| *k != key).map(|(k, _)| k.clone()).take(all.len() - 32).collect();
+        for k in stale { all.remove(&k); }
+    }
+}
+
+/// The sampled series for `key`, in the shape the CLOB history takes.
+fn live_history(g: &'static PlanBGlobals, key: &str) -> [Vec<(i64, f64)>; 2] {
+    lock(&g.live_mids).get(key).map(|m| m.series.clone()).unwrap_or_default()
+}
+
 fn fmt_features(v: &[f64; N_FEATURES]) -> String {
     let parts: Vec<String> = v.iter().map(|x| if x.is_nan() { "nan".to_string() } else { format!("{x}") }).collect();
     format!("[{}]", parts.join(","))
@@ -1705,7 +1772,7 @@ fn invalidate_shadow_record(asset: &str) {
 /// flagged simulated on a live instance would therefore place a real order —
 /// which is the whole reason the lane books its own trades and emits no signal.
 async fn sweep_shadow_exits(ctx: &StrategyContext, fee_rate: f64) {
-    let asset = &ctx.crypto_filter;
+    let asset = &planb_asset(ctx);
     let g = globals(asset);
     {
         let mut swept = lock(&g.shadow_swept);
@@ -1860,7 +1927,8 @@ impl Strategy for GboostPlanBStrategy {
             idle(&why);
             return Ok(StrategySignal::NoSignal);
         }
-        if !ctx.crypto_filter.eq_ignore_ascii_case("btc") {
+        let asset = planb_asset(ctx);
+        if !asset.eq_ignore_ascii_case("btc") {
             idle("the plan-B model is trained on BTC hourly markets only");
             return Ok(StrategySignal::NoSignal);
         }
@@ -1868,9 +1936,18 @@ impl Strategy for GboostPlanBStrategy {
             idle("misconfigured: first decision minute after the last, or min ask above max ask");
             return Ok(StrategySignal::NoSignal);
         }
-        let g = globals(&ctx.crypto_filter);
+        let g = globals(&asset);
+        // On a venue without public price history the market's own mids are what
+        // this instance sees: sampled on every tick the viper runs, whatever gate
+        // holds it afterwards, so the series is there when a decision minute comes.
+        if !crate::vipers::gboost_planb_train::has_public_history() {
+            sample_live_mids(
+                g, &market_key(&ctx.market), Utc::now().timestamp(),
+                (ctx.snapshot.yes_bid, ctx.snapshot.yes_ask), (ctx.snapshot.no_bid, ctx.snapshot.no_ask),
+            );
+        }
         // Checked on every tick, so a fresh start has the model loaded by its first decision minute.
-        let model = ensure_model(g, &ctx.crypto_filter);
+        let model = ensure_model(g, &asset);
         let f = |d: Decimal| d.to_f64().unwrap_or(0.0);
         {
             // The card's detail line: which lane, the serving model, and the
@@ -1885,7 +1962,7 @@ impl Strategy for GboostPlanBStrategy {
                 let lane = match model.as_deref() {
                     Some(m) => {
                         let plan_now = crate::vipers::gboost_planb_train::Plan::from_config(dc, plan_fee_rate());
-                        let rec = shadow_record_for(&ctx.crypto_filter, &m.version, &plan_now).await;
+                        let rec = shadow_record_for(&asset, &m.version, &plan_now).await;
                         Some(lane_line(
                             m.trained_venue.as_deref(), m.gate_passed, &rec, dc.gboost_planb_shadow_min_trades.max(0) as usize, f(dc.gboost_planb_shadow_min_win_rate),
                             dc.gboost_planb_trade_size_usdc, dc.gboost_planb_probation_trade_size_usdc,
@@ -1893,7 +1970,7 @@ impl Strategy for GboostPlanBStrategy {
                     }
                     None => None,
                 };
-                crate::helpers::viper_status::report_detail(&ctx.crypto_filter, STRATEGY_NAME, Some(detail_line(model.as_deref(), &ctx.crypto_filter, lane)));
+                crate::helpers::viper_status::report_detail(&ctx.crypto_filter, STRATEGY_NAME, Some(detail_line(model.as_deref(), &asset, lane)));
             }
         }
         if let Some(m) = &model {
@@ -1917,7 +1994,7 @@ impl Strategy for GboostPlanBStrategy {
             idle("outside the hourly window");
             return Ok(StrategySignal::NoSignal);
         }
-        let cid = market.condition_id.clone();
+        let cid = market_key(market);
         let minute_start = w + (now_s - w) / 60 * 60;
 
         let k = (now_s - w) / 60;
@@ -1939,7 +2016,7 @@ impl Strategy for GboostPlanBStrategy {
             return Ok(StrategySignal::NoSignal);
         }
         let Some(model) = model else {
-            match crate::vipers::gboost_planb_train::status_line(&ctx.crypto_filter) {
+            match crate::vipers::gboost_planb_train::status_line(&asset) {
                 Some(line) => idle(&format!("no model in service; {line}")),
                 None => idle("no model in service and the training pipeline is not running on this build"),
             }
@@ -1948,10 +2025,16 @@ impl Strategy for GboostPlanBStrategy {
         // Both fetches are kicked off in the same tick: serialized, a slow Binance
         // host could spend the whole decision window before the history is asked for.
         let minute_data = ensure_minute_data(g, t, model.needs_funding(), model.needs_derivs());
-        // The market's own price, from the same CLOB history and the same rule the
-        // training rows use ([B46]), never from the order book.
-        let tokens = [market.yes_token.as_str().to_string(), market.no_token.as_str().to_string()];
-        let history = ensure_price_history(g, &cid, tokens, t);
+        // The market's own price, from the same history and the same rule the training
+        // rows use ([B46]), never from the order book: the CLOB price history on the
+        // venue that publishes one, this instance's own minute samples on a venue
+        // that does not, which is also where that venue's training rows come from.
+        let history = if crate::vipers::gboost_planb_train::has_public_history() {
+            let tokens = [market.yes_token.as_str().to_string(), market.no_token.as_str().to_string()];
+            ensure_price_history(g, &cid, tokens, t)
+        } else {
+            Some(live_history(g, &cid))
+        };
         let Some((bars, funding, derivs)) = minute_data else {
             idle(match (model.needs_funding(), model.needs_derivs()) {
                 (true, true) => "waiting for Binance bars, the settled funding rate, open interest and taker flow",
@@ -2088,7 +2171,7 @@ impl Strategy for GboostPlanBStrategy {
         // the operator configured, and a live one at the stake the record has
         // earned (`live_stake`).
         let plan_now = crate::vipers::gboost_planb_train::Plan::from_config(dc, plan_fee_rate());
-        let record = shadow_record_for(&ctx.crypto_filter, &model.version, &plan_now).await;
+        let record = shadow_record_for(&asset, &model.version, &plan_now).await;
         let min_trades = dc.gboost_planb_shadow_min_trades.max(0) as usize;
         let min_win = f(dc.gboost_planb_shadow_min_win_rate);
         let lane_block = venue_blocks_live(model.trained_venue.as_deref(), crate::venues::ledger_venue())
@@ -2110,14 +2193,14 @@ impl Strategy for GboostPlanBStrategy {
             return Ok(StrategySignal::NoSignal);
         }
         if let Some(why) = lane_block {
-            let Some(pool) = crate::helpers::db::pool_for(&ctx.crypto_filter) else {
+            let Some(pool) = crate::helpers::db::pool_for(&asset) else {
                 idle("the shadow lane has no database to record into");
                 return Ok(StrategySignal::NoSignal);
             };
             // The live path asks the position map whether this market is already
             // held; the shadow lane is not in that map, so it has to ask its own
             // ledger or it would open a fresh simulated position every minute.
-            if crate::helpers::db::gboost_shadow_holds(&pool, &ctx.crypto_filter, &cid).await {
+            if crate::helpers::db::gboost_shadow_holds(&pool, &asset, &cid).await {
                 idle("a simulated position is already open on this market");
                 return Ok(StrategySignal::NoSignal);
             }
@@ -2129,7 +2212,7 @@ impl Strategy for GboostPlanBStrategy {
                 f(crate::venues::taker_fee_rate()), ask[side],
             );
             let opened = crate::helpers::db::gboost_shadow_open(
-                &pool, &ctx.crypto_filter, &model.version, &cid, token_id.as_str(),
+                &pool, &asset, &model.version, &cid, token_id.as_str(),
                 &market.market_name, label[side], w, ask[side], f(shares),
                 tp_price, stop_price, entry_fee, preds[side].1, decisions[side].break_even,
             ).await;
@@ -2138,7 +2221,7 @@ impl Strategy for GboostPlanBStrategy {
                 // lane takes one entry per side per market and the record counts
                 // the same population the live rule would have traded.
                 lock(&g.attempted).insert((cid.clone(), side));
-                invalidate_shadow_record(&ctx.crypto_filter);
+                invalidate_shadow_record(&asset);
                 let exit_plan = if plan_now.hold {
                     "held to settlement".to_string()
                 } else {
@@ -2208,7 +2291,7 @@ impl Strategy for GboostPlanBStrategy {
                 fee_bps,
                 is_neg_risk: market.is_neg_risk,
                 market_name: market.market_name.clone(),
-                condition_id: market.condition_id.clone(),
+                condition_id: market_key(market),
                 order_type: TimeInForce::Fak,
                 post_only: false,
                 ghost_mode: dc.ghost_mode,
@@ -2219,7 +2302,8 @@ impl Strategy for GboostPlanBStrategy {
 
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config;
-        let g = globals(&ctx.crypto_filter);
+        let asset = planb_asset(ctx);
+        let g = globals(&asset);
         let now_s = Utc::now().timestamp();
         // The shadow lane manages its own positions: they are not in the position
         // map, so nothing below this line would ever see them. Swept before the
@@ -2230,7 +2314,7 @@ impl Strategy for GboostPlanBStrategy {
         // `ensure_model` would look for a model on every ETH and SOL squadron and
         // on every market of another window length, and warn every ten minutes
         // that a file the BTC-only pipeline was never going to write is missing.
-        if dc.enable_gboost && shape_gate(&ctx.market).is_none() && ctx.crypto_filter.eq_ignore_ascii_case("btc") {
+        if dc.enable_gboost && shape_gate(&ctx.market).is_none() && asset.eq_ignore_ascii_case("btc") {
             sweep_shadow_exits(ctx, plan_fee_rate()).await;
         }
         let positions = ctx.positions.lock().await;
@@ -2250,7 +2334,7 @@ impl Strategy for GboostPlanBStrategy {
                 continue;
             }
             let token_is_yes = token_id == &market.yes_token;
-            lock(&g.attempted).insert((market.condition_id.clone(), if token_is_yes { 0 } else { 1 }));
+            lock(&g.attempted).insert((market_key(market), if token_is_yes { 0 } else { 1 }));
             if position.shares < VENUE_MIN_SHARES {
                 // Nothing below the venue minimum can be rested, and a sell that the venue
                 // rejects would only loop through fault cooldowns, so the remainder settles.
@@ -2271,7 +2355,7 @@ impl Strategy for GboostPlanBStrategy {
                 fee_bps: if token_is_yes { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 },
                 is_neg_risk: market.is_neg_risk,
                 market_name: market.market_name.clone(),
-                condition_id: market.condition_id.clone(),
+                condition_id: market_key(market),
                 order_type,
                 post_only,
                 ghost_mode: dc.ghost_mode,
@@ -3283,3 +3367,47 @@ mod venue_neutral_tests {
         assert!(venue_blocks_live(None, "kalshi").is_some(), "an unstamped model is the trained venue's, not every venue's");
     }
 }
+
+#[cfg(test)]
+mod live_mids_tests {
+    use super::*;
+    use crate::venues::core::MarketId;
+
+    fn q(bid: &str, ask: &str) -> (Decimal, Decimal) { (bid.parse().unwrap(), ask.parse().unwrap()) }
+
+    /// A venue with no condition id files each market under its YES leg, so two
+    /// markets never share a key; Polymarket International keeps the condition id.
+    #[test]
+    fn markets_without_a_condition_id_are_keyed_by_their_yes_leg() {
+        let mut m = MarketConfig {
+            yes_token: MarketId::new("KXBTCD-26OCT1721-T81299.99#yes"), no_token: MarketId::new("KXBTCD-26OCT1721-T81299.99#no"),
+            market_name: "m".into(), market_close_time: None, strike_price: None, window_secs: Some(3600),
+            is_neg_risk: false, condition_id: String::new(), yes_fee_bps: 0, no_fee_bps: 0,
+        };
+        assert_eq!(market_key(&m), "KXBTCD-26OCT1721-T81299.99#yes");
+        m.condition_id = "0xabc".into();
+        assert_eq!(market_key(&m), "0xabc");
+    }
+
+    /// The live series is sampled by the recorder's rule and read by the training
+    /// rows' rule, so a decision at minute t sees what a row built from a recorded
+    /// hour would see: the sample taken just after the previous minute boundary.
+    #[test]
+    fn live_mids_sample_once_a_minute_and_read_like_a_recorded_history() {
+        let g = globals("test-live-mids");
+        let key = "k#yes";
+        sample_live_mids(g, key, 3601, q("0.44", "0.46"), q("0.54", "0.56"));
+        sample_live_mids(g, key, 3630, q("0.47", "0.49"), q("0.51", "0.53")); // same minute: ignored
+        sample_live_mids(g, key, 3661, q("0", "0.49"), q("0.51", "0.53"));    // one-sided: no sample
+        sample_live_mids(g, key, 3662, q("0.48", "0.50"), q("0.50", "0.52"));
+        let h = live_history(g, key);
+        assert_eq!(h[0], vec![(3601, 0.45), (3662, 0.49)]);
+        assert_eq!(h[1], vec![(3601, 0.55), (3662, 0.51)]);
+        let at = |side: usize, t: i64| crate::vipers::gboost_planb_train::history_mid_at(&h[side], t);
+        assert_eq!(at(0, 3720), Some(0.49), "the minute's decision reads the last sample at or before it");
+        assert_eq!(at(0, 3660), Some(0.45));
+        assert_eq!(at(1, 3600), None, "nothing before the first sample");
+        assert!(live_history(g, "other").iter().all(|s| s.is_empty()));
+    }
+}
+
