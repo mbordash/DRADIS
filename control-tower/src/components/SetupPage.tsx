@@ -287,10 +287,11 @@ function CollateralPoolsCard() {
         <h3 className="text-sm font-mono text-gray-200">💰 Collateral by exchange shard</h3>
         <p className="text-xs text-gray-500 mt-1">
           The venue keeps a separate balance per exchange shard and an order can only spend the
-          balance of the shard its market trades on. Crypto markets trade on shard 2, sports on
-          shard 3, politics and everything else on shard 0. A deposit lands on shard 0, and API
-          orders do not move funds between shards. Shards marked in use fund a deployed
-          squadron&apos;s market.
+          balance of the shard its market trades on. Crypto markets trade on shard 2; Kalshi is
+          moving sports to shard 3 series by series, and politics and most other markets stay on
+          shard 0. A deposit lands on shard 0, and API orders do not move funds between shards.
+          Shards marked in use are where a deployed squadron&apos;s market trades, as the venue
+          reports it, so fund those rather than guessing by category.
         </p>
       </div>
       <table className="w-full text-xs font-mono">

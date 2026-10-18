@@ -107,6 +107,23 @@ To roll back before you terminate it, stop the new instance first, then choose
 **Resume trading here** on the old one. Never resume the old instance while the
 new one is running: two engines would trade the same wallet.
 
+## Kalshi: check the exchange shard balances after upgrading to 1.4.0
+
+Kalshi keeps a separate balance per exchange shard. Crypto markets trade on
+shard 2, Kalshi is moving sports to shard 3 series by series, politics and most
+other markets stay on shard 0, and a deposit lands on shard 0. Orders placed through the API spend only the balance of
+the shard the market trades on; the Kalshi app moves collateral for you, the API
+does not. An account whose funds all sit on shard 0 has every crypto order
+rejected while the engine looks healthy.
+
+From 1.4.0 the Setup tab shows the balance per shard, marks the shards your
+deployed squadrons' markets trade on (read from the venue, so it is right even
+as Kalshi moves series between shards), and lets you move funds between shards or set
+Kalshi's automatic rebalancing target, each behind the Setup password with a
+confirmation. The engine also refuses a buy its shard cannot cover and names the
+shard and the amount on the strategy's card. After moving to a 1.4.0 instance,
+open **Setup** and fund the shards marked in use before expecting fills.
+
 ## Why two engines must never trade one wallet
 
 Your wallet private key travels in the backup and in the config bundle, so after

@@ -2658,7 +2658,10 @@ fn register_kalshi_squadron(
         strike_price: pair.strike,
         window_secs: pair.window_secs,
         is_neg_risk: false,
-        condition_id: String::new(),
+        // Kalshi's market id is the ticker. The CAG publishes it as the
+        // squadron's `market_id`, which the collateral-pools endpoint uses to
+        // mark the shard each deployed squadron spends from.
+        condition_id: pair.ticker.clone(),
         yes_fee_bps: KALSHI_FEE_BPS as u32,
         no_fee_bps: KALSHI_FEE_BPS as u32,
     };

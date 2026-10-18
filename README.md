@@ -179,12 +179,13 @@ is a full paper-trading environment with play money and the same live crypto mar
 demo credentials are separate from production.
 
 **Fund the right exchange shard.** Kalshi runs separate matching engines
-("exchange shards") and keeps a balance on each: crypto markets trade on shard 2,
-sports on shard 3, politics and everything else on shard 0. The Kalshi app moves
+("exchange shards") and keeps a balance on each: crypto markets trade on shard 2, and
+Kalshi is moving sports to shard 3 series by series, while politics and most
+other markets stay on shard 0. The Kalshi app moves
 collateral between shards as you trade; API orders do not, so a deposit sitting on
 shard 0 leaves every crypto order rejected with `insufficient_shard_balance`. The
-Setup tab shows the balance per shard, marks the shards your deployed squadrons
-spend from, and lets you move funds between them or set Kalshi's automatic
+Setup tab shows the balance per shard, marks the shards your deployed squadrons'
+markets trade on (read from the venue, market by market), and lets you move funds between them or set Kalshi's automatic
 rebalancing target, each behind the admin session with a confirmation. The engine
 refuses an order its shard cannot cover and says so on the Viper's card instead of
 retrying. For a headless instance, `scripts/kalshi_shards.py` does the same from
