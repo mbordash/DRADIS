@@ -2,10 +2,13 @@
 //!
 //! Venue-neutral by construction: the inputs are the bookmaker board, the venue
 //! book and the Sports Raptor's own records, none of which is venue-specific.
-//! Wired today into the Polymarket International single-market patrol
-//! (`patrol_impl`), where the defect it closes was observed. The Kalshi and
-//! Polymarket US loops retire on their own close phase and have not shown the
-//! symptom; if they do, this is the rule to wire, unchanged.
+//! Wired into the Polymarket International single-market patrol
+//! (`patrol_impl`), where the defect it closes was first observed, and since
+//! 2026-10-19 into the Kalshi market loop (`venues::kalshi::trader`), which
+//! showed the same symptom: Kalshi dates a game market's close two days after
+//! the game, so a finished game held the sports slot until then. The Polymarket
+//! US loop retires on its own close phase and has not shown the symptom; if it
+//! does, this is the rule to wire, unchanged.
 
 use chrono::Utc;
 use rust_decimal::Decimal;

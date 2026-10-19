@@ -4,6 +4,28 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
+## 1.4.1 (2026-10-19)
+
+- Kalshi: sports and politics squadrons stand down when the venue closes or finalizes their market, instead of waiting for the market's stated close.
+- Kalshi: a sports squadron also retires once its game is over by the bookmaker board, the order book and the ledger, as on Polymarket International.
+
+### Detail
+
+**Kalshi finished games.** Kalshi dates a game market's close at its latest
+possible expiration, two days after the game, and finalizes the market a few
+hours after the final. The engine ended a pinned market only on that stated
+close, so a finished game held the sports squadron, blocked the sports slot for
+the next slate, and kept the "market data has stopped" banner up for two days.
+Pinned squadrons now ask the venue once a minute whether the market still
+trades and stand down, once flat, after the venue has said no for the
+retirement grace (five minutes by default). Sports squadrons additionally apply
+the game-over rule already used on Polymarket International: kick-off well
+past, the game off the bookmaker board, and the book dark or priced as decided.
+Nothing changes for crypto hourly markets, whose stated close is exact. The new
+retirement paths never stand down a squadron that holds a position; the
+exchange settles the position and the settlement sweep books it. A halted game
+(Kalshi status "inactive") is not read as closed.
+
 ## 1.4.0 (2026-10-18)
 
 - Kalshi: shard balances and funding controls in the Setup tab.

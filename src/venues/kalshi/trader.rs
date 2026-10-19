@@ -50,6 +50,7 @@ use crate::cag::Cag;
 use crate::helpers::db;
 use crate::helpers::dynamic_config::DynamicConfig;
 use crate::helpers::metrics;
+use crate::squadron::game_over::{sports_game_over_due, sports_game_over_verdict, GameOver, SportsBook, SportsGameSignals};
 use crate::orchestrator::{
     aggregate_and_resolve_signals, evaluate_strategies, StrategyContext,
     StrategyRegistry,
@@ -100,6 +101,16 @@ const MAX_CLOSE_DAILY_SECS: i64 = 129_600;
 const MARKET_RTB_WINDOW_SECS: i64 = 60;
 const LIFECYCLE_SYNC_SECS: u64 = 10;
 const MARKET_RESCAN_SECS: u64 = 120;
+/// How often a pinned market asks the venue whether it still trades. Kalshi
+/// dates a game market's `close_time` at its LATEST expiration, two days after
+/// the game, and finalizes it a few hours after the final; this probe is how
+/// the loop hears about that. Same cadence as the intl patrol's venue probe.
+const VENUE_STATUS_POLL_SECS: u64 = 60;
+/// Bound on the probe's REST call. It is awaited inline in the tick body, so a
+/// hung request would stall every exit and the operator-cancel arm for this
+/// squadron; the shared client has no timeout of its own (the balance fetch
+/// bounds itself the same way). A timeout is "no answer", nothing more.
+const VENUE_STATUS_TIMEOUT_SECS: u64 = 5;
 /// Rotate only when a candidate has this much more volume (contracts).
 const ROTATION_VOLUME_THRESHOLD: f64 = 5_000.0;
 /// Conservative quadratic-fee ceiling (1.75¢/contract at P=0.5) in bps.
@@ -462,6 +473,57 @@ fn raptor_stack_for(
 
 // ─── Rotation loop ────────────────────────────────────────────────────────────
 
+/// What the venue's own market record says about trading on it.
+///
+/// `Some(true)`: trading. `Some(false)`: over — closed to trading, finalized or
+/// settled, or carrying a result, which Kalshi records only once the market is
+/// decided. `None`: no usable answer, in which case the stated close keeps its
+/// authority exactly as before. A halt (`inactive`, `paused`: a review, an
+/// injury hold, a data problem) is deliberately no answer and NOT "over": a
+/// live game can be halted for longer than the retirement grace, and a flat
+/// squadron that retired on it would lose the rest of the game, since the
+/// seeder never redeploys onto a game that is off the board. Pre-open statuses
+/// and anything this build does not know are no answer for the same reason.
+/// Reads the same two fields as `interpret_settlement` (and the status list in
+/// `orders.rs`) but asks a different question: not "who won" but "is there
+/// anything left to trade".
+pub(crate) fn venue_accepting_orders(status: &str, result: &str) -> Option<bool> {
+    if !result.is_empty() {
+        return Some(false);
+    }
+    match status.trim() {
+        "active" | "open" => Some(true),
+        "closed" | "finalized" | "settled" | "determined" => Some(false),
+        "inactive" | "paused" | "initialized" | "unopened" => None,
+        _ => None,
+    }
+}
+
+/// Should a pinned squadron stand down on the venue's word? Only once the venue
+/// has said "not trading" continuously for the grace, and never while holding:
+/// the exchange settles what we hold, and standing down on top of it would
+/// strand the position with no viper to book its exit.
+pub(crate) fn venue_closed_retire_due(closed_for_secs: Option<i64>, grace_secs: i64, holding: bool) -> bool {
+    !holding && closed_for_secs.is_some_and(|s| s >= grace_secs)
+}
+
+/// The pinned market's book as the game-over rule reads it: whether any level
+/// exists on either leg, and the best bid across both. `(false, 0)` while the
+/// feed has no book yet, which the rule treats as absent. Kalshi books are bids
+/// only and an ask is the mirrored opposite bid, so a level on either side shows
+/// up as a bid here; this is `snapshot_has_book`'s rule in those terms.
+async fn book_state(hub: &ws::BookHub, ticker: &str) -> (bool, Decimal) {
+    let books = hub.read().await;
+    match books.get(ticker) {
+        Some(b) if b.ready => {
+            let yb = b.best_yes_bid().map_or(Decimal::ZERO, |(p, _)| p);
+            let nb = b.best_no_bid().map_or(Decimal::ZERO, |(p, _)| p);
+            (yb > Decimal::ZERO || nb > Decimal::ZERO, yb.max(nb))
+        }
+        _ => (false, Decimal::ZERO),
+    }
+}
+
 #[derive(Debug)]
 enum MarketOutcome {
     Closed,
@@ -685,6 +747,12 @@ impl crate::venues::deployment::DeploymentRunner for KalshiDeploymentRunner {
             &self.tennis_rx,
             Some(dep.id.as_str()),
         ).await;
+        // The order-book feed for this market runs on this token and nothing
+        // else cancels it: the rotation loop cancels its per-market token, but a
+        // pinned deployment returned its outcome and left the WebSocket open and
+        // reconnecting for the life of the process. Rare while a pinned market
+        // only ended on its stated close; once per finished game now.
+        cancel.cancel();
         // A Helm squadron's open intents go with it, whichever way the loop ended.
         //
         // The intl path does this inside `patrol_impl`'s retirement arm, which
@@ -1287,6 +1355,20 @@ async fn trade_one_market(
     let _ = rescan_tick.tick().await; // skip the immediate first fire
     let mut cooldown_until = Instant::now();
     let mut winding_down = false;
+    // Venue status and game-over probes for a pinned market; see the tick body.
+    // Both clocks start due so the first tick asks at once.
+    let poll = Duration::from_secs(VENUE_STATUS_POLL_SECS);
+    let mut venue_status_probed_at = Instant::now().checked_sub(poll).unwrap_or_else(Instant::now);
+    let mut sports_signals_probed_at = venue_status_probed_at;
+    let mut venue_accepting: Option<bool> = None;
+    let mut venue_closed_since: Option<Instant> = None;
+    let mut venue_closed_desc = String::new();
+    let mut venue_event_ticker: Option<String> = None;
+    let mut venue_expected_expiration: Option<chrono::DateTime<Utc>> = None;
+    let mut sports_kick_off: Option<chrono::DateTime<Utc>> = None;
+    let mut sports_resolved = false;
+    let mut book_absent_since: Option<Instant> = None;
+    let mut game_over_since: Option<Instant> = None;
 
     cag.update_state(&squadron_id, SquadronState::Patrolling);
 
@@ -1388,9 +1470,176 @@ async fn trade_one_market(
         }
         touch_heartbeat(process_heartbeat_secs);
 
-        match market_cfg.phase(Utc::now(), MARKET_RTB_WINDOW_SECS) {
+        // ── Venue status and game-over probes (pinned markets only) ───────
+        // The stated close is not enough for a market the operator or the
+        // seeder pinned. Kalshi dates a game market's `close_time` at its
+        // latest expiration, two days after the game, and the rescan arm above
+        // returns early for pinned markets, so until 2026-10-19 a finished game
+        // (KXNFLGAME-26OCT18DALGB-GB, finalized 03:47Z, stated close two days
+        // on) held the sports slot and the "market data has stopped" banner
+        // for the whole two days. Two further signals, both already proven on
+        // the intl patrol: the venue's own market record once a minute, and
+        // for sports the game-over rule (board, book, ledger). Never while
+        // holding: the exchange settles what we hold and the settled-position
+        // sweep books it. Crypto rotations are untouched; their close is exact.
+        let mut venue_retire: Option<String> = None;
+        if mandate == MarketMandate::Pinned {
+            let holding = !positions.lock().await.is_empty();
+            let grace = dyn_cfg.event_market_retire_grace_secs;
+            if venue_status_probed_at.elapsed() >= Duration::from_secs(VENUE_STATUS_POLL_SECS) {
+                venue_status_probed_at = Instant::now();
+                let probe = tokio::time::timeout(Duration::from_secs(VENUE_STATUS_TIMEOUT_SECS), venue.market(&pair.ticker)).await;
+                match probe.map_err(|_| anyhow::anyhow!("timed out after {VENUE_STATUS_TIMEOUT_SECS}s")).and_then(|r| r) {
+                    Ok(m) => {
+                        if venue_event_ticker.is_none() && !m.event_ticker.is_empty() {
+                            venue_event_ticker = Some(m.event_ticker.clone());
+                        }
+                        if venue_expected_expiration.is_none() {
+                            venue_expected_expiration = m.expected_expiration_time.parse::<chrono::DateTime<Utc>>().ok();
+                        }
+                        let accepting = venue_accepting_orders(&m.status, &m.result);
+                        // Announced once so the log shows the probe is running;
+                        // afterwards only a change of answer prints.
+                        if venue_accepting.is_none() && accepting.is_some() {
+                            info!(
+                                "📡 Squadron [{}] venue reports \"{}\" status={:?} result={:?} — re-checking every {}s",
+                                squadron_id, market_cfg.market_name, m.status, m.result, VENUE_STATUS_POLL_SECS,
+                            );
+                        }
+                        venue_accepting = accepting;
+                        match accepting {
+                            Some(true) => {
+                                if venue_closed_since.take().is_some() {
+                                    info!(
+                                        "🏁 Squadron [{}] venue is trading \"{}\" again — retirement clock reset",
+                                        squadron_id, market_cfg.market_name,
+                                    );
+                                }
+                            }
+                            Some(false) => {
+                                venue_closed_desc = format!("status={:?} result={:?}", m.status, m.result);
+                                if venue_closed_since.is_none() {
+                                    venue_closed_since = Some(Instant::now());
+                                    info!(
+                                        "🏁 Squadron [{}] venue reports \"{}\" no longer trading ({}) — retiring in {}s once flat",
+                                        squadron_id, market_cfg.market_name, venue_closed_desc, grace,
+                                    );
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                    // Unanswered is neither "closed" nor "open": a clock already
+                    // running keeps running, and the stated close keeps its
+                    // authority. A transient REST failure must not retire anything.
+                    Err(e) => {
+                        debug!("📡 Squadron [{}] venue status probe failed: {e}", squadron_id);
+                        venue_accepting = None;
+                    }
+                }
+            }
+            let closed_for = venue_closed_since.map(|t| t.elapsed().as_secs() as i64);
+            if venue_closed_retire_due(closed_for, grace, holding) {
+                venue_retire = Some(format!(
+                    "the venue reports it no longer trading ({venue_closed_desc}) for {}s", closed_for.unwrap_or(0),
+                ));
+            }
+
+            if venue_retire.is_none() && deployed_as == Some("sports") {
+                let (has_book, top_bid) = book_state(&hub, &pair.ticker).await;
+                if has_book {
+                    book_absent_since = None;
+                } else if book_absent_since.is_none() {
+                    book_absent_since = Some(Instant::now());
+                }
+                if sports_signals_probed_at.elapsed() >= Duration::from_secs(VENUE_STATUS_POLL_SECS) {
+                    sports_signals_probed_at = Instant::now();
+                    // The ledger writes to the primary pool on every venue and keys
+                    // a Kalshi game by its event ticker (`KalshiSportsCatalog`). A
+                    // game the ledger never matched falls back to the kick-off the
+                    // ticker or the expected expiration implies: the seeder only
+                    // deploys games on the board, so this is for a Helm pick.
+                    if let Some(p) = db::pool() {
+                        if sports_kick_off.is_none() {
+                            if let Some(ev) = venue_event_ticker.as_deref() {
+                                sports_kick_off = db::sports_ledger_kick_off(p, ev).await
+                                    .or_else(|| crate::venues::kalshi::sports::kickoff_for(ev, venue_expected_expiration));
+                            }
+                        }
+                        if !sports_resolved {
+                            sports_resolved = db::sports_resolved_price(p, market_cfg.yes_token.as_str()).await.is_some()
+                                || db::sports_resolved_price(p, market_cfg.no_token.as_str()).await.is_some();
+                        }
+                    }
+                }
+                let signals = SportsGameSignals {
+                    kick_off: sports_kick_off,
+                    on_board: crate::raptors::sports_ledger::line_for(
+                        market_cfg.yes_token.as_str(), market_cfg.no_token.as_str()).is_some(),
+                    resolved_by_ledger: sports_resolved,
+                    book: if has_book {
+                        SportsBook::Live { top_bid }
+                    } else {
+                        SportsBook::Absent { for_secs: book_absent_since.map_or(0, |t| t.elapsed().as_secs() as i64) }
+                    },
+                };
+                let verdict = sports_game_over_verdict(
+                    Utc::now(), &signals, dyn_cfg.sports_game_over_after_secs, dyn_cfg.sports_game_over_decided_bid,
+                );
+                match verdict {
+                    Some(v) => {
+                        if game_over_since.is_none() {
+                            game_over_since = Some(Instant::now());
+                            info!(
+                                "🏁 Squadron [{}] game \"{}\" reads as over: {} — retiring in {}s once flat ({})",
+                                squadron_id, market_cfg.market_name, v.describe(),
+                                if matches!(v, GameOver::Resolved) { 0 } else { grace },
+                                match venue_accepting {
+                                    Some(true) => "venue still reports it trading",
+                                    Some(false) => "venue also reports it closed",
+                                    None => "venue status unknown",
+                                },
+                            );
+                        }
+                    }
+                    None => {
+                        if game_over_since.take().is_some() {
+                            info!(
+                                "🏁 Squadron [{}] game \"{}\" no longer reads as over — retirement clock reset",
+                                squadron_id, market_cfg.market_name,
+                            );
+                        }
+                    }
+                }
+                let held = game_over_since.map_or(0, |t| t.elapsed().as_secs() as i64);
+                if sports_game_over_due(verdict, held, grace, holding) {
+                    venue_retire = Some(format!("game over: {}", verdict.map(|v| v.describe()).unwrap_or_default()));
+                }
+            }
+        }
+
+        let phase = if venue_retire.is_some() { MarketPhase::Closed } else { market_cfg.phase(Utc::now(), MARKET_RTB_WINDOW_SECS) };
+        match phase {
             MarketPhase::Closed => {
-                info!("🏁 Kalshi market \"{}\" reached close — standing down to rotate", market_cfg.market_name);
+                match &venue_retire {
+                    Some(why) => info!("🏁 Kalshi market \"{}\" retired: {why} — standing down", market_cfg.market_name),
+                    None => info!("🏁 Kalshi market \"{}\" reached close — standing down to rotate", market_cfg.market_name),
+                }
+                // The flat check behind `venue_retire` ran before the probe's
+                // REST call, and a resting quote can fill in between. Returning
+                // now would drop the fill listener on a position this squadron
+                // owns, so pull what rests and look once more; a position means
+                // staying on to manage it, and the probes ask again next tick.
+                if venue_retire.is_some() {
+                    lifecycle.cancel_all(venue.as_ref()).await;
+                    if !positions.lock().await.is_empty() {
+                        warn!(
+                            "🏁 Kalshi market \"{}\": a position landed while retiring — staying on to manage it",
+                            market_cfg.market_name,
+                        );
+                        continue;
+                    }
+                }
                 if let Some(r) = recorder.take() {
                     let (w, samples, ticker) = (r.window_start(), r.samples(), r.ticker().to_string());
                     // The whole hour's tape, paged; one page covered nine minutes.
@@ -3151,3 +3400,73 @@ mod hourly_market_tests {
     }
 }
 
+#[cfg(test)]
+mod venue_status_tests {
+    use super::*;
+
+    /// 2026-10-19 as production had it: KXNFLGAME-26OCT18DALGB-GB finalized at
+    /// 03:47Z with result "yes" and a stated close two days on. The venue's own
+    /// record is what says the market is over.
+    #[test]
+    fn a_finalized_game_with_a_result_is_no_longer_trading() {
+        assert_eq!(venue_accepting_orders("finalized", "yes"), Some(false));
+        assert_eq!(venue_accepting_orders("closed", ""), Some(false), "closed to trading but undetermined is still over");
+        assert_eq!(venue_accepting_orders("settled", "no"), Some(false));
+        assert_eq!(venue_accepting_orders("active", "yes"), Some(false), "a recorded result wins over a stale status");
+    }
+
+    /// Trading is trading, and a status this build does not know is no answer,
+    /// so the stated close keeps its authority rather than retiring on a guess.
+    #[test]
+    fn an_active_market_is_trading_and_an_unknown_status_is_no_answer() {
+        assert_eq!(venue_accepting_orders("active", ""), Some(true));
+        assert_eq!(venue_accepting_orders("open", ""), Some(true));
+        assert_eq!(venue_accepting_orders("initialized", ""), None);
+        assert_eq!(venue_accepting_orders("unopened", ""), None);
+        assert_eq!(venue_accepting_orders("", ""), None);
+        assert_eq!(venue_accepting_orders("something-new", ""), None);
+    }
+
+    /// A halted live game is NOT over. Kalshi records a halt as `inactive`
+    /// (`paused` in its query vocabulary); reading either as "closed" would
+    /// retire a flat squadron five minutes into an injury hold or a review, and
+    /// the seeder never redeploys onto a game that has left the board.
+    #[test]
+    fn a_halt_is_no_answer_not_closed() {
+        assert_eq!(venue_accepting_orders("inactive", ""), None);
+        assert_eq!(venue_accepting_orders("paused", ""), None);
+        assert_eq!(venue_accepting_orders(" inactive ", ""), None, "trimmed like orders.rs");
+    }
+
+    /// The venue has to say "closed" for the whole grace, and a squadron that
+    /// holds a position is never stood down on top of it.
+    #[test]
+    fn the_venue_must_say_closed_for_the_whole_grace_and_never_over_a_position() {
+        assert!(!venue_closed_retire_due(None, 300, false));
+        assert!(!venue_closed_retire_due(Some(299), 300, false));
+        assert!(venue_closed_retire_due(Some(300), 300, false));
+        assert!(!venue_closed_retire_due(Some(86_400), 300, true));
+    }
+
+    /// No book until the feed's first snapshot; a ready book with no levels is
+    /// still no book; the top bid is read across both legs.
+    #[tokio::test]
+    async fn book_state_reads_absent_until_ready_and_the_top_bid_across_legs() {
+        let hub = ws::new_book_hub();
+        assert_eq!(book_state(&hub, "T").await, (false, Decimal::ZERO));
+        {
+            let mut books = hub.write().await;
+            let mut b = ws::Book::default();
+            b.ready = true;
+            books.insert("T".into(), b);
+        }
+        assert_eq!(book_state(&hub, "T").await, (false, Decimal::ZERO), "ready with no levels is still no book");
+        {
+            let mut books = hub.write().await;
+            let b = books.get_mut("T").unwrap();
+            b.yes_bids.insert(dec!(0.02), dec!(10));
+            b.no_bids.insert(dec!(0.97), dec!(10));
+        }
+        assert_eq!(book_state(&hub, "T").await, (true, dec!(0.97)));
+    }
+}
