@@ -151,7 +151,7 @@ Parameters:
 Mappings:
   RegionMap:
     us-east-1:
-      AMI: ami-04011c4eb397941ed
+      AMI: ami-05e16f19b95664b58
 
 Conditions:
   PreselectVenue: !Not [!Equals [!Ref VenueSelection, choose-in-the-control-tower]]
