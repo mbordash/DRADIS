@@ -4,7 +4,7 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
-## 1.4.2 (unreleased)
+## 1.4.2 (2026-10-20)
 
 - Control Tower: a finished Kalshi sports or politics market no longer lingers in the "market data has stopped" banner or as stale vipers in the health strip after its squadron retires.
 - Polymarket International: "Retire and back up" no longer restarts the engine on the first click; the backup now builds on the first attempt.
