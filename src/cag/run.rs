@@ -282,12 +282,27 @@ where
     // patrol's market clock too; see `market_started_at_for` (B60).
     let mut last_hourly_cid: Option<String> = None;
 
+    // The token the current squadron is registered under: a child of `cancel`,
+    // minted per squadron below. Checked here, at the top, rather than only
+    // after `patrol()` returns, because the maker fee and neg-risk lookups
+    // `continue 'market_loop` on an error or timeout, and a Stand Down that
+    // landed during one of those would otherwise be overwritten by a fresh
+    // squadron registered under the same id.
+    let mut squadron_cancel: Option<CancellationToken> = None;
+
     'market_loop: loop {
         // Check external cancellation token — fired by Cag::stand_down_asset().
         // Checked first so a stand-down during bootstrap or fee-rate fetch is
         // honored immediately without waiting for the next I/O timeout.
         if cancel.is_cancelled() {
             info!("🛬  run_market_loop [{}]: cancellation token fired — exiting loop", crypto_filter.to_uppercase());
+            break 'market_loop;
+        }
+        // An operator Stand Down ends the asset loop, as it always has. A
+        // retirement falls through to the `is_retired()` branch below, which
+        // idles 30 s at a time so the process stays up for the backup (B59).
+        if squadron_cancel.as_ref().is_some_and(|t| stand_down_ends_the_loop(t.is_cancelled(), crate::helpers::migration::is_retired())) {
+            info!("🛬  run_market_loop [{}]: squadron stood down — exiting loop", crypto_filter.to_uppercase());
             break 'market_loop;
         }
 
@@ -444,12 +459,23 @@ where
         info!("🛫  Squadron [{}] → state={}", squadron.id, squadron.state);
 
         // Register with CAG so GET /api/squadrons shows this deployment.
-        // Registered with the loop's own cancellation token. On this venue a
-        // squadron IS the asset's current market, so a squadron stand-down and
-        // an asset stand-down are the same act — and this is the token the loop
-        // above actually checks.
+        //
+        // Registered with a CHILD of the loop's token, not the token itself. On
+        // this venue a squadron IS the asset's current market, so an operator
+        // Stand Down still ends the asset loop (`stand_down_ends_the_loop`
+        // below); the child exists so that a migration retirement, which
+        // stands every squadron down through this same token, does not. With
+        // the loop's own token registered, `stand_down_squadrons()` in
+        // `migration::prepare` ended this loop, `main.rs` finished awaiting the
+        // loop tasks, and the process exited 0 about 150 ms later: Docker
+        // restarted it retired, the in-memory backup task was gone, and the
+        // first "Retire and back up" click never produced a download. Seen on
+        // production 2026-10-13 (B59); the second click worked because the
+        // fresh process had no progress state to lose.
+        let this_squadron_cancel = cancel.child_token();
+        squadron_cancel = Some(this_squadron_cancel.clone());
         let _squadron_id = patrol_ctx.cag
-            .register_with_cancel(&squadron, cancel.clone());
+            .register_with_cancel(&squadron, this_squadron_cancel.clone());
 
         // Classify this market and link it to its eligible raptors/vipers via
         // the shared DB taxonomy (crypto → price+funding + full viper suite).
@@ -551,8 +577,44 @@ where
         //
         // A child rather than a clone so that a future edit inside `patrol()`
         // cancelling its own token cannot tear down the whole market loop.
-        let patrol_cancel = cancel.child_token();
+        let patrol_cancel = this_squadron_cancel.child_token();
         squadron.patrol(patrol_cancel, &mut patrol_ctx).await;
+        // Whether that return was a stand-down is judged at the top of the loop.
+    }
+}
+
+/// Whether the squadron's stand-down also ends the asset loop.
+///
+/// Stood down by the operator: yes, a squadron is the asset's market on this
+/// venue. Stood down by a migration retirement: no, the loop must stay up so
+/// the process does, or the backup task dies with it (B59). Not stood down at
+/// all (the patrol returned for a market rotation): no.
+fn stand_down_ends_the_loop(squadron_cancelled: bool, retired: bool) -> bool {
+    squadron_cancelled && !retired
+}
+
+#[cfg(test)]
+mod stand_down_tests {
+    use super::stand_down_ends_the_loop;
+
+    /// The operator's Stand Down keeps its meaning: the asset loop ends.
+    #[test]
+    fn an_operator_stand_down_ends_the_asset_loop() {
+        assert!(stand_down_ends_the_loop(true, false));
+    }
+
+    /// The B59 case: retirement stands the squadron down but the loop must
+    /// survive, or the process exits under the backup.
+    #[test]
+    fn a_retirement_keeps_the_asset_loop_alive() {
+        assert!(!stand_down_ends_the_loop(true, true));
+    }
+
+    /// A patrol that returned for a rotation is not a stand-down.
+    #[test]
+    fn a_rotation_is_not_a_stand_down() {
+        assert!(!stand_down_ends_the_loop(false, false));
+        assert!(!stand_down_ends_the_loop(false, true));
     }
 }
 

@@ -499,6 +499,18 @@ pub(crate) fn venue_accepting_orders(status: &str, result: &str) -> Option<bool>
     }
 }
 
+/// The final YES price a Kalshi `result` states, or `None` when it states no
+/// binary result yet. `yes` and `no` are the only values a $1/$0 settlement can
+/// be booked from; anything else (empty, `void`, a scalar) is not a result for
+/// this purpose and defers, as `interpret_settlement` does for live positions.
+pub(crate) fn kalshi_result_yes_price(result: &str) -> Option<Decimal> {
+    match result.trim() {
+        "yes" => Some(Decimal::ONE),
+        "no" => Some(Decimal::ZERO),
+        _ => None,
+    }
+}
+
 /// Should a pinned squadron stand down on the venue's word? Only once the venue
 /// has said "not trading" continuously for the grace, and never while holding:
 /// the exchange settles what we hold, and standing down on top of it would
@@ -1570,6 +1582,30 @@ async fn trade_one_market(
                                         "🏁 Squadron [{}] venue reports \"{}\" no longer trading ({}) — retiring in {}s once flat",
                                         squadron_id, market_cfg.market_name, venue_closed_desc, grace,
                                     );
+                                }
+                                // Simulated positions have no settlement path of
+                                // their own: the exchange settles what we really
+                                // hold, and the settled-position sweep books it,
+                                // but a ghost position is held by nobody. Left
+                                // alone it pins the squadron ("never over a
+                                // position") and the class with it. Kalshi
+                                // states the result in the market record, so
+                                // book straight from it; an empty or non-binary
+                                // result books nothing and the clock keeps
+                                // running. Once a minute, on the probe's cadence.
+                                if holding && scope.ghost {
+                                    if let (Some(yes_px), Some(p)) = (kalshi_result_yes_price(&m.result), pool.as_ref()) {
+                                        let n = crate::helpers::ghost_settlement::settle_ghost_positions_at(
+                                            &positions, p, asset, Some(market_class.as_str()),
+                                            &pair.long, &pair.short, yes_px,
+                                        ).await;
+                                        if n > 0 {
+                                            info!(
+                                                "👻 Squadron [{}]: booked {} simulated settlement(s) on \"{}\" from the venue's result {:?} — releasing the squadron",
+                                                squadron_id, n, market_cfg.market_name, m.result,
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             None => {}
@@ -3514,6 +3550,17 @@ mod venue_status_tests {
             b.no_bids.insert(dec!(0.97), dec!(10));
         }
         assert_eq!(book_state(&hub, "T").await, (true, dec!(0.97)));
+    }
+
+    /// Only a stated yes or no books a simulated settlement; everything else
+    /// defers, the same way the live sweep reads the venue.
+    #[test]
+    fn only_a_binary_result_prices_a_simulated_settlement() {
+        assert_eq!(kalshi_result_yes_price("yes"), Some(Decimal::ONE));
+        assert_eq!(kalshi_result_yes_price("no"), Some(Decimal::ZERO));
+        assert_eq!(kalshi_result_yes_price(""), None, "undetermined is not a result");
+        assert_eq!(kalshi_result_yes_price("void"), None);
+        assert_eq!(kalshi_result_yes_price("scalar"), None);
     }
 
     /// A pinned market's tickers leave the book-feed registry when its loop

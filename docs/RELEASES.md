@@ -7,8 +7,32 @@ version's release notes field; the detail below it is the full account.
 ## 1.4.2 (unreleased)
 
 - Control Tower: a finished Kalshi sports or politics market no longer lingers in the "market data has stopped" banner or as stale vipers in the health strip after its squadron retires.
+- Polymarket International: "Retire and back up" no longer restarts the engine on the first click; the backup now builds on the first attempt.
+- Kalshi: simulated (ghost mode) positions on a finished sports or politics market are booked as settlements from the venue's result, so a ghost game no longer holds its squadron and blocks the class.
 
 ### Detail
+
+**Retire and back up on Polymarket International.** The crypto squadron was
+registered with its asset loop's own cancellation token, so standing every
+squadron down for a migration backup also ended the loop, the process exited
+and Docker restarted it already retired, with the backup task gone. The first
+click showed "Retired for migration" and never offered a download; the second
+click worked. The squadron now has its own token: an operator Stand Down still
+ends the asset loop as before, while a retirement leaves it idling so the
+process stays up for the backup.
+
+**Simulated settlements on Kalshi.** Ghost mode has no settlement path of its
+own, and 1.4.1's retirement never stands down a squadron that holds a position.
+A simulated position on a finished game would therefore have pinned its
+squadron, and the seeder skips a class that already has one. Kalshi states the
+result in the market record, so once the venue reports a yes or no result
+(status determined or finalized), simulated positions on it are booked as
+settlements, marked simulated, charging the entry fee a live entry of the same
+kind would have paid (taker entries pay it, post-only entries do not), and the
+squadron retires as usual. A position with a real open-position row on the same
+token is never booked this way. An undetermined, voided or non-binary result
+books nothing, and such a position keeps its squadron until the operator stands
+it down.
 
 **Stale market state after retirement.** The first night 1.4.1 retired a
 finished game, the squadron stood down on time but the Control Tower kept
