@@ -524,6 +524,50 @@ async fn book_state(hub: &ws::BookHub, ticker: &str) -> (bool, Decimal) {
     }
 }
 
+/// Clears the per-market registries when a market loop ends, however it ends.
+///
+/// `build_snapshot` records the book feed under each ticker it streams, and the
+/// vipers record their verdicts under the squadron's status scope. Neither
+/// registry knew when a pinned Kalshi market was over: the only `forget` on
+/// this venue ran on crypto rotation and passed the asset, which never matched
+/// a ticker. Observed 2026-10-20, the first night 1.4.1 retired a finished
+/// game: the squadron was reaped at 23:38 ET and the Control Tower still showed
+/// "market data has stopped" for its ticker four hours later, with four
+/// "stale" sports vipers in the health strip for a squadron no longer on screen.
+///
+/// A `Drop` guard so every exit is covered — close, rotation, cancellation —
+/// without a call at each `return`.
+struct MarketRegistries {
+    tickers: Vec<String>,
+    /// `None` leaves the viper rows alone: a rotating crypto squadron keeps its
+    /// scope across markets (the rotation code forgets it when the underlying
+    /// changes), and Helm squadrons share one scope, so one finishing must not
+    /// wipe the others' rows.
+    status_scope: Option<String>,
+}
+
+impl MarketRegistries {
+    fn new(tickers: &[String], mandate: MarketMandate, status_scope: &str) -> Self {
+        let own_scope = mandate == MarketMandate::Pinned
+            && status_scope != crate::vipers::helm_impl::KIND;
+        Self {
+            tickers: tickers.to_vec(),
+            status_scope: own_scope.then(|| status_scope.to_string()),
+        }
+    }
+}
+
+impl Drop for MarketRegistries {
+    fn drop(&mut self) {
+        for t in &self.tickers {
+            crate::state::price_state::book_feed::forget(t);
+        }
+        if let Some(scope) = &self.status_scope {
+            crate::helpers::viper_status::forget(scope);
+        }
+    }
+}
+
 #[derive(Debug)]
 enum MarketOutcome {
     Closed,
@@ -1313,6 +1357,8 @@ async fn trade_one_market(
     if let Some(ref mp) = maker_pair {
         book_tickers.push(mp.ticker.clone());
     }
+    // Dropped when this function returns, whichever way — see the type.
+    let _registries = MarketRegistries::new(&book_tickers, mandate, status_scope);
     ws::spawn_orderbook_feed(
         super::ws_url(),
         venue.auth.clone(),
@@ -3468,5 +3514,46 @@ mod venue_status_tests {
             b.no_bids.insert(dec!(0.97), dec!(10));
         }
         assert_eq!(book_state(&hub, "T").await, (true, dec!(0.97)));
+    }
+
+    /// A pinned market's tickers leave the book-feed registry when its loop
+    /// ends, so a finished game is not reported dark for the life of the
+    /// process; its viper rows go with it so the health strip does not count
+    /// a reaped squadron as stale.
+    #[test]
+    fn a_finished_pinned_market_leaves_both_registries() {
+        use crate::helpers::viper_status;
+        use crate::state::price_state::book_feed;
+        let ticker = "KXTEST-REGISTRIES-GAME";
+        let scope = "test-registries-sports";
+        book_feed::note(ticker, false);
+        viper_status::record_idle(scope, "MakerStrategy", "waiting");
+        assert!(book_feed::is_tracked(ticker));
+        assert!(!viper_status::snapshot(Some(scope)).is_empty());
+
+        drop(MarketRegistries::new(&[ticker.to_string()], MarketMandate::Pinned, scope));
+
+        assert!(!book_feed::is_tracked(ticker), "the ticker should be forgotten");
+        assert!(viper_status::snapshot(Some(scope)).is_empty(), "the scope's viper rows should be gone");
+    }
+
+    /// A rotating crypto market forgets its ticker but keeps the asset's viper
+    /// rows (the next hourly market reuses them), and a Helm squadron keeps
+    /// the shared Helm scope because other Helm squadrons may still be flying.
+    #[test]
+    fn rotation_and_helm_keep_their_shared_viper_rows() {
+        use crate::helpers::viper_status;
+        use crate::state::price_state::book_feed;
+        let ticker = "KXTEST-REGISTRIES-HOURLY";
+        book_feed::note(ticker, false);
+        viper_status::record_idle("test-registries-btc", "MakerStrategy", "waiting");
+        drop(MarketRegistries::new(&[ticker.to_string()], MarketMandate::Rotating, "test-registries-btc"));
+        assert!(!book_feed::is_tracked(ticker));
+        assert!(!viper_status::snapshot(Some("test-registries-btc")).is_empty());
+        viper_status::forget("test-registries-btc");
+
+        let helm = crate::vipers::helm_impl::KIND;
+        let guard = MarketRegistries::new(&[], MarketMandate::Pinned, helm);
+        assert!(guard.status_scope.is_none(), "the Helm scope is shared and never forgotten here");
     }
 }

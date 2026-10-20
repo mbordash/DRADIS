@@ -527,6 +527,13 @@ fn note_inner(label: &str, market: &str, has_book: bool) {
                 .collect()
         }
 
+        /// Is `label` in the registry at all, dark or not? `dark_markets` lists
+        /// only the dark ones, so a caller that just forgot a live entry needs
+        /// this to see that it is gone.
+        pub fn is_tracked(label: &str) -> bool {
+            registry().lock().map(|reg| reg.contains_key(label)).unwrap_or(false)
+        }
+
         /// Forget a market — called when its squadron stands down or rotates
         /// away, so a closed market is not reported dark forever.
         pub fn forget(label: &str) {

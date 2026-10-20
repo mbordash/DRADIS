@@ -4,6 +4,19 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
+## 1.4.2 (unreleased)
+
+- Control Tower: a finished Kalshi sports or politics market no longer lingers in the "market data has stopped" banner or as stale vipers in the health strip after its squadron retires.
+
+### Detail
+
+**Stale market state after retirement.** The first night 1.4.1 retired a
+finished game, the squadron stood down on time but the Control Tower kept
+reporting its market as dark and its four vipers as stale for hours, because
+the engine's per-market registries were only cleared on crypto rotation. Every
+Kalshi market loop now clears its own entries when it ends, whichever way it
+ends. Nothing changes in trading.
+
 ## 1.4.1 (2026-10-19)
 
 - Kalshi: sports and politics squadrons stand down when the venue closes or finalizes their market, instead of waiting for the market's stated close.
