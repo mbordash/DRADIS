@@ -1361,6 +1361,77 @@ pub fn incumbent_usable(model: &crate::vipers::gboost_planb::PlanBModel, plan: &
     model.plan_mismatch(plan.tp, plan.sl, plan.lo, plan.hi, plan.entry.stamp(), plan.posture_stamp(), TRAINED_FORM).is_none()
 }
 
+/// Why a model stamped for another venue, or for bars in another currency, can
+/// never trade real money on this one, or `None`. Both stamps are fixed when the
+/// model is trained, so unlike the gate or the shadow record nothing the model
+/// does here can clear them: it scores and records in the shadow lane forever,
+/// and the record it builds counts toward nothing.
+///
+/// This is the normal state of an instance that migrated venues. The backup
+/// carries the old serving file over, the viper loads it (the venue stamp is
+/// read, not enforced) and it keeps scoring. Production ran this way after
+/// moving from Polymarket International to Kalshi on 2026-10-18. Under a bare
+/// skill comparison the carried model's months of training would have
+/// out-scored every young Kalshi candidate on the fold and held the slot until
+/// the Kalshi store was as deep as its own, with no record that could promote
+/// anything being built meanwhile. The same checks the viper's lane
+/// decision applies (`venue_blocks_live`, `denomination_blocks_live`), so the
+/// trainer and the viper cannot disagree about whether the serving model is
+/// stranded.
+pub fn stranded_here(trained_venue: Option<&str>, trained_denomination: Option<&str>) -> Option<String> {
+    crate::vipers::gboost_planb::venue_blocks_live(trained_venue, crate::venues::ledger_venue())
+        .or_else(|| crate::vipers::gboost_planb::denomination_blocks_live(trained_denomination, expected_kline_denomination()))
+}
+
+/// Why the serving model is not an incumbent worth comparing against, or `None`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IncumbentDefect {
+    /// The viper refuses it under the configured plan (`incumbent_usable`), so
+    /// it scores nothing and records nothing.
+    Refused,
+    /// It scores and records, but `stranded_here` says the record can never
+    /// promote it; the string is the lane check's own reason.
+    Stranded(String),
+}
+
+/// The serving model's defect, if any: refused by the viper, or stranded here.
+/// Either way `serve_decision` must not treat it as an incumbent, but only a
+/// refused model bypasses Auto Adopt: a stranded one is in service, so an
+/// operator who turned Auto Adopt off still decides when it is replaced.
+pub fn incumbent_defect(model: &crate::vipers::gboost_planb::PlanBModel, plan: &Plan) -> Option<IncumbentDefect> {
+    if !incumbent_usable(model, plan) {
+        return Some(IncumbentDefect::Refused);
+    }
+    stranded_here(model.trained_venue.as_deref(), model.trained_denomination.as_deref()).map(IncumbentDefect::Stranded)
+}
+
+/// The holdout fold a live-recorded store can afford: the configured days, or a
+/// third of the recorded hours as days (never under one day) while the store
+/// holds fewer than three folds' worth of markets.
+///
+/// The fold is the newest `holdout_days` of markets and the fit is everything
+/// older than it minus the purge gap, so a store younger than the fold has
+/// nothing to fit on. On a venue that records its own markets (Kalshi,
+/// Polymarket US) the configured fourteen days would have held the first cycle
+/// that could fit anything until day fifteen and reported `insufficient_data`
+/// on every cycle before it. Two thirds to fit and one third to judge keeps the
+/// decision honest while the store grows. While the fold grows a day at a time,
+/// yesterday's incumbent may have calibrated on part of today's fold;
+/// `incumbent_overlaps_fold` reports that, as it does for any incumbent.
+///
+/// Counted in markets that built rows, not in calendar span, so a few stray
+/// records from an earlier run do not size the fold for the markets that
+/// matter. Only for stores without public history: a backfilled Polymarket
+/// International store is as deep as its training window from the first cycle,
+/// and clipping its fold to a third of that window would silently override the
+/// operator's knob whenever the window is under three folds, so
+/// `run_cycle_blocking` consults `has_public_history` before calling this.
+pub fn effective_holdout_days(configured: i64, recorded_markets: usize) -> i64 {
+    let configured = configured.max(1);
+    let recorded_days = (recorded_markets / 24) as i64;
+    configured.min((recorded_days / 3).max(1))
+}
+
 /// What the serving model looked like when this cycle started.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Incumbent {
@@ -1368,11 +1439,16 @@ pub struct Incumbent {
     /// its own `gate_passed` stamp.
     pub gate_passed: bool,
     /// Whether the viper would trade it at all under the configured plan, i.e.
-    /// whether `plan_mismatch` accepts its entry rule and plan stamp.
+    /// whether `plan_mismatch` accepts its entry rule and plan stamp, and whether
+    /// it could ever earn real money on this venue (`stranded_here` is `None`).
     ///
     /// A licensed model the viper refuses is worse than an unlicensed one it
     /// accepts: the refusal happens before any lane is chosen, so the viper
-    /// scores nothing, records nothing and can never improve its position.
+    /// scores nothing, records nothing and can never improve its position. A
+    /// model stranded by its venue stamp is the quieter form of the same thing:
+    /// it scores and records, but the lane decision checks the venue before the
+    /// record, so what it records can never promote it, and while it holds the
+    /// slot no model that could be promoted is building a record.
     pub usable: bool,
     /// Its log-loss skill over the market mid on THIS cycle's fold, so the two
     /// are comparable.
@@ -1635,7 +1711,19 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
     let elig: Vec<&TrainingRow> = rows.iter().filter(|r| r.elig).collect();
     rep.rows_eligible = elig.len();
 
-    let fold_start = floor_hour(inputs.now) - inputs.holdout_days * 86400;
+    // A young live-recorded store (a venue recording its own markets, days after
+    // a migration) cannot afford the configured fold: with fourteen holdout days
+    // and three days of records every market is in the fold and nothing is left
+    // to fit. A backfilled store keeps the operator's fold.
+    let holdout_days = if has_public_history() { inputs.holdout_days.max(1) } else { effective_holdout_days(inputs.holdout_days, markets) };
+    if holdout_days != inputs.holdout_days {
+        rep.holdout_days = holdout_days;
+        info!(
+            "GBoost plan-B pipeline [{}]: {markets} recorded market(s) built rows, so this cycle's holdout fold is {holdout_days} day(s) rather than the configured {}",
+            inputs.asset, inputs.holdout_days,
+        );
+    }
+    let fold_start = floor_hour(inputs.now) - holdout_days * 86400;
     rep.fold_from = rfc3339(fold_start);
     rep.fold_through = rfc3339(floor_hour(inputs.now));
     let test: Vec<&TrainingRow> = elig.iter().copied().filter(|r| r.w >= fold_start).collect();
@@ -1804,12 +1892,16 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
     // produced a passing model had a viper that scored nothing, forever. That
     // idle state is the thing being removed; refusing to spend money on a model
     // with no demonstrated skill is not, and is unchanged.
+    // The same question the viper asks every tick, asked here with the plan this
+    // cycle was trained for, so the trainer and the viper cannot disagree about
+    // whether the serving model is usable; and whether a record it builds here
+    // could ever count (`stranded_here`).
+    let inc_defect = incumbent.as_ref().and_then(|m| incumbent_defect(m, &inputs.plan));
+    let inc_refused = matches!(inc_defect, Some(IncumbentDefect::Refused));
+    let inc_stranded: Option<String> = match &inc_defect { Some(IncumbentDefect::Stranded(why)) => Some(why.clone()), _ => None };
     let inc_state = rep.incumbent.as_ref().map(|stats| Incumbent {
         gate_passed: incumbent.as_ref().is_some_and(|m| m.gate_passed),
-        // The same question the viper asks every tick, asked here with the plan
-        // this cycle was trained for, so the trainer and the viper cannot
-        // disagree about whether the serving model is usable.
-        usable: incumbent.as_ref().is_some_and(|m| incumbent_usable(m, &inputs.plan)),
+        usable: inc_defect.is_none(),
         market_skill: stats.market_skill,
         shadow_trades: inputs.incumbent_shadow_trades,
         shadow_needed: inputs.shadow_min_trades,
@@ -1861,10 +1953,16 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
         }
         Serve::Candidate => {
             rep.comparison = match (&comparison, inc_state) {
-                _ if inc_unusable => Some(format!(
-                    "the serving model {inc_name} is not one this engine can trade under the configured plan, \
-                     so a candidate for the configured plan replaces it"
-                )),
+                _ if inc_unusable => Some(match &inc_stranded {
+                    Some(why) => format!(
+                        "the serving model {inc_name} could never trade real money on this venue ({why}), \
+                         so a candidate trained here replaces it"
+                    ),
+                    None => format!(
+                        "the serving model {inc_name} is not one this engine can trade under the configured plan, \
+                         so a candidate for the configured plan replaces it"
+                    ),
+                }),
                 (cmp, Some(inc)) if !inc.gate_passed => Some(format!(
                     "the serving model {inc_name} has not cleared the gate, so a passing candidate replaces it{}",
                     cmp.as_ref().map(|(_, why)| format!(" ({why}{overlap})")).unwrap_or_default(),
@@ -1875,11 +1973,18 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
         }
         Serve::CandidateInShadow => {
             rep.comparison = if inc_unusable {
-                Some(format!(
-                    "the serving model {inc_name} is not one this engine can trade under the configured plan, \
-                     so it is replaced even though the candidate did not clear the gate: a model in the shadow \
-                     lane scores and builds a record, one the viper refuses does neither"
-                ))
+                Some(match &inc_stranded {
+                    Some(why) => format!(
+                        "the serving model {inc_name} could never trade real money on this venue ({why}), so it \
+                         is replaced even though the candidate did not clear the gate: a candidate stamped for \
+                         this venue builds a shadow record that counts toward promotion, the serving model's never could"
+                    ),
+                    None => format!(
+                        "the serving model {inc_name} is not one this engine can trade under the configured plan, \
+                         so it is replaced even though the candidate did not clear the gate: a model in the shadow \
+                         lane scores and builds a record, one the viper refuses does neither"
+                    ),
+                })
             } else {
                 inc_state.map(|inc| format!(
                     "log-loss skill over the market mid {:+.4} against the serving model's {:+.4}; neither has cleared the gate",
@@ -1900,11 +2005,13 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
     // fails to load leaves the viper idle, so treating it as an incumbent and
     // declining to replace it would recreate the permanently idle viper behind an
     // unreadable file.
-    // `!inc_unusable` for the same reason as `incumbent.is_some()` itself: a
+    // `!inc_refused` for the same reason as `incumbent.is_some()` itself: a
     // model the viper refuses is not something in service, so declining to
     // replace it is not deferring to the operator, it is leaving the viper idle
-    // behind a file it will never use.
-    if !inputs.auto_adopt && incumbent.is_some() && !inc_unusable {
+    // behind a file it will never use. A STRANDED model is in service (it scores
+    // and records, in the shadow lane), so the operator's switch holds for it:
+    // the candidate waits in `candidate.json` until they adopt it.
+    if !inputs.auto_adopt && incumbent.is_some() && !inc_refused {
         let detail = if shadow_only {
             format!(
                 "candidate {version} failed the holdout gate and would serve in the shadow lane; \
@@ -1938,7 +2045,7 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
     }
     // An operator who turned Auto Adopt off and still sees an adoption is owed the
     // reason in the same line, or their switch looks broken.
-    let bypassed = match (inputs.auto_adopt, inc_unusable) {
+    let bypassed = match (inputs.auto_adopt, inc_refused) {
         (true, _) => "",
         (false, true) => " (Auto Adopt is off, but nothing this engine could trade was in service, \
                            so there was no operator decision to defer to)",
@@ -2771,9 +2878,23 @@ pub fn has_public_history() -> bool {
 }
 
 /// How many settled recorded markets a venue without public history needs on disk
-/// before a training cycle is worth running. A week of hourly markets: fewer
-/// gives the holdout nothing to judge and the gate would refuse every candidate.
-pub const MIN_RECORDED_MARKETS: usize = 7 * 24;
+/// before a training cycle is worth running. Two days of hourly markets: with
+/// `effective_holdout_days` keeping a third of a young store as the fold, a
+/// one-day fold leaves about a day of markets to fit and calibrate on, which
+/// clears the row floors when the usual share of asks is in the plan's band
+/// (the hard minimum of ten training markets needs about 36 on disk).
+///
+/// This used to be a week, on the argument that the gate would refuse anything
+/// trained on less. It would, and that is not the point: a candidate stamped for
+/// this venue serves in the shadow lane whether or not it clears the gate, and
+/// its shadow record counts toward promotion, which a model carried over from
+/// another venue's never can (`stranded_here`). Waiting a week for a model the
+/// gate was always going to refuse only delayed the record that matters, and
+/// with the default fourteen-day holdout the week was inside the fold anyway, so
+/// the first cycle that could fit anything was two weeks out. A cycle that still
+/// lacks rows says so on the card, with the counts, which is more useful than a
+/// countdown.
+pub const MIN_RECORDED_MARKETS: usize = 2 * 24;
 
 /// Settled records this venue's loop recorded, in `dir`'s training window. Only
 /// live-recorded records count: a fetched record in the directory would be another
@@ -3161,6 +3282,40 @@ mod tests {
         assert!(stats.market_skill.is_finite(), "skill over the market is measured on the same fold: {}", stats.market_skill);
         let _ = inputs;
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A model carried over from another venue can never trade real money here,
+    /// so it is not an incumbent worth keeping: the first candidate stamped for
+    /// this venue takes the slot even without clearing the gate. The check is the
+    /// viper's own lane check, so the two cannot disagree.
+    #[test]
+    fn a_model_stranded_by_its_venue_stamp_is_not_an_incumbent() {
+        use super::{expected_kline_denomination, stranded_here};
+        let here = crate::venues::ledger_venue();
+        assert!(stranded_here(Some(here), Some(expected_kline_denomination())).is_none(),
+                "a model stamped for this venue and its currency is not stranded");
+        let why = stranded_here(Some("another-venue"), Some(expected_kline_denomination()))
+            .expect("another venue's stamp strands the model");
+        assert!(why.contains("another-venue") && why.contains(here), "{why}");
+        let other = if expected_kline_denomination() == "usd" { "usdt" } else { "usd" };
+        assert!(stranded_here(Some(here), Some(other)).is_some(), "bars in the other currency strand the model too");
+    }
+
+    /// A young live-recorded store keeps a third of its recorded hours as the
+    /// holdout fold, never under a day, so the first cycles after a migration
+    /// have something to fit on; a store at least three folds deep gets the
+    /// configured fold unchanged.
+    #[test]
+    fn a_young_store_keeps_a_third_of_its_recorded_hours_as_the_fold() {
+        use super::effective_holdout_days;
+        assert_eq!(effective_holdout_days(14, 0), 1, "an empty store: the one-day floor (the row floors refuse the cycle anyway)");
+        assert_eq!(effective_holdout_days(14, 120 * 24), 14, "a deep store: unchanged");
+        assert_eq!(effective_holdout_days(14, 42 * 24), 14, "exactly three folds deep: unchanged");
+        assert_eq!(effective_holdout_days(14, 42 * 24 - 1), 13, "just under three folds: shrinks");
+        assert_eq!(effective_holdout_days(14, 6 * 24), 2);
+        assert_eq!(effective_holdout_days(14, 48), 1, "two days of records: a one-day fold");
+        assert_eq!(effective_holdout_days(14, 3), 1, "never under a day");
+        assert_eq!(effective_holdout_days(0, 120 * 24), 1, "a zero knob reads as one day, as the knob floor does");
     }
 
     /// The shadow-first rule table. Something is always served, and only the

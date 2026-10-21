@@ -2688,6 +2688,34 @@ mod tests {
         assert!((23..=26).all(|j| f[0][j].is_nan()));
     }
 
+    /// The serving model's defect decides whether it is an incumbent at all, and
+    /// which kind: a plan the viper refuses bypasses Auto Adopt, a venue stamp
+    /// that strands it does not, and a model stamped for this venue and plan is
+    /// a real incumbent.
+    #[test]
+    fn a_refused_or_stranded_serving_model_is_not_an_incumbent() {
+        use crate::vipers::gboost_planb_train::{expected_kline_denomination, incumbent_defect, EntryRule, IncumbentDefect, Plan};
+                let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45, hold: false };
+        let model = |entry_rule: &str, venue: Option<&str>, denomination: Option<&str>| {
+            // A booster is needed only to construct the struct; the smallest fit will do.
+            let data = vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
+            let matrix = Matrix::new(&data, 4, 2);
+            let mut b = PerpetualBooster::default().set_iteration_limit(Some(1)).set_num_threads(Some(1));
+            b.fit(&matrix, &[0.0, 1.0, 0.0, 1.0], None, None).unwrap();
+            PlanBModel { booster: b, platt_a: 1.0, platt_b: 0.0, version: "t".into(), trees: 1, zeroed: vec![23, 24, 25, 26], form: TRAINED_FORM, residual_shrink: 1.0, plan: Some([0.20, 0.11, 0.43, 0.75]), posture: Some(plan.posture_stamp().to_string()), entry_rule: Some(entry_rule.to_string()), trained_by: None, created_at: None, calibrated_through: None, holdout_summary: None, gate_passed: true, trained_venue: venue.map(str::to_string), trained_denomination: denomination.map(str::to_string) }
+        };
+        let here = crate::venues::ledger_venue();
+        let denom = expected_kline_denomination();
+        assert_eq!(incumbent_defect(&model("e2", Some(here), Some(denom)), &plan), None, "stamped for this venue and plan: a real incumbent");
+        assert_eq!(incumbent_defect(&model("e1", Some(here), Some(denom)), &plan), Some(IncumbentDefect::Refused), "the production e1 case: refused on every tick");
+        match incumbent_defect(&model("e2", Some("another-venue"), Some(denom)), &plan) {
+            Some(IncumbentDefect::Stranded(why)) => assert!(why.contains("another-venue"), "{why}"),
+            other => panic!("another venue's model is stranded, got {other:?}"),
+        }
+        assert_eq!(incumbent_defect(&model("e1", Some("another-venue"), Some(denom)), &plan), Some(IncumbentDefect::Refused),
+                   "a refusal comes first: the viper never scores it, so where it was trained is moot");
+    }
+
     /// The plan a model was labeled for is compared with the configured plan; the first
     /// production model carries it as `label=B_aggr20`.
     #[test]

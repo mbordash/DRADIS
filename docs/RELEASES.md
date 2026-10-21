@@ -4,6 +4,58 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
+## 1.4.3 (unreleased)
+
+- GBoost: an instance that moved venues no longer keeps the previous venue's model in service indefinitely; the first model trained on the new venue's own recorded markets takes over in the shadow lane, where its record counts toward real money.
+- GBoost: on venues that record their own hourly markets (Kalshi, Polymarket US), training starts after two days of settled records instead of a week, with a holdout fold sized to the young store.
+- Kalshi: the crypto squadron settles on one hourly strike about five minutes into the window and holds it to the close instead of hopping to a hotter strike every few minutes, so the vipers' per-market warmups stop restarting and the training recorder captures most of the hour.
+
+### Detail
+
+**A model from the previous venue.** A migration backup carries the serving
+GBoost model across, and the viper loads it: the venue stamp is read, not
+enforced, so the model scores and records in the shadow lane. The lane decision
+checks the venue before the record, so that record can never promote it, and the
+trainer would have compared each new candidate against it on holdout skill,
+keeping the carried model whenever a candidate trained on days of data scored
+worse than one trained on months. Production has carried such a model since
+moving to Kalshi on October 18. A serving model whose venue or currency stamp
+bars it from real money here is now treated like one the viper refuses: the
+first candidate the store can produce replaces it, in the shadow lane if it has
+not cleared the gate, and the shadow record that counts starts then. The gate
+and the shadow record decide real money exactly as before, and Auto Adopt still
+decides whether a candidate goes into service: with it off, the candidate waits
+in the candidate file for the operator.
+
+**Training on a young store.** A venue without public price history records its
+own hourly markets, and training waited for a week of settled records. With the
+default fourteen-day holdout every record of that week was inside the fold, so
+the first cycle that could fit anything was two weeks out. The wait is now two
+days, and the fold is a third of the recorded span (never under a day) until the
+store is at least three folds deep, after which the configured fold applies
+unchanged. A cycle that still lacks rows reports that on the GBoost card with
+the counts, as before.
+
+**One strike per hour on Kalshi.** Kalshi lists a ladder of strikes for each
+hourly window and the crypto squadron followed volume across it, rescanning
+every two minutes and moving whenever another strike was 5,000 contracts busier.
+On October 20 that was about a dozen moves in seventy minutes. Each move tears
+the squadron down and rebuilds it, restarting the warmups Momentum, Convergence
+and Trend Reversal run on a new market, and the training recorder, which samples
+mids only while the squadron sits on a market and writes at the close, kept a
+median of five minutes of mids per hour, below what a training row needs. The
+squadron now settles on a strike at its first rescan after minute five and holds
+it to the close, even when trading moves to a neighboring strike later in the
+hour; that strike's book then goes quiet and the squadron may sit idle until the
+close, which is the trade-off this makes. The first five minutes still follow
+volume, since every strike is empty at the top of the hour and the first pick is
+a guess, and a market of another underlying is still judged by volume at any
+minute, so a quiet hour's first pick gives way once BTC is clearly busier. The
+held market's volume is now refreshed on every rescan rather than frozen at
+selection, which had made it look colder than its neighbors. A better cadence
+appearing (an hourly market while flying a 15-minute one) still rotates at once,
+and a market the operator deployed was never rotated.
+
 ## 1.4.2 (2026-10-20)
 
 - Control Tower: a finished Kalshi sports or politics market no longer lingers in the "market data has stopped" banner or as stale vipers in the health strip after its squadron retires.

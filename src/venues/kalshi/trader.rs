@@ -113,6 +113,25 @@ const VENUE_STATUS_POLL_SECS: u64 = 60;
 const VENUE_STATUS_TIMEOUT_SECS: u64 = 5;
 /// Rotate only when a candidate has this much more volume (contracts).
 const ROTATION_VOLUME_THRESHOLD: f64 = 5_000.0;
+
+/// How far into an hourly window the loop may still move to a hotter strike of
+/// the same cadence. After this the strike is held to the close.
+///
+/// Kalshi lists a ladder of strikes per hour and volume moves across it as spot
+/// moves, so following volume meant a hop every rescan or two: on 2026-10-20
+/// production moved about a dozen times in seventy minutes. Every hop tears the
+/// squadron down and rebuilds it, restarting the per-market warmups Momentum,
+/// Convergence and Trend Reversal run on a new market, and the hourly recorder, which samples mids only while the squadron sits on a
+/// market and writes at the close, kept a median of five minutes of mids per
+/// hour, under what a training row needs. The first minutes are left free
+/// because at the top of the hour every strike is empty and the first pick is a
+/// guess (19:00:10 that day it was an ETH market with twenty contracts); five
+/// minutes is GBoost's first decision minute by default, so a strike is normally
+/// settled before the viper scores it (the pin lands at the first rescan after,
+/// so by minute seven). The pin holds only against the market's own ladder: a
+/// market of another underlying is still judged by volume, so that ETH pick
+/// gives way once a BTC strike is clearly busier, whatever the minute.
+const HOURLY_SETTLE_SECS: i64 = 300;
 /// Conservative quadratic-fee ceiling (1.75¢/contract at P=0.5) in bps.
 const KALSHI_FEE_BPS: u16 = 175;
 /// SQLite shard key for this venue. A *storage* identity — every Kalshi
@@ -278,7 +297,8 @@ impl KalshiPair {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum MarketMandate {
     /// Chosen by the venue's own volume rotation. May be rotated away from when
-    /// a hotter market appears.
+    /// a hotter market appears, except that an hourly market is held to its
+    /// close once it is `HOURLY_SETTLE_SECS` into its window (`hourly_pinned`).
     Rotating,
     /// Deployed by the operator. Traded until it closes or is stood down —
     /// rotating away from a market someone deliberately chose would be wrong.
@@ -1118,17 +1138,38 @@ fn choose_maker(pairs: &[KalshiPair], primary: &KalshiPair) -> Option<KalshiPair
         .cloned()
 }
 
+/// Is the hourly market `current` past its settle window, so the loop holds it
+/// to the close whatever the rest of its ladder is doing? Only an hourly market
+/// with a published close can be pinned: without the close the window's open is
+/// a guess, and the volume rule is the honest fallback. A missing window length
+/// (the venue always publishes one with an hourly close) reads as the nominal
+/// hour.
+fn hourly_pinned(current: &KalshiPair, now_s: i64) -> bool {
+    match (current.cadence, current.close_time) {
+        (Some(Cadence::Hourly), Some(close)) => {
+            let open_s = close.timestamp() - current.window_secs.unwrap_or(Cadence::Hourly.window_secs());
+            now_s >= open_s + HOURLY_SETTLE_SECS
+        }
+        _ => false,
+    }
+}
+
 /// Should the loop leave `current` for `best`, the candidate `choose_primary`
-/// picked from a fresh scan that excluded `current`?
+/// picked from a fresh scan that excluded `current`, at `now_s`?
 ///
 /// A better cadence always wins: a one-hour market appearing while the loop
 /// flies a 15-minute one is the market the hour-shaped Vipers exist for. Within
-/// the same cadence the old rule holds: only a clearly hotter market, by
+/// the same cadence an hourly market that has settled (`hourly_pinned`) is held
+/// to its close against the rest of its own ladder; a market of another
+/// underlying is still judged by volume, so a quiet hour's first pick (an ETH
+/// market with twenty contracts) gives way once a BTC strike is clearly busier.
+/// Otherwise the old rule holds: only a clearly hotter market, by
 /// `ROTATION_VOLUME_THRESHOLD` contracts, is worth the churn of moving.
-fn should_rotate(current: &KalshiPair, best: &KalshiPair) -> bool {
+fn should_rotate(current: &KalshiPair, best: &KalshiPair, now_s: i64) -> bool {
     let (cur, new) = (Cadence::primary_rank(current.cadence), Cadence::primary_rank(best.cadence));
     if new < cur { return true; }
     if new > cur { return false; }
+    if best.underlying == current.underlying && hourly_pinned(current, now_s) { return false; }
     best.volume > current.volume + ROTATION_VOLUME_THRESHOLD
 }
 
@@ -1166,7 +1207,7 @@ async fn trade_one_market(
     deployment_id: Option<&str>,
 ) -> MarketOutcome {
     let asset = KALSHI_ASSET;
-    let pair = selection.primary;
+    let mut pair = selection.primary;
     let maker_pair = selection.maker;
 
     // ── Raptor intelligence for the market's underlying ─────────────────────
@@ -1410,6 +1451,9 @@ async fn trade_one_market(
     let mut dash_tick = tokio::time::interval(Duration::from_secs(DASHBOARD_SYNC_SECS));
     let mut lifecycle_tick = tokio::time::interval(Duration::from_secs(LIFECYCLE_SYNC_SECS));
     let mut rescan_tick = tokio::time::interval(Duration::from_secs(MARKET_RESCAN_SECS));
+    // The pin is logged once per market, the first time it holds against a
+    // hotter strike; a line every rescan would be noise.
+    let mut pin_logged = false;
     let _ = rescan_tick.tick().await; // skip the immediate first fire
     let mut cooldown_until = Instant::now();
     let mut winding_down = false;
@@ -1477,8 +1521,25 @@ async fn trade_one_market(
                     continue;
                 }
                 let mut candidates = discover_pairs(venue, series).await;
+                // The current market's volume was frozen at selection, so it
+                // always read colder than the ladder around it; refresh it from
+                // the same scan the candidates come from.
+                if let Some(cur) = candidates.iter().find(|p| p.ticker == pair.ticker) { pair.volume = cur.volume; }
                 candidates.retain(|p| p.ticker != pair.ticker);
-                if let Some(best) = choose_primary(&candidates, None).filter(|b| should_rotate(&pair, b)) {
+                let now_s = Utc::now().timestamp();
+                let best = choose_primary(&candidates, None);
+                if let Some(b) = best.as_ref() {
+                    let hotter_same_ladder = b.cadence == pair.cadence && b.underlying == pair.underlying
+                        && b.volume > pair.volume + ROTATION_VOLUME_THRESHOLD;
+                    if !pin_logged && hotter_same_ladder && hourly_pinned(&pair, now_s) {
+                        pin_logged = true;
+                        info!(
+                            "📌 Kalshi hourly held: staying on \"{}\" vol={:.0} to its close; \"{}\" vol={:.0} is hotter, but the strike settled {}s into the window",
+                            pair.question, pair.volume, b.question, b.volume, HOURLY_SETTLE_SECS,
+                        );
+                    }
+                }
+                if let Some(best) = best.filter(|b| should_rotate(&pair, b, now_s)) {
                     {
                         info!(
                             "🔍 Better Kalshi market: \"{}\" {:?} vol={:.0} over \"{}\" {:?} vol={:.0} (threshold {:.0} within a cadence) — rotating",
@@ -3473,12 +3534,55 @@ mod hourly_market_tests {
     fn rotation_prefers_cadence_then_volume() {
         let quarter = pair("KXBTC15M-A", Some(Cadence::FifteenMin), 50_000.0);
         let hour = pair("KXBTCD-HOUR", Some(Cadence::Hourly), 100.0);
-        assert!(should_rotate(&quarter, &hour), "an hourly market appearing is the move the hour-shaped Vipers wait for");
-        assert!(!should_rotate(&hour, &quarter), "never back to the 15-minute market while an hourly is on the board");
+        assert!(should_rotate(&quarter, &hour, 0), "an hourly market appearing is the move the hour-shaped Vipers wait for");
+        assert!(!should_rotate(&hour, &quarter, 0), "never back to the 15-minute market while an hourly is on the board");
         let hotter_hour = pair("KXBTCD-HOUR-2", Some(Cadence::Hourly), 100.0 + ROTATION_VOLUME_THRESHOLD + 1.0);
         let warmer_hour = pair("KXBTCD-HOUR-3", Some(Cadence::Hourly), 100.0 + ROTATION_VOLUME_THRESHOLD - 1.0);
-        assert!(should_rotate(&hour, &hotter_hour));
-        assert!(!should_rotate(&hour, &warmer_hour));
+        assert!(should_rotate(&hour, &hotter_hour, 0), "no published close: the volume rule, not a guessed pin");
+        assert!(!should_rotate(&hour, &warmer_hour, 0));
+    }
+
+    /// Once an hourly market is five minutes into its window the loop holds it
+    /// to the close: a hotter strike no longer moves it. Before that the volume
+    /// rule still applies, so the first minutes after the top of the hour, when
+    /// every strike is empty and the first pick is a guess, can correct
+    /// themselves. A better cadence still wins at any minute.
+    #[test]
+    fn an_hourly_market_is_held_to_its_close_once_settled() {
+        let close = chrono::DateTime::<Utc>::from_timestamp(1_792_540_800, 0).unwrap();
+        let open = close.timestamp() - 3600;
+        let mut hour = pair("KXBTCD-HOUR-A", Some(Cadence::Hourly), 100.0);
+        hour.close_time = Some(close);
+        let hotter = pair("KXBTCD-HOUR-B", Some(Cadence::Hourly), 100.0 + ROTATION_VOLUME_THRESHOLD + 1.0);
+        assert!(hourly_pinned(&hour, open + HOURLY_SETTLE_SECS) && !hourly_pinned(&hour, open + HOURLY_SETTLE_SECS - 1));
+        assert!(should_rotate(&hour, &hotter, open + 10), "ten seconds in: the pick may still correct itself");
+        assert!(should_rotate(&hour, &hotter, open + HOURLY_SETTLE_SECS - 1));
+        assert!(!should_rotate(&hour, &hotter, open + HOURLY_SETTLE_SECS), "settled: held to the close");
+        assert!(!should_rotate(&hour, &hotter, close.timestamp() - 60));
+        // The venue's own window length, not the cadence's nominal one, places the open.
+        let mut odd = hour.clone();
+        odd.window_secs = Some(3660);
+        assert!(!should_rotate(&odd, &hotter, open - 60 + HOURLY_SETTLE_SECS) && should_rotate(&odd, &hotter, open - 60 + HOURLY_SETTLE_SECS - 1));
+        // No published window length: the cadence's nominal hour places the open.
+        let mut nominal = hour.clone();
+        nominal.window_secs = None;
+        assert!(!should_rotate(&nominal, &hotter, open + HOURLY_SETTLE_SECS) && should_rotate(&nominal, &hotter, open + HOURLY_SETTLE_SECS - 1));
+        // Another underlying is never pinned against: a quiet hour's first pick
+        // (ETH with twenty contracts) gives way once BTC is clearly busier, but
+        // the ETH market holds against its own ladder.
+        let mut eth = pair("KXETHD-HOUR-A", Some(Cadence::Hourly), 20.0);
+        eth.underlying = "eth";
+        eth.close_time = Some(close);
+        let btc_busier = pair("KXBTCD-HOUR-E", Some(Cadence::Hourly), 20.0 + ROTATION_VOLUME_THRESHOLD + 1.0);
+        assert!(should_rotate(&eth, &btc_busier, open + 1800), "a pinned ETH market still gives way to a clearly busier BTC one");
+        let mut eth_busier = pair("KXETHD-HOUR-B", Some(Cadence::Hourly), 20.0 + ROTATION_VOLUME_THRESHOLD + 1.0);
+        eth_busier.underlying = "eth";
+        assert!(!should_rotate(&eth, &eth_busier, open + 1800), "but holds against its own ladder");
+        let mut quarter = pair("KXBTC15M-A", Some(Cadence::FifteenMin), 50_000.0);
+        quarter.close_time = Some(close);
+        let any_hour = pair("KXBTCD-HOUR-C", Some(Cadence::Hourly), 1.0);
+        assert!(should_rotate(&quarter, &any_hour, open + 3000), "a better cadence still wins; the pin is for strikes of the same hour");
+        assert!(!should_rotate(&hour, &quarter, open + 10), "and a worse one never does, settled or not");
     }
 }
 
