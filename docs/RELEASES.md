@@ -4,6 +4,43 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
+## 1.5.0 (unreleased)
+
+- Includes the 1.4.3 changes below (GBoost venue handling, young-store training, Kalshi hourly strike pinning), which ran on production from 2026-10-20 but were never listed as a Marketplace version.
+- New Anchor viper, simulated only: on hourly crypto markets it takes the index level from the market's own price and the move from the oracle feed, prices the contract through its gamma, and records a simulated taker buy of the cheap side held to settlement. It places no order in this release; its ledger and the simulated rows in the trade list are the record real money will be gated on. Off by default, on the Anchor card of every crypto squadron.
+
+### Detail
+
+**Why another viper.** October's range regime (realized volatility near 31%
+annualized, seven in ten hours moving under a quarter of a percent) left the
+directional vipers idle, as they should be. Research on 307 settled Kalshi hours
+and 75 fully recorded ones found no volatility premium to sell: the hourly ladder
+is calibrated within two points at every price and every level-based range
+structure nets zero or less after the taker fee. It also found that a fair-value
+model fed from an external feed plus a fixed basis is anti-informative late in
+the hour, because the venue settles on an index the engine never sees and a
+small level error is a large share of the remaining sigma. What the market is
+slow at is the move, not the level.
+
+**What Anchor does.** It reads the index level the market's own YES mid implies
+under the normal model, keeps a rolling median of those readings from one to ten
+minutes ago as its anchor, and prices the contract from the oracle's move since
+then. When the anchored fair clears the ask by four cents net of fee, inside the
+last thirty to five minutes of the hour, within one sigma of the strike and at an
+ask between 0.20 and 0.60, it records a buy of ten contracts and holds to
+settlement. Every input is already in the strategy context, so the same code
+runs on Polymarket International, Polymarket US and Kalshi; the anchor absorbs
+whatever offset sits between the feed and each venue's settlement index.
+
+**Simulated, and why.** The backtest's record came from one week, one regime and
+fills read off prints other takers received. The viper therefore ships as a
+shadow lane: each would-be entry is written to its own ledger with the model's
+reading at the time, settled through the venue's own resolution once the market
+closes, and booked into the trade list as a simulated row that stays out of
+realized P&L. Its card on the squadron page shows the anchor, the fair against
+the ask, and the lane's running record. Real money is a later release, gated on
+that record.
+
 ## 1.4.3 (unreleased)
 
 - GBoost: an instance that moved venues no longer keeps the previous venue's model in service indefinitely; the first model trained on the new venue's own recorded markets takes over in the shadow lane, where its record counts toward real money.

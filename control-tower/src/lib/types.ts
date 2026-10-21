@@ -271,6 +271,23 @@ export interface DynamicConfig {
   bookline_max_open_markets?: number;
   bookline_resting_tp_edge?: string;
 
+  // ── Anchor Viper (hourly crypto, market-anchored gamma, simulated lane) ────
+  anchor_enabled?: boolean;
+  anchor_contracts?: string;
+  anchor_max_exposure_usdc?: string;
+  anchor_min_edge?: string;
+  anchor_max_z?: string;
+  anchor_min_entry_price?: string;
+  anchor_max_entry_price?: string;
+  anchor_min_secs_to_close?: number;
+  anchor_max_secs_to_close?: number;
+  anchor_min_age_secs?: number;
+  anchor_max_age_secs?: number;
+  anchor_min_samples?: number;
+  anchor_min_span_secs?: number;
+  anchor_obi_adverse_block?: string;
+  anchor_max_vol_annualized?: string;
+
   // ── Helm Viper (the operator's own position, posture-enforced exit) ─────────
   helm_enabled?: boolean;
   helm_live_enabled?: boolean;

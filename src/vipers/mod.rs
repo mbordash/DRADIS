@@ -30,6 +30,7 @@ pub mod gboost_planb_record;
 pub mod trendreversal_impl;
 pub mod convergence_impl;
 pub mod fairvalue_impl;
+pub mod anchor_impl;
 /// Bookline: the maker-first sports viper (ghost-only, disabled by default).
 pub mod bookline_impl;
 pub mod bookline_board;

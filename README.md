@@ -442,6 +442,7 @@ Eleven specialized Viper strategy classes. Each Viper is an autonomous tactical 
 | **GBoost**       | Hourly       | Engine-trained gradient-boosted model (plan B), fitted as a residual over the market mid and licensed for real money only when it out-forecasts the price on a holdout: scores both sides once a minute from Binance klines and funding, enters as a taker when P(win) clears break-even plus a margin, exits by the configured posture (resting take-profit and taker stop, or held to settlement) |
 | **TrendCapture** | Window/Daily | Exploits sustained multi-minute oracle drift (10m + 60m) before Polymarket reprices; Kelly-fractional sizing, OBI veto, trend-reversal exit                                               |
 | **FairValue**    | Window/Daily | Compare fair value of asset, compare market ask, enter when discount exceeds margin                                                                                                       |
+| **Anchor** *(trial)* | Hourly | Market-anchored gamma: takes the index level from the market's own price (rolling median of the level the mid implies, one to ten minutes back) and the move from the oracle feed, buys the cheap side as a taker when the anchored fair clears the ask net of fee, holds to settlement. **Simulated** — it keeps its own ledger and places no venue order
 | **Convergence**  | Hourly       | Macro-conviction directional Viper — opens YES/NO only when the Tide institutional pulse, Derivatives CVD, and OI all agree on a direction. BTC-only, US-cash-hours-only, fixed tiny size |
 | **Bookline** *(trial)* | Sports game | Sports moneylines, maker-first: rests a bid under the vig-free bookmaker consensus and holds to fee-free settlement. Pulls on adverse line movement or approaching kick-off. **Simulated** — it keeps its own ledger and places no venue order (see below) |
 | **Helm** *(beta)* | Single market | The operator's own conviction, entered through the engine. You state a thesis, a probability, a falsification condition and an exit posture; DRADIS validates the posture against the book, prices the fees, and then enforces the exit. **Live orders ship off**, and only the Polymarket International path has ever run (see below) |
@@ -490,7 +491,7 @@ Markets are classified into domains that determine which Raptors and Vipers are 
 
 | Market Class | Raptors | Vipers |
 |--------------|---------|--------|
-| `crypto` | Price, Funding, Derivatives, Tide | All nine crypto Vipers |
+| `crypto` | Price, Funding, Derivatives, Tide | All ten crypto Vipers |
 | `sports` | Sports (cross-book consensus) | Bookline, Arbitrage, Maker (venue-agnostic) |
 | `politics` | Politics (roadmap) | Arbitrage, Maker (venue-agnostic) |
 

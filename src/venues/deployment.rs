@@ -152,6 +152,7 @@ pub(crate) fn apply_viper_budgets(
             // `viper_kinds_all_have_a_budget_slot` pins the two lists together.
             "fairvalue"    => &mut cfg.fairvalue_max_exposure_usdc,
             "bookline"     => &mut cfg.bookline_max_exposure_usdc,
+            "anchor"       => &mut cfg.anchor_max_exposure_usdc,
             // Helm's cap is the ceiling on the operator's own notional. It is
             // read from the squadron's row like every other, and Helm squadrons
             // share one position map, so a budget set here caps the sum.
@@ -412,7 +413,7 @@ mod budget_coverage_tests {
     /// beside the match above so the two are edited together.
     const BUDGETED_KINDS: &[&str] = &[
         "arbitrage", "time_decay", "momentum", "maker", "basis",
-        "gboost", "trendcapture", "convergence", "fairvalue", "bookline", "helm",
+        "gboost", "trendcapture", "convergence", "fairvalue", "bookline", "anchor", "helm",
     ];
 
     /// A viper seeded into `viper_kind` with no arm in the budget match has its

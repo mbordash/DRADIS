@@ -965,6 +965,58 @@ pub const BOOKLINE_MAX_EXPOSURE_USDC: Decimal = dec!(10.0);
 pub const BOOKLINE_MAX_OPEN_MARKETS: usize = 2;
 
 // ============================================================================
+// ANCHOR VIPER (2026-10-21): market-anchored gamma on hourly crypto markets
+// ============================================================================
+// The level comes from the market, the move from the feed. The viper keeps a
+// rolling median of the index level the market's own mid implies (one to ten
+// minutes back) as its anchor, prices the contract from the oracle's move since
+// then through the contract's gamma, and buys the cheap side as a taker when the
+// anchored fair clears the ask by a fixed edge net of fee. Exit is settlement and
+// nothing else: a resting take-profit erased the edge in the spike's backtest.
+// See docs/spikes/sideways-regime-spike.md.
+//
+// Ships OFF and simulated only. Phase 0 is a shadow ledger (`anchor_shadow`)
+// settled through the venue's resolver; real money is gated on that record.
+/// Run the viper's shadow lane at all. Nothing in this build places an order.
+pub const ENABLE_ANCHOR_TRADING: bool = false;
+/// Contracts per simulated entry. The spike measured ten per signal minute.
+pub const ANCHOR_CONTRACTS: Decimal = dec!(5);
+/// Ceiling on the lane's simulated notional at risk.
+pub const ANCHOR_MAX_EXPOSURE_USDC: Decimal = dec!(6);
+/// Required `fair − ask − fee(ask)`, in probability points. Four cents is where
+/// the backtest's buy candidates turned positive against a negative control.
+pub const ANCHOR_MIN_EDGE: Decimal = dec!(0.04);
+/// Furthest the anchored level may sit from the strike, in sigmas of the
+/// remaining window. Beyond one sigma the edge went negative.
+pub const ANCHOR_MAX_Z: Decimal = dec!(1.0);
+/// Entry price band for the side being bought. The cheap side only: above 0.60
+/// the record was flat to negative.
+pub const ANCHOR_MIN_ENTRY_PRICE: Decimal = dec!(0.20);
+pub const ANCHOR_MAX_ENTRY_PRICE: Decimal = dec!(0.60);
+/// Entry window as seconds to the close: minutes 30 to 55 of the hour.
+pub const ANCHOR_MIN_SECS_TO_CLOSE: i64 = 300;
+pub const ANCHOR_MAX_SECS_TO_CLOSE: i64 = 1800;
+/// Age band of the implied-basis samples the anchor is read from. Younger than
+/// a minute the sample has not had time to be wrong yet; older than ten minutes
+/// it describes a different hour.
+pub const ANCHOR_MIN_AGE_SECS: i64 = 60;
+pub const ANCHOR_MAX_AGE_SECS: i64 = 600;
+/// Fewest samples, spanning at least this long, before the anchor is readable.
+pub const ANCHOR_MIN_SAMPLES: i64 = 20;
+pub const ANCHOR_MIN_SPAN_SECS: i64 = 300;
+/// Order-book imbalance on the side being bought below which the entry is
+/// refused: -1 is an all-offer book with no bid support.
+pub const ANCHOR_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.60);
+/// Trailing-hour realized vol of the oracle, annualized, above which the viper
+/// does not trade. The regime gate, and the thesis in one number: on 828
+/// Polymarket International hours and 71 Kalshi hours, below 35% the model's
+/// buys won and its control lost on both venues; above it the model was noise
+/// (Polymarket) or inverted (Kalshi). The market reprices a fast tape faster
+/// than a one-to-ten-minute anchor can follow.
+pub const ANCHOR_MAX_VOL_ANNUALIZED: Decimal = dec!(0.35);
+
+
+// ============================================================================
 // HELM — the operator's own position, with the engine holding the exit
 // ============================================================================
 

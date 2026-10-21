@@ -83,7 +83,7 @@ pub fn scope_for_group(group: &str) -> Option<ConfigScope> {
         // they belong to neither card alone. Squadron, because the vipers read them
         // from the per-tick squadron snapshot.
         "Sports Lines" => ConfigScope::Squadron,
-        "Arbitrage" | "Basis" | "Bookline" | "Convergence" | "FairValue" | "GBoost"
+        "Anchor" | "Arbitrage" | "Basis" | "Bookline" | "Convergence" | "FairValue" | "GBoost"
         | "Maker" | "Momentum" | "Time Decay" | "TrendReversal" => ConfigScope::Squadron,
         // Helm's posture knobs: read from the squadron snapshot like every
         // viper, overridable per position on the squadron page.
@@ -1203,6 +1203,63 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Maker will not quote a game whose books disagree by more than this (highest minus lowest book probability). A wide line is a soft line: the books themselves do not know the price, so a passive quote is likelier to be picked off than filled.").classes(&["sports"]));
         v.push(F::new("FairValue", Some("enable_sports_fairvalue"), "sports_fairvalue_min_consensus", "Sports Favorite Floor", "price", true,
             "Smallest bookmaker consensus a sports FairValue entry will buy. The pre-registered hypothesis is favorite-side only (0.55 and above); the longshot side is its declared negative control, and the de-vig method inflates consensus exactly there, so cheap outcomes show an 'edge' that is an artifact. Setting this below 0.55 trades outside the hypothesis the evidence is being gathered for.").classes(&["sports"]));
+        // ── Anchor (hourly crypto, market-anchored gamma, simulated lane) ────
+        // MUST equal the Control Tower card name in `VIPER_DEFS` (see Bookline).
+        {
+            let g = "Anchor"; let e = Some("anchor_enabled");
+            v.push(F::new(g, e, "anchor_enabled", "Enabled", "bool", false,
+                "Run the Anchor shadow lane. The viper takes the index level from the market's own price (a rolling \
+                 median of the level the YES mid implies, one to ten minutes back) and the move from the oracle feed \
+                 since then, prices the hourly contract through its gamma, and records a simulated taker buy of the \
+                 cheap side when that fair clears the ask by the Min Edge net of fee, held to settlement. Nothing in \
+                 this build places an order: every entry goes to its own ledger and appears in the trade list as a \
+                 simulated row. Ships off.").classes(&["crypto"]));
+            v.push(F::new(g, e, "anchor_contracts", "Contracts", "decimal", false,
+                "Contracts per simulated entry. The research measured ten per signal minute; the ask must show at \
+                 least this much size or the entry is refused.").min(1.0).step(1.0).classes(&["crypto"]));
+            v.push(F::new(g, e, "anchor_max_exposure_usdc", "Max Exposure", "usd", false,
+                "Ceiling on the lane's simulated notional at risk across its open rows.").min(0.0).step(1.0).unit("USDC").classes(&["crypto"]));
+            v.push(F::new(g, e, "anchor_min_edge", "Min Edge", "price", false,
+                "Required fair minus ask minus the taker fee at that ask, in probability points. Four cents is where \
+                 the backtest's buy candidates turned positive while the prints it called expensive lost.").range(0.0, 0.5).step(0.005).classes(&["crypto"]));
+            v.push(F::new(g, e, "anchor_max_z", "Max Strike Distance", "decimal", true,
+                "Furthest the anchored level may sit from the strike, in sigmas of the remaining window. Inside half a \
+                 sigma the record was strongest; beyond one it went negative, because a far-from-strike contract has \
+                 little gamma left for the feed's move to act on.").range(0.1, 3.0).step(0.1).classes(&["crypto"]));
+            v.push(F::new(g, e, "anchor_min_entry_price", "Min Entry Price", "price", true,
+                "Lowest ask the lane will buy. Below 0.20 the fee is a large share of the price and the inverse-normal \
+                 reading behind the anchor is at its noisiest.").range(0.01, 0.99).step(0.01).classes(&["crypto"]));
+            v.push(F::new(g, e, "anchor_max_entry_price", "Max Entry Price", "price", true,
+                "Asks at or above this are refused. The edge lived on the cheap side: 0.20 to 0.40 was best, 0.40 to 0.60 \
+                 positive, above 0.60 flat to negative.").range(0.01, 0.99).step(0.01).classes(&["crypto"]));
+            v.push(F::new(g, e, "anchor_min_secs_to_close", "Min Time To Close", "secs", true,
+                "No entry inside this many seconds of the close. The last five minutes carried no edge once the fee \
+                 was paid.").min(0.0).step(30.0).unit("s").classes(&["crypto"]));
+            v.push(F::new(g, e, "anchor_max_secs_to_close", "Max Time To Close", "secs", true,
+                "No entry earlier than this many seconds before the close. Before minute 30 the anchor is young and \
+                 the record was negative; minutes 30 to 45 carried most of the edge.").min(60.0).step(60.0).unit("s").classes(&["crypto"]));
+            v.push(F::new(g, e, "anchor_min_age_secs", "Anchor Min Sample Age", "secs", true,
+                "A basis sample younger than this is not yet part of the anchor: the whole point is to compare the \
+                 feed's move against where the market priced the level a little while ago.").min(0.0).step(10.0).unit("s").classes(&["crypto"]));
+            v.push(F::new(g, e, "anchor_max_age_secs", "Anchor Max Sample Age", "secs", true,
+                "A basis sample older than this drops out of the anchor; it describes a different state of the \
+                 hour.").min(60.0).step(30.0).unit("s").classes(&["crypto"]));
+            v.push(F::new(g, e, "anchor_min_samples", "Anchor Min Samples", "int", true,
+                "Fewest basis samples in the age band before the anchor is readable. A median of a handful of \
+                 samples is a guess, and the viper holds instead.").min(1.0).step(1.0).classes(&["crypto"]));
+            v.push(F::new(g, e, "anchor_min_span_secs", "Anchor Min Span", "secs", true,
+                "The samples behind the anchor must stretch over at least this long, so one burst of prints cannot \
+                 set the level by itself.").min(0.0).step(30.0).unit("s").classes(&["crypto"]));
+            v.push(F::new(g, e, "anchor_obi_adverse_block", "OBI Adverse Block", "decimal", true,
+                "Refuse the entry when the book on the side being bought is this offer-heavy. OBI = (bid depth − ask \
+                 depth) / total; −1.0 is an all-offer book with no bid support.").range(-1.0, 0.0).step(0.05).classes(&["crypto"]));
+            v.push(F::new(g, e, "anchor_max_vol_annualized", "Max Realized Vol", "decimal", false,
+                "The regime gate. Trailing-hour realized volatility of the oracle, annualized (0.35 = 35%), above which \
+                 the viper holds. Below this the anchored model's buys won and its control lost on both venues studied; \
+                 above it the model was noise on Polymarket International and inverted on Kalshi, because a fast tape is \
+                 repriced by the market faster than a one-to-ten-minute anchor can follow. This is the number that makes \
+                 Anchor a sideways-regime viper.").range(0.05, 2.0).step(0.05).classes(&["crypto"]));
+        }
         // ── Bookline (sports, maker-first, ghost-only) ────────────────────────
         // MUST equal the Control Tower card name in `VIPER_DEFS`: both ViperCard and
         // the advanced modal filter on `group === viper.name`, so "Bookline Viper"

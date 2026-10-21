@@ -24,6 +24,7 @@ use crate::vipers::gboost_planb::GboostPlanBStrategy;
 use crate::vipers::trendreversal_impl::TrendReversalStrategyImpl;
 use crate::vipers::convergence_impl::ConvergenceStrategyImpl;
 use crate::vipers::fairvalue_impl::FairValueStrategyImpl;
+use crate::vipers::anchor_impl::AnchorStrategy;
 use crate::vipers::bookline_impl::BooklineStrategy;
 use crate::vipers::helm_impl::HelmStrategy;
 use crate::config;
@@ -123,6 +124,9 @@ impl StrategyRegistry {
             Box::new(TrendReversalStrategyImpl::new())      as Box<dyn Strategy>,
             Box::new(ConvergenceStrategyImpl::new())       as Box<dyn Strategy>,
             Box::new(FairValueStrategyImpl::new())         as Box<dyn Strategy>,
+            // Market-anchored gamma on hourly crypto markets. Shadow lane only in
+            // this build: it keeps its own ledger and places no venue order.
+            Box::new(AnchorStrategy::new())                as Box<dyn Strategy>,
             Box::new(BooklineStrategy::new())              as Box<dyn Strategy>,
             // The operator's viper. Selected only by the `helm` class, which
             // carries nothing else; on every other class the kind filter below
@@ -182,6 +186,9 @@ impl StrategyRegistry {
             "ConvergenceStrategy",
             "FairValueStrategy",
             "BooklineStrategy",
+            // Anchor is deliberately absent while it is shadow-only: it holds no
+            // real position and never exits one, so an on-chain orphan must not
+            // be adopted under its name. Add it here with the live path.
             // Last, so it is the lowest adoption priority: an on-chain orphan
             // that no running viper claims must never be adopted as the
             // operator's conviction. Inside a Helm squadron the running set is
@@ -216,6 +223,7 @@ pub fn strategy_name_to_kind(name: &str) -> &'static str {
         "ConvergenceStrategy"   => "convergence",
         "FairValueStrategy"     => "fairvalue",
         "BooklineStrategy"      => "bookline",
+        crate::vipers::anchor_impl::STRATEGY_NAME => crate::vipers::anchor_impl::KIND,
         "TrendReversalStrategy" => "trendcapture",
         "TrendCaptureStrategy"  => "trendcapture", // legacy alias (pre-rename positions)
         crate::vipers::helm_impl::STRATEGY_NAME => crate::vipers::helm_impl::KIND,
@@ -286,10 +294,10 @@ mod class_filter_tests {
     async fn the_crypto_suite_does_not_include_helm() {
         let crypto = kinds(&[
             "arbitrage", "maker", "momentum", "gboost", "basis",
-            "time_decay", "trendcapture", "convergence", "fairvalue",
+            "time_decay", "trendcapture", "convergence", "fairvalue", "anchor",
         ]);
         let got = StrategyRegistry::create_strategies_for_kinds(&crypto);
-        assert_eq!(got.len(), 9);
+        assert_eq!(got.len(), 10);
         assert!(!got.iter().any(|s| s.name() == "HelmStrategy"));
     }
 

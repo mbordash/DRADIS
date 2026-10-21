@@ -652,6 +652,14 @@ export const VIPER_DEFS: ViperDef[] = [
     description: 'Sports moneylines, maker-first: rests a bid under the bookmaker consensus and holds to fee-free settlement. Simulated lane — it keeps its own books and places no venue order',
   },
   {
+    name: 'Anchor',
+    enableKey: 'anchor_enabled',
+    accentColor: 'sky',
+    statusKey: 'anchor',
+    strategyName: 'AnchorStrategy',
+    description: 'Hourly crypto, market-anchored gamma: takes the index level from the market\'s own price and the move from the oracle feed, buys the cheap side as a taker when the anchored fair clears the ask, holds to settlement. Simulated lane — it keeps its own ledger and places no venue order',
+  },
+  {
     name: 'Helm',
     enableKey: 'helm_enabled',
     instanceSwitch: 'Helm',

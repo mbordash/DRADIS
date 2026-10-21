@@ -279,6 +279,21 @@ fn default_bookline_pull_feed_age_secs() -> i64 { config::BOOKLINE_PULL_FEED_AGE
 fn default_bookline_pull_on_adverse_drift() -> Decimal { config::BOOKLINE_PULL_ON_ADVERSE_DRIFT }
 fn default_bookline_pull_before_start_secs() -> i64 { config::BOOKLINE_PULL_BEFORE_START_SECS }
 fn default_bookline_trade_size_usdc() -> Decimal { config::BOOKLINE_TRADE_SIZE_USDC }
+fn default_anchor_enabled()            -> bool    { config::ENABLE_ANCHOR_TRADING }
+fn default_anchor_contracts()          -> Decimal { config::ANCHOR_CONTRACTS }
+fn default_anchor_max_exposure_usdc()  -> Decimal { config::ANCHOR_MAX_EXPOSURE_USDC }
+fn default_anchor_min_edge()           -> Decimal { config::ANCHOR_MIN_EDGE }
+fn default_anchor_max_z()              -> Decimal { config::ANCHOR_MAX_Z }
+fn default_anchor_min_entry_price()    -> Decimal { config::ANCHOR_MIN_ENTRY_PRICE }
+fn default_anchor_max_entry_price()    -> Decimal { config::ANCHOR_MAX_ENTRY_PRICE }
+fn default_anchor_min_secs_to_close()  -> i64     { config::ANCHOR_MIN_SECS_TO_CLOSE }
+fn default_anchor_max_secs_to_close()  -> i64     { config::ANCHOR_MAX_SECS_TO_CLOSE }
+fn default_anchor_min_age_secs()       -> i64     { config::ANCHOR_MIN_AGE_SECS }
+fn default_anchor_max_age_secs()       -> i64     { config::ANCHOR_MAX_AGE_SECS }
+fn default_anchor_min_samples()        -> i64     { config::ANCHOR_MIN_SAMPLES }
+fn default_anchor_min_span_secs()      -> i64     { config::ANCHOR_MIN_SPAN_SECS }
+fn default_anchor_obi_adverse_block()  -> Decimal { config::ANCHOR_OBI_ADVERSE_BLOCK }
+fn default_anchor_max_vol_annualized() -> Decimal { config::ANCHOR_MAX_VOL_ANNUALIZED }
 fn default_bookline_max_exposure_usdc() -> Decimal { config::BOOKLINE_MAX_EXPOSURE_USDC }
 fn default_helm_enabled() -> bool { config::HELM_ENABLED }
 fn default_helm_live_enabled() -> bool { config::HELM_LIVE_ENABLED }
@@ -1305,6 +1320,43 @@ pub struct DynamicConfig {
     #[serde(default = "default_bookline_max_exposure_usdc")]
     pub bookline_max_exposure_usdc: Decimal,
 
+    // ── Anchor Viper (hourly crypto, market-anchored gamma, simulated lane) ───
+    // The level from the market, the move from the feed; taker at the ask, held
+    // to settlement. Ships off: Phase 1 (real money) is gated on the shadow
+    // record. See `vipers::anchor_impl`.
+    #[serde(default = "default_anchor_enabled")]
+    pub anchor_enabled: bool,
+    #[serde(default = "default_anchor_contracts")]
+    pub anchor_contracts: Decimal,
+    #[serde(default = "default_anchor_max_exposure_usdc")]
+    pub anchor_max_exposure_usdc: Decimal,
+    #[serde(default = "default_anchor_min_edge")]
+    pub anchor_min_edge: Decimal,
+    #[serde(default = "default_anchor_max_z")]
+    pub anchor_max_z: Decimal,
+    #[serde(default = "default_anchor_min_entry_price")]
+    pub anchor_min_entry_price: Decimal,
+    #[serde(default = "default_anchor_max_entry_price")]
+    pub anchor_max_entry_price: Decimal,
+    #[serde(default = "default_anchor_min_secs_to_close")]
+    pub anchor_min_secs_to_close: i64,
+    #[serde(default = "default_anchor_max_secs_to_close")]
+    pub anchor_max_secs_to_close: i64,
+    #[serde(default = "default_anchor_min_age_secs")]
+    pub anchor_min_age_secs: i64,
+    #[serde(default = "default_anchor_max_age_secs")]
+    pub anchor_max_age_secs: i64,
+    #[serde(default = "default_anchor_min_samples")]
+    pub anchor_min_samples: i64,
+    #[serde(default = "default_anchor_min_span_secs")]
+    pub anchor_min_span_secs: i64,
+    #[serde(default = "default_anchor_obi_adverse_block")]
+    pub anchor_obi_adverse_block: Decimal,
+    /// The regime gate: trailing-hour realized vol, annualized, above which the
+    /// viper holds. See `config::ANCHOR_MAX_VOL_ANNUALIZED`.
+    #[serde(default = "default_anchor_max_vol_annualized")]
+    pub anchor_max_vol_annualized: Decimal,
+
     // ── Helm: the operator's own position ───────────────────────────────────
     /// Kill switch for the path that spends: off freezes every Helm squadron at
     /// "intent acknowledged". The intents themselves are untouched.
@@ -1687,6 +1739,21 @@ impl Default for DynamicConfig {
             bookline_pull_before_start_secs: config::BOOKLINE_PULL_BEFORE_START_SECS,
             bookline_trade_size_usdc: config::BOOKLINE_TRADE_SIZE_USDC,
             bookline_max_exposure_usdc: config::BOOKLINE_MAX_EXPOSURE_USDC,
+            anchor_enabled: config::ENABLE_ANCHOR_TRADING,
+            anchor_contracts: config::ANCHOR_CONTRACTS,
+            anchor_max_exposure_usdc: config::ANCHOR_MAX_EXPOSURE_USDC,
+            anchor_min_edge: config::ANCHOR_MIN_EDGE,
+            anchor_max_z: config::ANCHOR_MAX_Z,
+            anchor_min_entry_price: config::ANCHOR_MIN_ENTRY_PRICE,
+            anchor_max_entry_price: config::ANCHOR_MAX_ENTRY_PRICE,
+            anchor_min_secs_to_close: config::ANCHOR_MIN_SECS_TO_CLOSE,
+            anchor_max_secs_to_close: config::ANCHOR_MAX_SECS_TO_CLOSE,
+            anchor_min_age_secs: config::ANCHOR_MIN_AGE_SECS,
+            anchor_max_age_secs: config::ANCHOR_MAX_AGE_SECS,
+            anchor_min_samples: config::ANCHOR_MIN_SAMPLES,
+            anchor_min_span_secs: config::ANCHOR_MIN_SPAN_SECS,
+            anchor_obi_adverse_block: config::ANCHOR_OBI_ADVERSE_BLOCK,
+            anchor_max_vol_annualized: config::ANCHOR_MAX_VOL_ANNUALIZED,
             helm_enabled: config::HELM_ENABLED,
             helm_live_enabled: config::HELM_LIVE_ENABLED,
             helm_max_exposure_usdc: config::HELM_MAX_EXPOSURE_USDC,
@@ -2032,6 +2099,7 @@ impl DynamicConfig {
             "fairvalue"    => self.enable_fairvalue,
             "trendcapture" => self.enable_trendcapture,
             "bookline"     => self.bookline_enabled,
+            "anchor"       => self.anchor_enabled,
             // The engine's kill switch for the one path that spends; the intent
             // is still the operator's declaration. `helm_live_enabled` gates
             // real orders separately.
@@ -2322,6 +2390,7 @@ impl DynamicConfig {
             "fairvalue"    => self.enable_fairvalue,
             "trendcapture" => self.enable_trendcapture,
             "bookline"     => self.bookline_enabled,
+            "anchor"       => self.anchor_enabled,
             "helm"         => self.helm_enabled,
             _ => return None,
         })
@@ -2681,6 +2750,11 @@ mod tests {
             "bookline_pull_before_start_secs",
             "bookline_trade_size_usdc",
             "bookline_max_exposure_usdc",
+            "anchor_enabled", "anchor_contracts", "anchor_max_exposure_usdc", "anchor_min_edge", "anchor_max_z",
+            "anchor_min_entry_price", "anchor_max_entry_price", "anchor_min_secs_to_close", "anchor_max_secs_to_close",
+            "anchor_min_age_secs", "anchor_max_age_secs", "anchor_min_samples", "anchor_min_span_secs",
+            "anchor_obi_adverse_block",
+            "anchor_max_vol_annualized",
             "helm_enabled", "helm_live_enabled", "helm_max_exposure_usdc",
             "helm_max_open_intents", "helm_entry_window_secs", "helm_min_secs_to_close",
             "helm_fee_verdict_enforce", "helm_fee_max_ratio", "helm_fee_max_notional_pct",
@@ -3098,7 +3172,7 @@ mod exit_retry_cooldown_tests {
     #[test]
     fn strategy_enabled_follows_each_vipers_own_flag() {
         let mut dc = DynamicConfig::default();
-        let setters: [(&str, fn(&mut DynamicConfig, bool)); 9] = [
+        let setters: [(&str, fn(&mut DynamicConfig, bool)); 10] = [
             ("ArbitrageStrategy",     |d, v| d.enable_arbitrage = v),
             ("MakerStrategy",         |d, v| d.enable_maker = v),
             ("MomentumStrategy",      |d, v| d.enable_momentum = v),
@@ -3108,6 +3182,7 @@ mod exit_retry_cooldown_tests {
             ("ConvergenceStrategy",   |d, v| d.enable_convergence = v),
             ("FairValueStrategy",     |d, v| d.enable_fairvalue = v),
             ("TrendReversalStrategy", |d, v| d.enable_trendcapture = v),
+            ("AnchorStrategy",        |d, v| d.anchor_enabled = v),
         ];
         for (name, set) in setters {
             set(&mut dc, true);

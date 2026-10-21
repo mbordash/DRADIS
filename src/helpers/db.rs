@@ -945,6 +945,10 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
         ("crypto", "arbitrage"), ("crypto", "maker"), ("crypto", "momentum"),
         ("crypto", "gboost"),    ("crypto", "basis"), ("crypto", "time_decay"),
         ("crypto", "trendcapture"), ("crypto", "convergence"), ("crypto", "fairvalue"),
+        // Anchor prices the hourly from the market's own implied level and the
+        // feed's move since; it needs a strike and an oracle, so crypto only.
+        // `INSERT OR IGNORE` adds it to an existing instance at its next start.
+        ("crypto", "anchor"),
         // FairValue prices a moneyline from the sports board's bookmaker
         // consensus (`sports_entry`), which is the only model that can price a
         // game — the crypto one needs a strike, an oracle and a vol estimate.
@@ -1281,6 +1285,171 @@ pub async fn sports_resolved_price(pool: &SqlitePool, token_id: &str) -> Option<
     sqlx::query_scalar("SELECT resolved_price FROM sports_line_results WHERE token_id = ?")
         .bind(token_id)
         .fetch_optional(pool).await.ok().flatten()
+}
+
+// ── Anchor shadow lane ───────────────────────────────────────────────────────
+//
+// The Anchor viper's simulated ledger (`vipers::anchor_impl`). Same posture as
+// the GBoost lane: its own table, REAL arithmetic, a ghost row in `trades` for
+// the operator, and the go/no-go statistics read from here.
+//
+// Two lanes share the table. `entry` rows are the would-be buys; `control` rows
+// are the sides the model called EXPENSIVE by the same margin, recorded and
+// settled identically but never booked to the trade list. The spike's go/no-go
+// requires the control lane to lose while the entry lane wins, which is what
+// separates a model with information from a market that drifts one way.
+
+/// The lane a row belongs to.
+pub const ANCHOR_LANE_ENTRY: &str = "entry";
+pub const ANCHOR_LANE_CONTROL: &str = "control";
+
+/// One simulated Anchor entry that has not settled yet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnchorShadow {
+    pub id: i64,
+    pub lane: String,
+    /// `gboost_planb::market_key`: the condition id where the venue has one, the
+    /// YES token elsewhere. What the one-row-per-side rule keys on.
+    pub market_key: String,
+    /// The venue's market handle for `resolve_leg`; empty on venues that key the
+    /// resolver by token alone.
+    pub condition_id: String,
+    pub token_id: String,
+    pub market: String,
+    pub side: String,
+    /// The market's close, which is also its settlement boundary.
+    pub close_s: i64,
+    pub entry_price: f64,
+    pub shares: f64,
+    /// Taker fee per share at the entry price.
+    pub entry_fee: f64,
+}
+
+/// The lane's record on one asset.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AnchorLaneSummary {
+    pub open: i64,
+    /// Rows settled with a P&L; abandoned rows are not counted.
+    pub closed: i64,
+    pub wins: i64,
+    pub net_usd: f64,
+    /// `net_usd` over the contracts in the settled rows.
+    pub net_per_contract: f64,
+}
+
+/// Open a simulated position. False if the write failed, in which case the
+/// caller must not treat the entry as taken.
+#[allow(clippy::too_many_arguments)]
+pub async fn anchor_shadow_open(
+    pool: &SqlitePool, asset: &str, lane: &str, squadron_id: &str, market_key: &str, condition_id: &str, token_id: &str,
+    market: &str, side: &str, close_s: i64, entry_price: f64, shares: f64, entry_fee: f64,
+    fair: f64, anchor_basis: f64, sigma: f64, z: f64, secs_left: i64, spot: f64, strike: f64, ask_depth: f64,
+) -> bool {
+    match sqlx::query(
+        "INSERT INTO anchor_shadow
+            (asset, lane, squadron_id, market_key, condition_id, token_id, market, side, close_s, opened_at,
+             entry_price, shares, entry_fee, fair, anchor_basis, sigma, z, secs_left, spot, strike, ask_depth)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(asset).bind(lane).bind(squadron_id).bind(market_key).bind(condition_id).bind(token_id).bind(market).bind(side)
+        .bind(close_s).bind(Utc::now().to_rfc3339())
+        .bind(entry_price).bind(shares).bind(entry_fee).bind(fair).bind(anchor_basis).bind(sigma).bind(z)
+        .bind(secs_left).bind(spot).bind(strike).bind(ask_depth)
+        .execute(pool).await
+    {
+        Ok(_) => true,
+        Err(e) => { error!("❌ DB anchor shadow open failed: {}", e); false }
+    }
+}
+
+/// Every simulated row still open on this asset, both lanes. `None` when the
+/// read failed: the caller keeps what it knew rather than treating a failed
+/// read as an empty ledger.
+pub async fn anchor_shadow_open_rows(pool: &SqlitePool, asset: &str) -> Option<Vec<AnchorShadow>> {
+    let rows: Vec<(i64, String, String, String, String, String, String, i64, f64, f64, f64)> = sqlx::query_as(
+        "SELECT id, lane, market_key, condition_id, token_id, market, side, close_s, entry_price, shares, entry_fee
+           FROM anchor_shadow
+          WHERE asset = ? AND closed_at IS NULL
+          ORDER BY id")
+        .bind(asset)
+        .fetch_all(pool).await
+        .map_err(|e| error!("❌ DB anchor shadow read failed: {}", e)).ok()?;
+    Some(rows.into_iter().map(|r| AnchorShadow {
+        id: r.0, lane: r.1, market_key: r.2, condition_id: r.3, token_id: r.4, market: r.5, side: r.6,
+        close_s: r.7, entry_price: r.8, shares: r.9, entry_fee: r.10,
+    }).collect())
+}
+
+/// Whether `lane` already holds `side` of this market. One row per side per hour
+/// per lane is the rule; the other side stays free.
+pub async fn anchor_shadow_holds(pool: &SqlitePool, asset: &str, lane: &str, market_key: &str, side: &str) -> bool {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM anchor_shadow
+          WHERE asset = ? AND lane = ? AND market_key = ? AND side = ? AND closed_at IS NULL")
+        .bind(asset).bind(lane).bind(market_key).bind(side)
+        .fetch_one(pool).await.unwrap_or(0);
+    n > 0
+}
+
+/// Notional the entry lane has at risk on this asset: Σ entry price × shares of
+/// its open rows. What the exposure cap is measured against; the control lane
+/// is never at risk.
+pub async fn anchor_shadow_open_notional(pool: &SqlitePool, asset: &str) -> f64 {
+    sqlx::query_scalar::<_, Option<f64>>(
+        "SELECT SUM(entry_price * shares) FROM anchor_shadow WHERE asset = ? AND lane = ? AND closed_at IS NULL")
+        .bind(asset).bind(ANCHOR_LANE_ENTRY)
+        .fetch_one(pool).await.ok().flatten().unwrap_or(0.0)
+}
+
+/// Settle a simulated position at the venue's final price, recording the total
+/// P&L in dollars (settlement pays no exit fee; the entry fee is netted).
+pub async fn anchor_shadow_close(pool: &SqlitePool, id: i64, exit_price: f64, reason: &str, pnl: f64) -> bool {
+    match sqlx::query(
+        "UPDATE anchor_shadow
+            SET closed_at = ?, exit_price = ?, exit_reason = ?, pnl = ?
+          WHERE id = ? AND closed_at IS NULL")
+        .bind(Utc::now().to_rfc3339()).bind(exit_price).bind(reason).bind(pnl).bind(id)
+        .execute(pool).await
+    {
+        Ok(r) => r.rows_affected() > 0,
+        Err(e) => { error!("❌ DB anchor shadow close failed: {}", e); false }
+    }
+}
+
+/// Close a simulated position that never resolved, recording NO P&L: a market
+/// the venue never settles is a trade with no outcome, not a bad one.
+pub async fn anchor_shadow_abandon(pool: &SqlitePool, id: i64, reason: &str) -> bool {
+    match sqlx::query(
+        "UPDATE anchor_shadow
+            SET closed_at = ?, exit_reason = ?
+          WHERE id = ? AND closed_at IS NULL")
+        .bind(Utc::now().to_rfc3339()).bind(reason).bind(id)
+        .execute(pool).await
+    {
+        Ok(r) => r.rows_affected() > 0,
+        Err(e) => { error!("❌ DB anchor shadow abandon failed: {}", e); false }
+    }
+}
+
+/// One lane's record on one asset, from its settled rows.
+pub async fn anchor_shadow_summary(pool: &SqlitePool, asset: &str, lane: &str) -> AnchorLaneSummary {
+    let row: Option<(i64, i64, i64, Option<f64>, Option<f64>)> = sqlx::query_as(
+        "SELECT
+            COALESCE(SUM(CASE WHEN closed_at IS NULL THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN pnl IS NOT NULL THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0),
+            SUM(CASE WHEN pnl IS NOT NULL THEN pnl END),
+            SUM(CASE WHEN pnl IS NOT NULL THEN shares END)
+           FROM anchor_shadow WHERE asset = ? AND lane = ?")
+        .bind(asset).bind(lane)
+        .fetch_optional(pool).await
+        .unwrap_or_else(|e| { error!("❌ DB anchor lane summary failed: {}", e); None });
+    let Some((open, closed, wins, net, shares)) = row else { return AnchorLaneSummary::default() };
+    let net_usd = net.unwrap_or(0.0);
+    let shares = shares.unwrap_or(0.0);
+    AnchorLaneSummary {
+        open, closed, wins, net_usd,
+        net_per_contract: if shares > 0.0 { net_usd / shares } else { 0.0 },
+    }
 }
 
 // ── GBoost shadow lane ───────────────────────────────────────────────────────
@@ -1787,6 +1956,46 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) {
     let _ = sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_bookline_shadow_lane
              ON bookline_shadow(lane, asset, closed_at)"
+    ).execute(pool).await;
+
+    // Anchor's simulated ledger (`vipers::anchor_impl`). One row per would-be
+    // entry, with the model's reading at the time, settled through the venue's
+    // resolver once the market closes. REAL columns throughout, like the GBoost
+    // lane: nothing here is money, and the promotion statistics are computed
+    // from this table rather than from `trades` (which gets a ghost row).
+    let _ = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS anchor_shadow (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset         TEXT    NOT NULL,
+            squadron_id   TEXT    NOT NULL,
+            condition_id  TEXT    NOT NULL,
+            token_id      TEXT    NOT NULL,
+            market        TEXT    NOT NULL,
+            side          TEXT    NOT NULL,
+            lane          TEXT    NOT NULL DEFAULT 'entry',
+            market_key    TEXT    NOT NULL,
+            close_s       INTEGER NOT NULL,
+            opened_at     TEXT    NOT NULL,
+            entry_price   REAL    NOT NULL,
+            shares        REAL    NOT NULL,
+            entry_fee     REAL    NOT NULL,
+            fair          REAL    NOT NULL,
+            anchor_basis  REAL    NOT NULL,
+            sigma         REAL    NOT NULL,
+            z             REAL    NOT NULL,
+            secs_left     INTEGER NOT NULL,
+            spot          REAL    NOT NULL,
+            strike        REAL    NOT NULL,
+            ask_depth     REAL    NOT NULL,
+            closed_at     TEXT,
+            exit_price    REAL,
+            exit_reason   TEXT,
+            pnl           REAL
+        )"
+    ).execute(pool).await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_anchor_shadow_live
+             ON anchor_shadow(asset, lane, closed_at)"
     ).execute(pool).await;
 
     // FairValue's stop counterfactual. One row per stop FILL the live
@@ -3052,6 +3261,9 @@ pub const VIPER_KINDS: &[(&str, &str, i32)] = &[
     // Sports-only, and not venue-agnostic: it prices from the bookmaker
     // consensus board, which exists for Polymarket International moneylines.
     ("bookline",     "Bookline",      0),
+    // Market-anchored gamma on hourly crypto markets; needs a strike, an
+    // oracle and a vol estimate, so crypto only. Shadow lane in this build.
+    ("anchor",       "Anchor",        0),
     // The operator's own position, managed from the book alone, on any venue.
     // Carried by the `helm` class and by nothing else; see `vipers::helm_impl`.
     (crate::vipers::helm_impl::KIND, "Helm", 1),
@@ -4273,7 +4485,10 @@ const EXIT_DUST_SHARES: Decimal = Decimal::from_parts(1, 0, 0, false, 2); // 0.0
 
 pub async fn market_has_matching_trade(pool: &SqlitePool, market: &str, shares: Decimal) -> bool {
     let share_dust = Decimal::new(1, 3); // 0.001
-    let rows: Vec<String> = sqlx::query_scalar("SELECT shares FROM trades WHERE market = ?")
+    // Simulated rows (GBoost's and Anchor's shadow lanes) carry the real market
+    // name at the real size; without the filter a real settlement booked a
+    // moment later would read as already recorded and never reach the ledger.
+    let rows: Vec<String> = sqlx::query_scalar("SELECT shares FROM trades WHERE market = ? AND COALESCE(ghost, 0) = 0")
         .bind(market)
         .fetch_all(pool)
         .await
