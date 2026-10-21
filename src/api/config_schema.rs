@@ -1203,22 +1203,23 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Maker will not quote a game whose books disagree by more than this (highest minus lowest book probability). A wide line is a soft line: the books themselves do not know the price, so a passive quote is likelier to be picked off than filled.").classes(&["sports"]));
         v.push(F::new("FairValue", Some("enable_sports_fairvalue"), "sports_fairvalue_min_consensus", "Sports Favorite Floor", "price", true,
             "Smallest bookmaker consensus a sports FairValue entry will buy. The pre-registered hypothesis is favorite-side only (0.55 and above); the longshot side is its declared negative control, and the de-vig method inflates consensus exactly there, so cheap outcomes show an 'edge' that is an artifact. Setting this below 0.55 trades outside the hypothesis the evidence is being gathered for.").classes(&["sports"]));
-        // ── Anchor (hourly crypto, market-anchored gamma, simulated lane) ────
+        // ── Anchor (hourly crypto, market-anchored gamma) ────────────────────
         // MUST equal the Control Tower card name in `VIPER_DEFS` (see Bookline).
         {
             let g = "Anchor"; let e = Some("anchor_enabled");
             v.push(F::new(g, e, "anchor_enabled", "Enabled", "bool", false,
-                "Run the Anchor shadow lane. The viper takes the index level from the market's own price (a rolling \
-                 median of the level the YES mid implies, one to ten minutes back) and the move from the oracle feed \
-                 since then, prices the hourly contract through its gamma, and records a simulated taker buy of the \
-                 cheap side when that fair clears the ask by the Min Edge net of fee, held to settlement. Nothing in \
-                 this build places an order: every entry goes to its own ledger and appears in the trade list as a \
-                 simulated row. Ships off.").classes(&["crypto"]));
+                "Run the Anchor viper. It takes the index level from the market's own price (a rolling median of the \
+                 level the YES mid implies, one to ten minutes back) and the move from the oracle feed since then, \
+                 prices the hourly contract through its gamma, and buys the cheap side at the ask when that fair \
+                 clears it by the Min Edge net of fee, holding to settlement with no exit order. Trades the way every \
+                 viper does: simulated while the instance is in ghost mode, real orders otherwise. Each fill's model \
+                 reading goes to the Anchor ledger as well, which is the record the strategy is judged on. Ships off.").classes(&["crypto"]));
             v.push(F::new(g, e, "anchor_contracts", "Contracts", "decimal", false,
-                "Contracts per simulated entry. The research measured ten per signal minute; the ask must show at \
-                 least this much size or the entry is refused.").min(1.0).step(1.0).classes(&["crypto"]));
+                "Contracts per entry. The research measured ten per signal minute; the ask must show at least this \
+                 much size or the entry is refused.").min(1.0).step(1.0).classes(&["crypto"]));
             v.push(F::new(g, e, "anchor_max_exposure_usdc", "Max Exposure", "usd", false,
-                "Ceiling on the lane's simulated notional at risk across its open rows.").min(0.0).step(1.0).unit("USDC").classes(&["crypto"]));
+                "Ceiling on the viper's unsettled notional: every fill counts from the moment it is bought until its \
+                 market settles, so a hold from the previous hour still occupies the cap in the next.").min(0.0).step(1.0).unit("USDC").classes(&["crypto"]));
             v.push(F::new(g, e, "anchor_min_edge", "Min Edge", "price", false,
                 "Required fair minus ask minus the taker fee at that ask, in probability points. Four cents is where \
                  the backtest's buy candidates turned positive while the prints it called expensive lost.").range(0.0, 0.5).step(0.005).classes(&["crypto"]));

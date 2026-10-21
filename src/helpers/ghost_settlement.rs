@@ -219,6 +219,8 @@ pub(crate) async fn book_ghost_settlements(
         let taker_entry = match key.strategy.as_str() {
             "FairValueStrategy" | "MomentumStrategy" | "GboostStrategy"
                 | "ConvergenceStrategy" | "TrendReversalStrategy" => true,
+            // Anchor buys the cheap side at the ask with a fill-and-kill order.
+            crate::vipers::anchor_impl::STRATEGY_NAME => true,
             // Read from the constant rather than assumed: Basis enters as a
             // maker on every shipped profile, but the switch is compile-time,
             // and a profile that flips it should get the matching fee without

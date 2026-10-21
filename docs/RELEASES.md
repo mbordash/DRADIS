@@ -7,7 +7,8 @@ version's release notes field; the detail below it is the full account.
 ## 1.5.0 (unreleased)
 
 - Includes the 1.4.3 changes below (GBoost venue handling, young-store training, Kalshi hourly strike pinning), which ran on production from 2026-10-20 but were never listed as a Marketplace version.
-- New Anchor viper, simulated only: on hourly crypto markets it takes the index level from the market's own price and the move from the oracle feed, prices the contract through its gamma, and records a simulated taker buy of the cheap side held to settlement. It places no order in this release; its ledger and the simulated rows in the trade list are the record real money will be gated on. Off by default, on the Anchor card of every crypto squadron.
+- New Anchor viper: on hourly crypto markets it takes the index level from the market's own price and the move from the oracle feed, prices the contract through its gamma, and buys the cheap side at the ask when the anchored fair clears it net of fee, holding to settlement with no exit order. It trades the way every viper does, simulated in ghost mode and with real orders otherwise, and keeps its own ledger of each fill's model reading beside a never-bought control lane, which is the record the strategy is judged on. Off by default, on the Anchor card of every crypto squadron.
+- Simulated settlements: a simulated Anchor position held through an hourly close is booked at the venue's result and released, where a simulated hold had no settlement path before.
 
 ### Detail
 
@@ -27,19 +28,40 @@ under the normal model, keeps a rolling median of those readings from one to ten
 minutes ago as its anchor, and prices the contract from the oracle's move since
 then. When the anchored fair clears the ask by four cents net of fee, inside the
 last thirty to five minutes of the hour, within one sigma of the strike and at an
-ask between 0.20 and 0.60, it records a buy of ten contracts and holds to
-settlement. Every input is already in the strategy context, so the same code
-runs on Polymarket International, Polymarket US and Kalshi; the anchor absorbs
-whatever offset sits between the feed and each venue's settlement index.
+ask between 0.20 and 0.60, it buys ten contracts with a fill-and-kill order and
+holds to settlement. Every input is already in the strategy context, so the same
+code runs on Polymarket International, Polymarket US and Kalshi; the anchor
+absorbs whatever offset sits between the feed and each venue's settlement index.
 
-**Simulated, and why.** The backtest's record came from one week, one regime and
-fills read off prints other takers received. The viper therefore ships as a
-shadow lane: each would-be entry is written to its own ledger with the model's
-reading at the time, settled through the venue's own resolution once the market
-closes, and booked into the trade list as a simulated row that stays out of
-realized P&L. Its card on the squadron page shows the anchor, the fair against
-the ask, and the lane's running record. Real money is a later release, gated on
-that record.
+**Order management.** Anchor sends its entry to the squadron's dispatcher like
+every other viper, so the instance's ghost switch decides whether the fill is
+simulated or real, the position appears on the positions table either way, and
+the venue's own settlement sweep books a real position at the result. It never
+sends an exit. The exposure cap counts every fill from the moment it is bought
+until its market settles, so one hour's hold occupies the cap in the next and
+cannot stack without limit. An order that does not fill is not asked for again
+for thirty seconds.
+
+**The ledger, and why it stays.** The backtest's record came from one week, one
+regime and fills read off prints other takers received. So every fill is also
+written to the viper's own ledger with the model's reading at the signal (fair,
+anchor, sigma, distance from the strike, seconds to close, depth at the ask),
+beside a control lane that records the side the model called expensive by the
+same margin and never buys it. The go/no-go for leaving the viper on with real
+money is read from that ledger: it needs a positive entry lane against a
+negative control lane over at least three hundred hours, per venue. Its card
+shows the anchor, the fair against the ask, and the running record in whichever
+mode the instance is in.
+
+**Simulated settlements.** Ghost mode had no settlement path for a position held
+through an hourly close: the Polymarket International patrol cleared the
+simulated row at rotation unscored, and the Kalshi and Polymarket US loops left
+it in place. Anchor books its own simulated settlements from the venue's result,
+through the same simulated-settlement path the sports squadrons use, so a
+simulated hold is scored and released like a real one. Each fill is stamped
+simulated or real when it is made, and that stamp, not the switch's position at
+the close, decides who books it, so flipping ghost mode mid-hold can neither
+double-book a position nor lose one.
 
 ## 1.4.3 (unreleased)
 

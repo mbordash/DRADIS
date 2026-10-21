@@ -1320,10 +1320,10 @@ pub struct DynamicConfig {
     #[serde(default = "default_bookline_max_exposure_usdc")]
     pub bookline_max_exposure_usdc: Decimal,
 
-    // ── Anchor Viper (hourly crypto, market-anchored gamma, simulated lane) ───
+    // ── Anchor Viper (hourly crypto, market-anchored gamma) ───────────────────
     // The level from the market, the move from the feed; taker at the ask, held
-    // to settlement. Ships off: Phase 1 (real money) is gated on the shadow
-    // record. See `vipers::anchor_impl`.
+    // to settlement, through the dispatcher like every other viper. Ships off.
+    // See `vipers::anchor_impl`.
     #[serde(default = "default_anchor_enabled")]
     pub anchor_enabled: bool,
     #[serde(default = "default_anchor_contracts")]

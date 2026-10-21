@@ -657,7 +657,7 @@ export const VIPER_DEFS: ViperDef[] = [
     accentColor: 'sky',
     statusKey: 'anchor',
     strategyName: 'AnchorStrategy',
-    description: 'Hourly crypto, market-anchored gamma: takes the index level from the market\'s own price and the move from the oracle feed, buys the cheap side as a taker when the anchored fair clears the ask, holds to settlement. Simulated lane — it keeps its own ledger and places no venue order',
+    description: 'Hourly crypto, market-anchored gamma: takes the index level from the market\'s own price and the move from the oracle feed, buys the cheap side as a taker when the anchored fair clears the ask, holds to settlement with no exit order. Simulated in ghost mode, real orders otherwise; every fill\'s model reading also goes to its own ledger',
   },
   {
     name: 'Helm',

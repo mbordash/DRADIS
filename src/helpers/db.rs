@@ -1287,23 +1287,26 @@ pub async fn sports_resolved_price(pool: &SqlitePool, token_id: &str) -> Option<
         .fetch_optional(pool).await.ok().flatten()
 }
 
-// ── Anchor shadow lane ───────────────────────────────────────────────────────
+// ── Anchor ledger ────────────────────────────────────────────────────────────
 //
-// The Anchor viper's simulated ledger (`vipers::anchor_impl`). Same posture as
-// the GBoost lane: its own table, REAL arithmetic, a ghost row in `trades` for
-// the operator, and the go/no-go statistics read from here.
+// The Anchor viper's ledger (`vipers::anchor_impl`): one row per fill with the
+// model's reading at the signal (fair, anchor, sigma, z, seconds to close,
+// depth), which the trade list cannot hold, settled through the venue's
+// resolver so the go/no-go statistics in the spike can be read from here. The
+// trade itself is on the normal books: the venue sweep writes it for a real
+// position, the viper's own sweep for a simulated one.
 //
-// Two lanes share the table. `entry` rows are the would-be buys; `control` rows
-// are the sides the model called EXPENSIVE by the same margin, recorded and
-// settled identically but never booked to the trade list. The spike's go/no-go
-// requires the control lane to lose while the entry lane wins, which is what
-// separates a model with information from a market that drifts one way.
+// Two lanes share the table. `entry` rows are the fills; `control` rows are the
+// sides the model called EXPENSIVE by the same margin, recorded and settled
+// identically but never bought or booked. The spike's go/no-go requires the
+// control lane to lose while the entry lane wins, which is what separates a
+// model with information from a market that drifts one way.
 
 /// The lane a row belongs to.
 pub const ANCHOR_LANE_ENTRY: &str = "entry";
 pub const ANCHOR_LANE_CONTROL: &str = "control";
 
-/// One simulated Anchor entry that has not settled yet.
+/// One Anchor ledger row (a fill or a control) that has not settled yet.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnchorShadow {
     pub id: i64,
@@ -1323,6 +1326,14 @@ pub struct AnchorShadow {
     pub shares: f64,
     /// Taker fee per share at the entry price.
     pub entry_fee: f64,
+    /// The squadron that opened it: the position map is keyed by squadron, and
+    /// the sweep may run from another squadron on the same asset.
+    pub squadron_id: String,
+    /// Whether the fill was simulated. `None` on control rows and on rows from
+    /// the shadow-only build, both of which were never positions.
+    pub ghost: Option<bool>,
+    /// RFC 3339, UTC: the floor for "already booked" lookups in the trade list.
+    pub opened_at: String,
 }
 
 /// The lane's record on one asset.
@@ -1344,16 +1355,19 @@ pub async fn anchor_shadow_open(
     pool: &SqlitePool, asset: &str, lane: &str, squadron_id: &str, market_key: &str, condition_id: &str, token_id: &str,
     market: &str, side: &str, close_s: i64, entry_price: f64, shares: f64, entry_fee: f64,
     fair: f64, anchor_basis: f64, sigma: f64, z: f64, secs_left: i64, spot: f64, strike: f64, ask_depth: f64,
+    // `Some(true)` for a simulated fill, `Some(false)` for a real one, `None` for
+    // a row that was never a position (the control lane).
+    ghost: Option<bool>,
 ) -> bool {
     match sqlx::query(
         "INSERT INTO anchor_shadow
             (asset, lane, squadron_id, market_key, condition_id, token_id, market, side, close_s, opened_at,
-             entry_price, shares, entry_fee, fair, anchor_basis, sigma, z, secs_left, spot, strike, ask_depth)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+             entry_price, shares, entry_fee, fair, anchor_basis, sigma, z, secs_left, spot, strike, ask_depth, ghost)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(asset).bind(lane).bind(squadron_id).bind(market_key).bind(condition_id).bind(token_id).bind(market).bind(side)
         .bind(close_s).bind(Utc::now().to_rfc3339())
         .bind(entry_price).bind(shares).bind(entry_fee).bind(fair).bind(anchor_basis).bind(sigma).bind(z)
-        .bind(secs_left).bind(spot).bind(strike).bind(ask_depth)
+        .bind(secs_left).bind(spot).bind(strike).bind(ask_depth).bind(ghost.map(|g| g as i32))
         .execute(pool).await
     {
         Ok(_) => true,
@@ -1365,8 +1379,9 @@ pub async fn anchor_shadow_open(
 /// read failed: the caller keeps what it knew rather than treating a failed
 /// read as an empty ledger.
 pub async fn anchor_shadow_open_rows(pool: &SqlitePool, asset: &str) -> Option<Vec<AnchorShadow>> {
-    let rows: Vec<(i64, String, String, String, String, String, String, i64, f64, f64, f64)> = sqlx::query_as(
-        "SELECT id, lane, market_key, condition_id, token_id, market, side, close_s, entry_price, shares, entry_fee
+    let rows: Vec<(i64, String, String, String, String, String, String, i64, f64, f64, f64, String, Option<i32>, String)> = sqlx::query_as(
+        "SELECT id, lane, market_key, condition_id, token_id, market, side, close_s, entry_price, shares, entry_fee,
+                squadron_id, ghost, opened_at
            FROM anchor_shadow
           WHERE asset = ? AND closed_at IS NULL
           ORDER BY id")
@@ -1375,8 +1390,30 @@ pub async fn anchor_shadow_open_rows(pool: &SqlitePool, asset: &str) -> Option<V
         .map_err(|e| error!("❌ DB anchor shadow read failed: {}", e)).ok()?;
     Some(rows.into_iter().map(|r| AnchorShadow {
         id: r.0, lane: r.1, market_key: r.2, condition_id: r.3, token_id: r.4, market: r.5, side: r.6,
-        close_s: r.7, entry_price: r.8, shares: r.9, entry_fee: r.10,
+        close_s: r.7, entry_price: r.8, shares: r.9, entry_fee: r.10, squadron_id: r.11, ghost: r.12.map(|g| g != 0),
+        opened_at: r.13,
     }).collect())
+}
+
+/// Has a settlement already been booked to the trade list for this Anchor fill?
+/// One buy per side per hourly market is the viper's own rule, so (market, side)
+/// identifies the position within an hour; `since` (the ledger row's own
+/// `opened_at`) keeps an earlier hour's settlement from answering, because a
+/// venue's market name need not carry the hour (Kalshi's carries the date and
+/// the strike), and the simulated flag keeps a ghost booking from answering for
+/// a real one and vice versa. `Err` when the read failed: the caller defers
+/// rather than booking on a guess.
+pub async fn anchor_settlement_booked(
+    pool: &SqlitePool, strategy: &str, market: &str, side: &str, ghost: bool, since: &str,
+) -> Result<bool, sqlx::Error> {
+    let found: Option<(i64,)> = sqlx::query_as(
+        "SELECT 1 FROM trades
+          WHERE strategy = ? AND market = ? AND side = ? AND COALESCE(ghost, 0) = ?
+            AND reason LIKE 'Settlement (%' AND ts >= ?
+          LIMIT 1")
+        .bind(strategy).bind(market).bind(side).bind(ghost as i32).bind(since)
+        .fetch_optional(pool).await?;
+    Ok(found.is_some())
 }
 
 /// Whether `lane` already holds `side` of this market. One row per side per hour
@@ -1990,9 +2027,18 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) {
             closed_at     TEXT,
             exit_price    REAL,
             exit_reason   TEXT,
-            pnl           REAL
+            pnl           REAL,
+            ghost         INTEGER
         )"
     ).execute(pool).await;
+    // `ghost`: whether the fill this row records was simulated (1) or real (0),
+    // stamped at fill time so settlement is booked by the mode the position was
+    // opened in, not the mode at the close. NULL on control rows (never a
+    // position) and on rows from the 1.5.0 shadow-only build, which were never
+    // positions either and book as simulated. Added after the table shipped;
+    // SQLite has no ADD COLUMN IF NOT EXISTS, so the duplicate-column error on
+    // an upgraded database is the expected no-op.
+    let _ = sqlx::query("ALTER TABLE anchor_shadow ADD COLUMN ghost INTEGER").execute(pool).await;
     let _ = sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_anchor_shadow_live
              ON anchor_shadow(asset, lane, closed_at)"
@@ -3262,7 +3308,7 @@ pub const VIPER_KINDS: &[(&str, &str, i32)] = &[
     // consensus board, which exists for Polymarket International moneylines.
     ("bookline",     "Bookline",      0),
     // Market-anchored gamma on hourly crypto markets; needs a strike, an
-    // oracle and a vol estimate, so crypto only. Shadow lane in this build.
+    // oracle and a vol estimate, so crypto only.
     ("anchor",       "Anchor",        0),
     // The operator's own position, managed from the book alone, on any venue.
     // Carried by the `helm` class and by nothing else; see `vipers::helm_impl`.

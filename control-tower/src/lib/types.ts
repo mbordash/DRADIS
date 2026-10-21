@@ -271,7 +271,7 @@ export interface DynamicConfig {
   bookline_max_open_markets?: number;
   bookline_resting_tp_edge?: string;
 
-  // ── Anchor Viper (hourly crypto, market-anchored gamma, simulated lane) ────
+  // ── Anchor Viper (hourly crypto, market-anchored gamma) ────────────────────
   anchor_enabled?: boolean;
   anchor_contracts?: string;
   anchor_max_exposure_usdc?: string;

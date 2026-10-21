@@ -124,8 +124,8 @@ impl StrategyRegistry {
             Box::new(TrendReversalStrategyImpl::new())      as Box<dyn Strategy>,
             Box::new(ConvergenceStrategyImpl::new())       as Box<dyn Strategy>,
             Box::new(FairValueStrategyImpl::new())         as Box<dyn Strategy>,
-            // Market-anchored gamma on hourly crypto markets. Shadow lane only in
-            // this build: it keeps its own ledger and places no venue order.
+            // Market-anchored gamma on hourly crypto markets: a taker buy of the
+            // cheap side, held to settlement, with its own ledger of readings.
             Box::new(AnchorStrategy::new())                as Box<dyn Strategy>,
             Box::new(BooklineStrategy::new())              as Box<dyn Strategy>,
             // The operator's viper. Selected only by the `helm` class, which
@@ -186,9 +186,9 @@ impl StrategyRegistry {
             "ConvergenceStrategy",
             "FairValueStrategy",
             "BooklineStrategy",
-            // Anchor is deliberately absent while it is shadow-only: it holds no
-            // real position and never exits one, so an on-chain orphan must not
-            // be adopted under its name. Add it here with the live path.
+            // Holds taker positions to settlement, so an orphan on an hourly
+            // market it was flying is adopted under its name and left to settle.
+            crate::vipers::anchor_impl::STRATEGY_NAME,
             // Last, so it is the lowest adoption priority: an on-chain orphan
             // that no running viper claims must never be adopted as the
             // operator's conviction. Inside a Helm squadron the running set is
@@ -311,6 +311,16 @@ mod class_filter_tests {
             StrategyRegistry::get_strategy_priority("HelmStrategy"),
             Some(names.len() - 1),
         );
+    }
+
+    /// Anchor holds taker positions to settlement, so an orphan on its market
+    /// is adopted under its name, ahead of Helm and behind every older viper.
+    #[test]
+    fn anchor_adopts_orphans_under_its_name() {
+        let names = StrategyRegistry::strategy_names();
+        let anchor = StrategyRegistry::get_strategy_priority(crate::vipers::anchor_impl::STRATEGY_NAME).expect("in the adoption order");
+        assert_eq!(anchor, names.len() - 2);
+        assert!(anchor > StrategyRegistry::get_strategy_priority("BooklineStrategy").unwrap());
     }
 
     /// The pre-rename position label still selects the renamed impl.

@@ -46,15 +46,38 @@
 //! index, which is what makes the same code honest on all three venues. Nothing
 //! here names a venue; `vipers::venue_agnostic_guard` enforces that.
 //!
-//! # Phase 0: the shadow lane
+//! # Order management
 //!
-//! This build places no order. Every would-be entry is written to the
-//! `anchor_shadow` ledger with the model's reading at the time, settled through
-//! the venue's installed resolver (`venues::core::resolve_leg`) once the market
-//! closes, and booked into the trade list as a ghost row so the operator can see
-//! it. The go/no-go for real money is computed from that ledger (see
-//! `docs/spikes/sideways-regime-spike.md`, section 5) and nothing in this file
-//! can spend until a later build adds the live path behind its own knob.
+//! The entry is a taker buy of the cheap side at the ask, sent to the squadron's
+//! dispatcher as `StrategySignal::Entry` with a fill-and-kill order, exactly as
+//! GBoost and FairValue send theirs. The dispatcher decides what that means: in
+//! ghost mode it records a simulated fill, otherwise it places the venue order.
+//! Nothing here knows the difference, and nothing here ever emits an exit: the
+//! position rides to settlement, where the venue's own settlement sweep books
+//! the result at $1.00 or $0.00 against this strategy.
+//!
+//! # The ledger
+//!
+//! Every fill is also written to the `anchor_shadow` ledger with the model's
+//! reading at the moment of the signal (fair, anchor, sigma, z, seconds to
+//! close, depth), which the trade list cannot hold and the go/no-go in
+//! `docs/spikes/sideways-regime-spike.md` section 5 is computed from. Beside it
+//! runs the control lane: the side the model calls EXPENSIVE by the entry
+//! margin, recorded on every tick inside the gates and settled the same way,
+//! never bought. If the control lane does not lose, the entry lane's gains are
+//! the market drifting, not the model knowing.
+//!
+//! # Simulated settlements
+//!
+//! A simulated position held through an hourly close has no settlement path in
+//! the loops: the Polymarket International patrol clears an expiring market's
+//! simulated rows at rotation unscored, and the Kalshi and Polymarket US loops
+//! leave them in place. So in ghost mode this viper books its own: the sweep
+//! asks the venue's installed resolver (`venues::core::resolve_leg`) what each
+//! filled entry settled at and books it through the shared simulated-settlement
+//! path (`helpers::ghost_settlement`), or from the ledger when the loop has
+//! already dropped the position. A real position is never touched by that path;
+//! the venue sweep owns it.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock};
@@ -65,15 +88,15 @@ use async_trait::async_trait;
 use chrono::Utc;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config;
 use crate::helpers::db::{ANCHOR_LANE_CONTROL, ANCHOR_LANE_ENTRY};
 use crate::helpers::dynamic_config::DynamicConfig;
 use crate::helpers::volatility::norm_cdf;
 use crate::orchestrator::strategy::{Strategy, StrategyContext};
-use crate::state::{StrategySignal, StrategyStatus};
-use crate::venues::core::MarketId;
+use crate::state::{OrderParams, PositionKey, StrategySignal, StrategyStatus};
+use crate::venues::core::{MarketId, TimeInForce};
 
 pub const STRATEGY_NAME: &str = "AnchorStrategy";
 /// Taxonomy kind id (`viper_kind.id`), the Control Tower card's `statusKey`.
@@ -101,6 +124,16 @@ const MAX_SNAPSHOT_AGE_SECS: i64 = 15;
 /// The ledger sweep runs this often; the patrol ticks far faster than a
 /// settlement arrives.
 const SWEEP_SECS: u64 = 10;
+/// How long an entry signal waits for its fill to show in the position map
+/// before it is forgotten, and how long the same side is not asked for again.
+/// A fill-and-kill order that did not fill leaves no position and arms no
+/// cooldown in the loop, so without this gate the viper would resend on every
+/// 50 ms tick while the snapshot showed depth.
+const PENDING_FILL_SECS: u64 = 30;
+/// A position still provisional this long after its order is treated as filled
+/// for the ledger: a phantom is removed within seconds, and a fill whose venue
+/// confirmation arrived before the position was recorded never confirms at all.
+const PROVISIONAL_LEDGER_SECS: u64 = 60;
 /// How often one closed market is asked for its resolution.
 const SHADOW_PROBE_SECS: u64 = 60;
 /// A row still unresolved this long after its close is written off unscored.
@@ -366,6 +399,57 @@ pub fn control_side(r: Reading, secs_left: i64, yes: SideQuote, no: SideQuote, g
     best
 }
 
+/// The model's reading at the moment an entry was sent, held until the fill
+/// shows in the position map so the ledger row carries the price and size that
+/// filled rather than the ask that was asked for.
+#[derive(Debug, Clone)]
+struct PendingEntry {
+    squadron_id: String,
+    market_key: String,
+    condition_id: String,
+    market_name: String,
+    side: &'static str,
+    close_s: i64,
+    fair: f64,
+    anchor_basis: f64,
+    sigma: f64,
+    z: f64,
+    secs_left: i64,
+    spot: f64,
+    strike: f64,
+    ask_depth: f64,
+    /// The mode the order was sent in (`OrderParams::ghost_mode`), stamped on
+    /// the ledger row so a switch flipped before the fill is ledgered cannot
+    /// change who books the settlement.
+    ghost: bool,
+    sent_at: Instant,
+}
+
+/// This viper's notional in `positions` for `squadron` that the ledger does not
+/// yet know: provisional fills and fills whose row is not written yet. Added to
+/// the ledger's own open notional, this is everything the viper has bought and
+/// not yet settled, which is what the exposure cap bounds. A position the
+/// ledger already holds is counted there and skipped here.
+pub fn unledgered_notional(positions: &crate::state::PositionMap, squadron: &str, ledgered: &HashSet<String>) -> f64 {
+    positions.iter()
+        .filter(|(k, _)| k.squadron == squadron && k.strategy == STRATEGY_NAME && !ledgered.contains(k.market.as_str()))
+        .map(|(_, p)| (p.shares * p.avg_entry).to_f64().unwrap_or(0.0))
+        .sum()
+}
+
+/// Who booked a filled entry's settlement. See `AnchorStrategy::book_settlement`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Booked {
+    /// A real position: the venue's settlement sweep writes the trade.
+    Venue,
+    /// A simulated position still in the map, booked through the shared path.
+    Simulated,
+    /// A simulated position the loop had already dropped, booked from the ledger.
+    Ledger,
+    /// Could not tell yet; the row stays open for the next sweep.
+    Deferred,
+}
+
 // ─── Per-asset state ─────────────────────────────────────────────────────────
 
 struct AnchorState {
@@ -393,8 +477,21 @@ struct Globals {
     /// asks memory and not the database on every tick. Filled on open and
     /// rebuilt from the ledger by each sweep.
     held: Mutex<HashSet<(String, String, String)>>,
-    /// Σ entry × shares of the entry lane's open rows, maintained the same way.
+    /// Tokens of the entry lane's open rows, rebuilt by each sweep: a fill in
+    /// the ledger is counted once, from the ledger, by the exposure rule.
+    ledgered: Mutex<HashSet<String>>,
+    /// Σ price × size of the entry lane's open rows (unsettled fills, on open
+    /// markets and closed ones alike), rebuilt by each sweep and bumped when a
+    /// row is written. The venue-neutral exposure figure: the position map is
+    /// per market on some venues and does not survive the close.
     open_notional: Mutex<f64>,
+    /// Entries sent and not yet seen filled, by token: the reading that goes
+    /// into the ledger row once the fill shows in the position map.
+    pending: Mutex<HashMap<String, PendingEntry>>,
+    /// `(market key, side)` → close time of every side filled this session, so
+    /// a side is bought once per hour even after settlement has released the
+    /// position from the map. Pruned a day after the close.
+    attempted: Mutex<HashMap<(String, String), i64>>,
     shadow_resolved: Mutex<HashMap<String, f64>>,
     shadow_probed: Mutex<HashMap<String, Instant>>,
     last_sweep: Mutex<Option<Instant>>,
@@ -523,11 +620,160 @@ impl AnchorStrategy {
         }
     }
 
-    /// Settle the lane's open rows through the venue's resolver, rebuild the
+    /// Write the ledger row for every sent entry whose fill has shown in the
+    /// position map, at the price and size that filled, and forget signals whose
+    /// order never filled. Runs on every exit tick, unthrottled, because a fill
+    /// that settled before its row was written would be a trade with no reading.
+    async fn ledger_fills(&self, ctx: &StrategyContext) {
+        let asset = ctx.crypto_filter.to_lowercase();
+        let g = globals(&asset);
+        if lock(&g.pending).is_empty() { return; }
+        let ghost = ctx.dynamic_config.ghost_mode;
+        let filled: Vec<(String, PendingEntry, f64, f64)> = {
+            let positions = ctx.positions.lock().await;
+            let mut pending = lock(&g.pending);
+            let mut out = Vec::new();
+            pending.retain(|token, pe| {
+                let key = PositionKey::new(&pe.squadron_id, STRATEGY_NAME, MarketId::new(token));
+                match positions.get(&key) {
+                    // A confirmed fill owns the shares the row claims. A position
+                    // still provisional a minute on is one whose confirmation
+                    // the venue will not echo (a phantom would have been removed
+                    // by now), so it is ledgered rather than lost.
+                    Some(p) if p.fill_effective_at(ghost).is_some()
+                        || pe.sent_at.elapsed().as_secs() >= PROVISIONAL_LEDGER_SECS =>
+                    {
+                        out.push((token.clone(), pe.clone(), p.avg_entry.to_f64().unwrap_or(0.0), p.shares.to_f64().unwrap_or(0.0)));
+                        false
+                    }
+                    Some(_) => true,
+                    None if pe.sent_at.elapsed().as_secs() >= PENDING_FILL_SECS => {
+                        debug!("⚓ Anchor {} entry on {} never filled; forgotten", pe.side, pe.market_name);
+                        false
+                    }
+                    None => true,
+                }
+            });
+            out
+        };
+        if filled.is_empty() { return; }
+        let Some(pool) = crate::helpers::db::pool_for(&asset) else { return };
+        for (token, pe, price, shares) in filled {
+            // The side is spent the moment it fills, whatever the ledger says.
+            lock(&g.attempted).insert((pe.market_key.clone(), pe.side.to_string()), pe.close_s);
+            let key = held_key(ANCHOR_LANE_ENTRY, &pe.market_key, pe.side);
+            if lock(&g.held).contains(&key) { continue; }
+            // The model's fee at the fill price, the same schedule the edge was
+            // measured against; the venue's actual fee is on the trade row.
+            let fee = crate::venues::taker_fee_per_share(Decimal::try_from(price).unwrap_or(Decimal::ZERO)).to_f64().unwrap_or(0.0);
+            let ok = crate::helpers::db::anchor_shadow_open(
+                &pool, &asset, ANCHOR_LANE_ENTRY, &pe.squadron_id, &pe.market_key, &pe.condition_id, &token,
+                &pe.market_name, pe.side, pe.close_s, price, shares, fee, pe.fair, pe.anchor_basis,
+                pe.sigma, pe.z, pe.secs_left, pe.spot, pe.strike, pe.ask_depth, Some(pe.ghost),
+            ).await;
+            if ok {
+                lock(&g.held).insert(key);
+                lock(&g.ledgered).insert(token.clone());
+                *lock(&g.open_notional) += price * shares;
+                info!(
+                    "⚓ Anchor {} filled on {}: {} contracts at ${:.3} (fair {:.3}, z {:.2}, T {}s){}; holding to settlement",
+                    pe.side, pe.market_name, shares, price, pe.fair, pe.z, pe.secs_left,
+                    if pe.ghost { ", simulated" } else { "" },
+                );
+            } else {
+                warn!("⚓ Anchor ledger write failed for the {} fill on {}; the position is managed, the reading is lost", pe.side, pe.market_name);
+            }
+        }
+    }
+
+    /// Book the settlement of one filled entry, by the mode the fill was made in
+    /// (`row.ghost`, stamped at fill time), never by the mode at the close: an
+    /// operator who flips the ghost switch mid-hold must not get a position
+    /// booked twice or not at all.
+    ///
+    /// * A real fill is the venue sweep's to book from the exchange's own
+    ///   result; nothing here writes a trade for it. So is any token a real
+    ///   `open_positions` row still claims, whatever the ledger says.
+    /// * A simulated fill still in the position map (the Polymarket
+    ///   International patrol keeps it as a zombie after rotation) is booked
+    ///   through the shared simulated-settlement path, which writes the trade,
+    ///   closes the position's row and releases it from the map.
+    /// * A simulated fill the loop has already dropped (the Kalshi and Polymarket
+    ///   US maps are per market and die at the close) is booked from the ledger,
+    ///   the only record left, and its leaked simulated row is closed.
+    ///
+    /// Both simulated paths are idempotent: one buy per side per hour means
+    /// (market, side) identifies the position, and a settlement already on the
+    /// trade list for it is not written again. "Could not tell" defers: the
+    /// ledger row stays open and the next sweep asks again.
+    async fn book_settlement(
+        positions: &std::sync::Arc<tokio::sync::Mutex<crate::state::PositionMap>>,
+        pool: &sqlx::SqlitePool,
+        asset: &str,
+        market_class: Option<&str>,
+        row: &crate::helpers::db::AnchorShadow,
+        px: f64,
+        pnl: f64,
+    ) -> Booked {
+        use crate::helpers::db;
+        if row.ghost == Some(false) {
+            return Booked::Venue;
+        }
+        match db::open_row_claims_token_in(pool, &row.token_id).await {
+            Ok(true) => return Booked::Venue,
+            Ok(false) => {}
+            Err(e) => {
+                warn!("⚓ Anchor could not tell whether {} is a real position ({e}); settlement deferred", row.token_id);
+                return Booked::Deferred;
+            }
+        }
+        match db::anchor_settlement_booked(pool, STRATEGY_NAME, &row.market, &row.side, true, &row.opened_at).await {
+            // Written by an earlier pass whose ledger close did not land.
+            Ok(true) => return Booked::Ledger,
+            Ok(false) => {}
+            Err(e) => {
+                warn!("⚓ Anchor could not read the trade list for {} {} ({e}); settlement deferred", row.market, row.side);
+                return Booked::Deferred;
+            }
+        }
+        let d = |x: f64| Decimal::try_from(x).unwrap_or(Decimal::ZERO);
+        let token = MarketId::new(&row.token_id);
+        let key = PositionKey::new(&row.squadron_id, STRATEGY_NAME, token.clone());
+        let candidate = positions.lock().await.get(&key).filter(|p| p.shares > Decimal::ZERO).map(|p| (key.clone(), p.clone()));
+        if let Some(candidate) = candidate {
+            let source = if px == 0.5 { crate::helpers::ghost_settlement::PriceSource::Tie } else { crate::helpers::ghost_settlement::PriceSource::Resolved };
+            let prices = HashMap::from([(row.token_id.clone(), (d(px), source))]);
+            // The shared path labels the side by comparing the token to the YES
+            // leg and never reads the NO leg; the ledger knows only this token.
+            let blank = MarketId::new("");
+            let (yes_leg, no_leg) = if row.side == "YES" { (token.clone(), blank) } else { (blank, token.clone()) };
+            let n = crate::helpers::ghost_settlement::book_ghost_settlements(
+                positions, pool, asset, market_class, &yes_leg, &no_leg, &prices, vec![candidate],
+            ).await;
+            return if n > 0 { Booked::Simulated } else { Booked::Deferred };
+        }
+        let outcome = if px == 0.5 { "tied or canceled" } else if px > 0.5 { "won" } else { "lost" };
+        let mut scope = crate::state::TradeScope::crypto(asset, "", asset);
+        scope.ghost = true;
+        let wrote = db::record_settlement_trade_checked(
+            pool, &scope, STRATEGY_NAME, &row.market, &row.side,
+            d(row.entry_price), d(px), d(row.shares), d(pnl), d(row.entry_fee * row.shares),
+            &format!("Settlement ({outcome} — simulated)"), None,
+        ).await;
+        if wrote == db::SettlementWrite::Failed {
+            return Booked::Deferred;
+        }
+        // The simulated row the loop left behind, if any. No real row claims
+        // this token (checked above), so only a simulated one can match.
+        db::close_open_position(pool, STRATEGY_NAME, &row.token_id).await;
+        Booked::Ledger
+    }
+
+    /// Settle the ledger's open rows through the venue's resolver, rebuild the
     /// in-memory holds from the ledger, and refresh the card's summary line.
     /// Runs whether or not the viper is enabled: a row opened while it was on
     /// is owed its settlement.
-    async fn sweep_shadow(&self, ctx: &StrategyContext) {
+    async fn sweep_ledger(&self, ctx: &StrategyContext) {
         let asset = ctx.crypto_filter.to_lowercase();
         let g = globals(&asset);
         {
@@ -537,13 +783,14 @@ impl AnchorStrategy {
         }
         let Some(pool) = crate::helpers::db::pool_for(&asset) else { return };
         let now_s = Utc::now().timestamp();
-        // A failed read keeps the previous holds and notional rather than
-        // clearing them, which would let the entry path re-enter a held side.
+        lock(&g.attempted).retain(|_, close_s| now_s < *close_s + SHADOW_GIVE_UP_SECS);
+        // A failed read keeps the previous holds rather than clearing them,
+        // which would let a fill be ledgered twice.
         if let Some(rows) = crate::helpers::db::anchor_shadow_open_rows(&pool, &asset).await {
             *lock(&g.held) = rows.iter().map(|r| held_key(&r.lane, &r.market_key, &r.side)).collect();
-            *lock(&g.open_notional) = rows.iter()
-                .filter(|r| r.lane == ANCHOR_LANE_ENTRY)
-                .map(|r| r.entry_price * r.shares).sum();
+            let entries = rows.iter().filter(|r| r.lane == ANCHOR_LANE_ENTRY);
+            *lock(&g.ledgered) = entries.clone().map(|r| r.token_id.clone()).collect();
+            *lock(&g.open_notional) = entries.map(|r| r.entry_price * r.shares).sum();
             for row in rows {
                 if now_s < row.close_s { continue; }
                 let resolved = lock(&g.shadow_resolved).get(&row.token_id).copied();
@@ -574,7 +821,7 @@ impl AnchorStrategy {
                         && crate::helpers::db::anchor_shadow_abandon(&pool, row.id, "unresolved").await
                     {
                         warn!(
-                            "⚓ Anchor shadow row written off unscored [{}] {}: the venue never resolved it \
+                            "⚓ Anchor ledger row written off unscored [{}] {}: the venue never resolved it \
                              {}h after close, so it counts as no trade rather than as a guess",
                             row.market, row.side, (now_s - row.close_s) / 3600,
                         );
@@ -582,32 +829,37 @@ impl AnchorStrategy {
                     continue;
                 };
                 lock(&g.shadow_resolved).remove(&row.token_id);
-                // Close and book in one spawned task, so the 500 ms strategy
-                // timeout cannot drop the ghost row between the two writes.
-                let (pool_c, asset_c) = (pool.clone(), asset.clone());
+                // Book and close in one spawned task, so the 500 ms strategy
+                // timeout cannot drop the ledger row between the two writes.
+                let (pool_c, asset_c, positions_c, class_c) = (pool.clone(), asset.clone(), ctx.positions.clone(), ctx.market_class.clone());
                 tokio::spawn(async move {
                     // Settlement pays no exit fee; the entry fee was charged at the ask.
                     let per_contract = px - row.entry_price - row.entry_fee;
                     let pnl = per_contract * row.shares;
-                    if !crate::helpers::db::anchor_shadow_close(&pool_c, row.id, px, "settlement", pnl).await {
-                        return;
-                    }
                     if row.lane != ANCHOR_LANE_ENTRY {
-                        info!("⚓ Anchor control settled [{}] {} at ${:.3}, resolved ${:.2}: {:+.2}c per contract (never taken)",
-                              row.market, row.side, row.entry_price, px, per_contract * 100.0);
+                        if crate::helpers::db::anchor_shadow_close(&pool_c, row.id, px, "settlement", pnl).await {
+                            info!("⚓ Anchor control settled [{}] {} at ${:.3}, resolved ${:.2}: {:+.2}c per contract (never taken)",
+                                  row.market, row.side, row.entry_price, px, per_contract * 100.0);
+                        }
                         return;
                     }
-                    let mut scope = crate::state::TradeScope::crypto(&asset_c, "", &asset_c);
-                    scope.ghost = true;
-                    let d = |x: f64| Decimal::try_from(x).unwrap_or(Decimal::ZERO);
-                    crate::helpers::db::record_trade_db(
-                        &pool_c, &scope, d(row.entry_fee * row.shares), STRATEGY_NAME, &row.market, &row.side,
-                        d(row.entry_price), d(px), d(row.shares), d(pnl),
-                        "Anchor settlement — simulated", None,
-                    ).await;
+                    let booked = Self::book_settlement(&positions_c, &pool_c, &asset_c, class_c.as_deref(), &row, px, pnl).await;
+                    let reason = match booked {
+                        Booked::Deferred => {
+                            // Resolved but not booked: the next sweep asks the
+                            // resolver again and lands here with the answer.
+                            return;
+                        }
+                        Booked::Venue => "settlement (booked by the venue sweep)",
+                        Booked::Simulated => "settlement (simulated)",
+                        Booked::Ledger => "settlement (simulated, booked from the ledger)",
+                    };
+                    if !crate::helpers::db::anchor_shadow_close(&pool_c, row.id, px, reason, pnl).await {
+                        return;
+                    }
                     info!(
-                        "⚓ Anchor settled [{}] {} bought at ${:.3}, resolved ${:.2}: {:+.2}c per contract, {:+.2} USD (simulated)",
-                        row.market, row.side, row.entry_price, px, per_contract * 100.0, pnl,
+                        "⚓ Anchor settled [{}] {} bought at ${:.3}, resolved ${:.2}: {:+.2}c per contract, {:+.2} USD ({})",
+                        row.market, row.side, row.entry_price, px, per_contract * 100.0, pnl, reason,
                     );
                 });
             }
@@ -619,11 +871,12 @@ impl AnchorStrategy {
             let control = if c.closed == 0 { String::new() } else {
                 format!(" | control: {} settled, {:+.1}c per contract", c.closed, 100.0 * c.net_per_contract)
             };
+            let mode = if ctx.dynamic_config.ghost_mode { "simulated" } else { "live" };
             let line = if s.closed == 0 {
-                format!("shadow: {} open, none settled yet{control}", s.open)
+                format!("{mode}: {} open, none settled yet{control}", s.open)
             } else {
                 format!(
-                    "shadow: {} settled, {:.0}% won, {:+.1}c per contract, {:+.2} USD, {} open{control}",
+                    "{mode}: {} settled, {:.0}% won, {:+.1}c per contract, {:+.2} USD, {} open{control}",
                     s.closed, 100.0 * s.wins as f64 / s.closed as f64,
                     100.0 * s.net_per_contract, s.net_usd, s.open,
                 )
@@ -719,7 +972,16 @@ impl Strategy for AnchorStrategy {
             return Ok(StrategySignal::NoSignal);
         }
         let Some(anchor) = anchor else {
-            idle(&format!("anchor warming: {n_samples} samples"));
+            // Say why there is nothing to read when the book itself is the
+            // reason: a market deep in or out of the money has no two-sided mid
+            // inside the sampling band, so "warming" would never end.
+            let mid = Self::yes_mid(&ctx.snapshot);
+            idle(&match mid {
+                None if n_samples == 0 => "no anchor: the YES book has no readable two-sided mid".to_string(),
+                Some(m) if n_samples == 0 && !(ANCHOR_SAMPLE_MID_LO..=ANCHOR_SAMPLE_MID_HI).contains(&m) =>
+                    format!("no anchor: YES mid {m:.2} is too far from the strike to read"),
+                _ => format!("anchor warming: {n_samples} samples"),
+            });
             return Ok(StrategySignal::NoSignal);
         };
         let Some(r) = reading(spot, strike, anchor.basis, sigma, secs_left as f64) else {
@@ -736,7 +998,7 @@ impl Strategy for AnchorStrategy {
         )));
 
         let Some(pool) = crate::helpers::db::pool_for(&asset) else {
-            idle("no database for the simulated ledger");
+            idle("no database for the ledger");
             return Ok(StrategySignal::NoSignal);
         };
         // The venue's taker fee at a price. Per-market fee bps
@@ -746,8 +1008,27 @@ impl Strategy for AnchorStrategy {
         let fee = |p: f64| crate::venues::taker_fee_per_share(Decimal::try_from(p).unwrap_or(Decimal::ZERO))
             .to_f64().unwrap_or(0.0);
         let close_s = now_s + secs_left;
-        // From the sweep's cache: the entry path runs every tick and must not query.
-        let open_notional = *lock(&g.open_notional);
+
+        // What this viper already holds: one position per market, from the map
+        // the dispatcher fills; and the cap over every unsettled fill, from the
+        // ledger (which outlives the map) plus anything the ledger has not seen.
+        let open_notional = {
+            let positions = ctx.positions.lock().await;
+            let mine = |tok: &MarketId| positions.get(&PositionKey::new(&ctx.squadron_id, STRATEGY_NAME, tok.clone()));
+            let held = [(mine(&market.yes_token), "YES"), (mine(&market.no_token), "NO")];
+            if held.iter().any(|(p, _)| p.is_some()) {
+                // Only a confirmed fill spends the side: a provisional position
+                // can still be removed as a phantom, and that entry should stay
+                // retryable.
+                let confirmed = held.iter().filter(|(p, _)| p.is_some_and(|p| p.fill_effective_at(dc.ghost_mode).is_some()));
+                for (_, side) in confirmed {
+                    lock(&g.attempted).insert((market_key.clone(), side.to_string()), close_s);
+                }
+                idle("position already open on this market");
+                return Ok(StrategySignal::NoSignal);
+            }
+            *lock(&g.open_notional) + unledgered_notional(&positions, &ctx.squadron_id, &lock(&g.ledgered))
+        };
         let pick = choose_side(r, secs_left, yes, no, &gates, open_notional, fee);
 
         // The control lane is sampled on EVERY tick inside the gates, whatever
@@ -763,7 +1044,7 @@ impl Strategy for AnchorStrategy {
                 if crate::helpers::db::anchor_shadow_open(
                     &pool, &asset, ANCHOR_LANE_CONTROL, &ctx.squadron_id, &market_key, &market.condition_id,
                     token.as_str(), &market.market_name, side, close_s, c.ask, gates.contracts, fee_at, c.fair,
-                    anchor.basis, sigma, r.z, secs_left, spot, strike, depth,
+                    anchor.basis, sigma, r.z, secs_left, spot, strike, depth, None,
                 ).await {
                     lock(&g.held).insert(key);
                     info!("⚓ Anchor control on {}: {} at ${:.3} is {:.3} over fair {:.3}; recorded, never taken",
@@ -785,40 +1066,95 @@ impl Strategy for AnchorStrategy {
                 return Ok(StrategySignal::NoSignal);
             }
         };
-        let side = if pick.is_yes { "YES" } else { "NO" };
-        let key = held_key(ANCHOR_LANE_ENTRY, &market_key, side);
-        if lock(&g.held).contains(&key) {
-            idle("already holding this side this hour (simulated)");
+        let side: &'static str = if pick.is_yes { "YES" } else { "NO" };
+        // One buy per side per hour, whether the position is still in the map,
+        // already settled out of it, or on the ledger from an earlier session.
+        if lock(&g.attempted).contains_key(&(market_key.clone(), side.to_string()))
+            || lock(&g.held).contains(&held_key(ANCHOR_LANE_ENTRY, &market_key, side))
+        {
+            idle("already bought this side this hour");
             return Ok(StrategySignal::NoSignal);
         }
-        let token = if pick.is_yes { &market.yes_token } else { &market.no_token };
+        let token = if pick.is_yes { market.yes_token.clone() } else { market.no_token.clone() };
+        // An order already out for this side waits for its fill or its forgetting
+        // (`PENDING_FILL_SECS`) before the side is asked for again.
+        if lock(&g.pending).get(token.as_str()).is_some_and(|pe| pe.sent_at.elapsed().as_secs() < PENDING_FILL_SECS) {
+            idle("entry sent, awaiting the fill");
+            return Ok(StrategySignal::NoSignal);
+        }
+        // The venue's own quote, not the f64 the rule priced from.
+        let ask_dec = if pick.is_yes { ctx.snapshot.yes_ask } else { ctx.snapshot.no_ask };
+        let fee_bps = (if pick.is_yes { market.yes_fee_bps } else { market.no_fee_bps }) as u16;
         let depth = if pick.is_yes { yes.ask_depth } else { no.ask_depth };
-        let opened = crate::helpers::db::anchor_shadow_open(
-            &pool, &asset, ANCHOR_LANE_ENTRY, &ctx.squadron_id, &market_key, &market.condition_id, token.as_str(),
-            &market.market_name, side, close_s, pick.ask, gates.contracts, pick.fee, pick.fair, anchor.basis,
-            sigma, r.z, secs_left, spot, strike, depth,
-        ).await;
-        if !opened {
-            idle("ledger write failed");
-            return Ok(StrategySignal::NoSignal);
-        }
-        lock(&g.held).insert(key);
-        *lock(&g.open_notional) += pick.ask * gates.contracts;
+        lock(&g.pending).insert(token.as_str().to_string(), PendingEntry {
+            squadron_id: ctx.squadron_id.clone(),
+            market_key: market_key.clone(),
+            condition_id: market.condition_id.clone(),
+            market_name: market.market_name.clone(),
+            side,
+            close_s,
+            fair: pick.fair,
+            anchor_basis: anchor.basis,
+            sigma,
+            z: r.z,
+            secs_left,
+            spot,
+            strike,
+            ask_depth: depth,
+            ghost: dc.ghost_mode,
+            sent_at: Instant::now(),
+        });
+        crate::helpers::metrics::stash_entry_signals_json_for(STRATEGY_NAME, token.as_str(), serde_json::json!({
+            "viper": "Anchor",
+            "side": side,
+            "ask": pick.ask,
+            "fair": pick.fair,
+            "edge_net_of_fee": pick.edge,
+            "fee_per_share": pick.fee,
+            "anchor_basis": anchor.basis,
+            "anchor_samples": anchor.samples,
+            "sigma_per_sqrt_sec": sigma,
+            "vol_annualized": vol_ann,
+            "z": r.z,
+            "secs_to_close": secs_left,
+            "spot": spot,
+            "strike": strike,
+            "ask_depth": depth,
+            "exit": "settlement",
+        }));
         info!(
-            "⚓ Anchor {} entry on {}: fair {:.3} vs ask ${:.3}, edge {:+.3} net of fee | anchor {:+.0} over {} samples, \
-             sigma {:.2e}/√s ({:.0}% ann.), z {:.2}, T {}s, K ${:.2} | {} contracts (simulated)",
+            "⚓ Anchor {} ENTRY on {}: fair {:.3} vs ask ${:.3}, edge {:+.3} net of fee | anchor {:+.0} over {} samples, \
+             sigma {:.2e}/√s ({:.0}% ann.), z {:.2}, T {}s, K ${:.2} | {} contracts{}",
             side, market.market_name, pick.fair, pick.ask, pick.edge, -anchor.basis, anchor.samples,
-            sigma, vol_ann * 100.0, r.z, secs_left, strike, gates.contracts,
+            sigma, vol_ann * 100.0, r.z, secs_left, strike, dc.anchor_contracts,
+            if dc.ghost_mode { " (simulated)" } else { "" },
         );
-        idle("simulated entry recorded this hour");
-        Ok(StrategySignal::NoSignal)
+        Ok(StrategySignal::Entry {
+            params: OrderParams {
+                token_id: token,
+                price: ask_dec,
+                shares: dc.anchor_contracts,
+                fee_bps,
+                is_neg_risk: market.is_neg_risk,
+                market_name: market.market_name.clone(),
+                condition_id: market_key,
+                order_type: TimeInForce::Fak,
+                post_only: false,
+                ghost_mode: dc.ghost_mode,
+            },
+            pair_params: None,
+        })
     }
 
+    /// Never an exit: the position rides to settlement, which the venue's own
+    /// sweep books (or, for a simulated position, this viper's). What runs here
+    /// is the bookkeeping: ledger rows for new fills, settlements for closed ones.
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         if ctx.market_class.as_deref().is_some_and(|c| c != "crypto") {
             return Ok(StrategySignal::NoSignal);
         }
-        self.sweep_shadow(ctx).await;
+        self.ledger_fills(ctx).await;
+        self.sweep_ledger(ctx).await;
         Ok(StrategySignal::NoSignal)
     }
 
@@ -826,7 +1162,7 @@ impl Strategy for AnchorStrategy {
     fn name(&self) -> String { STRATEGY_NAME.to_string() }
     fn venue(&self) -> &'static str { "Hourly" }
     fn max_exposure(&self) -> Decimal { config::ANCHOR_MAX_EXPOSURE_USDC }
-    fn risk_model(&self) -> &'static str { "Taker at the ask, hold to settlement (simulated)" }
+    fn risk_model(&self) -> &'static str { "Taker at the ask, hold to settlement" }
 }
 
 #[cfg(test)]
@@ -906,6 +1242,36 @@ mod tests {
     }
     fn q(ask: f64, depth: f64) -> SideQuote { SideQuote { ask: Some(ask), ask_depth: depth, obi: 0.0 } }
 
+    /// A fill the ledger already holds is counted from the ledger, not twice;
+    /// a provisional or not-yet-ledgered position is counted here; another
+    /// viper's or another squadron's position is not this viper's exposure.
+    #[test]
+    fn unledgered_notional_counts_only_this_vipers_unknown_fills() {
+        use crate::state::{Position, PositionKey, PositionMap};
+        let now = Utc::now();
+        let pos = |shares: i64, entry: &str, confirmed: bool| Position {
+            shares: Decimal::from(shares),
+            avg_entry: entry.parse().unwrap(),
+            opened_at: now,
+            close_time: None,
+            market_name: "Bitcoin price at 3PM".into(),
+            pair_token_id: MarketId::new("tok"),
+            fill_confirmed_at: confirmed.then_some(now),
+            paired_leg_token_id: None,
+            entry_fee: Decimal::ZERO,
+        };
+        let mut map = PositionMap::new();
+        map.insert(PositionKey::new("btc-open", STRATEGY_NAME, MarketId::new("ledgered")), pos(10, "0.44", true));
+        map.insert(PositionKey::new("btc-open", STRATEGY_NAME, MarketId::new("provisional")), pos(5, "0.30", false));
+        map.insert(PositionKey::new("btc-open", STRATEGY_NAME, MarketId::new("fresh")), pos(2, "0.50", true));
+        map.insert(PositionKey::new("btc-open", "FairValueStrategy", MarketId::new("fv")), pos(10, "0.60", true));
+        map.insert(PositionKey::new("eth-open", STRATEGY_NAME, MarketId::new("eth")), pos(10, "0.60", true));
+        let ledgered: HashSet<String> = ["ledgered".to_string()].into_iter().collect();
+        let got = unledgered_notional(&map, "btc-open", &ledgered);
+        assert!((got - (1.5 + 1.0)).abs() < 1e-9, "got {got}: the provisional and the fresh fill, not the ledgered one");
+        assert_eq!(unledgered_notional(&map, "sol-open", &ledgered), 0.0);
+    }
+
     /// The cheap side is bought: fair YES 0.52 against a 0.44 ask clears four
     /// cents net of fee, while NO at 0.58 against 0.48 fair does not.
     #[test]
@@ -950,7 +1316,7 @@ mod tests {
         let close_s = Utc::now().timestamp() + 900;
         assert!(db::anchor_shadow_open(
             &p, "btc", db::ANCHOR_LANE_ENTRY, "btc-open", "cid-1", "cid-1", "tok-yes", "Bitcoin price at 3PM", "YES", close_s,
-            0.44, 10.0, fee(0.44), 0.52, 93.0, 4.0e-5, 0.3, 900, 83_200.0, 83_100.0, 50.0,
+            0.44, 10.0, fee(0.44), 0.52, 93.0, 4.0e-5, 0.3, 900, 83_200.0, 83_100.0, 50.0, Some(true),
         ).await);
         assert!(db::anchor_shadow_holds(&p, "btc", db::ANCHOR_LANE_ENTRY, "cid-1", "YES").await);
         assert!(!db::anchor_shadow_holds(&p, "btc", db::ANCHOR_LANE_ENTRY, "cid-1", "NO").await, "the other side is still free");
@@ -960,6 +1326,7 @@ mod tests {
         let open = db::anchor_shadow_open_rows(&p, "btc").await.expect("a readable ledger");
         assert_eq!(open.len(), 1);
         assert_eq!((open[0].lane.as_str(), open[0].market_key.as_str()), ("entry", "cid-1"));
+        assert_eq!((open[0].squadron_id.as_str(), open[0].ghost), ("btc-open", Some(true)));
         assert_eq!(open[0].close_s, close_s);
         let pnl = (1.0 - 0.44 - fee(0.44)) * 10.0;
         assert!(db::anchor_shadow_close(&p, open[0].id, 1.0, "settlement", pnl).await);
@@ -1011,7 +1378,7 @@ mod tests {
         db::run_migrations(&p).await;
         assert!(db::anchor_shadow_open(
             &p, "btc", db::ANCHOR_LANE_ENTRY, "btc-open", "cid-9", "cid-9", "tok-no", "m", "NO", 1, 0.30, 10.0, fee(0.30), 0.36, -20.0, 4.0e-5, 0.5, 600,
-            1.0, 1.0, 20.0,
+            1.0, 1.0, 20.0, None,
         ).await);
         let id = db::anchor_shadow_open_rows(&p, "btc").await.unwrap()[0].id;
         assert!(db::anchor_shadow_abandon(&p, id, "unresolved").await);
