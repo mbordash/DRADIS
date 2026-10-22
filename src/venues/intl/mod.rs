@@ -479,7 +479,8 @@ impl Execution for IntlClobVenue {
     }
     /// Best bid on `market`'s book.
     ///
-    /// Lifted from `api::server::fetch_side_price`, which took a whole
+    /// Lifted from the Trade Log's old intl-only quote helper
+    /// (`api::server::fetch_side_price`, removed in 1.5.1), which took a whole
     /// `SessionState` only to reach `session.venue.trading_client()`. Helm's
     /// posture validator needs both ends of the book and had been reaching into
     /// `venues::intl` directly to get them, which is what kept the Helm API

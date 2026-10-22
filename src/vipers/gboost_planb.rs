@@ -1976,7 +1976,9 @@ async fn sweep_shadow_exits(ctx: &StrategyContext, fee_rate: f64) {
             crate::vipers::gboost_planb_train::fee_per_share(fee_rate, exit_price)
         } else { 0.0 };
         let fees = (t.entry_fee + exit_fee) * t.shares;
-        let mut scope = crate::state::TradeScope::new(asset, "", Some("crypto".to_string()), Some(asset.to_uppercase()));
+        // Lower-case underlying, the convention every other writer follows and
+        // the one the trade log keys its asset badge on.
+        let mut scope = crate::state::TradeScope::new(asset, "", Some("crypto".to_string()), Some(asset.to_lowercase()));
         scope.ghost = true;
         crate::helpers::db::record_trade_db(
             &pool, &scope, Decimal::from_f64_retain(fees).unwrap_or_default(),

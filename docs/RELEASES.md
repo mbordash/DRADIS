@@ -4,6 +4,20 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
+## 1.5.1 (unreleased)
+
+- Trade log: simulated rows (instance ghost mode, the GBoost and Anchor shadow lanes) no longer count toward the Realized, Unrealized and Net figures under the table, which now agree with the lifetime cards above it; simulated results get their own labeled line.
+- Trade log: GBoost's simulated settlements are filed under their venue the moment they are written instead of waiting for the next restart to fill the column, and their asset badge matches every other viper's.
+- Trade log: open positions on Kalshi and Polymarket US now show a live bid and unrealized P&L. The live-quote endpoint behind the in-flight rows was built for Polymarket International only, so on the other venues every open position sat with no mark until it settled.
+
+### Detail
+
+**Marks on Kalshi and Polymarket US.** The Trade Log marks an in-flight row from `/api/positions/quotes`, which asked the Polymarket International client directly and was compiled for that venue alone; on the other builds the route did not exist, the dashboard's poll got a 405, and nothing else refreshes a stored mark there (the 300 s chain-sync sweep is also Polymarket International's). The first real Anchor fill on a Kalshi instance showed the gap: five NO contracts in flight with no unrealized P&L for the whole hour. The endpoint now reads both ends of the book through the venue trait, the way Helm's validator does, so Kalshi derives the NO leg from its YES book and Polymarket US answers from its own quote. A zero from an empty side is still reported as missing rather than as a price.
+
+**Simulated money in the footer.** The lifetime cards at the top of the Trade Log have excluded simulated rows since the GBoost shadow lane first booked them on a live instance, but the per-filter footer under the table still summed every loaded row. On a live Kalshi instance with 44 simulated settlements and 6 real trades the footer read a realized loss eleven times the real one. The footer now splits the same way the cards do: Realized, Unrealized and Net are real rows only, and a Simulated line appears beneath them whenever the filter includes ghost rows, with the row count and the words "not money".
+
+**Venue on GBoost shadow rows.** Every trade writer files a row under the venue bound to its shard. GBoost's shadow lane names its shard by asset ("btc"), which on Kalshi is not a shard (the Kalshi database is one shard, keyed "kalshi"), so the lookup missed and the row's venue stayed NULL until the next restart backfilled it. The settlement writer already fell back to the venue bound to the database file itself; the trade and entry writers now do the same. The same lane wrote its underlying in upper case, which the Control Tower's badge lookup did not match, so GBoost rows wore a generic badge beside every other viper's bitcoin one. It writes lower case now and the upgrade folds existing rows.
+
 ## 1.5.0 (unreleased)
 
 - Includes the 1.4.3 changes below (GBoost venue handling, young-store training, Kalshi hourly strike pinning), which ran on production from 2026-10-20 but were never listed as a Marketplace version.

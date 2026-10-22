@@ -87,7 +87,7 @@ const CLASS_EMOJI: Record<string, string> = {
  * instead of an invented ticker.
  */
 function subjectBadge(e: LogEntry): string {
-  if (e.underlying)  return `${ASSET_EMOJI[e.underlying] ?? '◈'} ${e.underlying.toUpperCase()}`;
+  if (e.underlying)  return `${ASSET_EMOJI[e.underlying.toLowerCase()] ?? '◈'} ${e.underlying.toUpperCase()}`;
   if (e.marketClass) return `${CLASS_EMOJI[e.marketClass] ?? '◈'} ${e.marketClass.toUpperCase()}`;
   return '—';
 }
@@ -284,8 +284,10 @@ function SummaryBar({ entries, stats, unknown }: {
   const inflight   = entries.filter(e => e.status === 'inflight').length;
   const completedCount = stats.reduce((s, t) => s + t.count, 0);
   const realizedPnl    = stats.reduce((s, t) => s + t.realized_pnl, 0);
+  // `stats` is already scoped to real rows server-side; keep the open side on
+  // the same footing, so a simulated open position never pads the headline.
   const unrealized = entries
-    .filter(e => e.status !== 'completed' && e.pnl !== null)
+    .filter(e => e.status !== 'completed' && e.pnl !== null && !e.ghost)
     .reduce((s, e) => s + (e.pnl ?? 0), 0);
 
   const pnlTotal = realizedPnl + unrealized;
@@ -736,7 +738,7 @@ export default function TradelogPage({ availableAssets }: Props) {
                 {filtered.map(e => {
                   const isLong   = ['YES', 'UP', 'BUY'].includes(e.side.toUpperCase());
                   const sm       = STATUS_META[e.status];
-                  const assetCls = ASSET_COLOR[e.underlying ?? ''] ?? 'bg-gray-500/10 text-gray-300 border-gray-500/20';
+                  const assetCls = ASSET_COLOR[(e.underlying ?? '').toLowerCase()] ?? 'bg-gray-500/10 text-gray-300 border-gray-500/20';
                   const isOpen   = e.status !== 'completed';
 
                   return (
@@ -924,9 +926,19 @@ export default function TradelogPage({ availableAssets }: Props) {
 
         {/* Filtered P&L footer */}
         {!isLoading && filtered.length > 0 && (() => {
-          const realized   = filtered.filter(e => e.status === 'completed').reduce((s, e) => s + (e.pnl ?? 0), 0);
-          const unrealized = filtered.filter(e => e.status !== 'completed' && e.pnl !== null).reduce((s, e) => s + (e.pnl ?? 0), 0);
+          // Simulated rows (instance ghost mode, the GBoost and Anchor shadow
+          // lanes) stay out of the money figures, matching the lifetime cards
+          // above, which the server already scopes to real rows. A live
+          // operator must never read a simulated loss as money lost; a customer
+          // in ghost mode still gets their simulated running total on its own
+          // line, labeled as such.
+          const sum  = (xs: LogEntry[]) => xs.reduce((s, e) => s + (e.pnl ?? 0), 0);
+          const real = filtered.filter(e => !e.ghost);
+          const sim  = filtered.filter(e => e.ghost);
+          const realized   = sum(real.filter(e => e.status === 'completed'));
+          const unrealized = sum(real.filter(e => e.status !== 'completed' && e.pnl !== null));
           const net = realized + unrealized;
+          const simulated = sum(sim.filter(e => e.status === 'completed' || e.pnl !== null));
           return (
             <div className="px-4 py-3 border-t border-[#1e1e32] flex flex-wrap gap-6 text-xs font-mono">
               <span className="text-gray-500">
@@ -944,6 +956,14 @@ export default function TradelogPage({ availableAssets }: Props) {
                   {net >= 0 ? '+' : ''}${net.toFixed(4)}
                 </span>
               </span>
+              {sim.length > 0 && (
+                <span className="text-gray-500" title="Simulated rows: instance ghost mode and the GBoost / Anchor shadow lanes. Not money; kept out of Realized, Unrealized and Net.">
+                  👻 Simulated: <span className="text-amber-400 opacity-80">
+                    {simulated >= 0 ? '+' : ''}${simulated.toFixed(4)}
+                  </span>
+                  <span className="text-gray-600"> ({sim.length} {sim.length === 1 ? 'row' : 'rows'}, not money)</span>
+                </span>
+              )}
             </div>
           );
         })()}

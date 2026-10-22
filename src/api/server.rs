@@ -1583,7 +1583,14 @@ async fn get_venue_income() -> Response {
 /// paced for a dashboard left open all day, and an operator deciding whether to
 /// close a position by hand needs the book as of now. The refetch still writes
 /// through to the cache, so the press benefits every other viewer too.
-#[cfg(feature = "intl_clob")]
+///
+/// Venue-neutral since 1.5.1: the quotes come through the `Execution` trait,
+/// the way Helm's validator reads the book. Until then this handler was built
+/// for Polymarket International only and the route did not exist on the other
+/// builds, so on Kalshi and Polymarket US an open position never got a mark:
+/// no loop refreshes `current_price` there, the Trade Log's live-quote poll
+/// got a 405, and every in-flight row showed no unrealized P&L at all. The
+/// first real Anchor fill on a Kalshi instance (2026-10-21) sat that way.
 async fn get_position_quotes(State(s): State<ApiState>, Query(q): Query<AssetQuery>) -> Response {
     use std::collections::HashMap as StdHashMap;
     use std::sync::{Mutex as StdMutex, OnceLock};
@@ -1607,7 +1614,12 @@ async fn get_position_quotes(State(s): State<ApiState>, Query(q): Query<AssetQue
     let Some(asset) = q.asset.clone() else {
         return (StatusCode::BAD_REQUEST, "asset query parameter is required").into_response();
     };
-    let Some(session) = s.cag.session_for_asset(&asset) else {
+    // `asset` is the Trade Log's shard selector. On Polymarket International
+    // that is a squadron asset with a session of its own; on Kalshi and
+    // Polymarket US the shard is the venue ("kalshi", "us") and no session
+    // carries that name. A build serves exactly one venue, so every session
+    // holds the same venue handle and the primary's quotes the same book.
+    let Some(session) = s.cag.session_for_asset(&asset).or_else(|| s.cag.session()) else {
         return (StatusCode::BAD_REQUEST, "Asset not found").into_response();
     };
     let Some(pool) = db::pool_for_opt_retry(Some(&asset)).await else {
@@ -1668,9 +1680,23 @@ async fn get_position_quotes(State(s): State<ApiState>, Query(q): Query<AssetQue
             }
         }
 
-        let Ok(token) = U256::from_str(&pos.token_id) else { continue };
-        let bid = fetch_side_price(&session, token, Side::Buy).await;
-        let ask = fetch_side_price(&session, token, Side::Sell).await;
+        // Through the `Execution` trait, so every venue answers in its own
+        // terms: Kalshi and Polymarket US derive the NO leg from their one
+        // YES-side book. A zero is not a price: a venue reports it for an
+        // empty side, and passing it through would paint a $0.0000 row wearing
+        // the green "bid" badge, with unrealized P&L of the entire position.
+        // Missing stays missing: the caller is an operator deciding whether to
+        // sell, and an invented number is worse than a blank.
+        use crate::venues::core::Execution as _;
+        let leg = crate::venues::core::MarketId::new(pos.token_id.as_str());
+        let (bid, ask) = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.venue.quote_both(&leg),
+        ).await {
+            Ok(Ok((b, a))) => (b.filter(|p| *p > Decimal::ZERO), a.filter(|p| *p > Decimal::ZERO)),
+            Ok(Err(e)) => { debug!("quote: fetch failed for {}: {e}", pos.token_id); (None, None) }
+            Err(_)     => { debug!("quote: fetch timed out for {}", pos.token_id); (None, None) }
+        };
         let mid = match (bid, ask) {
             (Some(b), Some(a)) => Some((b + a) / Decimal::TWO),
             _ => None,
@@ -1707,33 +1733,6 @@ async fn get_position_quotes(State(s): State<ApiState>, Query(q): Query<AssetQue
     }
 
     Json(out).into_response()
-}
-
-/// One side's best price, or `None` when the venue has no quote or is slow.
-///
-/// A missing price is reported as missing rather than substituted, because the
-/// caller is an operator deciding whether to sell: an invented number is worse
-/// than a blank.
-#[cfg(feature = "intl_clob")]
-pub(crate) async fn fetch_side_price(
-    session: &crate::cag::session::SessionState,
-    token: U256,
-    side: Side,
-) -> Option<Decimal> {
-    let req = PriceRequest::builder().token_id(token).side(side).build();
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        session.venue.trading_client().price(&req),
-    ).await {
-        // A zero is not a price. The venue returns it rather than an error when
-        // a side is empty — manual_exit already guards on `current_bid <= 0` for
-        // this reason. Passing it through would paint a $0.0000 row wearing the
-        // green "bid" badge, with unrealized P&L of the entire position.
-        Ok(Ok(r)) if r.price > Decimal::ZERO => Some(r.price),
-        Ok(Ok(_)) => { debug!("quote: venue returned a non-positive price for {token}"); None }
-        Ok(Err(e)) => { debug!("quote: price fetch failed for {token}: {e}"); None }
-        Err(_)     => { debug!("quote: price fetch timed out for {token}"); None }
-    }
 }
 
 async fn get_open_positions(Query(q): Query<AssetQuery>) -> Response {
@@ -4697,17 +4696,17 @@ pub async fn run_api_server(
         .route("/api/deployments/{id}/retry",   axum::routing::post(retry_deployment))
         .route("/api/taxonomy/raptors",      get(get_taxonomy_raptors))
         .route("/api/taxonomy/vipers",       get(get_taxonomy_vipers))
-        .route("/api/markets/available",     get(get_available_markets));
+        .route("/api/markets/available",     get(get_available_markets))
+        // Live bid/ask/mid for open positions, through the venue trait. Every
+        // build serves it: it is how the Trade Log marks an in-flight row.
+        .route("/api/positions/quotes",      get(get_position_quotes));
 
     // Intl-only endpoints: self-custody chain-sync + manual on-chain FAK exit.
     // The US custodial venue performs settlement/exit differently (Step 3b).
     #[cfg(feature = "intl_clob")]
     let protected_routes = protected_routes
         .route("/api/positions/sync",        axum::routing::post(sync_positions))
-        .route("/api/positions/manual-exit", axum::routing::post(manual_exit))
-        // Live bid/ask/mid for open positions — the surface a manual exit is
-        // decided from, and intl-only for the same reason manual-exit is.
-        .route("/api/positions/quotes",      get(get_position_quotes));
+        .route("/api/positions/manual-exit", axum::routing::post(manual_exit));
 
     // Helm intents: the operator's conviction record. Mounted here so the
     // API-key and read-only gates below apply to its writes like any other.

@@ -162,7 +162,7 @@ ASSETS=us                          # keep the dashboard pool tidy (US data lives
 > reconcile via `OrderLifecycle`. Open positions and portfolio P&L appear in the Control Tower under the **`us`**
 > asset selector. The Control Tower API stays live on `:9000` regardless. A second
 > **crypto wing** (`us-crypto` asset) hunts crypto-class markets with the full Raptor
-> stack, so all nine crypto Vipers fly on them; among short-dated markets it takes the
+> stack, so all ten crypto Vipers fly on them; among short-dated markets it takes the
 > one-hour shape first. GBoost works here as it does on Kalshi: it scores one-hour BTC
 > markets, keys its model on the market's underlying, reads the market's own mids from
 > the book it streams (this venue publishes neither prints nor history), and records
@@ -208,7 +208,7 @@ ASSETS=kalshi                            # keep the dashboard pool tidy (data in
 > the primary: Kalshi's one-hour above/below listing when one is on the board
 > (`KXBTCD` carries both an hourly and a daily listing), the 15-minute market
 > otherwise, with the daily market on the same coin beside it for the slower
-> Vipers. It classifies both via the shared taxonomy and runs all nine crypto
+> Vipers. It classifies both via the shared taxonomy and runs all ten crypto
 > Vipers with the full Raptor intelligence stack. GBoost scores one-hour markets,
 > the shape its model is trained on, so it idles and says so between hourly
 > listings; a model stamped for another venue trades the shadow lane, settling
@@ -430,7 +430,7 @@ The **Tennis Raptor** reads the event itself rather than the betting line: it po
 
 ## ✈️ Viper Wing (`src/vipers/`)
 
-Eleven specialized Viper strategy classes. Each Viper is an autonomous tactical unit with its own capital budget, position book, and entry/exit logic.
+Twelve specialized Viper strategy classes. Each Viper is an autonomous tactical unit with its own capital budget, position book, and entry/exit logic.
 
 | Viper            | Venue        | Description                                                                                                                                                                               |
 |------------------|--------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -455,11 +455,19 @@ It is maker-first and deliberately timid. It refuses to quote at all unless enou
 
 Two staleness thresholds govern the feed, and the distinction matters: **Max Feed Age To Quote** is how old a consensus may be for Bookline to *place* a bid, while **Max Feed Age To Hold** is how old it may get before an *already-resting* bid is withdrawn. The second is much looser than the first, because committing new capital demands a current line whereas a bid already resting at a price that was current when placed is not made wrong by the feed going quiet. Sharing one threshold capped a quote's life at the entry bar, which is far too short for a passive maker to be crossed. Keep the hold threshold comfortably above the widest gap in the snapshot schedule.
 
-**Status: simulated, and unproven.** Bookline is instantiated and evaluated on every venue like the other nine, and it runs live on real markets rather than behind instance-wide ghost mode — but it places no venue order. It keeps its own ledger (`bookline_shadow`) recording each quote, pull, fill and settlement so the strategy accumulates a real record against real books before any capital is committed. The venue-matching layer is implemented for all three venues; at the time of writing the Polymarket US path has not yet been exercised against the live gateway, and no settled Bookline record exists on any venue. Treat the numbers it produces as a trial in progress, not as a track record. It is off by default (`BOOKLINE_ENABLED`) and every threshold above is a live `DynamicConfig` knob on the Bookline card in Control Tower.
+**Status: simulated, and unproven.** Bookline is instantiated and evaluated on every venue like the ten crypto Vipers, and it runs live on real markets rather than behind instance-wide ghost mode — but it places no venue order. It keeps its own ledger (`bookline_shadow`) recording each quote, pull, fill and settlement so the strategy accumulates a real record against real books before any capital is committed. The venue-matching layer is implemented for all three venues; at the time of writing the Polymarket US path has not yet been exercised against the live gateway, and no settled Bookline record exists on any venue. Treat the numbers it produces as a trial in progress, not as a track record. It is off by default (`BOOKLINE_ENABLED`) and every threshold above is a live `DynamicConfig` knob on the Bookline card in Control Tower.
+
+### Anchor — the sideways-regime Viper, and why it keeps a ledger
+
+**Anchor** exists for the hours the other crypto Vipers sit out: the market drifting a few hundred dollars around its strike with nothing for Momentum or TrendCapture to catch. The research behind it found that pricing an hourly market from an external feed alone is noise near the strike late in the hour, because the venue's settlement index and the oracle feed differ by a basis that moves, and a $15 level error is a quarter of the remaining sigma. So Anchor takes the **level from the market itself**: each tick it inverts the YES mid into the index the market implies, keeps a rolling median of the difference between that and the oracle over the previous one to ten minutes, and uses the oracle only for the **move** since then. Fair value is then a plain gamma read from that anchored level, and Anchor buys the cheap side as a taker when fair clears the ask by the minimum edge net of fee.
+
+It is narrow by design and every gate is a `DynamicConfig` knob on its card. It trades hourly crypto markets only, in the last thirty minutes of the hour but not the last five; it wants an ask between 0.20 and 0.60, the strike within one sigma of the anchored level, realized vol under 35% annualized (above that, the other Vipers have the regime), at least twenty anchor samples spanning five minutes, and a clean order book. One buy per side per hour, a fixed contract count, a ceiling on unsettled notional, and no exit order: the position is held to settlement and the venue sweep books it.
+
+**Status: trial.** Anchor trades through the squadron's dispatcher like every other Viper, so instance-wide ghost mode decides whether its fills are simulated or real. Either way it writes each fill, with the model's reading at that moment, to its own ledger (`anchor_shadow`), and beside it records a **control lane**: the expensive side it refused, so the record shows whether the model is picking sides or just picking cheap contracts. In ghost mode it also books its own simulated settlements, since the venue loops have no settlement path for a simulated position held through an hourly close. The go/no-go is statistical, not anecdotal: roughly 300 hours and 150 entries with a positive average per contract after fees, more hours positive than not, and the control lane negative. Until the ledger says that, a losing hour means nothing and a winning one means nothing. It is off by default (`ENABLE_ANCHOR_TRADING`).
 
 ### Helm — the operator in the cockpit, and what "beta" means here
 
-Every other Viper decides for itself. **Helm** is the one that does not: the operator picks the market and the side, and the engine supplies the discipline. It exists because the nine model-driven Vipers are blind outside their domain. Momentum needs Binance velocity, FairValue needs a strike, GBoost needs its hourly feature set, so a market about a hurricane, an election or a fight has no signal any of them can read. The only signal available there is the operator's own, and Helm's purpose is to make acting on that signal accountable rather than casual.
+Every other Viper decides for itself. **Helm** is the one that does not: the operator picks the market and the side, and the engine supplies the discipline. It exists because the ten model-driven Vipers are blind outside their domain. Momentum needs Binance velocity, FairValue needs a strike, GBoost needs its hourly feature set, so a market about a hurricane, an election or a fight has no signal any of them can read. The only signal available there is the operator's own, and Helm's purpose is to make acting on that signal accountable rather than casual.
 
 So the entry is a form, not a button. You state a **thesis**, a **probability**, a **horizon**, and the condition that would prove you **wrong**, and you choose the exit posture: a stop, a take-profit, a time limit, or holding to settlement. The thesis is stored as first written and never changes. The posture is versioned, so you can move a stop as the trade develops and the record still shows what you believed when you committed. That asymmetry is the whole design: a conviction you can quietly rewrite after the outcome is not evidence of anything.
 
@@ -501,7 +509,7 @@ Classification is data-driven via the `market_class_rule` table — add a new ma
 
 | Preset          | Raptors         | Vipers                             |
 |-----------------|-----------------|------------------------------------|
-| `full_wing`     | Price + Funding + Derivatives + Tide | All nine crypto Vipers (current default) |
+| `full_wing`     | Price + Funding + Derivatives + Tide | All ten crypto Vipers (current default) |
 | `momentum_only` | Price only      | Momentum + GBoost                  |
 | `arb_wing`      | Price + Funding | Arbitrage + Basis                  |
 
@@ -586,7 +594,7 @@ The **Markets** page answers "what does DRADIS think of this market, and why is 
 
 Every parameter in the Viper cards maps directly to the runtime `DynamicConfig`. Editing a value sends `PATCH /api/config` — **no restart required**. Changes take effect on the next 50ms tick.
 
-> **Hot-Enable Design** — All ten Vipers are always instantiated at startup. The `DynamicConfig` enable flags are the sole runtime gate. Toggle any Viper on or off during a live session with immediate effect.
+> **Hot-Enable Design** — All twelve Vipers are always instantiated at startup. The `DynamicConfig` enable flags are the sole runtime gate. Toggle any Viper on or off during a live session with immediate effect.
 
 ### Setup Tab — No-Shell Credential Management
 
@@ -871,8 +879,8 @@ POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_API_KEY
 | Profile      | File                                 | Wallet    | Risk   | Vipers            |
 |--------------|--------------------------------------|-----------|--------|-------------------|
 | Conservative | `src/config.conservative.rs.example` | < $100    | Low    | Maker, Time Decay |
-| Balanced     | `src/config.balanced.rs.example`     | $100–$300 | Medium | All nine crypto   |
-| Aggressive   | `src/config.aggressive.rs.example`   | $200+     | High   | All nine crypto   |
+| Balanced     | `src/config.balanced.rs.example`     | $100–$300 | Medium | All ten crypto, Anchor off |
+| Aggressive   | `src/config.aggressive.rs.example`   | $200+     | High   | All ten crypto, Anchor off |
 
 ```bash
 cp src/config.balanced.rs.example src/config.rs
@@ -990,7 +998,7 @@ setup for why write-capable tools are gated behind future work.
 
 ## FAQ
 
-**Why Rust?** Fearless concurrency — evaluating ten Vipers every 50ms needs a multi-threaded runtime with no GIL or GC pauses.
+**Why Rust?** Fearless concurrency — evaluating a dozen Vipers every 50ms needs a multi-threaded runtime with no GIL or GC pauses.
 
 **Can I trade multiple assets at once?** Yes — set `ASSETS=btc,eth,sol` in `.env`. Each asset runs its own independent patrol loop (raptors, session state, LLM advisor, SQLite DB) inside a `tokio::spawn`ed task. The wallet, CLOB client, and API server are shared. Each asset writes to its own DB file (`logs/btc-dradis.db`, `logs/eth-dradis.db`, etc.); pass `?asset=eth` to any API endpoint to scope results to that asset.
 
@@ -1006,7 +1014,7 @@ setup for why write-capable tools are gated behind future work.
 
 **Does DRADIS support the US Polymarket API?** Yes.  Polymarket's **US platform** is a separate, custodial, CFTC-regulated exchange with web2 auth (API key / secret / session token) and string/UUID market IDs. We have **venue abstraction** so a build targets one venue via a Cargo feature flag (`intl_clob` default, `us_retail`, `kalshi`) — single-venue per binary, so the US deployment carries none of the Polygon crypto weight and stays inside its own regulatory/network footprint. Start a US build with `VENUE=us ./start-local.sh`.
 
-**What about Kalshi?** Fully supported. Build with `--features kalshi` (or `VENUE=kalshi ./start-local.sh`) — RSA-PSS signed REST + WebSocket, crypto-first trading loop over Kalshi's hourly, 15-minute and daily BTC/ETH series (the one-hour market is preferred when listed), all nine crypto Vipers with the full Raptor stack (GBoost scores one-hour markets only, see above), and event-precise fill confirmation. Paper-trade it risk-free against [demo.kalshi.co](https://demo.kalshi.co) with `KALSHI_DEMO=1`. See "Kalshi configuration" above.
+**What about Kalshi?** Fully supported. Build with `--features kalshi` (or `VENUE=kalshi ./start-local.sh`) — RSA-PSS signed REST + WebSocket, crypto-first trading loop over Kalshi's hourly, 15-minute and daily BTC/ETH series (the one-hour market is preferred when listed), all ten crypto Vipers with the full Raptor stack (GBoost scores one-hour markets only, see above), and event-precise fill confirmation. Paper-trade it risk-free against [demo.kalshi.co](https://demo.kalshi.co) with `KALSHI_DEMO=1`. See "Kalshi configuration" above.
 
 **Control Tower shows "Offline"?** Check: (1) DRADIS running? (2) `curl http://localhost:9000/api/health`? (3) Docker — same `dradis-net` network?
 

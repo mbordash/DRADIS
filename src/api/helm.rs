@@ -151,7 +151,8 @@ async fn book_facts(s: &ApiState, market_id: &str, side: &str) -> Result<BookFac
     // Everything below goes through the venue, so this function is venue-neutral.
     //
     // It used to call Gamma for the tokens and reach into
-    // `venues::intl::u256_from_market_id` plus `api::server::fetch_side_price`
+    // `venues::intl::u256_from_market_id` plus the Trade Log's intl-only quote
+    // helper (since removed; `/api/positions/quotes` reads the trait too now)
     // for the book, which is why Helm entry was gated to one venue and why this
     // file carried `#[cfg]` arms the project reserves for `src/venues/mod.rs`.
     // `SessionState` has held `venue: Arc<ActiveVenue>` since the venue

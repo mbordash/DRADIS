@@ -108,6 +108,20 @@ fn resolved_venue(scope: &TradeScope) -> Option<String> {
     (!v.is_empty()).then_some(v)
 }
 
+/// `resolved_venue`, then the venue bound to the database `pool` writes to.
+///
+/// The last leg catches a writer that names its shard by asset on a venue whose
+/// shard is the venue itself: GBoost's shadow lane files under shard "btc" while
+/// the Kalshi registry key is "kalshi", so the shard lookup missed and every
+/// shadow row sat with a NULL venue until the next restart's backfill. The pool
+/// knows which file it is connected to, and one file belongs to one venue.
+fn resolved_venue_for(scope: &TradeScope, pool: &SqlitePool) -> Option<String> {
+    resolved_venue(scope).or_else(|| {
+        let v = venue_for_pool(pool);
+        (!v.is_empty()).then_some(v)
+    })
+}
+
 /// The session ID for the current process lifetime.  Set once by `init_session()`
 /// and remains stable for the entire run.  Format: RFC-3339 timestamp so it is
 /// human-readable and lexicographically sortable.
@@ -2161,6 +2175,16 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) {
     // claim about them.
     let _ = sqlx::query("ALTER TABLE trades ADD COLUMN ghost INTEGER NOT NULL DEFAULT 0")
         .execute(pool).await;
+    // `underlying` is a lower-case symbol everywhere it is written ("btc"), and
+    // the Control Tower keys its asset badge on exactly that. GBoost's shadow
+    // lane wrote "BTC" until 1.5.1, so its rows wore a generic badge beside
+    // every other viper's bitcoin one. Fold the legacy rows; idempotent.
+    for table in ["trades", "entries", "open_positions"] {
+        let _ = sqlx::query(&format!(
+            "UPDATE {table} SET underlying = lower(underlying)
+             WHERE underlying IS NOT NULL AND underlying <> lower(underlying)"
+        )).execute(pool).await;
+    }
     // `price_updated_at`: when `current_price` was last refreshed.
     //
     // That price comes from the 300s chain-sync sweep reading the Polymarket
@@ -2299,7 +2323,7 @@ pub async fn record_trade_db(
 ) {
     let ts = timestamp.unwrap_or_else(|| Utc::now()).to_rfc3339();
     let sid = current_session_id();
-    let venue = resolved_venue(scope);
+    let venue = resolved_venue_for(scope, pool);
     if let Err(e) = sqlx::query(
         "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, session_id,
                              venue, market_class, underlying, fees, ghost)
@@ -2385,10 +2409,7 @@ pub async fn record_settlement_trade_checked(
 ) -> SettlementWrite {
     let ts = timestamp.unwrap_or_else(Utc::now).to_rfc3339();
     let sid = current_session_id();
-    let venue = resolved_venue(scope).or_else(|| {
-        let v = venue_for_pool(pool);
-        (!v.is_empty()).then_some(v)
-    });
+    let venue = resolved_venue_for(scope, pool);
     match sqlx::query(
         "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, session_id, fees,
                              venue, market_class, underlying, ghost)
@@ -2504,7 +2525,7 @@ pub async fn record_entry_db(
 ) {
     let ts = Utc::now().to_rfc3339();
     let sid = current_session_id();
-    let venue = resolved_venue(scope);
+    let venue = resolved_venue_for(scope, pool);
     if let Err(e) = sqlx::query(
         "INSERT INTO entries (ts, strategy, token_id, market, side, entry_price, shares, session_id,
                               venue, market_class, underlying)
@@ -6669,6 +6690,43 @@ mod reconcile_tests {
         assert_eq!(row.try_get::<Option<String>, _>(0).unwrap(), Some("polymarket-us".to_string()));
         assert_eq!(row.try_get::<Option<String>, _>(1).unwrap(), Some("sports".to_string()));
         assert_eq!(row.try_get::<Option<String>, _>(2).unwrap(), None);
+    }
+
+    /// A writer that names its shard by asset on a venue whose shard is the
+    /// venue itself (GBoost's shadow lane on Kalshi: scope shard "btc", registry
+    /// key "kalshi") still files its trade and entry rows under the pool's
+    /// venue, instead of leaving the column NULL until a restart backfills it.
+    #[tokio::test]
+    async fn a_mismatched_shard_still_takes_the_pools_venue() {
+        let path = std::env::temp_dir().join(format!("dradis-venue-fallback-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        init_shard("venue-fallback-shard", path.to_str().unwrap(), "kalshi").await.expect("file shard");
+        let pool = pool_for_opt(Some("venue-fallback-shard")).expect("shard registered");
+        let scope = TradeScope::new("btc", "", Some("crypto".into()), Some("btc".into()));
+        record_trade_db(&pool, &scope, Decimal::ZERO, "GboostStrategy", "BTC hourly", "YES",
+            dec_of("0.63"), dec_of("0"), dec_of("6"), dec_of("-3.99"), "Shadow settlement — simulated", None).await;
+        record_entry_db(&pool, &scope, "GboostStrategy", "tok-g", "BTC hourly", "YES", dec_of("0.63"), dec_of("6")).await;
+
+        let t: Option<String> = sqlx::query_scalar("SELECT venue FROM trades").fetch_one(&pool).await.unwrap();
+        let e: Option<String> = sqlx::query_scalar("SELECT venue FROM entries").fetch_one(&pool).await.unwrap();
+        assert_eq!(t.as_deref(), Some("kalshi"), "trade row takes the pool's venue");
+        assert_eq!(e.as_deref(), Some("kalshi"), "entry row takes the pool's venue");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An upper-case underlying left by an older GBoost shadow row is folded to
+    /// the lower-case convention every other writer uses, so one asset is one
+    /// badge in the trade log.
+    #[tokio::test]
+    async fn migration_folds_underlying_to_lower_case() {
+        let pool = mem_pool().await;
+        sqlx::query(
+            "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, underlying)
+             VALUES ('2026-10-21T23:11:51Z','GboostStrategy','BTC hourly','YES','0.63','0','6','-3.99','Shadow settlement','BTC')"
+        ).execute(&pool).await.unwrap();
+        run_migrations(&pool).await;
+        let u: Option<String> = sqlx::query_scalar("SELECT underlying FROM trades").fetch_one(&pool).await.unwrap();
+        assert_eq!(u.as_deref(), Some("btc"));
     }
 
     /// Two underlyings sharing one shard stay distinguishable — the Kalshi case
