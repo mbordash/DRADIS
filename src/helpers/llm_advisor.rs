@@ -683,9 +683,19 @@ These can be adjusted live without restarting the bot:
   FairValue:    trade_size_usdc, max_exposure, stop_loss_pct, target_profit_pct, base_edge
   Convergence:  position_size_usdc, max_exposure, stop_loss_pct, target_profit_pct, max_entry_price
   Arbitrage:    position_size_usdc, max_exposure, profit_threshold, min_leg_conviction
+  Anchor:       contracts, max_exposure_usdc, min_edge (hourly crypto only; holds to settlement, so there is no stop or take-profit to tune)
   Enable flags: enable_momentum, enable_maker, enable_basis, enable_gboost,
                 enable_time_decay, enable_arbitrage, enable_trendcapture,
-                enable_fairvalue, enable_convergence
+                enable_fairvalue, enable_convergence, anchor_enabled
+                (bookline_enabled is operator-only: recommend it in prose, never in the json block)
+
+== Scope of the trade list ==
+The trades and open positions in the user message are the WHOLE instance's,
+across every squadron, because risk is shared at the account. The config you
+may change is this one squadron's. Each trade row names its market class; a row
+from another class belongs to another squadron and says nothing about this
+squadron's vipers or flags. Do not infer that a viper is disabled because it is
+absent from this squadron's config: it may simply not fly this market class.
 
 IMPORTANT: The CURRENT VALUES of every parameter are provided in the user message
 under "== Current Live Configuration ==". Always use those exact values as the
@@ -799,8 +809,48 @@ fn viper_key_prefix(strategy: &str) -> &'static str {
         "trendreversal" | "trendcapture" => "trendcapture",
         "fairvalue" => "fairvalue",
         "convergence" => "convergence",
+        "anchor" => "anchor",
+        "bookline" => "bookline",
         "helm" => "helm",
         _ => "",
+    }
+}
+
+/// The market class a trade row belongs to, for the prompt's `class` column.
+/// `-` where none was recorded: rows written before the column existed, and
+/// rows the venue sweeps adopt from the account without knowing the market's
+/// class. The honest answer is "not recorded", never a guess from the name.
+fn trade_class(t: &db::TradeRow) -> &str {
+    t.market_class.as_deref().unwrap_or("-")
+}
+
+/// A viper switch as the enabled-flags line shows it: `n/a` when this
+/// squadron's market class does not fly the viper at all, else its value.
+fn switch_state(kind: &str, enabled: bool, allowed_vipers: &[String]) -> &'static str {
+    if !allowed_vipers.iter().any(|v| v == kind) {
+        "n/a"
+    } else if enabled {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+/// Whether a schema field belongs to a viper this squadron's market class does
+/// not fly. `enable_key` is the viper's switch; most are `enable_<kind>`, while
+/// Anchor, Bookline and Helm spell theirs `<kind>_enabled`. Until both
+/// spellings were read, Anchor's knobs slipped past this filter onto the
+/// politics and sports squadrons, which cannot fly it: the model was offered
+/// `anchor_enabled` on a squadron where it governs nothing and, reading `false`
+/// there, concluded the viper had been switched off while its trades were in
+/// flight. The same rule now keeps Helm's two basic knobs to the `helm` class.
+fn foreign_to_class(enable_key: &str, allowed_vipers: &[String]) -> bool {
+    let kind = enable_key
+        .strip_prefix("enable_")
+        .or_else(|| enable_key.strip_suffix("_enabled"));
+    match kind {
+        Some(kind) => !allowed_vipers.iter().any(|v| v == kind),
+        None => false,
     }
 }
 
@@ -1039,6 +1089,10 @@ fn build_user_prompt(
     session_id: &str,
     dyn_cfg: &DynamicConfig,
     fewshot: &[db::LlmActionRow],
+    // Market class this squadron flies (`crypto`, `sports`, `politics`). The
+    // trade list below is instance-wide, so the prompt names the class the
+    // config belongs to and tags every row with its own.
+    squadron_class: &str,
     // Viper kinds linked to this squadron's market class — the only ones worth
     // offering the model, since a proposal into a viper the squadron does not
     // fly can never take effect.
@@ -1053,23 +1107,30 @@ fn build_user_prompt(
     let mut lines = Vec::new();
 
     lines.push(format!(
-        "Session: {}  |  P&L: ${:.2}  |  Starting collateral: ${:.2}  |  Session trades: {}",
+        "Session: {}  |  P&L: ${:.2}  |  Starting collateral: ${:.2}  |  Session trades: {}  |  This squadron flies: {} markets",
         truncate_on_char_boundary(session_id, 16), // trim to readable date+time prefix
-        session_pnl, starting_collateral, session_trades.len()
+        session_pnl, starting_collateral, session_trades.len(), squadron_class
     ));
     lines.push(String::new());
 
     // ── Current session trades ────────────────────────────────────────────────
     if !session_trades.is_empty() {
-        lines.push("=== CURRENT SESSION TRADES (newest first) ===".to_string());
+        lines.push("=== CURRENT SESSION TRADES (newest first, whole instance) ===".to_string());
+        lines.push(format!(
+            "Rows whose class is not `{squadron_class}` were made by another squadron's vipers \
+             and are context for shared risk only; `-` means the row has no recorded class; \
+             `sim` rows are simulated and not money."
+        ));
         lines.push(
-            "ts | strategy | market | side | entry | exit | shares | pnl | reason".to_string(),
+            "ts | class | mode | strategy | market | side | entry | exit | shares | pnl | reason".to_string(),
         );
         lines.push("-".repeat(90));
         for t in session_trades {
             lines.push(format!(
-                "{} | {} | {} | {} | {} | {} | {} | ${} | {}",
+                "{} | {} | {} | {} | {} | {} | {} | {} | {} | ${} | {}",
                 &t.ts[5..16],
+                trade_class(t),
+                if t.ghost { "sim" } else { "live" },
                 t.strategy.replace("Strategy", ""),
                 truncate_on_char_boundary(&t.market, 32),
                 t.side,
@@ -1081,42 +1142,60 @@ fn build_user_prompt(
             ));
         }
 
-        // Current session summary
-        let (wins, losses, total_pnl_f): (usize, usize, f64) = session_trades.iter().fold(
-            (0, 0, 0.0),
-            |(w, l, p), t| {
+        // Current session summary. Real rows only: the simulated lanes (GBoost
+        // and Anchor shadows, instance ghost mode) are listed above as `sim`
+        // and would otherwise dominate the headline on an instance where a
+        // shadow lane books an hourly settlement, which is exactly the trade
+        // log footer bug 1.5.1 fixed on the dashboard.
+        let tally = |rows: &mut dyn Iterator<Item = &db::TradeRow>| -> (usize, usize, f64) {
+            rows.fold((0, 0, 0.0), |(w, l, p), t| {
                 let pnl: f64 = t.pnl.parse().unwrap_or(0.0);
                 if pnl > 0.0 { (w + 1, l, p + pnl) }
                 else if pnl < 0.0 { (w, l + 1, p + pnl) }
                 else { (w, l, p) }
-            },
-        );
+            })
+        };
+        let (wins, losses, total_pnl_f) = tally(&mut session_trades.iter().filter(|t| !t.ghost));
         let win_rate = if wins + losses > 0 {
             (wins as f64 / (wins + losses) as f64) * 100.0
         } else { 0.0 };
 
         lines.push(String::new());
         lines.push(format!(
-            "Current session: {} wins / {} losses | Win rate: {:.0}% | P&L: ${:.2}",
+            "Current session, live rows only, whole instance: {} wins / {} losses | Win rate: {:.0}% | P&L: ${:.2}",
             wins, losses, win_rate, total_pnl_f
         ));
+        let sim_rows = session_trades.iter().filter(|t| t.ghost).count();
+        if sim_rows > 0 {
+            let (sw, sl, sp) = tally(&mut session_trades.iter().filter(|t| t.ghost));
+            lines.push(format!(
+                "Simulated rows, not money, excluded above: {} ({} wins / {} losses / ${:.2})",
+                sim_rows, sw, sl, sp
+            ));
+        }
 
-        // Strategy-level breakdown for current session
-        let mut by_strategy: std::collections::HashMap<&str, (usize, usize, f64)> =
+        // Strategy-level breakdown for current session, live rows only; a
+        // strategy whose rows are all simulated is listed as such.
+        let mut by_strategy: std::collections::HashMap<&str, (usize, usize, f64, usize)> =
             std::collections::HashMap::new();
         for t in session_trades {
             let strat = t.strategy.as_str();
+            let entry = by_strategy.entry(strat).or_insert((0, 0, 0.0, 0));
+            if t.ghost {
+                entry.3 += 1;
+                continue;
+            }
             let pnl: f64 = t.pnl.parse().unwrap_or(0.0);
-            let entry = by_strategy.entry(strat).or_insert((0, 0, 0.0));
             if pnl > 0.0 { entry.0 += 1; }
             else if pnl < 0.0 { entry.1 += 1; }
             entry.2 += pnl;
         }
-        lines.push("Per-strategy (current session):".to_string());
+        lines.push("Per-strategy (current session, live rows; simulated rows counted separately):".to_string());
         let mut strat_entries: Vec<_> = by_strategy.into_iter().collect();
         strat_entries.sort_by(|a, b| b.1.2.partial_cmp(&a.1.2).unwrap_or(std::cmp::Ordering::Equal));
-        for (strat, (w, l, p)) in strat_entries {
-            lines.push(format!("  {}: {} wins / {} losses / ${:.2}", strat.replace("Strategy", ""), w, l, p));
+        for (strat, (w, l, p, sim)) in strat_entries {
+            let sim_note = if sim > 0 { format!(" | {sim} simulated row(s), not money") } else { String::new() };
+            lines.push(format!("  {}: {} wins / {} losses / ${:.2}{}", strat.replace("Strategy", ""), w, l, p, sim_note));
         }
     } else {
         lines.push("NO TRADES this session.".to_string());
@@ -1153,13 +1232,15 @@ fn build_user_prompt(
                 prior.len()
             ));
             lines.push(
-                "ts | strategy | market | side | entry | exit | shares | pnl | reason".to_string(),
+                "ts | class | mode | strategy | market | side | entry | exit | shares | pnl | reason".to_string(),
             );
             lines.push("-".repeat(90));
             for t in prior {
                 lines.push(format!(
-                    "{} | {} | {} | {} | {} | {} | {} | ${} | {}",
+                    "{} | {} | {} | {} | {} | {} | {} | {} | {} | ${} | {}",
                     truncate_on_char_boundary(&t.ts, 16),
+                    trade_class(t),
+                    if t.ghost { "sim" } else { "live" },
                     t.strategy.replace("Strategy", ""),
                     truncate_on_char_boundary(&t.market, 32),
                     t.side,
@@ -1175,12 +1256,25 @@ fn build_user_prompt(
 
     lines.push(String::new());
     lines.push("== Current Live Configuration ==".to_string());
+    // Every viper switch, including the ones added after this line was first
+    // written (FairValue, Convergence, Anchor, Bookline); a flag missing here
+    // read to the model as a viper that did not exist. A viper this squadron's
+    // market class does not fly reads `n/a`, not `false`: on a politics
+    // squadron `Anchor=false` is literally true of the config row and still
+    // the wrong thing to tell the model, which took it as the viper having
+    // been switched off while its (crypto) trades were in flight.
+    let sw = |kind: &str, on: bool| switch_state(kind, on, allowed_vipers);
     lines.push(format!(
-        "Ghost mode: {} | Strategies enabled: Momentum={}, Maker={}, Basis={}, GBoost={}, TimeDecay={}, Arbitrage={}, TrendCapture={}",
+        "Ghost mode: {} | Strategies enabled on this squadron (n/a = not flown on this market class): \
+         Momentum={}, Maker={}, Basis={}, GBoost={}, TimeDecay={}, Arbitrage={}, TrendCapture={}, \
+         FairValue={}, Convergence={}, Anchor={}, Bookline={}",
         dyn_cfg.ghost_mode,
-        dyn_cfg.enable_momentum, dyn_cfg.enable_maker, dyn_cfg.enable_basis,
-        dyn_cfg.enable_gboost, dyn_cfg.enable_time_decay, dyn_cfg.enable_arbitrage,
-        dyn_cfg.enable_trendcapture,
+        sw("momentum", dyn_cfg.enable_momentum), sw("maker", dyn_cfg.enable_maker),
+        sw("basis", dyn_cfg.enable_basis), sw("gboost", dyn_cfg.enable_gboost),
+        sw("time_decay", dyn_cfg.enable_time_decay), sw("arbitrage", dyn_cfg.enable_arbitrage),
+        sw("trendcapture", dyn_cfg.enable_trendcapture), sw("fairvalue", dyn_cfg.enable_fairvalue),
+        sw("convergence", dyn_cfg.enable_convergence), sw("anchor", dyn_cfg.anchor_enabled),
+        sw("bookline", dyn_cfg.bookline_enabled),
     ));
     lines.push(format!(
         "Momentum: momentum_stop_loss_pct={:.0}%, momentum_target_profit_pct={:.0}%, momentum_min_trade_size_usdc=${}, momentum_max_trade_size_usdc=${}, momentum_max_exposure_usdc=${}",
@@ -1241,20 +1335,21 @@ fn build_user_prompt(
     // ── Open positions (in-flight, not yet closed) ───────────────────────────
     if !open_positions.is_empty() {
         lines.push(String::new());
-        lines.push(format!("== Open Positions ({} currently in-flight) ==", open_positions.len()));
-        lines.push("strategy | side | market | entry_price | shares | mode".to_string());
+        lines.push(format!("== Open Positions ({} currently in-flight, whole instance) ==", open_positions.len()));
+        lines.push("class | mode | strategy | side | market | entry_price | shares".to_string());
         for p in open_positions {
             lines.push(format!(
-                "{} | {} | {} | {} | {} | {}",
+                "{} | {} | {} | {} | {} | {} | {}",
+                p.market_class.as_deref().unwrap_or("-"),
+                if p.ghost_mode { "sim" } else { "live" },
                 p.strategy.replace("Strategy", ""),
                 p.side,
                 truncate_on_char_boundary(&p.market, 32),
                 p.entry_price,
                 p.shares,
-                if p.ghost_mode { "ghost" } else { "live" },
             ));
         }
-        lines.push("Note: these positions are open and awaiting exit/settlement. Account for them in your P&L and risk assessment.".to_string());
+        lines.push("Note: these positions are open and awaiting exit/settlement. Account for the live ones in your P&L and risk assessment; `sim` rows are simulated and not money.".to_string());
     }
 
     // ── Machine-editable key list for the proposals json block ────────────────
@@ -1292,10 +1387,8 @@ fn build_user_prompt(
             // or GBoost invites proposals that could never take effect and burns
             // the change budget on them. `enable_maker` → `maker` is exact,
             // which is why the enable key is used rather than the display group.
-            if let Some(kind) = enable_key.strip_prefix("enable_") {
-                if !allowed_vipers.iter().any(|v| v == kind) {
-                    continue;
-                }
+            if foreign_to_class(enable_key, allowed_vipers) {
+                continue;
             }
         }
         let current = cfg_json
@@ -2375,6 +2468,7 @@ pub async fn run_llm_advisor_loop(
             &session_id,
             &dyn_cfg,
             &fewshot,
+            &market_class,
             &allowed_vipers,
             &refusals,
             &in_flight,
@@ -2898,7 +2992,7 @@ mod refusal_ledger_tests {
         ])];
         let prompt = build_user_prompt(
             &[], None, &[], rust_decimal::Decimal::ZERO, rust_decimal_macros::dec!(100),
-            "2026-09-08T12:00:00Z", &dc, &[], &["maker".to_string()], &reports, &[],
+            "2026-09-08T12:00:00Z", &dc, &[], "crypto", &["maker".to_string()], &reports, &[],
         );
         assert!(prompt.contains("NO TRADES this session."));
         assert!(!prompt.contains("unlock trade opportunities"));
@@ -2907,6 +3001,155 @@ mod refusal_ledger_tests {
         let config = prompt.find("== Current Live Configuration ==").expect("config section present");
         assert!(ledger < config, "the ledger must precede the knobs");
         assert!(prompt.contains("[arithmetic]"));
+    }
+
+    fn trade(strategy: &str, class: Option<&str>, ghost: bool, pnl: &str) -> db::TradeRow {
+        db::TradeRow {
+            ts: "2026-10-22T10:02:33+00:00".into(),
+            strategy: strategy.into(),
+            market: "Bitcoin price on Oct 22, 2026? — $81,700 or above".into(),
+            side: "YES".into(),
+            entry_price: "0.46".into(),
+            exit_price: "1".into(),
+            shares: "5".into(),
+            pnl: pnl.into(),
+            reason: "Settlement (won — cash settled)".into(),
+            venue: Some("kalshi".into()),
+            market_class: class.map(str::to_string),
+            underlying: Some("btc".into()),
+            ghost,
+            fees: None,
+            intent_id: None,
+        }
+    }
+
+    /// The trade list is the whole instance's; the politics pass on
+    /// 2026-10-22 read Anchor's crypto settlements as its own history and
+    /// concluded the viper had been disabled mid-session. Every row now names
+    /// its class and whether it was money, and the header names the class this
+    /// squadron flies.
+    #[test]
+    fn trade_rows_carry_their_class_and_mode() {
+        let dc = DynamicConfig::default();
+        let trades = vec![
+            trade("AnchorStrategy", Some("crypto"), false, "2.7"),
+            trade("GboostStrategy", Some("crypto"), true, "-4.0"),
+            trade("MakerStrategy", None, false, "0.1"),
+        ];
+        let prompt = build_user_prompt(
+            &trades, None, &[], rust_decimal::Decimal::ZERO, rust_decimal_macros::dec!(100),
+            "2026-10-22T01:41:00Z", &dc, &[], "politics", &["maker".to_string()], &[], &[],
+        );
+        assert!(prompt.contains("This squadron flies: politics markets"), "{prompt}");
+        assert!(prompt.contains("whole instance"), "{prompt}");
+        assert!(prompt.contains("Rows whose class is not `politics`"), "{prompt}");
+        assert!(prompt.contains("| crypto | live | Anchor |"), "{prompt}");
+        assert!(prompt.contains("| crypto | sim | Gboost |"), "{prompt}");
+        assert!(prompt.contains("| - | live | Maker |"), "legacy rows say so, not a guess: {prompt}");
+    }
+
+    /// Anchor's switch is `anchor_enabled`, not `enable_anchor`; on a squadron
+    /// that cannot fly it the knob must not be offered at all.
+    #[test]
+    fn anchor_knobs_are_withheld_from_squadrons_that_cannot_fly_it() {
+        let dc = DynamicConfig::default();
+        let politics = build_user_prompt(
+            &[], None, &[], rust_decimal::Decimal::ZERO, rust_decimal_macros::dec!(100),
+            "2026-10-22T01:41:00Z", &dc, &[], "politics", &["maker".to_string(), "arbitrage".to_string()], &[], &[],
+        );
+        let keys = politics.find("== Machine-Editable Keys").unwrap_or(politics.len());
+        assert!(!politics[keys..].contains("anchor_enabled"), "{politics}");
+        let crypto = build_user_prompt(
+            &[], None, &[], rust_decimal::Decimal::ZERO, rust_decimal_macros::dec!(100),
+            "2026-10-22T01:41:00Z", &dc, &[], "crypto", &["maker".to_string(), "anchor".to_string()], &[], &[],
+        );
+        assert!(crypto.contains("anchor_enabled = false"), "{crypto}");
+    }
+
+    /// Both spellings of a viper switch resolve to its kind.
+    #[test]
+    fn both_switch_spellings_resolve_to_the_viper_kind() {
+        let allowed = vec!["maker".to_string(), "anchor".to_string()];
+        assert!(!foreign_to_class("enable_maker", &allowed));
+        assert!(!foreign_to_class("anchor_enabled", &allowed));
+        assert!(foreign_to_class("enable_momentum", &allowed));
+        assert!(foreign_to_class("bookline_enabled", &allowed));
+    }
+
+    /// The enabled-flags summary used to stop at TrendCapture; a viper absent
+    /// from it read as a viper that did not exist. A viper the squadron's class
+    /// does not fly reads `n/a`, since `false` there is what the politics pass
+    /// took for "switched off mid-session".
+    #[test]
+    fn the_enabled_summary_names_every_viper_switch_and_marks_foreign_ones_na() {
+        let mut dc = DynamicConfig::default();
+        dc.anchor_enabled = true;
+        let crypto = build_user_prompt(
+            &[], None, &[], rust_decimal::Decimal::ZERO, rust_decimal_macros::dec!(100),
+            "2026-10-22T01:41:00Z", &dc, &[], "crypto",
+            &["anchor".to_string(), "fairvalue".to_string(), "maker".to_string()], &[], &[],
+        );
+        for must in ["FairValue=", "Convergence=n/a", "Anchor=true", "Bookline=n/a", "Maker="] {
+            assert!(crypto.contains(must), "summary lost {must:?}: {crypto}");
+        }
+        let politics = build_user_prompt(
+            &[], None, &[], rust_decimal::Decimal::ZERO, rust_decimal_macros::dec!(100),
+            "2026-10-22T01:41:00Z", &dc, &[], "politics",
+            &["maker".to_string(), "arbitrage".to_string()], &[], &[],
+        );
+        assert!(politics.contains("Anchor=n/a"), "{politics}");
+        assert!(!politics.contains("Anchor=true"), "{politics}");
+        assert!(politics.contains("Maker=true") || politics.contains("Maker=false"), "{politics}");
+    }
+
+    /// The headline and per-strategy totals count real rows only; simulated
+    /// rows are totaled on their own line and flagged per strategy.
+    #[test]
+    fn session_totals_keep_simulated_rows_out_of_the_money() {
+        let dc = DynamicConfig::default();
+        let trades = vec![
+            trade("AnchorStrategy", Some("crypto"), false, "2.7"),
+            trade("AnchorStrategy", Some("crypto"), false, "-1.1"),
+            trade("GboostStrategy", Some("crypto"), true, "-4.0"),
+            trade("GboostStrategy", Some("crypto"), true, "3.44"),
+        ];
+        let prompt = build_user_prompt(
+            &trades, None, &[], rust_decimal::Decimal::ZERO, rust_decimal_macros::dec!(100),
+            "2026-10-22T01:41:00Z", &dc, &[], "crypto", &["anchor".to_string(), "gboost".to_string()], &[], &[],
+        );
+        assert!(prompt.contains("live rows only, whole instance: 1 wins / 1 losses | Win rate: 50% | P&L: $1.60"), "{prompt}");
+        assert!(prompt.contains("Simulated rows, not money, excluded above: 2 (1 wins / 1 losses / $-0.56)"), "{prompt}");
+        assert!(prompt.contains("Anchor: 1 wins / 1 losses / $1.60"), "{prompt}");
+        assert!(prompt.contains("Gboost: 0 wins / 0 losses / $0.00 | 2 simulated row(s), not money"), "{prompt}");
+    }
+
+    /// Open positions carry the same class and mode columns as the trades.
+    #[test]
+    fn open_positions_carry_class_and_mode() {
+        let dc = DynamicConfig::default();
+        let open = vec![db::OpenPositionRow {
+            ts: "2026-10-22T10:35:33+00:00".into(),
+            strategy: "AnchorStrategy".into(),
+            token_id: "KXBTCD-26OCT2207-T82099.99#yes".into(),
+            market: "Bitcoin price on Oct 22, 2026? — $82,100 or above".into(),
+            side: "YES".into(),
+            entry_price: "0.22".into(),
+            shares: "5".into(),
+            ghost_mode: false,
+            chain_adopted: false,
+            status: "confirmed".into(),
+            current_price: None,
+            price_updated_at: None,
+            venue: Some("kalshi".into()),
+            market_class: Some("crypto".into()),
+            underlying: Some("btc".into()),
+        }];
+        let prompt = build_user_prompt(
+            &[], None, &open, rust_decimal::Decimal::ZERO, rust_decimal_macros::dec!(100),
+            "2026-10-22T01:41:00Z", &dc, &[], "sports", &["bookline".to_string()], &[], &[],
+        );
+        assert!(prompt.contains("== Open Positions (1 currently in-flight, whole instance) =="), "{prompt}");
+        assert!(prompt.contains("crypto | live | Anchor | YES |"), "{prompt}");
     }
 }
 

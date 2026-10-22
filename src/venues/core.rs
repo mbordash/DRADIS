@@ -821,22 +821,61 @@ pub struct MarketFacts {
 /// unreachable at startup is ordinary, and waiting is strictly better than
 /// trading against a baseline known to be false. Returns `None` only if
 /// cancelled, in which case the caller is shutting down anyway.
+///
+/// The baseline is a fact about the SESSION (the process), not about the
+/// caller. On Kalshi and Polymarket US every squadron runs its own loop, and
+/// that loop is re-entered for every market it rotates onto, so until 1.5.1
+/// each squadron took a fresh reading here every market, usually every hour.
+/// Two things followed. The session P&L each loop wrote to `pnl_snapshots`
+/// restarted from zero at every rotation, and the three squadrons disagreed
+/// with each other whenever one had rotated since the last settlement: on
+/// 2026-10-22 two were writing +$1.45 and one 0.00 into the same table, the
+/// dashboard header, the P&L chart and the LLM advisor read the newest row,
+/// and the figure flipped between the two with every sync. The first reading
+/// of the process is therefore remembered and every later caller gets it
+/// back, which is what Polymarket International's `SessionState` has always
+/// done. The session drawdown guard (`is_drawdown_limit_hit`) reads the same
+/// baseline, so on these venues it now measures the whole process, as it
+/// does on Polymarket International, instead of clearing at the next rotation.
+///
+/// The baseline is cash plus the cost of the positions already held, because
+/// that is the `total` both dashboard syncs compare it against. A reading of
+/// cash alone made the session start in profit by the cost of whatever was
+/// open at the time (an Anchor hold through a deploy is the ordinary case),
+/// and with one baseline per process that error would never have washed out.
+/// Deposits and withdrawals during the session still move the figure; the
+/// baseline cannot tell them from trading.
 pub async fn starting_collateral<V: Execution + ?Sized>(
     venue: &V,
     cancel: &tokio_util::sync::CancellationToken,
     retry_secs: u64,
 ) -> Option<Decimal> {
+    if let Some(c) = SESSION_STARTING_COLLATERAL.get() {
+        return Some(*c);
+    }
     let mut attempt: u32 = 0;
     loop {
         if cancel.is_cancelled() {
             return None;
         }
-        match venue.collateral().await {
-            Ok(c) => {
+        let read = async {
+            let cash = venue.collateral().await?;
+            let held = venue.positions().await?;
+            Ok::<_, anyhow::Error>((cash, held))
+        };
+        match read.await {
+            Ok((cash, held)) => {
+                let baseline = cash + positions_at_cost(&held);
                 if attempt > 0 {
-                    tracing::info!("💰 Starting collateral resolved after {attempt} retries: ${c:.2}");
+                    tracing::info!("💰 Starting collateral resolved after {attempt} retries: ${baseline:.2}");
                 }
-                return Some(c);
+                if !held.is_empty() {
+                    tracing::info!(
+                        "💰 Session baseline ${baseline:.2} = ${cash:.2} cash + {} position(s) at cost",
+                        held.len()
+                    );
+                }
+                return Some(session_baseline(&SESSION_STARTING_COLLATERAL, baseline));
             }
             Err(e) => {
                 attempt += 1;
@@ -855,6 +894,68 @@ pub async fn starting_collateral<V: Execution + ?Sized>(
                 }
             }
         }
+    }
+}
+
+/// The session's starting collateral, set by the first `starting_collateral`
+/// reading of the process. See that function for why there is exactly one.
+static SESSION_STARTING_COLLATERAL: std::sync::OnceLock<Decimal> = std::sync::OnceLock::new();
+
+/// Cost basis of the positions a venue reports: shares times average entry
+/// price, which is how both dashboard syncs value a holding in their `total`.
+fn positions_at_cost(held: &[Position]) -> Decimal {
+    held.iter().map(|p| p.shares * p.avg_price).sum()
+}
+
+/// Settle `fresh` into `cell` and return the session baseline: the value
+/// already there when another squadron got there first, `fresh` otherwise.
+/// A function over the cell rather than the static so the rule is testable.
+fn session_baseline(cell: &std::sync::OnceLock<Decimal>, fresh: Decimal) -> Decimal {
+    let settled = *cell.get_or_init(|| fresh);
+    if settled != fresh {
+        tracing::info!(
+            "💰 Starting collateral ${fresh:.2} read after the session baselined at ${settled:.2}: \
+             keeping the session baseline so every squadron reports the same P&L"
+        );
+    }
+    settled
+}
+
+#[cfg(test)]
+mod session_baseline_tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    /// The first squadron to read its balance sets the session baseline.
+    #[test]
+    fn the_first_reading_sets_the_baseline() {
+        let cell = std::sync::OnceLock::new();
+        assert_eq!(session_baseline(&cell, dec!(41.99)), dec!(41.99));
+        assert_eq!(cell.get(), Some(&dec!(41.99)));
+    }
+
+    /// A position held through the restart is part of the account the session
+    /// starts with; counting it at cost is what makes the first P&L reading
+    /// 0.00 rather than the position's cost in profit.
+    #[test]
+    fn open_positions_count_toward_the_baseline_at_cost() {
+        let held = vec![
+            Position { market: MarketId::new("KXBTCD-26OCT2207-T82099.99#yes"), shares: dec!(5), avg_price: dec!(0.22) },
+            Position { market: MarketId::new("KXBTCD-26OCT2207-T82099.99#no"), shares: dec!(0), avg_price: dec!(0.78) },
+        ];
+        assert_eq!(positions_at_cost(&held), dec!(1.10));
+        assert_eq!(positions_at_cost(&[]), Decimal::ZERO);
+    }
+
+    /// A squadron that starts after a settlement has moved the balance gets
+    /// the session's baseline back, not the balance it read, so its
+    /// `total - starting` agrees with every other squadron's.
+    #[test]
+    fn a_later_squadron_inherits_the_session_baseline() {
+        let cell = std::sync::OnceLock::new();
+        assert_eq!(session_baseline(&cell, dec!(41.99)), dec!(41.99));
+        assert_eq!(session_baseline(&cell, dec!(43.44)), dec!(41.99));
+        assert_eq!(cell.get(), Some(&dec!(41.99)));
     }
 }
 
