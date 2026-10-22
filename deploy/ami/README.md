@@ -123,14 +123,46 @@ EC2 and SSM calls get POSTed to object storage and return a bare HTTP status
 with an empty body, naming nothing. Keep AWS keys in a profile of their own
 with no `endpoint_url`, and select it with `--profile` or `AWS_PROFILE`.
 
-Marketplace ingests and scans AMIs from **us-east-1**, so build there
-(`--region us-east-1`) even though the script defaults to eu-west-1.
+Marketplace ingests and scans AMIs from **us-east-1**, which is the script's
+default region; `--region` exists for test builds elsewhere, and an image built
+elsewhere cannot be published.
 
 `iam-policy.json` in this directory is the least-privilege policy the build
 needs — EC2 builder lifecycle, image creation, the Marketplace image-sharing
-attribute, and read access to Canonical's public SSM parameter for the Ubuntu
-base AMI. The write statements are conditioned on `aws:RequestedRegion`, so add
+attribute, read access to Canonical's public SSM parameter for the Ubuntu
+base AMI, and the Marketplace Catalog calls that `publish-version.sh` makes
+(plus `iam:PassRole` on the ingestion role, scoped to the Marketplace service).
+The write statements are conditioned on `aws:RequestedRegion`, so add
 a region there before building outside us-east-1 / eu-west-1.
+
+## Publishing a version
+
+`publish-version.sh` submits a built AMI as a new version of the listing
+through the Marketplace Catalog API, replacing the seller-portal steps (share
+the AMI with the scanner account, fill in the version form):
+
+```
+./deploy/ami/publish-version.sh --profile dradis --ami ami-0123456789abcdef0 --version 1.5.1
+```
+
+or in one step from a committed tree, `build-ami.sh --publish --version v1.5.1`.
+
+The version title is the number you pass. Release notes are the bullets under
+`## <version>` in `docs/RELEASES.md` (above its `### Detail` line) followed by
+the upgrade link, and the usage text is the block between the two rule lines of
+`docs/USAGE.md`, so a release is published from the same files it is documented
+in. Everything else about the delivery (OS name and version, SSH user, scanning
+port, recommended instance type, security-group rules) is copied from the
+listing's newest existing version, so a release never changes them by accident;
+change those once in the portal and every later release inherits them. The
+script refuses a version title or AMI the listing already has.
+
+One-time setup: the `AWSMarketplaceAmiIngestion` role in the account (the
+seller portal creates it under Settings), and the two Marketplace statements in
+`iam-policy.json` on the publishing user. `--dry-run` prints the change set and
+submits nothing; `--validate` has AWS check it without creating the version. A
+real submission takes AWS about an hour to scan; the script waits and reports,
+or `--no-wait` prints the change-set id to poll later.
 
 Defaults reflect the three-venue build: `c5.4xlarge` (16 vCPU) on a 60 GB
 volume, because each venue is a full Rust release build and cargo rebuilds the

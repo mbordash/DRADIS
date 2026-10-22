@@ -29,6 +29,9 @@
 #   --instance-type TYPE   default: c5.4xlarge (16 vCPU — three Rust builds)
 #   --version LABEL        default: git describe (AMI name suffix)
 #   --keep-instance        don't terminate the builder on failure (debugging)
+#   --publish              after the build, submit the AMI as a new version of
+#                          the Marketplace listing via publish-version.sh
+#                          (needs an explicit --version, "v1.5.1" or "1.5.1")
 # =============================================================================
 set -euo pipefail
 
@@ -48,6 +51,7 @@ VENUES="intl us kalshi"
 PROFILE=""
 VERSION=""
 KEEP_INSTANCE=false
+PUBLISH=false
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -57,9 +61,17 @@ while [ $# -gt 0 ]; do
         --instance-type) INSTANCE_TYPE="$2"; shift 2 ;;
         --version)       VERSION="$2"; shift 2 ;;
         --keep-instance) KEEP_INSTANCE=true; shift ;;
+        --publish)       PUBLISH=true; shift ;;
         *) echo "unknown option: $1"; exit 1 ;;
     esac
 done
+
+# A Marketplace version needs a title that matches a "## <version>" section in
+# docs/RELEASES.md; a `git describe` label ("v1.5.0-3-gabc1234") is not one.
+if [ "$PUBLISH" = true ] && [ -z "$VERSION" ]; then
+    echo "--publish needs an explicit --version (the release number, e.g. v1.5.1)"
+    exit 1
+fi
 
 for v in $VENUES; do
     case "$v" in
@@ -515,6 +527,21 @@ echo "   Venues:  $VENUES"
 echo ""
 echo "Test it:   launch the AMI, open http://<public-ip>/ and log in with"
 echo "           user 'admin' / password = the new instance's ID."
-echo "Publish:   share the AMI with the AWS Marketplace scanner account via"
-echo "           the seller portal (Assets → Amazon Machine Image)."
+if [ "$PUBLISH" = true ]; then
+    echo "Publish:   submitting to the Marketplace listing now (publish-version.sh)."
+else
+    echo "Publish:   ./deploy/ami/publish-version.sh --ami $AMI_ID --version $VERSION${PROFILE:+ --profile $PROFILE}"
+    echo "           (or rerun the build with --publish to do it in one step)"
+fi
 echo "═══════════════════════════════════════════════════════════════════"
+
+# ── 7. Marketplace submission (opt-in) ───────────────────────────────────────
+# Runs only once the AMI is tagged and available, so a failed build never
+# reaches the listing. publish-version.sh copies the OS, user, instance type
+# and security-group settings from the listing's newest version and takes the
+# release notes and usage text from docs/, then waits for the scan.
+if [ "$PUBLISH" = true ]; then
+    echo ""
+    "$(dirname "$0")/publish-version.sh" --ami "$AMI_ID" --version "$VERSION" \
+        ${PROFILE:+--profile "$PROFILE"}
+fi
