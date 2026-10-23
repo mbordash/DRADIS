@@ -755,8 +755,8 @@ impl AnchorStrategy {
         let outcome = if px == 0.5 { "tied or canceled" } else if px > 0.5 { "won" } else { "lost" };
         let mut scope = crate::state::TradeScope::crypto(asset, "", asset);
         scope.ghost = true;
-        let wrote = db::record_settlement_trade_checked(
-            pool, &scope, STRATEGY_NAME, &row.market, &row.side,
+        let wrote = db::record_settlement_trade_for_token(
+            pool, &scope, Some((&row.token_id, db::opened_at_or_dawn(&row.opened_at))), STRATEGY_NAME, &row.market, &row.side,
             d(row.entry_price), d(px), d(row.shares), d(pnl), d(row.entry_fee * row.shares),
             &format!("Settlement ({outcome} — simulated)"), None,
         ).await;

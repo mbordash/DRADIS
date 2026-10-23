@@ -269,8 +269,8 @@ pub(crate) async fn book_ghost_settlements(
         // booked this settlement and the position is genuinely finished; a
         // failure means nothing is recorded, and retiring the position on the
         // strength of it loses the trade while reporting success.
-        let written = crate::helpers::db::record_settlement_trade_checked(
-            pool, &scope, &key.strategy, &pos.market_name, side,
+        let written = crate::helpers::db::record_settlement_trade_for_token(
+            pool, &scope, Some((key.market.as_str(), pos.opened_at)), &key.strategy, &pos.market_name, side,
             pos.avg_entry, resolved, pos.shares, pnl, entry_fee, &reason, None,
         ).await;
         match written {

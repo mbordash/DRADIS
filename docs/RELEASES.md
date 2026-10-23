@@ -4,7 +4,18 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
-## 1.5.1 (unreleased)
+## 1.5.2
+
+- Trade log: a settlement is no longer skipped as "already recorded" because an earlier market with the same question text, side and share count had one. Kalshi hourly markets with the same strike share their question text across hours, so a win could be dropped against the previous hour's loss on the same text; the account balance was right and the trade log was not. Settlement rows now name the contract they closed and the check keys on it. The skipped booking, when it is a genuine duplicate, is logged where the operator can find it.
+- Trade log: settlements on Kalshi and Polymarket US are now net of the entry fee, with the fee in the Fees column. The fee was kept in memory but never written to the open position's row, so every settlement booked on these venues was gross with a zero fee, about seven cents a trade at five Kalshi contracts, in the direction of flattering the record.
+
+### Detail
+
+**A settlement dropped by a name-keyed check.** When a held contract settles, the venue sweep books a settlement row unless one already exists for the same market, side and share count. The market is the question text, and the trades table carried no contract id, so the check could not tell two markets with the same text apart. On 2026-10-22 an Anchor position on the 7 PM ET Bitcoin hour lost and the next position, same strike text, same side, same five contracts, won the 8 PM hour; the win was skipped against the loss, the position row was released, the balance moved, and the trade log showed the pair as a net loss. Rows written by the sweep and by the simulated-settlement paths now carry the contract id, and a row that names a different contract never covers another position, whatever its price, size or result. Rows written before this version, and by writers that do not know the contract, are matched the old way, bounded to rows written after the position opened, which is the only time a re-booking of that position could have happened. The column is added on upgrade and older rows keep working. One narrow case remains across the upgrade itself: a settlement booked by the previous version after the next hour's position had already opened, on the same text, side and size, still covers that position; from then on every row names its contract and the case cannot recur. Simulated settlements no longer count as a booking of a real position on the same contract. Nothing is added back for a settlement that was already dropped; the operator can insert the row by hand from the Anchor ledger.
+
+**Fees on Kalshi and Polymarket US settlements.** The fill path keeps the venue's fee on the in-memory position so a strategy exit can net it, but the row in the open positions table was written before the fee was known and never updated afterwards on these two venues. The settlement sweep reads the fee from that row and, finding none, books the gross result with a zero fee, by design, so as not to invent a cost. The fill path now writes the fee to its own row as soon as the venue reports it. Settlements booked before this version stay gross; the Fees column says 0 for them.
+
+## 1.5.1 (2026-10-22)
 
 - Trade log: simulated rows (instance ghost mode, the GBoost and Anchor shadow lanes) no longer count toward the Realized, Unrealized and Net figures under the table, which now agree with the lifetime cards above it; simulated results get their own labeled line.
 - Trade log: GBoost's simulated settlements are filed under their venue the moment they are written instead of waiting for the next restart to fill the column, and their asset badge matches every other viper's.
@@ -24,7 +35,7 @@ version's release notes field; the detail below it is the full account.
 
 **Venue on GBoost shadow rows.** Every trade writer files a row under the venue bound to its shard. GBoost's shadow lane names its shard by asset ("btc"), which on Kalshi is not a shard (the Kalshi database is one shard, keyed "kalshi"), so the lookup missed and the row's venue stayed NULL until the next restart backfilled it. The settlement writer already fell back to the venue bound to the database file itself; the trade and entry writers now do the same. The same lane wrote its underlying in upper case, which the Control Tower's badge lookup did not match, so GBoost rows wore a generic badge beside every other viper's bitcoin one. It writes lower case now and the upgrade folds existing rows.
 
-## 1.5.0 (unreleased)
+## 1.5.0 (2026-10-21)
 
 - Includes the 1.4.3 changes below (GBoost venue handling, young-store training, Kalshi hourly strike pinning), which ran on production from 2026-10-20 but were never listed as a Marketplace version.
 - New Anchor viper: on hourly crypto markets it takes the index level from the market's own price and the move from the oracle feed, prices the contract through its gamma, and buys the cheap side at the ask when the anchored fair clears it net of fee, holding to settlement with no exit order. It trades the way every viper does, simulated in ghost mode and with real orders otherwise, and keeps its own ledger of each fill's model reading beside a never-bought control lane, which is the record the strategy is judged on. Off by default, on the Anchor card of every crypto squadron.
@@ -83,7 +94,7 @@ simulated or real when it is made, and that stamp, not the switch's position at
 the close, decides who books it, so flipping ghost mode mid-hold can neither
 double-book a position nor lose one.
 
-## 1.4.3 (unreleased)
+## 1.4.3 (not listed; included in 1.5.0)
 
 - GBoost: an instance that moved venues no longer keeps the previous venue's model in service indefinitely; the first model trained on the new venue's own recorded markets takes over in the shadow lane, where its record counts toward real money.
 - GBoost: on venues that record their own hourly markets (Kalshi, Polymarket US), training starts after two days of settled records instead of a week, with a holdout fold sized to the young store.

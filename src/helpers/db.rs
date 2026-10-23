@@ -2175,6 +2175,15 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) {
     // claim about them.
     let _ = sqlx::query("ALTER TABLE trades ADD COLUMN ghost INTEGER NOT NULL DEFAULT 0")
         .execute(pool).await;
+    // `token_id`: the venue leg a settlement row closed. [B66] The venue sweep
+    // deduplicated settlements on market text, side and share count, and Kalshi
+    // hourly markets with the same strike share the exact question text across
+    // hours, so a real win (2026-10-22, Anchor YES 0.22 x5, +$3.84) was skipped
+    // as "already recorded" against the previous hour's loss on the same text.
+    // Nullable: rows written before this column, and writers that do not know
+    // the leg, stay NULL and are matched the old way, bounded in time.
+    let _ = sqlx::query("ALTER TABLE trades ADD COLUMN token_id TEXT")
+        .execute(pool).await;
     // `underlying` is a lower-case symbol everywhere it is written ("btc"), and
     // the Control Tower keys its asset badge on exactly that. GBoost's shadow
     // lane wrote "BTC" until 1.5.1, so its rows wore a generic badge beside
@@ -2407,17 +2416,58 @@ pub async fn record_settlement_trade_checked(
     reason: &str,
     timestamp: Option<DateTime<Utc>>,
 ) -> SettlementWrite {
+    record_settlement_trade_for_token(
+        pool, scope, None, strategy, market, side, entry_price, exit_price, shares, pnl, fees,
+        reason, timestamp,
+    ).await
+}
+
+/// [`record_settlement_trade_checked`] with the venue leg the settlement closed
+/// and the time the position on it opened.
+///
+/// The leg is stamped on the row and joins the duplicate fingerprint under the
+/// same rule as `settlement_row_covers`: a row that names a DIFFERENT leg is a
+/// different position, however exactly its price, size and result match, and
+/// a row that names no leg (written before 1.5.2, or by a writer that does not
+/// know it) is this position's only when written after the position opened.
+/// Two Kalshi hours with the same strike carry the same question text, and a
+/// viper that buys the same side at the same price in both would otherwise
+/// book the second result as a duplicate of the first, against the earlier
+/// hour's keyed row or against its unkeyed pre-1.5.2 row alike. `None` here
+/// behaves exactly as the plain writer.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_settlement_trade_for_token(
+    pool: &SqlitePool,
+    scope: &TradeScope,
+    leg: Option<(&str, DateTime<Utc>)>,
+    strategy: &str,
+    market: &str,
+    side: &str,
+    entry_price: Decimal,
+    exit_price: Decimal,
+    shares: Decimal,
+    pnl: Decimal,
+    fees: Decimal,
+    reason: &str,
+    timestamp: Option<DateTime<Utc>>,
+) -> SettlementWrite {
     let ts = timestamp.unwrap_or_else(Utc::now).to_rfc3339();
     let sid = current_session_id();
     let venue = resolved_venue_for(scope, pool);
+    let token_id = leg.map(|(t, _)| t);
+    // Both `ts` columns are `to_rfc3339()` of a UTC time, so the string order
+    // is the time order to within the fractional digits, which is far finer
+    // than the minutes between an open and its settlement.
+    let opened = leg.map(|(_, at)| at.to_rfc3339());
     match sqlx::query(
         "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, session_id, fees,
-                             venue, market_class, underlying, ghost)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                             venue, market_class, underlying, ghost, token_id)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          WHERE NOT EXISTS (
              SELECT 1 FROM trades
              WHERE strategy = ? AND market = ? AND side = ? AND reason = ?
                AND shares = ? AND pnl = ?
+               AND (? IS NULL OR token_id = ? OR (token_id IS NULL AND ts >= ?))
          )"
     )
     .bind(&ts)
@@ -2435,6 +2485,7 @@ pub async fn record_settlement_trade_checked(
     .bind(scope.market_class.clone())
     .bind(scope.underlying.clone())
     .bind(scope.ghost as i32)
+    .bind(token_id)
     // WHERE NOT EXISTS fingerprint binds:
     .bind(strategy)
     .bind(market)
@@ -2442,6 +2493,9 @@ pub async fn record_settlement_trade_checked(
     .bind(reason)
     .bind(shares.to_string())
     .bind(pnl.to_string())
+    .bind(token_id)
+    .bind(token_id)
+    .bind(opened)
     .execute(pool)
     .await {
         Ok(r) if r.rows_affected() > 0 => SettlementWrite::Inserted,
@@ -3919,6 +3973,37 @@ pub async fn set_open_position_entry_fee(pool: &SqlitePool, token_id: &str, entr
     }
 }
 
+/// [`set_open_position_entry_fee`] for one viper's row on the token.
+///
+/// The plain writer stamps every row holding the token, which is right on
+/// Polymarket International where the caller has just confirmed that one viper
+/// owns it. The Kalshi and Polymarket US entry paths write a row per
+/// (squadron, viper, token), two vipers can hold the same contract, and each
+/// paid its own fee, so the stamp follows the same key the row was inserted
+/// under. A top-up on a held token replaces the earlier fee, as the in-memory
+/// guard replaces the position.
+pub async fn set_open_position_entry_fee_scoped(
+    pool: &SqlitePool,
+    squadron_id: &str,
+    strategy: &str,
+    token_id: &str,
+    entry_fee: Decimal,
+) {
+    if let Err(e) = sqlx::query(
+        "UPDATE open_positions SET entry_fee = ?
+          WHERE token_id = ? AND strategy = ? AND (squadron_id = ? OR squadron_id = '')"
+    )
+        .bind(entry_fee.to_string())
+        .bind(token_id)
+        .bind(strategy)
+        .bind(squadron_id)
+        .execute(pool)
+        .await
+    {
+        error!("❌ DB set_open_position_entry_fee_scoped failed for {} {}: {}", strategy, token_id, e);
+    }
+}
+
 /// Overwrite an open position's cost basis with a fill's real price.
 ///
 /// `record_open_position` never touches an existing row, so a leg whose row was
@@ -4787,8 +4872,9 @@ pub async fn confirmed_open_positions(pool: &SqlitePool) -> Vec<(String, String)
     .unwrap_or_default()
 }
 
-/// Returns true if a SETTLEMENT trade row already exists for `market` + `side` with a
-/// share count matching `shares` within dust tolerance.
+/// The id of a SETTLEMENT trade row that already books the position
+/// `token_id` opened at `opened_at` on `market` + `side` with `shares` (within
+/// dust tolerance), or `None` when the settlement is still owed.
 ///
 /// Settlement-scoped variant of `market_has_matching_trade`. The generic market+shares
 /// match is too weak for resolution-time booking: an earlier same-session round-trip on
@@ -4796,26 +4882,85 @@ pub async fn confirmed_open_positions(pool: &SqlitePool) -> Vec<(String, String)
 /// morning, then a fresh 15-share arb pair at noon) false-matches and silently drops
 /// the settlement row (observed 2026-07-15: the winning YES leg's +$1.50 was never
 /// booked because the 09:23 "Orphan flatten" row matched on market+shares).
+///
+/// Only real rows are consulted: this sweep settles real positions, and a
+/// simulated viper's settlement on the same contract (same text, side and
+/// size, by construction) is not a booking of the real one.
+///
+/// [B66] Market text alone is not a position either. Kalshi hourly markets with
+/// the same strike share the exact question text across hours, so on 2026-10-22
+/// Anchor's 8 PM win (YES 0.22 x5, +$3.84) matched its 7 PM loss (YES 0.40 x5)
+/// on text, side and share count and was never booked. A row that names its
+/// leg counts only when it is THIS leg; a row with no leg (written before the
+/// column existed, or by a writer that does not know the leg) counts only when
+/// it was written after this position opened, which is when a re-booking of
+/// this position could have happened and before which only another position
+/// on the same text could have settled. See `settlement_row_covers`.
 pub async fn market_has_settlement_trade(
     pool: &SqlitePool,
     market: &str,
     side: &str,
     shares: Decimal,
-) -> bool {
+    token_id: &str,
+    opened_at: &str,
+) -> Option<i64> {
     let share_dust = Decimal::new(1, 3); // 0.001
-    let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT shares FROM trades WHERE market = ? AND side = ? AND reason LIKE 'Settlement%'"
+    let rows: Vec<(i64, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT id, shares, token_id, ts FROM trades
+          WHERE market = ? AND side = ? AND reason LIKE 'Settlement%'
+            AND COALESCE(ghost, 0) = 0
+          ORDER BY id"
     )
         .bind(market)
         .bind(side)
         .fetch_all(pool)
         .await
         .unwrap_or_default();
-    rows.iter().any(|s| {
-        s.parse::<Decimal>()
-            .map(|v| (v - shares).abs() <= share_dust)
-            .unwrap_or(false)
-    })
+    // An open row with no readable timestamp is treated as older than every
+    // settlement row, which is the pre-1.5.2 behavior: every unkeyed row on the
+    // text counts.
+    let opened = opened_at_or_dawn(opened_at);
+    rows.iter()
+        .find(|(_, s, row_token, row_ts)| {
+            let size_matches = s.parse::<Decimal>()
+                .map(|v| (v - shares).abs() <= share_dust)
+                .unwrap_or(false);
+            size_matches && settlement_row_covers(row_token.as_deref(), row_ts, token_id, opened)
+        })
+        .map(|(id, ..)| *id)
+}
+
+/// An `open_positions.ts` as a time, or the dawn of time when it cannot be
+/// read, which makes every unkeyed settlement row count: the pre-1.5.2
+/// behavior for a malformed record.
+pub fn opened_at_or_dawn(opened_at: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(opened_at)
+        .map(|t| t.with_timezone(&Utc))
+        .unwrap_or(DateTime::<Utc>::MIN_UTC)
+}
+
+/// Whether a settlement row on the same market text, side and size books the
+/// position `token_id` that opened at `opened`.
+///
+/// A row that names a leg books this position only if it names THIS leg. A row
+/// that names none is the pre-1.5.2 record, or a writer that does not know the
+/// leg; it is taken to book this position when it was written after the
+/// position opened, since a settlement written before the open can only belong
+/// to an earlier position on the same text. A row whose timestamp cannot be
+/// read is counted, which keeps the old behavior for a malformed record rather
+/// than booking a second time on the strength of it.
+pub fn settlement_row_covers(
+    row_token: Option<&str>,
+    row_ts: &str,
+    token_id: &str,
+    opened: DateTime<Utc>,
+) -> bool {
+    match row_token {
+        Some(t) => t == token_id,
+        None => DateTime::parse_from_rfc3339(row_ts)
+            .map(|t| t.with_timezone(&Utc) >= opened)
+            .unwrap_or(true),
+    }
 }
 
 /// Returns true if any resolution-time settlement row ("pending redemption") already
@@ -5134,10 +5279,13 @@ pub async fn purge_stale_open_positions(
                         "🧾 Resolution booking: {} {} {} sh already covered by a settled arb pair — skipping",
                         market, side, qty
                     );
-                } else if market_has_settlement_trade(pool, &market, &side, qty).await {
-                    debug!(
-                        "🧾 Resolution booking: settlement already recorded for {} {} {} sh — skipping",
-                        market, side, qty
+                } else if let Some(prior) = market_has_settlement_trade(pool, &market, &side, qty, &token_id, &ts).await {
+                    // Info, not debug: a skipped booking is a ledger decision
+                    // the operator should be able to find, and the one that hid
+                    // [B66] was logged where nobody looked.
+                    info!(
+                        "🧾 Resolution booking: {} {} {} | {} sh already booked as trade #{} — skipping",
+                        strategy, market, side, qty, prior
                     );
                 } else {
                     // Settlement pays out with NO exit fee — verified against
@@ -5160,14 +5308,26 @@ pub async fn purge_stale_open_positions(
                         if won { "won" } else { "lost" },
                         if *chain_size > Decimal::ZERO { "pending redemption" } else { "cash settled" }
                     );
-                    let inserted = record_settlement_trade_idempotent(
-                        pool, &scope, &strategy, &market, &side, entry, resolved_px, qty, pnl, entry_fee, &reason, None,
-                    ).await;
-                    if inserted {
-                        info!(
+                    match record_settlement_trade_for_token(
+                        pool, &scope, Some((&token_id, opened_at_or_dawn(&ts))), &strategy, &market, &side,
+                        entry, resolved_px, qty, pnl, entry_fee, &reason, None,
+                    ).await {
+                        SettlementWrite::Inserted => info!(
                             "🧾 Resolution booking: {} {} {} | {} sh entry=${:.4} → resolved ${:.2} → pnl=${:.4} (redemption pending)",
                             strategy, market, side, qty, entry, resolved_px, pnl
-                        );
+                        ),
+                        // The row is released below either way; a booking that
+                        // did not happen must say so where the operator reads.
+                        SettlementWrite::Duplicate => info!(
+                            "🧾 Resolution booking: {} {} {} | {} sh pnl=${:.4} already on the books with this exact \
+                             result — not booked twice",
+                            strategy, market, side, qty, pnl
+                        ),
+                        SettlementWrite::Failed => error!(
+                            "❌ Resolution booking: {} {} {} | {} sh pnl=${:.4} NOT recorded (write failed); the row is \
+                             released and no later pass will book it",
+                            strategy, market, side, qty, pnl
+                        ),
                     }
                 }
             } else {
@@ -8016,6 +8176,225 @@ mod reconcile_tests {
         .bind(strategy).bind(token).bind(market).bind(side)
         .bind(entry).bind(shares).bind(status).bind(cur)
         .execute(pool).await.expect("insert open_position");
+    }
+
+    /// [B66] Two positions on markets with the same question text each get
+    /// their own settlement row.
+    ///
+    /// Replays 2026-10-22 on production: Anchor lost the 7 PM ET hour (YES 0.40
+    /// x5) and won the 8 PM hour (YES 0.22 x5) on two Kalshi markets with the
+    /// same strike and so the same text. The 8 PM win matched the 7 PM loss on
+    /// text, side and share count and was never booked; the balance was right
+    /// and the trade log was not.
+    #[tokio::test]
+    async fn a_second_position_on_the_same_question_text_books_its_own_settlement() {
+        let pool = mem_pool().await;
+        let text = "Bitcoin price above $81,299.99?";
+        insert_open(&pool, "AnchorStrategy", "KXBTCD-26OCT2219-T81299.99#yes", text, "YES",
+                    "0.40", "5", Some("0.0005"), "confirmed").await;
+        let mut marks = std::collections::HashMap::new();
+        marks.insert("KXBTCD-26OCT2219-T81299.99#yes".to_string(), (Decimal::ZERO, Decimal::ZERO));
+        assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &marks, &HashSet::new()).await, 1);
+
+        insert_open(&pool, "AnchorStrategy", "KXBTCD-26OCT2220-T81299.99#yes", text, "YES",
+                    "0.22", "5", Some("0.9995"), "confirmed").await;
+        let mut marks = std::collections::HashMap::new();
+        marks.insert("KXBTCD-26OCT2220-T81299.99#yes".to_string(), (Decimal::ONE, Decimal::ZERO));
+        assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &marks, &HashSet::new()).await, 1);
+
+        let rows: Vec<(Option<String>, String, String)> = sqlx::query_as(
+            "SELECT token_id, reason, pnl FROM trades WHERE market = ? ORDER BY id"
+        ).bind(text).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 2, "both hours settle; the win must not be deduped against the loss");
+        assert_eq!(rows[0].0.as_deref(), Some("KXBTCD-26OCT2219-T81299.99#yes"), "the row names its leg");
+        assert!(rows[0].1.starts_with("Settlement (lost"), "7 PM: {:?}", rows[0].1);
+        assert_eq!(rows[0].2.parse::<Decimal>().unwrap(), dec_of("-2.00"));
+        assert_eq!(rows[1].0.as_deref(), Some("KXBTCD-26OCT2220-T81299.99#yes"));
+        assert!(rows[1].1.starts_with("Settlement (won"), "8 PM: {:?}", rows[1].1);
+        assert_eq!(rows[1].2.parse::<Decimal>().unwrap(), dec_of("3.90"));
+    }
+
+    /// [B66] The same position is still booked once.
+    ///
+    /// A row the sweep already wrote for THIS leg, and an unkeyed row another
+    /// writer booked for it after it opened, both count. The dedup is keyed
+    /// tighter, not removed.
+    #[tokio::test]
+    async fn a_settlement_already_booked_for_the_same_leg_is_not_booked_twice() {
+        let pool = mem_pool().await;
+        let text = "Bitcoin price above $81,299.99?";
+        // The sweep's own earlier booking of this leg, re-adopted since.
+        insert_open(&pool, "AnchorStrategy", "tok-same-leg", text, "YES", "0.40", "5", Some("0.9995"), "confirmed").await;
+        let mut marks = std::collections::HashMap::new();
+        marks.insert("tok-same-leg".to_string(), (Decimal::ONE, Decimal::ZERO));
+        assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &marks, &HashSet::new()).await, 1);
+        insert_open(&pool, "AnchorStrategy", "tok-same-leg", text, "YES", "0.40", "5", Some("0.9995"), "confirmed").await;
+        assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &marks, &HashSet::new()).await, 1,
+                   "the re-adopted row is released");
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM trades WHERE market = ?")
+            .bind(text).fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1, "one settlement for one leg");
+
+        // An unkeyed row written AFTER the position opened (another writer booked
+        // this very position) still covers it.
+        insert_open(&pool, "FairValueStrategy", "tok-unkeyed", text, "NO", "0.55", "8", Some("0.9995"), "confirmed").await;
+        sqlx::query(
+            "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason)
+             VALUES (?, 'FairValueStrategy', ?, 'NO', '0.55', '1', '8', '3.6', 'Settlement (won — cash settled)')"
+        ).bind((Utc::now() + chrono::Duration::seconds(5)).to_rfc3339()).bind(text)
+         .execute(&pool).await.unwrap();
+        let mut marks = std::collections::HashMap::new();
+        marks.insert("tok-unkeyed".to_string(), (Decimal::ONE, Decimal::ZERO));
+        assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &marks, &HashSet::new()).await, 1);
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM trades WHERE market = ? AND side = 'NO'")
+            .bind(text).fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1, "the unkeyed later row already books this position");
+    }
+
+    /// [B66] An unkeyed settlement row written BEFORE the position opened is an
+    /// earlier position on the same text, not this one: the pre-1.5.2 record of
+    /// the previous hour must not swallow the next hour's result.
+    #[tokio::test]
+    async fn an_unkeyed_settlement_older_than_the_position_does_not_cover_it() {
+        let pool = mem_pool().await;
+        let text = "Bitcoin price above $81,299.99?";
+        sqlx::query(
+            "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason)
+             VALUES (?, 'AnchorStrategy', ?, 'YES', '0.40', '0', '5', '-2', 'Settlement (lost — cash settled)')"
+        ).bind((Utc::now() - chrono::Duration::hours(1)).to_rfc3339()).bind(text)
+         .execute(&pool).await.unwrap();
+        insert_open(&pool, "AnchorStrategy", "tok-next-hour", text, "YES", "0.22", "5", Some("0.9995"), "confirmed").await;
+        let mut marks = std::collections::HashMap::new();
+        marks.insert("tok-next-hour".to_string(), (Decimal::ONE, Decimal::ZERO));
+        assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &marks, &HashSet::new()).await, 1);
+        let pnls: Vec<String> = sqlx::query_scalar("SELECT pnl FROM trades WHERE market = ? ORDER BY id")
+            .bind(text).fetch_all(&pool).await.unwrap();
+        assert_eq!(pnls.len(), 2, "the legacy loss row and this hour's win");
+        assert_eq!(pnls[1].parse::<Decimal>().unwrap(), dec_of("3.90"));
+    }
+
+    /// [B66] The leg, not the timestamp, decides once a row names one.
+    #[test]
+    fn a_settlement_row_covers_only_its_own_leg_or_an_unkeyed_later_booking() {
+        let opened = Utc::now();
+        let before = (opened - chrono::Duration::minutes(10)).to_rfc3339();
+        let after = (opened + chrono::Duration::minutes(10)).to_rfc3339();
+        assert!(settlement_row_covers(Some("leg-a"), &before, "leg-a", opened), "same leg, whenever written");
+        assert!(!settlement_row_covers(Some("leg-b"), &after, "leg-a", opened), "another leg, whenever written");
+        assert!(!settlement_row_covers(None, &before, "leg-a", opened), "unkeyed and older: a previous position");
+        assert!(settlement_row_covers(None, &after, "leg-a", opened), "unkeyed and later: a booking of this one");
+        assert!(settlement_row_covers(None, "not a time", "leg-a", opened), "unreadable: the old behavior");
+    }
+
+    /// [B66] Two legs with identical price, size and result are two rows; the
+    /// same leg twice is one.
+    #[tokio::test]
+    async fn the_settlement_fingerprint_tells_legs_apart_but_not_unkeyed_rows() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::shard_only("test");
+        let text = "Bitcoin price above $81,299.99?";
+        let opened = Utc::now() - chrono::Duration::minutes(20);
+        let write = |leg: Option<(&'static str, DateTime<Utc>)>| {
+            let pool = pool.clone();
+            let scope = scope.clone();
+            async move {
+                record_settlement_trade_for_token(
+                    &pool, &scope, leg, "AnchorStrategy", text, "YES",
+                    dec_of("0.28"), Decimal::ONE, dec_of("5"), dec_of("3.60"), Decimal::ZERO,
+                    "Settlement (won — cash settled)", None,
+                ).await
+            }
+        };
+        assert_eq!(write(Some(("leg-9pm", opened))).await, SettlementWrite::Inserted);
+        assert_eq!(write(Some(("leg-9pm", opened))).await, SettlementWrite::Duplicate, "same leg again");
+        assert_eq!(write(Some(("leg-10pm", opened))).await, SettlementWrite::Inserted, "an identical win on the next hour's leg");
+        assert_eq!(write(None).await, SettlementWrite::Duplicate, "an unkeyed writer matches the old way");
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM trades WHERE market = ?")
+            .bind(text).fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 2);
+    }
+
+    /// [B66] A keyed write against the pre-1.5.2 record: an unkeyed row with
+    /// the identical result is a duplicate only when it was written after this
+    /// position opened. The review case: the 7 PM hour booked unkeyed before
+    /// the upgrade, the 8 PM hour losing the same way after it.
+    #[tokio::test]
+    async fn a_keyed_write_is_not_a_duplicate_of_an_unkeyed_row_older_than_its_open() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::shard_only("test");
+        let text = "Bitcoin price on Oct 22, 2026? — $81,300 or above";
+        let legacy_ts = Utc::now() - chrono::Duration::hours(1);
+        sqlx::query(
+            "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason)
+             VALUES (?, 'AnchorStrategy', ?, 'YES', '0.40', '0', '5', '-2.00', 'Settlement (lost — cash settled)')"
+        ).bind(legacy_ts.to_rfc3339()).bind(text).execute(&pool).await.unwrap();
+
+        let write = |opened: DateTime<Utc>| {
+            let pool = pool.clone();
+            let scope = scope.clone();
+            async move {
+                record_settlement_trade_for_token(
+                    &pool, &scope, Some(("leg-8pm", opened)), "AnchorStrategy", text, "YES",
+                    dec_of("0.40"), Decimal::ZERO, dec_of("5"), dec_of("-2.00"), Decimal::ZERO,
+                    "Settlement (lost — cash settled)", None,
+                ).await
+            }
+        };
+        // Opened after the legacy row was written: a new position, booked.
+        assert_eq!(write(legacy_ts + chrono::Duration::minutes(30)).await, SettlementWrite::Inserted);
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM trades WHERE market = ?")
+            .bind(text).fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 2, "the next hour's identical loss is its own row");
+
+        // A position opened BEFORE the legacy row was written is the one that
+        // row booked (the pre-upgrade sweep wrote it unkeyed): still a duplicate.
+        sqlx::query("DELETE FROM trades WHERE token_id = 'leg-8pm'").execute(&pool).await.unwrap();
+        assert_eq!(write(legacy_ts - chrono::Duration::minutes(30)).await, SettlementWrite::Duplicate);
+    }
+
+    /// [B66] A simulated settlement on the same contract is not a booking of
+    /// the real one. The sweep settles real rows only, and a ghost viper on the
+    /// same leg writes a row with the same text, side and size by construction.
+    #[tokio::test]
+    async fn a_simulated_settlement_does_not_cover_a_real_position_on_the_same_leg() {
+        let pool = mem_pool().await;
+        let text = "Bitcoin price on Oct 22, 2026? — $81,300 or above";
+        let mut ghost = TradeScope::shard_only("test");
+        ghost.ghost = true;
+        let opened = Utc::now() - chrono::Duration::minutes(20);
+        insert_open(&pool, "AnchorStrategy", "tok-shared", text, "YES", "0.28", "5", Some("0.9995"), "confirmed").await;
+        assert_eq!(record_settlement_trade_for_token(
+            &pool, &ghost, Some(("tok-shared", opened)), "FairValueStrategy", text, "YES",
+            dec_of("0.30"), Decimal::ONE, dec_of("5"), dec_of("3.50"), Decimal::ZERO,
+            "Settlement (won — simulated)", None,
+        ).await, SettlementWrite::Inserted);
+
+        let mut marks = std::collections::HashMap::new();
+        marks.insert("tok-shared".to_string(), (Decimal::ONE, Decimal::ZERO));
+        assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &marks, &HashSet::new()).await, 1);
+        let real: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM trades WHERE market = ? AND ghost = 0 AND strategy = 'AnchorStrategy'"
+        ).bind(text).fetch_one(&pool).await.unwrap();
+        assert_eq!(real, 1, "the real settlement is booked beside the simulated one");
+    }
+
+    /// [B67] The scoped fee stamp reaches one viper's row and no other.
+    #[tokio::test]
+    async fn the_scoped_entry_fee_stamp_lands_on_one_vipers_row() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::shard_only("test");
+        record_open_position_with_status(&pool, &scope, "btc-open", "AnchorStrategy", "tok-fee",
+            "Bitcoin price above $81,299.99?", "YES", dec_of("0.28"), dec_of("5"), false, "pending").await;
+        record_open_position_with_status(&pool, &scope, "btc-open", "FairValueStrategy", "tok-fee",
+            "Bitcoin price above $81,299.99?", "YES", dec_of("0.30"), dec_of("4"), false, "pending").await;
+        set_open_position_entry_fee_scoped(&pool, "btc-open", "AnchorStrategy", "tok-fee", dec_of("0.0635")).await;
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT strategy, entry_fee FROM open_positions WHERE token_id = 'tok-fee' ORDER BY strategy"
+        ).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows, vec![
+            ("AnchorStrategy".to_string(), Some("0.0635".to_string())),
+            ("FairValueStrategy".to_string(), None),
+        ]);
     }
 
     /// The settlement-sweep candidate set carries only rows a venue actually

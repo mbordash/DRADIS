@@ -2514,6 +2514,17 @@ async fn record_entry(
             p, scope, squadron_id, strategy_name, params.token_id.as_str(), &params.market_name,
             side, fill.price, fill.filled, params.ghost_mode, status,
         ).await;
+        // [B67] The fee the venue charged for this fill goes on the row, not
+        // only on the in-memory guard. The settlement sweep nets the row's
+        // `entry_fee` out of the P&L it books, and with the column left NULL
+        // every settlement on this venue was booked gross with `fees = 0`
+        // (about seven cents a trade at five Kalshi contracts). A fee of zero
+        // is left as NULL: the venue reported none, and the row says so.
+        if !fill.fee.is_zero() {
+            db::set_open_position_entry_fee_scoped(
+                p, squadron_id, strategy_name, params.token_id.as_str(), fill.fee,
+            ).await;
+        }
     }
 }
 

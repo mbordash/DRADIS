@@ -2773,6 +2773,17 @@ async fn record_entry(
             p, scope, squadron_id, strategy_name, params.token_id.as_str(), &params.market_name,
             side, fill.price, fill.filled, params.ghost_mode, status,
         ).await;
+        // [B67] The fee the venue charged for this fill goes on the row, not
+        // only on the in-memory guard. The settlement sweep nets the row's
+        // `entry_fee` out of the P&L it books, and with the column left NULL
+        // every settlement on this venue was booked gross with `fees = 0`
+        // (about seven cents a trade at five Kalshi contracts). A fee of zero
+        // is left as NULL: the venue reported none, and the row says so.
+        if !fill.fee.is_zero() {
+            db::set_open_position_entry_fee_scoped(
+                p, squadron_id, strategy_name, params.token_id.as_str(), fill.fee,
+            ).await;
+        }
     }
 }
 
@@ -3310,6 +3321,58 @@ mod fill_accounting_tests {
         assert_eq!(a.shares, dec!(20));
         assert_eq!(b.shares, dec!(12), "the short leg's own partial fill was lost");
         assert_eq!(b.avg_entry, dec!(0.50));
+    }
+
+    /// [B67] The fill's fee reaches the `open_positions` row, and the settlement
+    /// sweep nets it out of the P&L it books.
+    ///
+    /// Before 1.5.2 the fee lived only on the in-memory guard, so every Kalshi
+    /// and Polymarket US settlement was booked gross with `fees = 0`: Anchor's
+    /// own ledger netted $0.07 a trade that the trade log did not (2026-10-23).
+    #[tokio::test]
+    async fn a_fills_fee_is_stamped_on_the_row_and_netted_at_settlement() {
+        let pool = db::memory_pool_for_tests().await;
+        db::run_migrations(&pool).await;
+        let scope = TradeScope::shard_only("test");
+        let mut p = params(dec!(5), dec!(0.28));
+        p.market_name = "Bitcoin price above $81,299.99?".into();
+        record_entry("btc-open", &Some(pool.clone()), &scope, "AnchorStrategy", &p,
+                     &fill(dec!(5), dec!(0.28), dec!(0.0635))).await;
+
+        let fee: Option<String> = sqlx::query_scalar(
+            "SELECT entry_fee FROM open_positions WHERE token_id = 'KX-1#yes' AND strategy = 'AnchorStrategy'"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(fee.as_deref(), Some("0.0635"), "the fee is on the row");
+
+        // The venue settles the contract at $1.
+        let mut marks = std::collections::HashMap::new();
+        marks.insert("KX-1#yes".to_string(), (Decimal::ONE, Decimal::ZERO));
+        let swept = db::purge_stale_open_positions(
+            &pool, &std::collections::HashSet::new(), &marks, &std::collections::HashSet::new(),
+        ).await;
+        assert_eq!(swept, 1);
+        let (pnl, fees): (String, Option<String>) = sqlx::query_as(
+            "SELECT pnl, fees FROM trades WHERE market = 'Bitcoin price above $81,299.99?'"
+        ).fetch_one(&pool).await.unwrap();
+        // (1.00 − 0.28) × 5 = 3.60 gross, 3.5365 net of the fee.
+        assert_eq!(pnl.parse::<Decimal>().unwrap(), dec!(3.5365), "settlement P&L is net of the entry fee");
+        assert_eq!(fees.as_deref(), Some("0.0635"));
+    }
+
+    /// [B67] A venue that reports no fee leaves the column unset rather than
+    /// writing a zero that claims the fee is known.
+    #[tokio::test]
+    async fn a_zero_fee_is_not_stamped() {
+        let pool = db::memory_pool_for_tests().await;
+        db::run_migrations(&pool).await;
+        let scope = TradeScope::shard_only("test");
+        let p = params(dec!(5), dec!(0.28));
+        record_entry("btc-open", &Some(pool.clone()), &scope, "AnchorStrategy", &p,
+                     &fill(dec!(5), dec!(0.28), dec!(0))).await;
+        let fee: Option<String> = sqlx::query_scalar(
+            "SELECT entry_fee FROM open_positions WHERE token_id = 'KX-1#yes'"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(fee, None);
     }
 }
 
