@@ -1441,9 +1441,11 @@ async fn trade_one_market(
     // See `TradeScope::ghost`: the ledger records whether a trade was real.
     scope.ghost = crate::config::GHOST_MODE || dyn_cfg.ghost_mode;
     if let Some(p) = &pool {
-        let (coll, total) = sync_dashboard(&squadron_id, venue.as_ref(), p, &positions, starting).await;
+        let (coll, total) = sync_dashboard(&squadron_id, venue.as_ref(), p, &positions, starting, None).await;
         available_collateral = coll;
-        session_pnl = if dyn_cfg.ghost_mode { crate::helpers::metrics::realised_session_pnl() } else { total - starting };
+        if let Some(total) = total {
+            session_pnl = if dyn_cfg.ghost_mode { crate::helpers::metrics::realised_session_pnl() } else { total - starting };
+        }
     }
 
     // ── Tick loop ────────────────────────────────────────────────────────────
@@ -1498,9 +1500,16 @@ async fn trade_one_market(
             }
             _ = dash_tick.tick() => {
                 if let Some(p) = &pool {
-                    let (coll, total) = sync_dashboard(&squadron_id, venue.as_ref(), p, &positions, starting).await;
+                    let (coll, total) = sync_dashboard(
+                        &squadron_id, venue.as_ref(), p, &positions, starting, Some(available_collateral),
+                    ).await;
                     available_collateral = coll;
-                    session_pnl = if dyn_cfg.ghost_mode { crate::helpers::metrics::realised_session_pnl() } else { total - starting };
+                    // A pass the venue could not be read leaves session P&L alone:
+                    // `total - starting` with no total is zero, and zero clears the
+                    // drawdown guard for every viper for 30 s (review of [B69]).
+                    if let Some(total) = total {
+                        session_pnl = if dyn_cfg.ghost_mode { crate::helpers::metrics::realised_session_pnl() } else { total - starting };
+                    }
                 }
                 release_swept_positions(&positions).await;
                 dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;
@@ -2308,7 +2317,7 @@ async fn dispatch_signal(
                     lifecycle.track(&b, strategy_name, pp.order_type, Some(params.token_id.clone())).await;
                     record_entry(squadron_id, pool, scope, strategy_name, params, &a).await;
                     record_entry(squadron_id, pool, scope, strategy_name, pp, &b).await;
-                    if let Some(p) = pool { sync_dashboard(squadron_id, venue, p, positions, starting).await; }
+                    if let Some(p) = pool { sync_dashboard(squadron_id, venue, p, positions, starting, None).await; }
                     true
                 }
                 Err(e) => {
@@ -2582,7 +2591,7 @@ async fn dispatch_single(
                 lifecycle.track(&f, strategy_name, params.order_type, None).await;
                 record_entry(squadron_id, pool, scope, strategy_name, params, &f).await;
             }
-            if let Some(p) = pool { sync_dashboard(squadron_id, venue, p, positions, starting).await; }
+            if let Some(p) = pool { sync_dashboard(squadron_id, venue, p, positions, starting, None).await; }
             Some(f)
         }
         Err(e) => {
@@ -2851,10 +2860,26 @@ async fn sync_dashboard(
     pool: &sqlx::SqlitePool,
     guards: &Arc<Mutex<PositionMap>>,
     starting: Decimal,
-) -> (Decimal, Decimal) {
+    // The loop's current available collateral, returned unchanged when the
+    // venue cannot be read; `None` on the loop's first sync and on the
+    // post-fill syncs, whose result is not read. See
+    // `core::collateral_after_failed_read`.
+    last_collateral: Option<Decimal>,
+    // Returns (available collateral, total account value). The total is `None`
+    // when the venue could not be read this pass: the loop then leaves its
+    // session P&L where it was, because a total it did not measure would read
+    // as a session P&L of zero and clear the drawdown guard for the pass.
+) -> (Decimal, Option<Decimal>) {
     let collateral = match venue.collateral().await {
         Ok(c) => c,
-        Err(e) => { warn!("Kalshi dashboard sync: collateral query failed: {e}"); return (Decimal::ZERO, starting); }
+        Err(e) => {
+            let kept = crate::venues::core::collateral_after_failed_read(last_collateral, starting);
+            warn!(
+                "Kalshi dashboard sync: collateral query failed: {e} — available collateral stays at the \
+                 last reading (${kept:.2}); no P&L snapshot this pass"
+            );
+            return (kept, None);
+        }
     };
     // A failed positions fetch ABANDONS the sweep — it must never read as "the
     // account holds nothing". This used to be `unwrap_or_default()`, which
@@ -2867,14 +2892,14 @@ async fn sync_dashboard(
     // in tasks/cleanup.rs); same rule here.
     //
     // Collateral was already fetched successfully, so the caller gets the real
-    // figure; `starting` as the total keeps its session P&L flat for the pass
+    // figure; no total is returned, so the loop keeps the session P&L it had
     // rather than reporting a phantom drop equal to the unpriced positions, and
     // no P&L snapshot is written from a total we could not compute.
     let positions = match venue.positions().await {
         Ok(p) => p,
         Err(e) => {
             warn!("Kalshi dashboard sync: positions query failed — skipping reconcile/purge this pass: {e}");
-            return (collateral, starting);
+            return (collateral, None);
         }
     };
 
@@ -3034,7 +3059,7 @@ async fn sync_dashboard(
         total - starting
     };
     db::record_pnl_snapshot(pool, session_pnl_recorded, collateral, total).await;
-    (collateral, total)
+    (collateral, Some(total))
 }
 
 /// `YES`/`NO` display label from a `{ticker}#yes|#no` leg id.

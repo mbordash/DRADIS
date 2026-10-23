@@ -277,6 +277,8 @@ export interface DynamicConfig {
   anchor_max_exposure_usdc?: string;
   anchor_min_edge?: string;
   anchor_max_z?: string;
+  anchor_min_z?: string;
+  anchor_max_basis_sigmas?: string;
   anchor_min_entry_price?: string;
   anchor_max_entry_price?: string;
   anchor_min_secs_to_close?: number;

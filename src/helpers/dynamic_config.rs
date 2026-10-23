@@ -284,6 +284,8 @@ fn default_anchor_contracts()          -> Decimal { config::ANCHOR_CONTRACTS }
 fn default_anchor_max_exposure_usdc()  -> Decimal { config::ANCHOR_MAX_EXPOSURE_USDC }
 fn default_anchor_min_edge()           -> Decimal { config::ANCHOR_MIN_EDGE }
 fn default_anchor_max_z()              -> Decimal { config::ANCHOR_MAX_Z }
+fn default_anchor_min_z()              -> Decimal { config::ANCHOR_MIN_Z }
+fn default_anchor_max_basis_sigmas()   -> Decimal { config::ANCHOR_MAX_BASIS_SIGMAS }
 fn default_anchor_min_entry_price()    -> Decimal { config::ANCHOR_MIN_ENTRY_PRICE }
 fn default_anchor_max_entry_price()    -> Decimal { config::ANCHOR_MAX_ENTRY_PRICE }
 fn default_anchor_min_secs_to_close()  -> i64     { config::ANCHOR_MIN_SECS_TO_CLOSE }
@@ -1334,6 +1336,10 @@ pub struct DynamicConfig {
     pub anchor_min_edge: Decimal,
     #[serde(default = "default_anchor_max_z")]
     pub anchor_max_z: Decimal,
+    #[serde(default = "default_anchor_min_z")]
+    pub anchor_min_z: Decimal,
+    #[serde(default = "default_anchor_max_basis_sigmas")]
+    pub anchor_max_basis_sigmas: Decimal,
     #[serde(default = "default_anchor_min_entry_price")]
     pub anchor_min_entry_price: Decimal,
     #[serde(default = "default_anchor_max_entry_price")]
@@ -1744,6 +1750,8 @@ impl Default for DynamicConfig {
             anchor_max_exposure_usdc: config::ANCHOR_MAX_EXPOSURE_USDC,
             anchor_min_edge: config::ANCHOR_MIN_EDGE,
             anchor_max_z: config::ANCHOR_MAX_Z,
+            anchor_min_z: config::ANCHOR_MIN_Z,
+            anchor_max_basis_sigmas: config::ANCHOR_MAX_BASIS_SIGMAS,
             anchor_min_entry_price: config::ANCHOR_MIN_ENTRY_PRICE,
             anchor_max_entry_price: config::ANCHOR_MAX_ENTRY_PRICE,
             anchor_min_secs_to_close: config::ANCHOR_MIN_SECS_TO_CLOSE,
@@ -2751,6 +2759,7 @@ mod tests {
             "bookline_trade_size_usdc",
             "bookline_max_exposure_usdc",
             "anchor_enabled", "anchor_contracts", "anchor_max_exposure_usdc", "anchor_min_edge", "anchor_max_z",
+            "anchor_min_z", "anchor_max_basis_sigmas",
             "anchor_min_entry_price", "anchor_max_entry_price", "anchor_min_secs_to_close", "anchor_max_secs_to_close",
             "anchor_min_age_secs", "anchor_max_age_secs", "anchor_min_samples", "anchor_min_span_secs",
             "anchor_obi_adverse_block",

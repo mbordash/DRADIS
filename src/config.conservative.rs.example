@@ -992,6 +992,25 @@ pub const ANCHOR_MIN_EDGE: Decimal = dec!(0.04);
 /// Furthest the anchored level may sit from the strike, in sigmas of the
 /// remaining window. Beyond one sigma the edge went negative.
 pub const ANCHOR_MAX_Z: Decimal = dec!(1.0);
+/// Nearest the anchored level may sit to the strike, in sigmas of the remaining
+/// window. At the strike the gamma model says 0.50 for both sides whatever the
+/// anchor reads, so the whole "edge" there is the market skewing one side, which
+/// is the crowd's directional view and not the model's. The first three live
+/// entries under z 0.07 all lost (2026-10-22 and 23); the near-strike wins came
+/// at z 0.12 and 0.18 with a move behind them.
+pub const ANCHOR_MIN_Z: Decimal = dec!(0.10);
+/// Largest anchor offset the model will trade on, in sigmas of the anchor's
+/// own sample window (`σ × √anchor_max_age_secs × spot`, about $80 on a 23%
+/// tape). The offset between the market's implied level and the feed is a slow
+/// quantity, tens of dollars on Kalshi, under half a window sigma on every
+/// honest ledger row; an offset of a window sigma or more means the feed moved
+/// inside the sample window and the market lagged it, so the median is the lag,
+/// not the level, and the model fades the move. 2026-10-23 09:30 ET: a $211
+/// ten-minute rally, an offset of $124 (1.5 window sigmas), a NO bought at 0.37
+/// against a 0.53 "fair", settled $400 through the strike. Scaled by the sample
+/// window and not by the time to close, so the bar does not tighten through the
+/// hour. Zero disables the gate.
+pub const ANCHOR_MAX_BASIS_SIGMAS: Decimal = dec!(1.0);
 /// Entry price band for the side being bought. The cheap side only: above 0.60
 /// the record was flat to negative.
 pub const ANCHOR_MIN_ENTRY_PRICE: Decimal = dec!(0.20);

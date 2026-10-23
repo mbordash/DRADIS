@@ -897,6 +897,22 @@ pub async fn starting_collateral<V: Execution + ?Sized>(
     }
 }
 
+/// The available collateral a loop should carry after a balance read failed.
+///
+/// [B69] The last reading, when there is one. A failed read is "unknown", not
+/// "zero": the Kalshi dashboard sync used to return zero on any failure, and
+/// every viper that gates entries on `available_collateral` (Arbitrage,
+/// FairValue, Basis, GBoost, Helm) then believed the account was empty until
+/// the next successful sync, 30 seconds later. With three squadron loops
+/// started in the same second and Kalshi allowing one `/portfolio/balance`
+/// call per second, two of the three syncs failed every cycle, so on two
+/// squadrons those vipers sat on a phantom empty account two thirds of the
+/// time (production, 2026-10-22 and 2026-10-23). `None` is the first sync of
+/// a loop, where the starting reading is the only figure there is.
+pub fn collateral_after_failed_read(last: Option<Decimal>, starting: Decimal) -> Decimal {
+    last.unwrap_or(starting)
+}
+
 /// The session's starting collateral, set by the first `starting_collateral`
 /// reading of the process. See that function for why there is exactly one.
 static SESSION_STARTING_COLLATERAL: std::sync::OnceLock<Decimal> = std::sync::OnceLock::new();
@@ -1034,3 +1050,17 @@ mod resolver_tests {
     }
 }
 
+#[cfg(test)]
+mod failed_collateral_read_tests {
+    use super::collateral_after_failed_read;
+    use rust_decimal_macros::dec;
+
+    /// [B69] A failed balance read is unknown, not zero: the loop keeps the
+    /// figure it had, and the starting reading on a first sync.
+    #[test]
+    fn a_failed_read_keeps_the_last_figure_and_never_zeroes_it() {
+        assert_eq!(collateral_after_failed_read(Some(dec!(51.86)), dec!(52.86)), dec!(51.86));
+        assert_eq!(collateral_after_failed_read(None, dec!(52.86)), dec!(52.86));
+        assert_ne!(collateral_after_failed_read(Some(dec!(51.86)), dec!(52.86)), dec!(0));
+    }
+}

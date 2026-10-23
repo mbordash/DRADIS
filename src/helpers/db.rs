@@ -1372,16 +1372,23 @@ pub async fn anchor_shadow_open(
     // `Some(true)` for a simulated fill, `Some(false)` for a real one, `None` for
     // a row that was never a position (the control lane).
     ghost: Option<bool>,
+    // Interquartile range of the basis samples behind the anchor, and the
+    // oracle's range over the sample window, both in the oracle's units; `None`
+    // when the viper could not measure them.
+    basis_spread: Option<f64>,
+    spot_range: Option<f64>,
 ) -> bool {
     match sqlx::query(
         "INSERT INTO anchor_shadow
             (asset, lane, squadron_id, market_key, condition_id, token_id, market, side, close_s, opened_at,
-             entry_price, shares, entry_fee, fair, anchor_basis, sigma, z, secs_left, spot, strike, ask_depth, ghost)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+             entry_price, shares, entry_fee, fair, anchor_basis, sigma, z, secs_left, spot, strike, ask_depth, ghost,
+             basis_spread, spot_range)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(asset).bind(lane).bind(squadron_id).bind(market_key).bind(condition_id).bind(token_id).bind(market).bind(side)
         .bind(close_s).bind(Utc::now().to_rfc3339())
         .bind(entry_price).bind(shares).bind(entry_fee).bind(fair).bind(anchor_basis).bind(sigma).bind(z)
         .bind(secs_left).bind(spot).bind(strike).bind(ask_depth).bind(ghost.map(|g| g as i32))
+        .bind(basis_spread).bind(spot_range)
         .execute(pool).await
     {
         Ok(_) => true,
@@ -2053,6 +2060,13 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) {
     // SQLite has no ADD COLUMN IF NOT EXISTS, so the duplicate-column error on
     // an upgraded database is the expected no-op.
     let _ = sqlx::query("ALTER TABLE anchor_shadow ADD COLUMN ghost INTEGER").execute(pool).await;
+    // `basis_spread`: interquartile range of the basis samples the anchor was
+    // read from, in the oracle's units; `spot_range`: how far the oracle moved
+    // over the same window. Both describe whether the anchor was a level or a
+    // lag (1.5.2, after a $124 offset on a $211 rally was traded as a level).
+    // NULL on rows written before the columns existed.
+    let _ = sqlx::query("ALTER TABLE anchor_shadow ADD COLUMN basis_spread REAL").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE anchor_shadow ADD COLUMN spot_range REAL").execute(pool).await;
     let _ = sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_anchor_shadow_live
              ON anchor_shadow(asset, lane, closed_at)"

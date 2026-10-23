@@ -267,8 +267,11 @@ impl Execution for KalshiVenue {
     }
 
     async fn collateral(&self) -> Result<Decimal> {
-        // Never cached: this figure is booked into P&L snapshots right after fills.
-        let resp = self.balance_fresh().await?;
+        // Shared across callers for a few seconds, never longer: this figure is
+        // booked into P&L snapshots right after fills, and a fill empties the
+        // cache first, so the post-fill read still reaches the venue. See
+        // `COLLATERAL_SHARED_SECS` for the rate limit that forced the sharing.
+        let resp = self.balance_shared().await?;
         Ok(resp.dollars())
     }
 

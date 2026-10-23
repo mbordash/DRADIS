@@ -214,6 +214,11 @@ pub struct AnchorRead {
     pub samples: usize,
     /// Seconds between the oldest and newest eligible sample.
     pub span_secs: i64,
+    /// Interquartile range of the eligible samples, in the oracle's units. A
+    /// level reads tight; a feed that moved inside the window while the market
+    /// lagged reads wide, because the early samples carry a different offset
+    /// from the late ones. Recorded on every ledger row for review.
+    pub spread: f64,
 }
 
 /// Median of the basis samples aged between `min_age` and `max_age` seconds,
@@ -239,7 +244,26 @@ pub fn anchor_from(
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = v.len();
     let median = if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) };
-    Some(AnchorRead { basis: median, samples: n, span_secs: span })
+    // Quartiles want a few points per quarter; below that the full range is the
+    // honest spread.
+    let spread = if n >= 8 { v[(3 * n) / 4] - v[n / 4] } else { v[n - 1] - v[0] };
+    Some(AnchorRead { basis: median, samples: n, span_secs: span, spread })
+}
+
+/// How far the oracle moved over the anchor's sample window: the range of the
+/// spot samples aged between `min_age` and `max_age` seconds, in the oracle's
+/// units. `None` with fewer than two samples in the window. Recorded beside
+/// each ledger row so a large offset can be read against the move that made it.
+pub fn spot_range_from(samples: &VecDeque<(i64, f64)>, now_s: i64, min_age_secs: i64, max_age_secs: i64) -> Option<f64> {
+    let (mut lo, mut hi, mut n) = (f64::INFINITY, f64::NEG_INFINITY, 0usize);
+    for &(t, p) in samples {
+        let age = now_s - t;
+        if age < min_age_secs || age > max_age_secs { continue; }
+        lo = lo.min(p);
+        hi = hi.max(p);
+        n += 1;
+    }
+    (n >= 2).then_some(hi - lo)
 }
 
 /// The model's reading of one market: fair P(YES) from the anchored level, and
@@ -248,15 +272,25 @@ pub fn anchor_from(
 pub struct Reading {
     pub fair_yes: f64,
     pub z: f64,
+    /// The anchor's offset from the feed in sigmas of the anchor's own sample
+    /// window, `|b| / (σ √W · S)` with W the window length. The level the
+    /// market implies normally sits within tens of dollars of the feed, under
+    /// half a window sigma; an offset of a window sigma or more means the feed
+    /// moved inside the sample window and the market lagged it, so the anchor
+    /// is the lag and not the level. Scaled by the window the samples span and
+    /// not by the time to close, so the same offset reads the same at every
+    /// point in the hour.
+    pub basis_sigmas: f64,
 }
 
-/// `Φ(ln((S − b)/K) / (σ√T))` and `|ln((S − b)/K)| / (σ√T)`.
-pub fn reading(spot: f64, strike: f64, basis: f64, sigma: f64, secs_left: f64) -> Option<Reading> {
+/// `Φ(ln((S − b)/K) / (σ√T))`, `|ln((S − b)/K)| / (σ√T)` and `|b| / (σ√W·S)`,
+/// `W` being the anchor's sample window in seconds.
+pub fn reading(spot: f64, strike: f64, basis: f64, sigma: f64, secs_left: f64, window_secs: f64) -> Option<Reading> {
     let level = spot - basis;
-    if level <= 0.0 || strike <= 0.0 || sigma <= 0.0 || secs_left <= 0.0 { return None; }
+    if level <= 0.0 || strike <= 0.0 || sigma <= 0.0 || secs_left <= 0.0 || window_secs <= 0.0 { return None; }
     let d = (level / strike).ln() / (sigma * secs_left.sqrt());
     if !d.is_finite() { return None; }
-    Some(Reading { fair_yes: norm_cdf(d), z: d.abs() })
+    Some(Reading { fair_yes: norm_cdf(d), z: d.abs(), basis_sigmas: basis.abs() / (sigma * window_secs.sqrt() * spot) })
 }
 
 // ─── Gates ───────────────────────────────────────────────────────────────────
@@ -276,6 +310,11 @@ pub struct SideQuote {
 pub struct Gates {
     pub min_edge: f64,
     pub max_z: f64,
+    /// Nearest to the strike the model will trade; zero disables the gate.
+    pub min_z: f64,
+    /// Largest anchor offset, in sigmas of the anchor's sample window, the
+    /// model will trade on; zero disables the gate.
+    pub max_basis_sigmas: f64,
     pub min_price: f64,
     pub max_price: f64,
     pub min_secs_to_close: i64,
@@ -291,6 +330,8 @@ impl Gates {
         Self {
             min_edge: f(dc.anchor_min_edge),
             max_z: f(dc.anchor_max_z),
+            min_z: f(dc.anchor_min_z),
+            max_basis_sigmas: f(dc.anchor_max_basis_sigmas),
             min_price: f(dc.anchor_min_entry_price),
             max_price: f(dc.anchor_max_entry_price),
             min_secs_to_close: dc.anchor_min_secs_to_close,
@@ -318,6 +359,8 @@ pub struct Pick {
 pub enum Refusal {
     OutsideWindow,
     TooFarFromStrike,
+    TooCloseToStrike,
+    AnchorAdrift,
     NoAsk,
     AskOutsideBand,
     EdgeBelowBar,
@@ -331,6 +374,8 @@ impl Refusal {
         match self {
             Self::OutsideWindow    => "outside the entry window",
             Self::TooFarFromStrike => "level too far from the strike",
+            Self::TooCloseToStrike => "level at the strike: the model has no opinion there",
+            Self::AnchorAdrift     => "anchor adrift: the feed moved inside the sample window",
             Self::NoAsk            => "no ask on either side",
             Self::AskOutsideBand   => "ask outside the entry price band",
             Self::EdgeBelowBar     => "edge below the bar",
@@ -359,6 +404,19 @@ pub fn choose_side(
     if r.z > g.max_z {
         return Err(Refusal::TooFarFromStrike);
     }
+    // An offset of a window sigma or more is a move the market lagged, not a
+    // level; trading on it fades the move (2026-10-23: $124 offset, $211 rally,
+    // lost). Checked before the strike gate because a lagged level often lands
+    // on the strike too, and this is the more specific cause.
+    if anchor_adrift(r.basis_sigmas, g.max_basis_sigmas) {
+        return Err(Refusal::AnchorAdrift);
+    }
+    // At the strike the model prices both sides at 0.50 whatever the anchor
+    // reads, so a discount there is the market's directional view and not the
+    // model's. The first three live entries under z 0.07 all lost.
+    if r.z < g.min_z {
+        return Err(Refusal::TooCloseToStrike);
+    }
     let mut best: Option<Pick> = None;
     // The furthest any side got, by gate order.
     let mut furthest: Option<(u8, Refusal)> = None;
@@ -380,13 +438,22 @@ pub fn choose_side(
     best.ok_or_else(|| furthest.map(|(_, why)| why).unwrap_or(Refusal::NoAsk))
 }
 
+/// Whether the anchor's offset exceeds the bound; a bound of zero disables the
+/// gate, as a zero minimum strike distance does.
+pub fn anchor_adrift(basis_sigmas: f64, max_basis_sigmas: f64) -> bool {
+    max_basis_sigmas > 0.0 && basis_sigmas > max_basis_sigmas
+}
+
 /// The control lane's candidate: a side inside the same price band and window
 /// that the model calls EXPENSIVE by the entry margin (`ask − fair ≥ min_edge`,
 /// no fee term, the backtest's own control definition). Recorded and settled
 /// like an entry, never booked. If the control lane does not lose, the entry
 /// lane's gains are the market drifting, not the model knowing.
 pub fn control_side(r: Reading, secs_left: i64, yes: SideQuote, no: SideQuote, g: &Gates) -> Option<Pick> {
-    if secs_left < g.min_secs_to_close || secs_left > g.max_secs_to_close || r.z > g.max_z { return None; }
+    // The same structural gates as the entry rule, so the two lanes are drawn
+    // from the same moments and stay comparable.
+    if secs_left < g.min_secs_to_close || secs_left > g.max_secs_to_close { return None; }
+    if r.z > g.max_z || r.z < g.min_z || anchor_adrift(r.basis_sigmas, g.max_basis_sigmas) { return None; }
     let mut best: Option<Pick> = None;
     for (is_yes, q, fair) in [(true, yes, r.fair_yes), (false, no, 1.0 - r.fair_yes)] {
         let Some(ask) = q.ask else { continue };
@@ -418,6 +485,10 @@ struct PendingEntry {
     spot: f64,
     strike: f64,
     ask_depth: f64,
+    /// Spread of the anchor's samples and the feed's range over the sample
+    /// window at the moment of entry, for the ledger row.
+    basis_spread: f64,
+    spot_range: Option<f64>,
     /// The mode the order was sent in (`OrderParams::ghost_mode`), stamped on
     /// the ledger row so a switch flipped before the fill is ledgered cannot
     /// change who books the settlement.
@@ -670,6 +741,7 @@ impl AnchorStrategy {
                 &pool, &asset, ANCHOR_LANE_ENTRY, &pe.squadron_id, &pe.market_key, &pe.condition_id, &token,
                 &pe.market_name, pe.side, pe.close_s, price, shares, fee, pe.fair, pe.anchor_basis,
                 pe.sigma, pe.z, pe.secs_left, pe.spot, pe.strike, pe.ask_depth, Some(pe.ghost),
+                Some(pe.basis_spread), pe.spot_range,
             ).await;
             if ok {
                 lock(&g.held).insert(key);
@@ -984,15 +1056,20 @@ impl Strategy for AnchorStrategy {
             });
             return Ok(StrategySignal::NoSignal);
         };
-        let Some(r) = reading(spot, strike, anchor.basis, sigma, secs_left as f64) else {
+        let Some(r) = reading(spot, strike, anchor.basis, sigma, secs_left as f64, dc.anchor_max_age_secs as f64) else {
             idle("fair value not computable");
             return Ok(StrategySignal::NoSignal);
         };
+        // The feed's own range over the anchor's sample window, from the vol
+        // sampler's spot series: the context a large offset is read against.
+        let spot_range = spot_range_from(&lock(&g.sigma), now_s, dc.anchor_min_age_secs, dc.anchor_max_age_secs);
         let yes = Self::side_quote(&ctx.snapshot, true);
         let no = Self::side_quote(&ctx.snapshot, false);
         crate::helpers::viper_status::report_detail(&ctx.crypto_filter, STRATEGY_NAME, Some(format!(
-            "anchor {:+.0} ({} samples) | fair YES {:.3} vs ask {} | z {:.2} | vol {:.0}% | T {}s | {}",
-            -anchor.basis, anchor.samples, r.fair_yes,
+            "anchor {:+.0} ({} samples, spread {:.0}, {:.2} window σ) | feed range {} | fair YES {:.3} vs ask {} | z {:.2} | vol {:.0}% | T {}s | {}",
+            -anchor.basis, anchor.samples, anchor.spread, r.basis_sigmas,
+            spot_range.map_or("n/a".to_string(), |x| format!("{x:.0}")),
+            r.fair_yes,
             yes.ask.map_or("n/a".to_string(), |a| format!("{a:.3}")),
             r.z, vol_ann * 100.0, secs_left, lock(&g.summary).1,
         )));
@@ -1044,7 +1121,7 @@ impl Strategy for AnchorStrategy {
                 if crate::helpers::db::anchor_shadow_open(
                     &pool, &asset, ANCHOR_LANE_CONTROL, &ctx.squadron_id, &market_key, &market.condition_id,
                     token.as_str(), &market.market_name, side, close_s, c.ask, gates.contracts, fee_at, c.fair,
-                    anchor.basis, sigma, r.z, secs_left, spot, strike, depth, None,
+                    anchor.basis, sigma, r.z, secs_left, spot, strike, depth, None, Some(anchor.spread), spot_range,
                 ).await {
                     lock(&g.held).insert(key);
                     info!("⚓ Anchor control on {}: {} at ${:.3} is {:.3} over fair {:.3}; recorded, never taken",
@@ -1057,7 +1134,7 @@ impl Strategy for AnchorStrategy {
             Ok(p) => p,
             Err(why) => {
                 idle(why.label());
-                if matches!(why, Refusal::AskTooThin | Refusal::ObiAdverse | Refusal::ExposureCap)
+                if matches!(why, Refusal::AskTooThin | Refusal::ObiAdverse | Refusal::ExposureCap | Refusal::AnchorAdrift | Refusal::TooCloseToStrike)
                     && crate::vipers::gate_log_permitted(STRATEGY_NAME, &asset, why.label(), GATE_LOG_INTERVAL_SECS)
                 {
                     info!("⚓ Anchor hold on {}: {} (fair YES {:.3}, z {:.2}, T {}s)",
@@ -1101,6 +1178,8 @@ impl Strategy for AnchorStrategy {
             spot,
             strike,
             ask_depth: depth,
+            basis_spread: anchor.spread,
+            spot_range,
             ghost: dc.ghost_mode,
             sent_at: Instant::now(),
         });
@@ -1113,6 +1192,9 @@ impl Strategy for AnchorStrategy {
             "fee_per_share": pick.fee,
             "anchor_basis": anchor.basis,
             "anchor_samples": anchor.samples,
+            "anchor_basis_spread": anchor.spread,
+            "anchor_basis_sigmas": r.basis_sigmas,
+            "spot_range_over_window": spot_range,
             "sigma_per_sqrt_sec": sigma,
             "vol_annualized": vol_ann,
             "z": r.z,
@@ -1123,9 +1205,10 @@ impl Strategy for AnchorStrategy {
             "exit": "settlement",
         }));
         info!(
-            "⚓ Anchor {} ENTRY on {}: fair {:.3} vs ask ${:.3}, edge {:+.3} net of fee | anchor {:+.0} over {} samples, \
-             sigma {:.2e}/√s ({:.0}% ann.), z {:.2}, T {}s, K ${:.2} | {} contracts{}",
+            "⚓ Anchor {} ENTRY on {}: fair {:.3} vs ask ${:.3}, edge {:+.3} net of fee | anchor {:+.0} over {} samples \
+             (spread {:.0}, {:.2} window σ; feed range {} over the window), sigma {:.2e}/√s ({:.0}% ann.), z {:.2}, T {}s, K ${:.2} | {} contracts{}",
             side, market.market_name, pick.fair, pick.ask, pick.edge, -anchor.basis, anchor.samples,
+            anchor.spread, r.basis_sigmas, spot_range.map_or("n/a".to_string(), |x| format!("{x:.0}")),
             sigma, vol_ann * 100.0, r.z, secs_left, strike, dc.anchor_contracts,
             if dc.ghost_mode { " (simulated)" } else { "" },
         );
@@ -1192,7 +1275,7 @@ mod tests {
         let fair = norm_cdf(((spot - basis) / strike).ln() / (sigma * t.sqrt()));
         let b = implied_basis(spot, strike, fair, sigma, t).expect("in band");
         assert!((b - basis).abs() < 0.5, "basis {b} vs {basis}");
-        let r = reading(spot, strike, b, sigma, t).unwrap();
+        let r = reading(spot, strike, b, sigma, t, 600.0).unwrap();
         assert!((r.fair_yes - fair).abs() < 1e-6);
         assert!(implied_basis(spot, strike, 0.95, sigma, t).is_none(), "outside the sample band");
         assert!(implied_basis(spot, strike, 0.5, 0.0, t).is_none(), "no sigma, no sample");
@@ -1212,6 +1295,15 @@ mod tests {
         assert_eq!(a.samples, 40);
         assert_eq!(a.span_secs, 390);
         assert!(a.basis > 90.0 && a.basis < 500.0, "median {}", a.basis);
+        // Half the samples sit near 100 and half at 500: the interquartile range spans the gap.
+        assert!(a.spread > 350.0 && a.spread < 420.0, "spread {}", a.spread);
+        let tight: VecDeque<_> = (0..40).map(|i| (now - 60 - i * 10, 90.0 + (i % 3) as f64)).collect();
+        assert!(anchor_from(&tight, now, 60, 600, 20, 300).unwrap().spread <= 2.0, "a steady level reads tight");
+        // With fewer than eight samples the spread is the full range, not a quartile guess.
+        let few: VecDeque<_> = [10.0, 50.0, 20.0, 40.0, 30.0].iter().enumerate()
+            .map(|(i, b)| (now - 60 - i as i64 * 100, *b)).collect();
+        let a = anchor_from(&few, now, 60, 600, 5, 300).unwrap();
+        assert!((a.spread - 40.0).abs() < 1e-9, "range of five samples, got {}", a.spread);
         assert!(anchor_from(&s, now, 60, 600, 41, 300).is_none(), "too few");
         assert!(anchor_from(&s, now, 60, 600, 20, 400).is_none(), "span too short");
         // Everything younger than the minimum age is excluded.
@@ -1235,7 +1327,7 @@ mod tests {
 
     fn gates() -> Gates {
         Gates {
-            min_edge: 0.04, max_z: 1.0, min_price: 0.20, max_price: 0.60,
+            min_edge: 0.04, max_z: 1.0, min_z: 0.10, max_basis_sigmas: 1.0, min_price: 0.20, max_price: 0.60,
             min_secs_to_close: 300, max_secs_to_close: 1800, contracts: 10.0, max_exposure: 12.0,
             obi_adverse_block: -0.60,
         }
@@ -1276,13 +1368,13 @@ mod tests {
     /// cents net of fee, while NO at 0.58 against 0.48 fair does not.
     #[test]
     fn the_rule_buys_the_cheap_side_and_only_inside_its_gates() {
-        let r = Reading { fair_yes: 0.52, z: 0.3 };
+        let r = Reading { fair_yes: 0.52, z: 0.3, basis_sigmas: 0.1 };
         let p = choose_side(r, 1200, q(0.44, 50.0), q(0.58, 50.0), &gates(), 0.0, fee).unwrap();
         assert!(p.is_yes);
         assert!((p.edge - (0.52 - 0.44 - fee(0.44))).abs() < 1e-12);
         // The same book one minute from the close, or far from the strike, is refused before pricing.
         assert_eq!(choose_side(r, 60, q(0.44, 50.0), q(0.58, 50.0), &gates(), 0.0, fee), Err(Refusal::OutsideWindow));
-        assert_eq!(choose_side(Reading { fair_yes: 0.52, z: 1.5 }, 1200, q(0.44, 50.0), q(0.58, 50.0), &gates(), 0.0, fee),
+        assert_eq!(choose_side(Reading { fair_yes: 0.52, z: 1.5, basis_sigmas: 0.1 }, 1200, q(0.44, 50.0), q(0.58, 50.0), &gates(), 0.0, fee),
                    Err(Refusal::TooFarFromStrike));
         // A thin ask, an all-offer book, and a full lane each stop the side that otherwise qualified.
         assert_eq!(choose_side(r, 1200, q(0.44, 4.0), q(0.58, 50.0), &gates(), 0.0, fee), Err(Refusal::AskTooThin));
@@ -1290,7 +1382,7 @@ mod tests {
         assert_eq!(choose_side(r, 1200, toxic, q(0.58, 50.0), &gates(), 0.0, fee), Err(Refusal::ObiAdverse));
         assert_eq!(choose_side(r, 1200, q(0.44, 50.0), q(0.58, 50.0), &gates(), 9.0, fee), Err(Refusal::ExposureCap));
         // Outside the price band the edge is never computed.
-        assert_eq!(choose_side(Reading { fair_yes: 0.80, z: 0.8 }, 1200, q(0.70, 50.0), q(0.32, 50.0), &gates(), 0.0, fee),
+        assert_eq!(choose_side(Reading { fair_yes: 0.80, z: 0.8, basis_sigmas: 0.1 }, 1200, q(0.70, 50.0), q(0.32, 50.0), &gates(), 0.0, fee),
                    Err(Refusal::EdgeBelowBar), "NO at 0.32 against fair 0.20 is dear; YES at 0.70 is outside the band");
         // No ask at all on either side.
         let none = SideQuote { ask: None, ask_depth: 0.0, obi: -1.0 };
@@ -1300,9 +1392,82 @@ mod tests {
     /// The reported refusal is the gate the best side reached, not the first in the list.
     #[test]
     fn the_refusal_names_the_binding_gate() {
-        let r = Reading { fair_yes: 0.52, z: 0.3 };
+        let r = Reading { fair_yes: 0.52, z: 0.3, basis_sigmas: 0.1 };
         // YES has the edge but no depth; NO fails earlier on price. The answer is depth.
         assert_eq!(choose_side(r, 1200, q(0.44, 1.0), q(0.70, 50.0), &gates(), 0.0, fee), Err(Refusal::AskTooThin));
+    }
+
+    /// At the strike the model has no opinion: a cheap side there is the
+    /// market's view, and both lanes stand aside. Zero disables the gate.
+    #[test]
+    fn the_rule_stands_aside_at_the_strike_on_both_lanes() {
+        let at_strike = Reading { fair_yes: 0.47, z: 0.05, basis_sigmas: 0.1 };
+        assert_eq!(choose_side(at_strike, 1796, q(0.40, 400.0), q(0.62, 400.0), &gates(), 0.0, fee),
+                   Err(Refusal::TooCloseToStrike), "YES at 0.40 against 0.47 is the 2026-10-22 7 PM loss");
+        assert!(control_side(at_strike, 1796, q(0.40, 400.0), q(0.62, 400.0), &gates()).is_none(),
+                "the control lane is drawn from the same moments");
+        let mut open = gates();
+        open.min_z = 0.0;
+        assert!(choose_side(at_strike, 1796, q(0.40, 400.0), q(0.62, 400.0), &open, 0.0, fee).is_ok(), "zero disables the gate");
+        // Just past the bound the rule prices as before.
+        let near = Reading { fair_yes: 0.549, z: 0.12, basis_sigmas: 0.1 };
+        assert!(choose_side(near, 1226, q(0.46, 60.0), q(0.56, 60.0), &gates(), 0.0, fee).unwrap().is_yes,
+                "the 2026-10-22 6 AM win at z 0.12 still trades");
+    }
+
+    /// An anchor offset of a window sigma or more is a lagged move, not a level:
+    /// the reading reports it in sigmas of the sample window and both lanes
+    /// refuse it, whatever the time to close.
+    #[test]
+    fn an_anchor_adrift_by_a_window_sigma_is_refused_on_both_lanes() {
+        // 2026-10-23 09:30 ET: spot 81,614.67, strike 81,499.99, offset $123.66,
+        // sigma 4.06e-5/√s, 1,800 s left, 600 s sample window: σ√W·S is about $81.
+        let r = reading(81_614.67, 81_499.99, 123.66, 4.06e-5, 1800.0, 600.0).unwrap();
+        assert!(r.basis_sigmas > 1.45 && r.basis_sigmas < 1.6, "offset in window sigmas {}", r.basis_sigmas);
+        assert!(r.z < 0.1, "the lagged level sat at the strike, z {}", r.z);
+        // Both gates trip; the adrift one is reported, being the more specific cause.
+        assert_eq!(choose_side(r, 1800, q(0.63, 100.0), q(0.37, 18.0), &gates(), 0.0, fee), Err(Refusal::AnchorAdrift),
+                   "NO at 0.37 against the lagged 0.53 fair is the trade that lost");
+        assert!(control_side(r, 1800, q(0.63, 100.0), q(0.37, 18.0), &gates()).is_none());
+        // Zero disables the gate and the strike gate then answers.
+        let mut g = gates();
+        g.max_basis_sigmas = 0.0;
+        assert_eq!(choose_side(r, 1800, q(0.63, 100.0), q(0.37, 18.0), &g, 0.0, fee), Err(Refusal::TooCloseToStrike));
+        // The same offset reads the same with five minutes left as with thirty:
+        // the scale is the sample window, not the time to close.
+        let late = reading(81_614.67, 81_499.99, 123.66, 4.06e-5, 300.0, 600.0).unwrap();
+        assert!((late.basis_sigmas - r.basis_sigmas).abs() < 1e-9);
+        // The largest honest offset in the ledger, $24 on a $61 window sigma,
+        // clears the offset gate early and late in the hour alike; the fair it
+        // prices moves with T (and so does the edge), but the offset reading
+        // does not.
+        for t in [1464.0, 320.0] {
+            let steady = reading(81_575.23, 81_499.99, 24.27, 3.054e-5, t, 600.0).unwrap();
+            assert!(steady.basis_sigmas > 0.35 && steady.basis_sigmas < 0.45, "T {t}: {}", steady.basis_sigmas);
+            assert!(!anchor_adrift(steady.basis_sigmas, gates().max_basis_sigmas), "T {t}: an honest offset is not adrift");
+        }
+        let steady = reading(81_575.23, 81_499.99, 24.27, 3.054e-5, 1464.0, 600.0).unwrap();
+        assert!(choose_side(steady, 1464, q(0.77, 100.0), q(0.24, 400.0), &gates(), 0.0, fee).is_ok(),
+                "the 2026-10-23 1 AM win still trades");
+    }
+
+    /// The feed's range over the sample window is read from the spot series
+    /// the vol sampler already keeps, over the same ages as the anchor.
+    #[test]
+    fn the_spot_range_covers_only_the_anchor_window() {
+        let now = 10_000;
+        let mut s = VecDeque::new();
+        for i in 0..200 {
+            // Five-second spot samples: flat at 81,400, with a $211 rally only
+            // inside the last twelve minutes (ages 0 to 720).
+            let age = i * 5;
+            let p = if age <= 720 { 81_400.0 + 211.0 * (1.0 - age as f64 / 720.0) } else { 81_400.0 };
+            s.push_back((now - age, p));
+        }
+        let over_window = spot_range_from(&s, now, 60, 600).unwrap();
+        assert!(over_window > 150.0 && over_window < 165.0, "{over_window}: the part of the rally inside ages 60 to 600");
+        assert_eq!(spot_range_from(&s, now, 900, 1000), Some(0.0), "flat before the rally");
+        assert_eq!(spot_range_from(&s, now, 5000, 6000), None, "no samples that old");
     }
 
     /// The ledger round trip: open, hold, settle, summarize.
@@ -1316,13 +1481,17 @@ mod tests {
         let close_s = Utc::now().timestamp() + 900;
         assert!(db::anchor_shadow_open(
             &p, "btc", db::ANCHOR_LANE_ENTRY, "btc-open", "cid-1", "cid-1", "tok-yes", "Bitcoin price at 3PM", "YES", close_s,
-            0.44, 10.0, fee(0.44), 0.52, 93.0, 4.0e-5, 0.3, 900, 83_200.0, 83_100.0, 50.0, Some(true),
+            0.44, 10.0, fee(0.44), 0.52, 93.0, 4.0e-5, 0.3, 900, 83_200.0, 83_100.0, 50.0, Some(true), Some(12.0), Some(40.0),
         ).await);
         assert!(db::anchor_shadow_holds(&p, "btc", db::ANCHOR_LANE_ENTRY, "cid-1", "YES").await);
         assert!(!db::anchor_shadow_holds(&p, "btc", db::ANCHOR_LANE_ENTRY, "cid-1", "NO").await, "the other side is still free");
         assert!(!db::anchor_shadow_holds(&p, "btc", db::ANCHOR_LANE_CONTROL, "cid-1", "YES").await, "the control lane is a different ledger");
         assert!(!db::anchor_shadow_holds(&p, "btc", db::ANCHOR_LANE_ENTRY, "cid-2", "YES").await);
         assert!((db::anchor_shadow_open_notional(&p, "btc").await - 4.4).abs() < 1e-9);
+        let (spread, range): (Option<f64>, Option<f64>) = sqlx::query_as(
+            "SELECT basis_spread, spot_range FROM anchor_shadow WHERE token_id = 'tok-yes'"
+        ).fetch_one(&p).await.unwrap();
+        assert_eq!((spread, range), (Some(12.0), Some(40.0)), "the window readings are on the row");
         let open = db::anchor_shadow_open_rows(&p, "btc").await.expect("a readable ledger");
         assert_eq!(open.len(), 1);
         assert_eq!((open[0].lane.as_str(), open[0].market_key.as_str()), ("entry", "cid-1"));
@@ -1342,7 +1511,7 @@ mod tests {
     /// inside the same band and window, and nothing else.
     #[test]
     fn the_control_lane_records_the_expensive_side_only() {
-        let r = Reading { fair_yes: 0.40, z: 0.3 };
+        let r = Reading { fair_yes: 0.40, z: 0.3, basis_sigmas: 0.1 };
         // YES at 0.46 is six cents dear; NO at 0.56 against fair 0.60 is cheap, not a control.
         let c = control_side(r, 1200, q(0.46, 50.0), q(0.56, 50.0), &gates()).expect("a control");
         assert!(c.is_yes);
@@ -1378,7 +1547,7 @@ mod tests {
         db::run_migrations(&p).await;
         assert!(db::anchor_shadow_open(
             &p, "btc", db::ANCHOR_LANE_ENTRY, "btc-open", "cid-9", "cid-9", "tok-no", "m", "NO", 1, 0.30, 10.0, fee(0.30), 0.36, -20.0, 4.0e-5, 0.5, 600,
-            1.0, 1.0, 20.0, None,
+            1.0, 1.0, 20.0, None, None, None,
         ).await);
         let id = db::anchor_shadow_open_rows(&p, "btc").await.unwrap()[0].id;
         assert!(db::anchor_shadow_abandon(&p, id, "unresolved").await);

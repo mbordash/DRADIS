@@ -116,6 +116,27 @@ pub struct KalshiVenue {
 
 /// How long a balance reading serves repeat callers before Kalshi is asked again.
 const BALANCE_CACHE_SECS: u64 = 10;
+/// How old a balance reading may be and still answer [`Execution::collateral`].
+///
+/// [B69] Kalshi meters `GET /portfolio/balance` in a bucket of its own, one
+/// call per second on the Basic and Advanced tiers with no burst allowance.
+/// Every squadron loop reads the balance on its 30 second dashboard sync, and
+/// loops started by the same restart tick in the same second, so three
+/// squadrons made three calls in one second and two came back 429 every cycle
+/// (1,051 in one day on production). Readings this close together are the
+/// same reading; the mutex on the cache makes the concurrent callers wait for
+/// the one fetch and share it. Every path that moves money (fills, cancels,
+/// collateral moves) drops the cache first, so a snapshot taken right after a
+/// fill still fetches. Shorter than [`BALANCE_CACHE_SECS`] because this
+/// figure is booked into P&L snapshots, where the pre-trade check can afford
+/// to be ten seconds behind.
+const COLLATERAL_SHARED_SECS: u64 = 3;
+
+/// Whether a balance reading `age` old still answers a collateral read; see
+/// [`COLLATERAL_SHARED_SECS`].
+pub(crate) fn collateral_reading_is_shared(age: std::time::Duration) -> bool {
+    age < std::time::Duration::from_secs(COLLATERAL_SHARED_SECS)
+}
 /// Bound on one balance request. The cache lock is held across it so concurrent
 /// callers share a single reading; without a bound one stalled connection would
 /// hold every buy in the process.
@@ -296,12 +317,16 @@ impl KalshiVenue {
         self.fetch_balance_into(&mut cache).await
     }
 
-    /// A balance reading taken now, never served from the cache. The P&L
-    /// snapshot after a fill must see the cash the fill moved, or the entry
-    /// cost is counted twice (cash not yet debited, position already held).
-    /// Refreshes the cache for the readers that may use it.
-    pub(crate) async fn balance_fresh(&self) -> anyhow::Result<types::BalanceResponse> {
+    /// The account balance for [`Execution::collateral`]: a reading at most
+    /// [`COLLATERAL_SHARED_SECS`] old, so squadron loops syncing in the same
+    /// second share one fetch, else a fresh one. Refreshes the cache.
+    pub(crate) async fn balance_shared(&self) -> anyhow::Result<types::BalanceResponse> {
         let mut cache = self.balance_cache.lock().await;
+        if let Some((at, resp)) = cache.as_ref() {
+            if collateral_reading_is_shared(at.elapsed()) {
+                return Ok(resp.clone());
+            }
+        }
         self.fetch_balance_into(&mut cache).await
     }
 
@@ -629,5 +654,24 @@ async fn kalshi_settlement_resolution_live_smoke() {
         let r = v.settlement_resolution(&leg_id(&m.ticker, true)).await;
         println!("open {}: {r:?}", m.ticker);
         assert_eq!(r, R::NotClosed, "an open market's position left by a trade, not settlement");
+    }
+}
+
+#[cfg(test)]
+mod shared_collateral_reading_tests {
+    use super::collateral_reading_is_shared;
+    use std::time::Duration;
+
+    /// [B69] Loops syncing in the same second share one balance fetch; a
+    /// reading older than the window is refetched, and the window is well
+    /// inside the 30 second sync so a stale figure never reaches a snapshot.
+    #[test]
+    fn readings_within_the_window_are_shared_and_older_ones_are_not() {
+        assert!(collateral_reading_is_shared(Duration::from_millis(0)));
+        assert!(collateral_reading_is_shared(Duration::from_millis(900)));
+        assert!(collateral_reading_is_shared(Duration::from_millis(2_999)));
+        assert!(!collateral_reading_is_shared(Duration::from_secs(3)));
+        assert!(!collateral_reading_is_shared(Duration::from_secs(10)));
+        assert!(super::COLLATERAL_SHARED_SECS < super::BALANCE_CACHE_SECS);
     }
 }

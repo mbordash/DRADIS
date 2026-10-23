@@ -1227,6 +1227,18 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
                 "Furthest the anchored level may sit from the strike, in sigmas of the remaining window. Inside half a \
                  sigma the record was strongest; beyond one it went negative, because a far-from-strike contract has \
                  little gamma left for the feed's move to act on.").range(0.1, 3.0).step(0.1).classes(&["crypto"]));
+            v.push(F::new(g, e, "anchor_min_z", "Min Strike Distance", "decimal", true,
+                "Nearest the anchored level may sit to the strike, in sigmas of the remaining window. At the strike the \
+                 model says 0.50 for both sides whatever the anchor reads, so any discount there is the market's \
+                 directional view, not the model's; the first three live entries under 0.07 all lost. Zero disables \
+                 the gate.").range(0.0, 1.0).step(0.05).classes(&["crypto"]));
+            v.push(F::new(g, e, "anchor_max_basis_sigmas", "Max Anchor Offset", "decimal", true,
+                "Largest offset between the market's implied level and the feed the model will trade on, in sigmas of \
+                 the anchor's own sample window (about $80 on a 23% tape). The offset is normally tens of dollars; a \
+                 window sigma or more means the feed moved inside the sample window and the market lagged, so the anchor \
+                 is the lag and the model would fade the move (the 2026-10-23 $124 offset, 1.5 window sigmas, after a \
+                 $211 rally). Each ledger row records the offset, the samples' spread and the feed's range over the \
+                 window for review. Zero disables the gate.").range(0.0, 3.0).step(0.05).classes(&["crypto"]));
             v.push(F::new(g, e, "anchor_min_entry_price", "Min Entry Price", "price", true,
                 "Lowest ask the lane will buy. Below 0.20 the fee is a large share of the price and the inverse-normal \
                  reading behind the anchor is at its noisiest.").range(0.01, 0.99).step(0.01).classes(&["crypto"]));
