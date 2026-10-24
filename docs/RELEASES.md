@@ -4,7 +4,7 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
-## 1.5.2
+## 1.5.2 (2026-10-23)
 
 - Trade log: a settlement is no longer skipped as "already recorded" because an earlier market with the same question text, side and share count had one. Kalshi hourly markets with the same strike share their question text across hours, so a win could be dropped against the previous hour's loss on the same text; the account balance was right and the trade log was not. Settlement rows now name the contract they closed and the check keys on it. The skipped booking, when it is a genuine duplicate, is logged where the operator can find it.
 - Trade log: settlements on Kalshi and Polymarket US are now net of the entry fee, with the fee in the Fees column. The fee was kept in memory but never written to the open position's row, so every settlement booked on these venues was gross with a zero fee, about seven cents a trade at five Kalshi contracts, in the direction of flattering the record.

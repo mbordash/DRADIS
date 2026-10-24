@@ -21,16 +21,10 @@ Public Demo Site: https://demo.dradis.live/
 ## Two ways to run it
 
 **From source — this repository**
-Clone, pick a risk profile, run it with Docker. The full engine, all ten
-strategies and the Control Tower are here; nothing is held back for the paid
-image. **AGPL v3** — see [LICENSE](LICENSE).
+Clone, pick a risk profile, run it with Docker. The full engine, all 12 strategies and the Control Tower are here; nothing is held back for the AMI. **AGPL v3** — see [LICENSE](LICENSE).
 
 **Prebuilt AMI — [AWS Marketplace](https://aws.amazon.com/marketplace/pp/prodview-dv5dats2bmm5q)**
-Launches a configured instance in your own AWS account. All three venues ship in
-the image, the Control Tower comes with it, and your API keys stay on your
-infrastructure. Marketplace subscribers receive a **commercial license**, not the
-AGPL, so the copyleft obligations below do not apply to that deployment.
-Install and upgrade guides: <https://dradis.live/docs>
+Launches a configured instance in your own AWS account. All three venues ship in the image, the Control Tower comes with it, and your API keys stay on your infrastructure. Marketplace subscribers receive a **commercial license**, not the AGPL, so the copyleft obligations below do not apply to that deployment. Install and upgrade guides: <https://dradis.live/docs>
 
 The rest of this README covers the source route.
 
