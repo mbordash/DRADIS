@@ -41,7 +41,7 @@ import { ViperHealthStrip } from '@/components/ViperHealthStrip';
 import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, getPortfolioValue, getVenueIncome, getSquadrons, refusalText } from '@/lib/api';
 import { DEMO_MODE } from '@/lib/demo';
 import { getSetupStatus } from '@/lib/setupApi';
-import type { DynamicConfig, SquadronSummary, PortfolioValue, VenueIncome, AvailableMarket } from '@/lib/types';
+import type { DynamicConfig, SquadronSummary, PortfolioValue, VenueIncome, AvailableMarket, OddsFeedHealth } from '@/lib/types';
 
 // Recharts must be loaded client-side only
 // Loading states are explicit: without one these render nothing at all while
@@ -249,6 +249,41 @@ function DarkFeedBanner({ feeds }: { feeds?: { market: string; market_name?: str
               </li>
             ))}
           </ul>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The bookmaker feed has been failing. Shown only after a second consecutive
+ * failure so one timed-out poll does not flash a banner; the engine keeps the
+ * sports slot idle for as long as this lasts, and until 1.5.3 it said so only at
+ * debug level, so a cancelled key went five days unnoticed.
+ */
+function OddsFeedBanner({ feed }: { feed?: OddsFeedHealth }) {
+  if (!feed?.failing_since || feed.consecutive_failures < 2) return null;
+  const since = new Date(feed.failing_since);
+  const mins = Math.max(0, Math.round((Date.now() - since.getTime()) / 60000));
+  const ago = mins >= 120 ? `${Math.round(mins / 60)}h` : `${mins}m`;
+  return (
+    <div className="card px-4 py-3 border border-amber-500/30 bg-amber-500/10">
+      <div className="flex items-start gap-3">
+        <span className="text-lg leading-none">🏈</span>
+        <div className="min-w-0">
+          <p className="text-sm font-mono text-amber-300">
+            Bookmaker feed failing for {ago} ({feed.consecutive_failures} calls in a row)
+          </p>
+          <p className="text-[11px] text-gray-400 mt-1 leading-relaxed">
+            The Odds API is not answering, so no sports market can be seeded or priced until it
+            recovers; crypto and politics squadrons are unaffected. A key that was cancelled or
+            ran out of credits answers HTTP 401 or 429: check the Odds API key on the Setup page.
+          </p>
+          {feed.last_error && (
+            <p className="mt-2 text-[11px] font-mono text-amber-400/90 break-words">
+              {feed.last_sport ? `${feed.last_sport}: ` : ''}{feed.last_error}
+            </p>
+          )}
         </div>
       </div>
     </div>
@@ -868,6 +903,7 @@ export default function DashboardPage() {
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
           {config?.ghost_mode && <GhostBanner ghost />}
           <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <OddsFeedBanner feed={status?.odds_feed} />
           <SquadronDetailView squadron={focusedSquadron} onBack={handleBackToCag} onOpenMarket={selectMarket} />
           <div className="mt-12"><Footer /></div>
         </main>
@@ -940,6 +976,7 @@ export default function DashboardPage() {
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
           <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <OddsFeedBanner feed={status?.odds_feed} />
           <TradelogPage availableAssets={availableAssets} />
           <Footer />
         </main>
@@ -950,6 +987,7 @@ export default function DashboardPage() {
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
           <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <OddsFeedBanner feed={status?.odds_feed} />
           <ErrorBoundary label="Helm">
             <HelmPage />
           </ErrorBoundary>
@@ -962,6 +1000,7 @@ export default function DashboardPage() {
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
           <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <OddsFeedBanner feed={status?.odds_feed} />
           <ErrorBoundary label="Telemetry">
             <ChunkBoundary name="Telemetry">
               <TelemetryPage availableAssets={availableAssets} venue={setupStatus?.venue} />
@@ -976,6 +1015,7 @@ export default function DashboardPage() {
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
           <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <OddsFeedBanner feed={status?.odds_feed} />
           <ErrorBoundary label="Markets">
             <ChunkBoundary name="Markets">
               <MarketsPage
@@ -1001,6 +1041,7 @@ export default function DashboardPage() {
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
           <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <OddsFeedBanner feed={status?.odds_feed} />
           <ErrorBoundary label="AI Actions">
             <AiActionsPage />
           </ErrorBoundary>
@@ -1035,6 +1076,7 @@ export default function DashboardPage() {
         {/* Ghost mode banner */}
         {config?.ghost_mode && <GhostBanner ghost />}
           <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <OddsFeedBanner feed={status?.odds_feed} />
 
         {/* ── Portfolio Value Banner ─────────────────────────────────── */}
         <PortfolioValueBanner

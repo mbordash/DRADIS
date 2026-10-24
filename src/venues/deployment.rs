@@ -304,7 +304,12 @@ async fn seed_auto_deployments<R: DeploymentRunner + ?Sized>(runner: &R, cag: &C
 
     // Read the operator's switches fresh each pass so turning one off takes
     // effect without a restart. Only reached when a class actually needs
-    // seeding, so the cost is a read on an idle tick at most.
+    // seeding, so the cost is a read on an idle tick at most. From the live
+    // broadcast, which holds what the DB holds: an idle sports slot reaches this
+    // every 5 s for as long as it has no games, and reading through
+    // `load_or_default` here used to write a 12 KB history row each time
+    // (17,000 a day; a customer's ledger hit 1.1 GB). The DB read covers only
+    // the pre-registration window.
     let mut cfg: Option<Arc<DynamicConfig>> = None;
 
     for class in AUTO_DEPLOY_CLASSES {
@@ -314,7 +319,10 @@ async fn seed_auto_deployments<R: DeploymentRunner + ?Sized>(runner: &R, cag: &C
         let cfg = match &cfg {
             Some(c) => Arc::clone(c),
             None => {
-                let c = DynamicConfig::load_or_default().await;
+                let c = match crate::helpers::dynamic_config::global_config_tx() {
+                    Some(tx) => tx.borrow().clone(),
+                    None => DynamicConfig::load_or_default().await,
+                };
                 cfg = Some(Arc::clone(&c));
                 c
             }

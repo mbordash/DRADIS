@@ -544,7 +544,12 @@ fn backup_sources(work: &Path, include_training_data: bool) -> Result<Vec<PathBu
     walk_files(&logs.join("gboost_planb"), &mut training)?;
     for p in training {
         let r = rel(work, &p);
-        if !allowed_payload_path(&r) || r.ends_with(".tmp") {
+        // `allowed_payload_path` refuses the flat layout's candidate only; under
+        // the venue-nested layout (`gboost_planb/<venue>/<asset>/`) the file sits
+        // one level deeper and slipped through, so the last training candidate
+        // travelled in every backup made since 1.4.0. Excluded by name here; the
+        // reader stays permissive so archives already made still restore.
+        if !allowed_payload_path(&r) || r.ends_with(".tmp") || r.ends_with("/candidate.json") {
             continue;
         }
         if include_training_data || r.split('/').nth(3) == Some("archive") {
@@ -611,6 +616,13 @@ fn write_archive(staging: &Path, archive: &Path) -> Result<()> {
     let file = fs::File::create(&partial)?;
     let gz = flate2::write::GzEncoder::new(io::BufWriter::new(file), flate2::Compression::fast());
     let mut tar = tar::Builder::new(gz);
+    // Plain regular entries only. The builder detects sparse files by default
+    // and writes them as GNU sparse entries (typeflag `S`); a database copy
+    // `VACUUM INTO` has just written can look sparse under ext4's delayed
+    // allocation, and on 2026-10-24 a customer's 1.16 GB ledger went into the
+    // archive that way. The reader below accepts such entries now, but a new
+    // archive must not depend on that.
+    tar.sparse(false);
     // The manifest goes first so a reader can refuse a wrong archive early.
     tar.append_path_with_name(staging.join("manifest.json"), "manifest.json")?;
     let mut files = Vec::new();
@@ -649,6 +661,18 @@ impl std::fmt::Display for StageError {
             StageError::Invalid(m) => f.write_str(m),
         }
     }
+}
+
+/// Whether a tar entry carries file data a restore may extract.
+///
+/// Regular entries, and GNU sparse entries (typeflag `S`), which the `tar`
+/// crate expands on read so the extracted bytes are the whole file. Archives
+/// written before 1.5.3 carry a large database as a sparse entry whenever the
+/// filesystem reported it so at append time, and every one of them must still
+/// restore; the manifest checksum proves the expansion. Anything else, a
+/// symlink, a device, a hard link, stays refused.
+pub fn archive_entry_is_file(kind: tar::EntryType) -> bool {
+    kind.is_file() || kind.is_gnu_sparse()
 }
 
 /// Extract and verify an uploaded archive, then mark it pending for the next boot.
@@ -701,7 +725,7 @@ fn stage_restore_checked(
         if kind.is_dir() {
             continue;
         }
-        if !kind.is_file() {
+        if !archive_entry_is_file(kind) {
             return Err(invalid(format!("the archive entry {path} is not a regular file")));
         }
         if path != "manifest.json" && !allowed_payload_path(&path) {
@@ -946,6 +970,7 @@ pub fn apply_pending_restore_at_boot() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Seek, Write};
 
     /// A fresh working directory per call. Unique by a counter, not by the clock:
     /// macOS reports time in microseconds, and tests running in parallel that
@@ -1321,5 +1346,116 @@ mod tests {
         let _ = fs::remove_file(staging.join("logs/btc-gboost_planb_v1.json"));
         let extra = verify_manifest(&staging, &honest, "intl", "1.2.0").unwrap_err();
         assert!(extra.contains("does not list"), "{extra}");
+    }
+
+    /// Only regular and GNU sparse entries carry data a restore may extract.
+    #[test]
+    fn regular_and_gnu_sparse_entries_are_files_nothing_else_is() {
+        use tar::EntryType;
+        assert!(archive_entry_is_file(EntryType::Regular));
+        assert!(archive_entry_is_file(EntryType::GNUSparse));
+        for other in [EntryType::Symlink, EntryType::Link, EntryType::Directory, EntryType::Char, EntryType::Fifo, EntryType::XHeader] {
+            assert!(!archive_entry_is_file(other), "{other:?}");
+        }
+    }
+
+    /// A file with a hole, as a freshly written database copy can look to the
+    /// filesystem. Big enough that the builder's sparse detection has something
+    /// to find, with real bytes at both ends so the checksum is meaningful.
+    fn holey_db(path: &Path) {
+        if let Some(parent) = path.parent() { fs::create_dir_all(parent).unwrap(); }
+        let mut f = fs::File::create(path).unwrap();
+        f.write_all(b"SQLite format 3\0").unwrap();
+        f.set_len(4 << 20).unwrap();
+        f.seek(io::SeekFrom::End(-16)).unwrap();
+        f.write_all(b"last page bytes!").unwrap();
+    }
+
+    fn manifest_for(staging: &Path, rel_paths: &[&str], venue: &str, version: &str) -> Manifest {
+        let files = rel_paths.iter().map(|r| {
+            let (bytes, sha256) = sha256_file(&staging.join(r)).unwrap();
+            ManifestFile { path: r.to_string(), bytes, sha256 }
+        }).collect();
+        Manifest {
+            kind: BACKUP_KIND.to_string(),
+            schema_version: BACKUP_SCHEMA_VERSION,
+            app_version: version.to_string(),
+            venue: venue.to_string(),
+            created_at: "2026-10-24T11:12:58Z".to_string(),
+            include_training_data: false,
+            trades: 67,
+            open_positions: 3,
+            files,
+        }
+    }
+
+    /// 2026-10-24: a customer's 1.16 GB ledger went into its backup as a GNU
+    /// sparse entry because the builder detects sparse files by default, and the
+    /// restore refused it as "not a regular file" with every byte intact. The
+    /// writer now asks for plain entries whatever the filesystem reports.
+    #[test]
+    fn the_backup_writer_emits_regular_entries_for_a_sparse_database() {
+        let staging = temp_dir("sparse-writer");
+        holey_db(&staging.join("logs/kalshi-dradis.db"));
+        let m = manifest_for(&staging, &["logs/kalshi-dradis.db"], "kalshi", "1.5.3");
+        write_json_atomic(&staging.join("manifest.json"), &m).unwrap();
+        let archive = temp_dir("sparse-writer-out").join("out.tar.gz");
+        write_archive(&staging, &archive).unwrap();
+
+        let mut reader = tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(&archive).unwrap()));
+        let kinds: Vec<(String, tar::EntryType)> = reader.entries().unwrap()
+            .map(|e| { let e = e.unwrap(); (e.path().unwrap().to_string_lossy().into_owned(), e.header().entry_type()) })
+            .collect();
+        assert_eq!(kinds[0].0, "manifest.json", "the manifest leads");
+        assert!(kinds.iter().all(|(_, k)| *k == tar::EntryType::Regular), "{kinds:?}");
+    }
+
+    /// An archive written by an earlier build, with the database as a GNU sparse
+    /// entry, restores: the entry is expanded on read and the checksum holds.
+    /// The builder is left on its sparse default here; whether the filesystem
+    /// reports the hole decides the entry type, so the archive is staged under
+    /// either and the test is honest about which it exercised.
+    #[test]
+    fn an_archive_with_a_sparse_database_entry_stages_and_checks_out() {
+        let src = temp_dir("sparse-src");
+        holey_db(&src.join("logs/kalshi-dradis.db"));
+        let m = manifest_for(&src, &["logs/kalshi-dradis.db"], "kalshi", "1.5.1");
+        write_json_atomic(&src.join("manifest.json"), &m).unwrap();
+
+        let archive = src.join("legacy.tar.gz");
+        {
+            let gz = flate2::write::GzEncoder::new(fs::File::create(&archive).unwrap(), flate2::Compression::fast());
+            let mut tar = tar::Builder::new(gz);
+            tar.append_path_with_name(src.join("manifest.json"), "manifest.json").unwrap();
+            tar.append_path_with_name(src.join("logs/kalshi-dradis.db"), "logs/kalshi-dradis.db").unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        let mut reader = tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(&archive).unwrap()));
+        let db_kind = reader.entries().unwrap().map(|e| e.unwrap())
+            .find(|e| e.path().unwrap().ends_with("kalshi-dradis.db"))
+            .map(|e| e.header().entry_type())
+            .expect("the database entry is in the archive");
+        eprintln!("database entry written as {db_kind:?} on this filesystem");
+
+        let new = temp_dir("sparse-new");
+        let staged = stage_restore(&new, &archive, "kalshi", "1.5.3", 0, true)
+            .unwrap_or_else(|e| panic!("a {db_kind:?} database entry must stage: {e}"));
+        assert_eq!(staged.trades, 67);
+        let (bytes, sha) = sha256_file(&migration_dir(&new).join(STAGING_DIR).join("logs/kalshi-dradis.db")).unwrap();
+        assert_eq!((bytes, sha.as_str()), (m.files[0].bytes, m.files[0].sha256.as_str()), "expanded bytes match the manifest");
+    }
+
+    /// The last training candidate is excluded by the flat-layout rule only; under
+    /// the venue-nested layout it sat one level deeper and travelled anyway.
+    #[test]
+    fn the_training_candidate_stays_home_under_the_nested_layout_too() {
+        let work = temp_dir("nested-candidate");
+        write(&work.join("logs/gboost_planb/kalshi/btc/candidate.json"), "{\"model\":\"candidate\"}");
+        write(&work.join("logs/gboost_planb/kalshi/btc/archive/incumbent.json"), "{\"model\":\"incumbent\"}");
+        write(&work.join("logs/gboost_planb/kalshi/btc/klines/2026-10-23.json"), "[]");
+        let names: Vec<String> = backup_sources(&work, true).unwrap().iter().map(|p| rel(&work, p)).collect();
+        assert!(names.iter().any(|n| n.ends_with("archive/incumbent.json")), "{names:?}");
+        assert!(names.iter().any(|n| n.ends_with("klines/2026-10-23.json")), "{names:?}");
+        assert!(!names.iter().any(|n| n.ends_with("candidate.json")), "{names:?}");
     }
 }

@@ -50,6 +50,10 @@ interface LogEntry {
   curOrExit: number | null; // current_price for open; exit_price for completed
   priceAgeSecs: number | null; // seconds since the shown price was fetched (open rows only)
   priceIsLiveBid: boolean;    // true when the price is a live venue bid, not the stored mark
+  /** The venue answered the live-quote poll for this position with its book (open rows only). */
+  quoteSeen: boolean;
+  /** Live best ask when the venue has one, for the "no bid" caption. */
+  liveAsk: number | null;
   shares:    number;
   pnl:       number | null; // realized for completed; unrealized for open
   reason:    string;
@@ -179,6 +183,8 @@ function assetToEntries(
       curOrExit:  parseFloat(t.exit_price),
       priceAgeSecs: null, // a completed trade's exit price is final, not a mark
       priceIsLiveBid: false,
+      quoteSeen:  false,
+      liveAsk:    null,
       shares:     parseFloat(t.shares),
       pnl:        parseFloat(t.pnl),
       reason:     t.reason,
@@ -201,6 +207,7 @@ function assetToEntries(
     // actually get. Fall back to the stored mark, which the age badge labels.
     const liveQuote = quoteByToken[p.token_id];
     const liveBid   = liveQuote?.bid ? parseFloat(liveQuote.bid) : null;
+    const liveAsk   = liveQuote?.ask ? parseFloat(liveQuote.ask) : null;
     const cur   = liveBid ?? (p.current_price ? parseFloat(p.current_price) : null);
     const shares = parseFloat(p.shares);
     const unrealized = fmtUnrealized(entry, cur, shares);
@@ -224,6 +231,10 @@ function assetToEntries(
       entry,
       curOrExit:   cur,
       priceIsLiveBid: liveBid !== null,
+      // Only a venue answer counts: a failed or timed-out read also comes back
+      // with empty sides, and that is "unknown", not "no bid".
+      quoteSeen: liveQuote?.fetched === true,
+      liveAsk,
       priceAgeSecs: liveBid !== null
         ? (liveQuote?.age_secs ?? null)
         : p.price_updated_at
@@ -854,7 +865,18 @@ export default function TradelogPage({ availableAssets }: Props) {
                               )}
                             </span>
                           );
-                        })() : <span className="text-gray-600">—</span>}
+                        })() : isOpen && e.quoteSeen ? (
+                          /* The venue answered and has no bid: the position cannot be
+                             sold right now and settles at close. A dash here read as a
+                             stuck trade (2026-10-23, a losing Anchor hold whose YES side
+                             had no bidders for its last eleven minutes). */
+                          <span
+                            className="text-amber-400/80 text-[10px]"
+                            title="The venue's book has no bid for this position, so there is no price a sale could execute at. The position settles at the market close. Nothing is stuck."
+                          >
+                            {e.liveAsk !== null ? `no bid · ask ${e.liveAsk.toFixed(4)}` : 'no bid, no ask'}
+                          </span>
+                        ) : <span className="text-gray-600">—</span>}
                       </td>
 
                       {/* P&L, with fees folded in beneath it. The two belong
@@ -863,7 +885,9 @@ export default function TradelogPage({ availableAssets }: Props) {
                       <td className="px-3 py-2 font-semibold whitespace-nowrap">
                         <div>
                           {isOpen && e.curOrExit === null
-                            ? <span className="text-gray-600">—</span>
+                            ? (e.quoteSeen
+                                ? <span className="text-amber-400/80 text-[10px]" title="Unrealized P&L needs a bid to mark against; the book has none. The position settles at close.">no bid</span>
+                                : <span className="text-gray-600">—</span>)
                             : <>{fmtPnl(e.pnl)}{fmtPnlPct(e.pnl, e.entry, e.shares)}</>
                           }
                           {isOpen && e.pnl !== null && (

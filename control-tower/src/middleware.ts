@@ -33,8 +33,11 @@ export function middleware(req: NextRequest) {
 }
 
 export const config = {
-  // Apply to every route except Next.js internals and the public icons (so the login
-  // prompt's tab shows them before credentials are sent).
+  // Apply to every route except Next.js static assets and the public icons (so the
+  // login prompt's tab shows them before credentials are sent). `/_next/image`
+  // is NOT excluded: nothing here uses the image optimizer, and leaving the one
+  // unauthenticated Next.js route open bought nothing (reviewed 2026-10-23
+  // against GHSA-2464-fhr4-w9xw).
   //
   // `api/migration/restore` is excluded for a different reason: Next.js clones the
   // request body for every middleware-matched route and silently truncates that
@@ -43,7 +46,7 @@ export const config = {
   // The `$` matters: without it the exclusion is a prefix and would also drop
   // `restore/apply` and `restore/discard`, which restart the engine, out of auth.
   matcher: [
-    '/((?!_next/static|_next/image|favicon.ico|icon.svg|apple-icon.png|api/migration/restore$).*)',
+    '/((?!_next/static|favicon.ico|icon.svg|apple-icon.png|api/migration/restore$).*)',
   ],
 };
 

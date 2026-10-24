@@ -2239,7 +2239,26 @@ fn refuse_ceiling_violations(patch: &serde_json::Value) -> Result<()> {
 impl DynamicConfig {
     /// Load the most recent DynamicConfig from SQLite.
     /// If no record exists (first run), seeds defaults and writes them to DB.
+    ///
+    /// A read, not an event: this writes nothing to `config_history`. Until
+    /// 1.5.3 every call recorded a 12 KB "session start" snapshot, and the
+    /// auto-deploy seeder called it every 5 s while a class had nothing to seed
+    /// (a sports slot with no games), which is the permanent state of a box
+    /// without a working Odds API key. A customer's ledger reached 1.1 GB with 67
+    /// trades: 94,000 snapshots. The one snapshot a session gets is written by
+    /// [`Self::load_at_startup`], from `main.rs` only.
     pub async fn load_or_default() -> Arc<Self> {
+        Self::load_inner(false).await
+    }
+
+    /// The startup load: the same read, plus the one `session_start_snapshot`
+    /// row per session that lets a developer see what config a session began
+    /// with. Called once, from `main.rs`, right after the static snapshot.
+    pub async fn load_at_startup() -> Arc<Self> {
+        Self::load_inner(true).await
+    }
+
+    async fn load_inner(record_session_snapshot: bool) -> Arc<Self> {
         if read_only_mode() {
             info!("⚙️  READ-ONLY demo mode — bypassing persisted DynamicConfig, using compile-time defaults");
             return Arc::new(DynamicConfig::default());
@@ -2264,18 +2283,22 @@ impl DynamicConfig {
 
                         info!("⚙️  DynamicConfig loaded from SQLite (safety floors applied)");
 
-                        // Record startup load in config_history so developers can see
-                        // exactly what DynamicConfig was active at the start of every session.
-                        // Tagged 'startup_dynamic' to distinguish from the compile-time
-                        // 'startup_static' snapshot taken immediately before this.
-                        if let Ok(new_json) = serde_json::to_string(&cfg) {
-                            db::record_config_change(
-                                pool,
-                                "startup_dynamic",
-                                "session_start_snapshot",
-                                None,   // no "previous" — this is the session anchor
-                                &new_json,
-                            ).await;
+                        // Record the startup load in config_history so developers can
+                        // see exactly what DynamicConfig was active at the start of a
+                        // session. Tagged 'startup_dynamic' to distinguish from the
+                        // compile-time 'startup_static' snapshot taken just before.
+                        // Startup only: see `load_or_default` for the 1.1 GB ledger
+                        // that writing it on every read produced.
+                        if record_session_snapshot {
+                            if let Ok(new_json) = serde_json::to_string(&cfg) {
+                                db::record_config_change(
+                                    pool,
+                                    "startup_dynamic",
+                                    "session_start_snapshot",
+                                    None,   // no "previous" — this is the session anchor
+                                    &new_json,
+                                ).await;
+                            }
                         }
 
                         set_config_origin(ConfigOrigin::Shard);

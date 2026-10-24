@@ -884,6 +884,19 @@ pub fn strategy_market_key(squadron_id: &str, viper_kind: &str) -> String {
     format!("{squadron_id}:{viper_kind}")
 }
 
+/// Drop every `/api/status` `strategy_markets` entry a squadron wrote.
+///
+/// The map is only ever added to by the loops, so a pinned squadron that
+/// finished (a game that ended) kept listing its vipers on its market for as
+/// long as the process lived: seven hours after `sports-open` was reaped on
+/// 2026-10-23 the status page still showed `sports-open:arbitrage` on the New
+/// England game. The key prefix includes the separator so `btc-open` never
+/// matches `btc-open-2`.
+pub fn forget_squadron_markets(map: &mut std::collections::HashMap<String, String>, squadron_id: &str) {
+    let prefix = format!("{squadron_id}:");
+    map.retain(|k, _| !k.starts_with(&prefix));
+}
+
 /// Current market data snapshot.
 /// Used for broadcasting to strategies.
 #[derive(Debug, Clone)]
@@ -1624,5 +1637,20 @@ mod fill_effective_tests {
         let p = pos(Some(confirmed), opened);
         assert_eq!(p.fill_effective_at(true), Some(confirmed));
         assert_eq!(p.fill_effective_at(false), Some(confirmed));
+    }
+
+    /// A reaped squadron's entries leave the status map; a squadron whose id
+    /// merely starts the same way keeps its own.
+    #[test]
+    fn forgetting_a_squadron_drops_only_its_own_status_entries() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(strategy_market_key("sports-open", "arbitrage"), "New England game".to_string());
+        map.insert(strategy_market_key("sports-open", "maker"), "New England game".to_string());
+        map.insert(strategy_market_key("sports-open-2", "maker"), "Ole Miss game".to_string());
+        map.insert(strategy_market_key("btc-open", "anchor"), "Bitcoin hourly".to_string());
+        forget_squadron_markets(&mut map, "sports-open");
+        let mut left: Vec<&String> = map.keys().collect();
+        left.sort();
+        assert_eq!(left, vec!["btc-open:anchor", "sports-open-2:maker"]);
     }
 }

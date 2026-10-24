@@ -486,7 +486,7 @@ async fn run() -> Result<()> {
     }
 
     // Snapshot the compile-time constants (config.rs) into config_history.
-    // This runs BEFORE DynamicConfig::load_or_default() so both snapshots land
+    // This runs BEFORE DynamicConfig::load_at_startup() so both snapshots land
     // in the same session with the static one first.  Because these constants can
     // only change via recompile+restart, diffing two consecutive startup_static
     // rows immediately shows what the developer tuned between sessions.
@@ -494,7 +494,7 @@ async fn run() -> Result<()> {
         db::record_static_config_snapshot(pool).await;
     }
 
-    let initial_dyn_cfg = DynamicConfig::load_or_default().await;
+    let initial_dyn_cfg = DynamicConfig::load_at_startup().await;
     // Wrap the sender in Arc so it can be shared with the axum API server.
     let (config_tx, config_rx) = watch::channel(initial_dyn_cfg);
     let config_tx = Arc::new(config_tx);

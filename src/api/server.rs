@@ -1251,6 +1251,10 @@ struct StatusResponse {
     /// "✅ Maker quoting" — every gate correctly declined to trade an empty
     /// book, and declining quietly is indistinguishable from a quiet market.
     dark_market_feeds: Vec<DarkFeed>,
+    /// The bookmaker feed (The Odds API): last success, failing since, the last
+    /// error. A box whose key was cancelled sat for five days with an idle
+    /// sports slot and no other sign (2026-10-18 to 10-23).
+    odds_feed: crate::raptors::sports_ledger::OddsFeedHealth,
 }
 
 
@@ -1308,6 +1312,7 @@ async fn get_status(State(s): State<ApiState>) -> Response {
         llm_advisor_enabled: crate::helpers::llm_advisor::advisor_enabled_setting(),
         llm_advisor: crate::helpers::llm_advisor::advisor_health(),
         session_started_at, raptors, dark_market_feeds,
+        odds_feed: crate::raptors::sports_ledger::odds_feed_health(),
     }).into_response()
 }
 
@@ -1606,6 +1611,9 @@ async fn get_position_quotes(State(s): State<ApiState>, Query(q): Query<AssetQue
         mid: Option<String>,
         /// Age of this quote in seconds. Zero means it was just fetched.
         age_secs: u64,
+        /// The venue answered. False when the read failed or timed out, in
+        /// which case the empty sides mean "unknown", not "no bid".
+        fetched: bool,
     }
 
     static CACHE: OnceLock<StdMutex<StdHashMap<String, (Quote, Instant)>>> = OnceLock::new();
@@ -1689,13 +1697,13 @@ async fn get_position_quotes(State(s): State<ApiState>, Query(q): Query<AssetQue
         // sell, and an invented number is worse than a blank.
         use crate::venues::core::Execution as _;
         let leg = crate::venues::core::MarketId::new(pos.token_id.as_str());
-        let (bid, ask) = match tokio::time::timeout(
+        let (bid, ask, fetched) = match tokio::time::timeout(
             std::time::Duration::from_secs(5),
             session.venue.quote_both(&leg),
         ).await {
-            Ok(Ok((b, a))) => (b.filter(|p| *p > Decimal::ZERO), a.filter(|p| *p > Decimal::ZERO)),
-            Ok(Err(e)) => { debug!("quote: fetch failed for {}: {e}", pos.token_id); (None, None) }
-            Err(_)     => { debug!("quote: fetch timed out for {}", pos.token_id); (None, None) }
+            Ok(Ok((b, a))) => (b.filter(|p| *p > Decimal::ZERO), a.filter(|p| *p > Decimal::ZERO), true),
+            Ok(Err(e)) => { debug!("quote: fetch failed for {}: {e}", pos.token_id); (None, None, false) }
+            Err(_)     => { debug!("quote: fetch timed out for {}", pos.token_id); (None, None, false) }
         };
         let mid = match (bid, ask) {
             (Some(b), Some(a)) => Some((b + a) / Decimal::TWO),
@@ -1722,6 +1730,7 @@ async fn get_position_quotes(State(s): State<ApiState>, Query(q): Query<AssetQue
             ask: ask.map(|d| d.to_string()),
             mid: mid.map(|d| d.to_string()),
             age_secs: 0,
+            fetched,
         };
         if let Ok(mut guard) = cache.lock() {
             guard.insert(pos.token_id.clone(), (quote.clone(), Instant::now()));

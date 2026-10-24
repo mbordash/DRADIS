@@ -576,15 +576,28 @@ struct MarketRegistries {
     /// changes), and Helm squadrons share one scope, so one finishing must not
     /// wipe the others' rows.
     status_scope: Option<String>,
+    /// The `/api/status` `strategy_markets` map and the squadron id whose
+    /// entries leave with the market. Same rule as `status_scope`: only a pinned
+    /// squadron's own entries, since a rotating one overwrites its own keys on
+    /// the next market. The third registry the 1.4.2 fix missed: seven hours
+    /// after `sports-open` was reaped on 2026-10-23 the status page still listed
+    /// its vipers on the finished game.
+    markets: Option<(Arc<watch::Sender<HashMap<String, String>>>, String)>,
 }
 
 impl MarketRegistries {
-    fn new(tickers: &[String], mandate: MarketMandate, status_scope: &str) -> Self {
+    fn new(
+        tickers: &[String],
+        mandate: MarketMandate,
+        status_scope: &str,
+        markets: Option<(&Arc<watch::Sender<HashMap<String, String>>>, &str)>,
+    ) -> Self {
         let own_scope = mandate == MarketMandate::Pinned
             && status_scope != crate::vipers::helm_impl::KIND;
         Self {
             tickers: tickers.to_vec(),
             status_scope: own_scope.then(|| status_scope.to_string()),
+            markets: if own_scope { markets.map(|(tx, id)| (Arc::clone(tx), id.to_string())) } else { None },
         }
     }
 }
@@ -596,6 +609,9 @@ impl Drop for MarketRegistries {
         }
         if let Some(scope) = &self.status_scope {
             crate::helpers::viper_status::forget(scope);
+        }
+        if let Some((tx, squadron_id)) = &self.markets {
+            tx.send_modify(|map| crate::state::forget_squadron_markets(map, squadron_id));
         }
     }
 }
@@ -1411,7 +1427,7 @@ async fn trade_one_market(
         book_tickers.push(mp.ticker.clone());
     }
     // Dropped when this function returns, whichever way — see the type.
-    let _registries = MarketRegistries::new(&book_tickers, mandate, status_scope);
+    let _registries = MarketRegistries::new(&book_tickers, mandate, status_scope, Some((markets_tx, squadron_id.as_str())));
     ws::spawn_orderbook_feed(
         super::ws_url(),
         venue.auth.clone(),
@@ -3770,7 +3786,18 @@ mod venue_status_tests {
         assert!(book_feed::is_tracked(ticker));
         assert!(!viper_status::snapshot(Some(scope)).is_empty());
 
-        drop(MarketRegistries::new(&[ticker.to_string()], MarketMandate::Pinned, scope));
+        let (tx, rx) = watch::channel::<HashMap<String, String>>(HashMap::new());
+        let tx = Arc::new(tx);
+        tx.send_modify(|m| {
+            m.insert(crate::state::strategy_market_key("test-registries-sports", "arbitrage"), "the game".into());
+            m.insert(crate::state::strategy_market_key("test-registries-btc", "anchor"), "the hourly".into());
+        });
+
+        drop(MarketRegistries::new(&[ticker.to_string()], MarketMandate::Pinned, scope, Some((&tx, "test-registries-sports"))));
+
+        let left = rx.borrow().clone();
+        assert!(!left.contains_key("test-registries-sports:arbitrage"), "the squadron's status entries should be gone: {left:?}");
+        assert!(left.contains_key("test-registries-btc:anchor"), "another squadron's entry stays");
 
         assert!(!book_feed::is_tracked(ticker), "the ticker should be forgotten");
         assert!(viper_status::snapshot(Some(scope)).is_empty(), "the scope's viper rows should be gone");
@@ -3786,13 +3813,18 @@ mod venue_status_tests {
         let ticker = "KXTEST-REGISTRIES-HOURLY";
         book_feed::note(ticker, false);
         viper_status::record_idle("test-registries-btc", "MakerStrategy", "waiting");
-        drop(MarketRegistries::new(&[ticker.to_string()], MarketMandate::Rotating, "test-registries-btc"));
+        let (tx, rx) = watch::channel::<HashMap<String, String>>(HashMap::new());
+        let tx = Arc::new(tx);
+        tx.send_modify(|m| { m.insert(crate::state::strategy_market_key("test-registries-btc", "anchor"), "the hourly".into()); });
+        drop(MarketRegistries::new(&[ticker.to_string()], MarketMandate::Rotating, "test-registries-btc", Some((&tx, "test-registries-btc"))));
+        assert!(rx.borrow().contains_key("test-registries-btc:anchor"), "a rotating squadron keeps its status entries for the next market");
         assert!(!book_feed::is_tracked(ticker));
         assert!(!viper_status::snapshot(Some("test-registries-btc")).is_empty());
         viper_status::forget("test-registries-btc");
 
         let helm = crate::vipers::helm_impl::KIND;
-        let guard = MarketRegistries::new(&[], MarketMandate::Pinned, helm);
+        let guard = MarketRegistries::new(&[], MarketMandate::Pinned, helm, None);
+        assert!(guard.markets.is_none(), "the Helm scope keeps its shared status entries too");
         assert!(guard.status_scope.is_none(), "the Helm scope is shared and never forgotten here");
     }
 }

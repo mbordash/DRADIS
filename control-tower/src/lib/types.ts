@@ -360,6 +360,8 @@ export interface PositionQuote {
   mid:      string | null;
   /** Seconds since this quote was fetched from the venue. */
   age_secs: number;
+  /** The venue answered; false when the read failed or timed out. Absent on engines before 1.5.3. */
+  fetched?: boolean;
 }
 
 export interface PnlSnapshotRow {
@@ -660,6 +662,22 @@ export interface StatusResponse {
   raptors?: Record<string, AssetRaptorHealth>;
   /** Markets whose order-book feed has gone dark. Empty is the healthy case. */
   dark_market_feeds?: { market: string; dark_for_secs: number }[];
+  /** The bookmaker feed (The Odds API). Absent on engines before 1.5.3. */
+  odds_feed?: OddsFeedHealth;
+}
+
+/**
+ * Health of the bookmaker feed. Every field is null or zero until the feed has
+ * been asked once this session (B43: unknown is not healthy and not failing).
+ * `failing_since` set means the last call failed.
+ */
+export interface OddsFeedHealth {
+  last_ok: string | null;
+  failing_since: string | null;
+  consecutive_failures: number;
+  /** The last failure's text, secrets redacted, HTTP status included. */
+  last_error: string | null;
+  last_sport: string | null;
 }
 
 

@@ -1936,6 +1936,13 @@ pub async fn fairvalue_stop_shadow_summary(pool: &SqlitePool, asset: &str) -> Fa
 /// Add new columns to existing tables that pre-date the session tracking feature.
 /// Uses sqlx error suppression rather than IF NOT EXISTS (SQLite does not support that syntax).
 pub(crate) async fn run_migrations(pool: &SqlitePool) {
+    // Thin the startup snapshots an earlier build wrote every 5 s (see the
+    // function). Here, so a ledger restored from such a build is trimmed on the
+    // first start after the upgrade.
+    let pruned = prune_startup_snapshots(pool).await;
+    if pruned > 0 {
+        info!("🧹 config_history: removed {pruned} repeated startup snapshot(s) written by an earlier build; one per session kept");
+    }
     // The GBoost shadow lane's ledger. Created here rather than in `init_schema`
     // so an instance upgrading from an earlier build gets it at the next start
     // without a fresh database.
@@ -3794,6 +3801,42 @@ pub async fn record_config_change(
     .execute(pool)
     .await {
         error!("❌ DB config_history write failed: {}", e);
+    }
+}
+
+/// Thin the five-second `session_start_snapshot` rows an earlier build wrote.
+///
+/// Until 1.5.3 `DynamicConfig::load_or_default` recorded a 12 KB startup snapshot
+/// on every call, and the auto-deploy seeder called it every 5 s while a class
+/// had nothing to seed, so an idle sports slot wrote 17,000 rows a day. A
+/// customer's 8-day-old ledger was 1.1 GB with 67 trades; its backup was 125 MB
+/// and its restore slow. Keeps the newest snapshot of each session (the rows an
+/// old build wrote every 5 s all carry that process's session id), which is
+/// exactly the one row per session the record was meant to be, and leaves every
+/// other row (operator changes, static snapshots, squadron configs) alone. Runs
+/// at every start and is a no-op once the history is thin: a build that writes
+/// one row per session has nothing for it to remove. The freed pages stay in the
+/// file until the next `VACUUM`; a backup already compacts (`VACUUM INTO`), so
+/// backups shrink immediately.
+///
+/// Returns the number of rows removed.
+pub async fn prune_startup_snapshots(pool: &SqlitePool) -> u64 {
+    match sqlx::query(
+        "DELETE FROM config_history
+          WHERE changed_by = 'startup_dynamic' AND param_name = 'session_start_snapshot'
+            AND id NOT IN (
+                SELECT MAX(id) FROM config_history
+                 WHERE changed_by = 'startup_dynamic' AND param_name = 'session_start_snapshot'
+                 GROUP BY session_id)"
+    )
+    .execute(pool)
+    .await
+    {
+        Ok(r) => r.rows_affected(),
+        Err(e) => {
+            warn!("⚠️  config_history: could not prune startup snapshots: {e}");
+            0
+        }
     }
 }
 
@@ -6649,6 +6692,39 @@ mod reconcile_tests {
     use super::*;
     use rust_decimal_macros::dec;
     use std::collections::{HashMap, HashSet};
+
+    /// 2026-10-24: a customer's ledger held 93,833 twelve-kilobyte startup
+    /// snapshots written every 5 s by the auto-deploy seeder. The prune keeps the
+    /// newest per session, so two restarts on one day keep two records, and
+    /// nothing else goes.
+    #[tokio::test]
+    async fn repeated_startup_snapshots_thin_to_one_per_session_and_touch_nothing_else() {
+        let pool = memory_pool_for_tests().await;
+        let put = |ts: &str, sid: &str, by: &str, name: &str| {
+            let (ts, sid, by, name) = (ts.to_string(), sid.to_string(), by.to_string(), name.to_string());
+            let pool = pool.clone();
+            async move {
+                sqlx::query("INSERT INTO config_history (ts, session_id, changed_by, param_name, old_value, new_value) VALUES (?, ?, ?, ?, NULL, '{}')")
+                    .bind(ts).bind(sid).bind(by).bind(name).execute(&pool).await.unwrap();
+            }
+        };
+        for sec in 0..12 { put(&format!("2026-10-23T10:00:{sec:02}+00:00"), "session-a", "startup_dynamic", "session_start_snapshot").await; }
+        for sec in 0..5  { put(&format!("2026-10-23T11:00:{sec:02}+00:00"), "session-b", "startup_dynamic", "session_start_snapshot").await; }
+        put("2026-10-23T11:00:03+00:00", "session-b", "operator", "squadron:btc-open").await;
+        put("2026-10-23T11:00:04+00:00", "session-b", "startup_static", "static_config_snapshot").await;
+        put("2026-10-23T11:00:05+00:00", "session-b", "startup_dynamic", "full_snapshot").await;
+
+        assert_eq!(prune_startup_snapshots(&pool).await, 15, "eleven of the first session and four of the second go");
+        let kept: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(
+            "SELECT session_id, ts FROM config_history WHERE param_name = 'session_start_snapshot' ORDER BY ts")
+            .fetch_all(&pool).await.unwrap();
+        assert_eq!(kept.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
+                   vec!["2026-10-23T10:00:11+00:00", "2026-10-23T11:00:04+00:00"], "the newest of each session survives, both on the same day");
+        let others: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM config_history WHERE param_name <> 'session_start_snapshot'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(others, 3, "operator, static and full snapshots are untouched");
+        assert_eq!(prune_startup_snapshots(&pool).await, 0, "a thin history is left alone");
+    }
 
     /// A brand-new database must be able to queue a deployment.
     ///

@@ -437,12 +437,94 @@ pub async fn odds_events_for_sport(
     sport_key: &str,
 ) -> (Vec<OddsEvent>, Option<i64>) {
     match get_json(http, &format!("{ODDS}/sports/{sport_key}/events"), Some(api_key), &[]).await {
-        Ok((v, remaining, _)) => (parse_odds_events(&v), remaining),
+        Ok((v, remaining, _)) => {
+            note_odds_ok(Utc::now());
+            (parse_odds_events(&v), remaining)
+        }
         Err(e) => {
-            debug!("🏈 Sports ledger: Odds API events for '{sport_key}' failed: {e}");
+            // A dead bookmaker feed used to log at debug only, so a box whose paid
+            // key had been cancelled (production, 2026-10-18 to 10-23) showed an
+            // idle sports slot and nothing else. Loud on the first failure and
+            // every ten minutes after, with the HTTP status the API gave; quiet
+            // in between. The health record below is what `/api/status` shows.
+            if note_odds_failure(Utc::now(), sport_key, &e) {
+                warn!(
+                    "🏈 Sports ledger: Odds API events for '{sport_key}' failed: {e} — the bookmaker feed is down, \
+                     so sports squadrons cannot be seeded or priced until it recovers; check the Odds API key in Setup"
+                );
+            } else {
+                debug!("🏈 Sports ledger: Odds API events for '{sport_key}' failed: {e}");
+            }
             (Vec::new(), None)
         }
     }
+}
+
+/// How long a failing feed stays quiet between warnings.
+const ODDS_WARN_EVERY_SECS: i64 = 600;
+
+/// The bookmaker feed's health, for `/api/status` and the Control Tower banner.
+///
+/// Honest-state: every field is `None` or zero until the feed has been asked at
+/// least once this process. `failing_since` set means the last call failed;
+/// `last_ok` is the last success, whichever came first.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct OddsFeedHealth {
+    pub last_ok: Option<String>,
+    pub failing_since: Option<String>,
+    pub consecutive_failures: u32,
+    /// The last failure's text, secrets redacted, HTTP status included.
+    pub last_error: Option<String>,
+    pub last_sport: Option<String>,
+    #[serde(skip)]
+    last_warned: Option<DateTime<Utc>>,
+}
+
+impl OddsFeedHealth {
+    fn ok(&mut self, now: DateTime<Utc>) {
+        self.last_ok = Some(now.to_rfc3339());
+        self.failing_since = None;
+        self.consecutive_failures = 0;
+        self.last_error = None;
+        self.last_sport = None;
+        // `last_warned` is kept: one misconfigured league failing beside a
+        // healthy one would otherwise warn on every pass.
+    }
+
+    /// Record a failure; true when it should be logged at warn.
+    fn failure(&mut self, now: DateTime<Utc>, sport: &str, err: &str) -> bool {
+        if self.failing_since.is_none() {
+            self.failing_since = Some(now.to_rfc3339());
+        }
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.last_error = Some(err.to_string());
+        self.last_sport = Some(sport.to_string());
+        let loud = self.last_warned.map_or(true, |t| (now - t).num_seconds() >= ODDS_WARN_EVERY_SECS);
+        if loud {
+            self.last_warned = Some(now);
+        }
+        loud
+    }
+}
+
+static ODDS_FEED: std::sync::OnceLock<std::sync::Mutex<OddsFeedHealth>> = std::sync::OnceLock::new();
+
+fn odds_feed_cell() -> &'static std::sync::Mutex<OddsFeedHealth> {
+    ODDS_FEED.get_or_init(|| std::sync::Mutex::new(OddsFeedHealth::default()))
+}
+
+/// The bookmaker feed's current health.
+pub fn odds_feed_health() -> OddsFeedHealth {
+    odds_feed_cell().lock().map(|h| h.clone()).unwrap_or_default()
+}
+
+fn note_odds_ok(now: DateTime<Utc>) {
+    if let Ok(mut h) = odds_feed_cell().lock() { h.ok(now); }
+}
+
+fn note_odds_failure(now: DateTime<Utc>, sport: &str, err: &str) -> bool {
+    // A poisoned lock must not silence the log.
+    odds_feed_cell().lock().map(|mut h| h.failure(now, sport, err)).unwrap_or(true)
 }
 
 pub fn parse_odds_events(events: &Value) -> Vec<OddsEvent> {
@@ -1127,10 +1209,14 @@ async fn refresh_catalog(
             if unmatched.is_empty() { break; }
             // Free: /events does not count against the quota but still reports it.
             let odds = match get_json(http, &format!("{ODDS}/sports/{key}/events"), Some(api_key), &[]).await {
-                Ok((v, r, _)) => { remaining = r.or(remaining); parse_odds_events(&v) }
+                Ok((v, r, _)) => { note_odds_ok(Utc::now()); remaining = r.or(remaining); parse_odds_events(&v) }
                 Err(e) => {
                     failed_keys += 1;
-                    debug!("🏈 Sports ledger: Odds API events for '{key}' failed: {e}");
+                    if note_odds_failure(Utc::now(), key, &e) {
+                        warn!("🏈 Sports ledger: Odds API events for '{key}' failed: {e} — the bookmaker feed is down; check the Odds API key in Setup");
+                    } else {
+                        debug!("🏈 Sports ledger: Odds API events for '{key}' failed: {e}");
+                    }
                     continue;
                 }
             };
@@ -1175,10 +1261,20 @@ async fn fetch_odds(
     sport_key: &str,
     regions: &str,
 ) -> Result<(Value, DateTime<Utc>, Option<i64>, Option<i64>), String> {
-    let (odds, remaining, last) = get_json(
+    // The one paid call. An exhausted key answers 200 on the free `/events` and
+    // 429 here, so this is where a spent quota shows in the feed health.
+    let (odds, remaining, last) = match get_json(
         http, &format!("{ODDS}/sports/{sport_key}/odds"), Some(api_key),
         &[("regions", regions), ("markets", "h2h"), ("oddsFormat", "decimal")],
-    ).await?;
+    ).await {
+        Ok(v) => { note_odds_ok(Utc::now()); v }
+        Err(e) => {
+            if note_odds_failure(Utc::now(), sport_key, &e) {
+                warn!("🏈 Sports ledger: Odds API odds for '{sport_key}' failed: {e} — the bookmaker feed is down; check the Odds API key and its credits in Setup");
+            }
+            return Err(e);
+        }
+    };
     // Everything after this is free reads that take their own time, so the odds
     // are as of here and not as of the pass start.
     Ok((odds, Utc::now(), remaining, last))
@@ -2200,5 +2296,35 @@ mod redaction_tests {
         assert!(!safe.contains("one") && !safe.contains("two"), "{safe}");
         assert_eq!(redact_url_secrets("HTTP 401: quota reached"), "HTTP 401: quota reached");
         assert_eq!(redact_url_secrets(""), "");
+    }
+
+    /// The bookmaker feed's health: loud on the first failure and every ten
+    /// minutes after, quiet in between, and a success clears the record.
+    #[test]
+    fn odds_feed_failures_are_loud_once_then_every_ten_minutes_and_a_success_clears_them() {
+        use super::OddsFeedHealth;
+        use chrono::{Duration as ChronoDuration, TimeZone, Utc};
+        let t0 = Utc.with_ymd_and_hms(2026, 10, 24, 12, 0, 0).unwrap();
+        let mut h = OddsFeedHealth::default();
+        assert_eq!(h, OddsFeedHealth::default(), "nothing known before the first call");
+
+        assert!(h.failure(t0, "americanfootball_nfl", "HTTP 401 Unauthorized: {}"), "first failure is loud");
+        assert_eq!(h.consecutive_failures, 1);
+        assert_eq!(h.failing_since.as_deref(), Some(t0.to_rfc3339().as_str()));
+        assert_eq!(h.last_sport.as_deref(), Some("americanfootball_nfl"));
+        assert!(!h.failure(t0 + ChronoDuration::seconds(5), "americanfootball_nfl", "HTTP 401 Unauthorized: {}"), "five seconds later: quiet");
+        assert!(!h.failure(t0 + ChronoDuration::seconds(599), "basketball_nba", "HTTP 401 Unauthorized: {}"));
+        assert!(h.failure(t0 + ChronoDuration::seconds(600), "basketball_nba", "HTTP 401 Unauthorized: {}"), "ten minutes on: loud again");
+        assert_eq!(h.consecutive_failures, 4);
+        assert_eq!(h.failing_since.as_deref(), Some(t0.to_rfc3339().as_str()), "failing_since is the first failure");
+        assert_eq!(h.last_sport.as_deref(), Some("basketball_nba"));
+
+        let t1 = t0 + ChronoDuration::seconds(700);
+        h.ok(t1);
+        assert_eq!(h.last_ok.as_deref(), Some(t1.to_rfc3339().as_str()));
+        assert_eq!((h.failing_since.clone(), h.consecutive_failures, h.last_error.clone()), (None, 0, None));
+        assert!(!h.failure(t1 + ChronoDuration::seconds(1), "icehockey_nhl", "HTTP 404: unknown sport"),
+                "a league failing beside a healthy one keeps the ten-minute throttle");
+        assert!(h.failure(t0 + ChronoDuration::seconds(1200), "icehockey_nhl", "HTTP 404: unknown sport"), "and is loud again on schedule");
     }
 }

@@ -817,7 +817,13 @@ const AUTO_DEPLOY_RECHECK_SECS: u64 = 30;
 /// Crypto is always allowed: it is the venue's own rotation, the equivalent of
 /// Kalshi's crypto loop, and is not one of the classes the switches govern.
 async fn wing_auto_deploy_enabled(wing: Wing) -> bool {
-    let cfg = DynamicConfig::load_or_default().await;
+    // The live broadcast, not a DB read: this runs every 30 s per idle wing for
+    // as long as the wing stays off, and the DB path used to write a history
+    // row per call. The DB read covers only the pre-registration window.
+    let cfg = match crate::helpers::dynamic_config::global_config_tx() {
+        Some(tx) => tx.borrow().clone(),
+        None => DynamicConfig::load_or_default().await,
+    };
     match wing {
         Wing::Politics => cfg.auto_deploy_politics,
         Wing::Sports => cfg.auto_deploy_sports,
