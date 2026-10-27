@@ -4,7 +4,7 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
-## 1.5.4 (unreleased)
+## 1.5.4 (2026-10-27)
 
 - Trade log: Close Now now works on Kalshi and Polymarket US. The button was shown on every venue, but the engine behind it existed only in the Polymarket International build, so pressing it on the other two answered "Close Now failed:" with nothing after the colon and left the position open. The exit now goes through the same venue layer every strategy trades through: it reads the live bid, sells one tick under it as a fill-or-kill order (the position either closes in full or stays exactly as it was), books the fill the venue reports net of both legs' fees, and hands the closed position to the trading loop so no strategy keeps managing shares that were sold. A simulated (ghost) position is booked at the bid without touching the venue. While the operator's order is in flight the engine's own stop on that position stands aside, so the same contracts cannot be sold twice. When the engine refuses, the message carries the HTTP status and the engine's reason.
 - Polymarket International and Polymarket US: an immediate (fill-and-kill or fill-or-kill) order the venue accepted but did not fill is now reported as unfilled. It used to be reported as filled at the requested size, which could book a close that never happened.
