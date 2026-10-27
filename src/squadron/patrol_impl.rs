@@ -152,36 +152,6 @@ fn bump_quote_epoch(map: &mut QuoteEpochs, key: &PositionKey) -> u64 {
     e.0
 }
 
-/// Close simulated position rows for the market a squadron is leaving.
-///
-/// The rotation half of the ghost-row leak. A ghost row is excluded from the chain
-/// reconciler and from `purge_stale_open_positions` by design, which leaves market
-/// expiry as the only moment it can be closed — and `cleanup_expired_positions`
-/// only looks at the market the squadron is CURRENTLY running. Rotation breaks this
-/// loop and redeploys against new tokens before that can happen, so the row is left
-/// open forever. Observed on the v1.0.9 production instance, 2026-08-31: a paper
-/// position opened on the 2AM ET market was still an open row nine hours and five
-/// rotations later.
-///
-/// The in-memory entry is NOT dropped at rotation — it lingers in the session map
-/// as a zombie. What makes the row safe to delete is not that the position is gone
-/// from memory but that it is UNEXITABLE: once its market has rotated away,
-/// `venue_for_token` can no longer resolve the token to a book, so no viper will
-/// ever act on it again. Call this only for tokens whose market genuinely rotated.
-///
-/// Called where the tokens being left behind are still known, which is why it lives
-/// here rather than in `Squadron::stand_down` — that has the squadron but not the
-/// market it was trading.
-async fn close_ghost_rows_for_market(
-    asset: &str,
-    tokens: &[&crate::venues::core::MarketId],
-) {
-    let Some(pool) = db::pool_for(asset) else { return };
-    for token in tokens {
-        db::close_ghost_open_position(&pool, &token.to_string()).await;
-    }
-}
-
 /// Is `epoch` still the live quote for `key`?
 ///
 /// A fill watcher spawned for a quote must ask this before recording an entry.
@@ -568,6 +538,16 @@ impl Squadron {
             Arc::clone(&positions),
             peripheral_cancel.clone(),
             asset_lc.clone(),
+            squadron_id.clone(),
+            scope.clone(),
+            {
+                let mut legs = vec![hourly_yes_token.clone(), hourly_no_token.clone()];
+                if let Some(mk) = maker_market_config.as_ref() {
+                    legs.push(mk.yes_token.clone());
+                    legs.push(mk.no_token.clone());
+                }
+                legs
+            },
         );
 
         // Watchdog: fires cancel (the patrol token) on stall, stops on peripheral_cancel.
@@ -865,9 +845,9 @@ impl Squadron {
                     // against the same market, and the position map is session
                     // scoped, so the position is still held and still exitable.
                     // Deleting its row would hide a live position rather than
-                    // retire a dead one. Rotation handles the rotated-away case and
-                    // the startup sweep is the backstop for a process that never
-                    // comes back.
+                    // retire a dead one. A rotated-away simulated position's row
+                    // waits for the closed-hold sweep [B65], and the startup sweep
+                    // is the backstop for a process that never comes back.
                     break;
                 }
                 // ── 2. Market rotation ──────────────────────────────────────────
@@ -897,21 +877,20 @@ impl Squadron {
 
                     { phantom_cooldowns.lock().await.clear(); }
                     { pending_orders.lock().await.clear(); }
-                    // Simulated rows for the market(s) actually being left behind.
-                    //
-                    // Gated per market, because the two rotate independently and
-                    // this arm fires when EITHER changes. The daily maker market
-                    // survives roughly 23 of every 24 hourly rotations, and the
-                    // redeployed squadron keeps the same id and the same
-                    // session-scoped position map — so its paper positions are
-                    // still held, still found by `venue_for_token`, and still
-                    // exited normally. Sweeping them here deleted the open row of
-                    // a live position once an hour: Bug #19 inverted.
-                    //
-                    // A token whose market HAS rotated away is genuinely
-                    // unexitable — no viper can resolve it to a book any more —
-                    // which is the only case where dropping the row is right.
+                    // Simulated rows for the market(s) being left behind are KEPT.
+                    // Until 1.5.4 this arm deleted them (the rotation half of the
+                    // ghost-row leak, 2026-08-31), which also meant a simulated hold
+                    // through the close vanished with no trade. The row is now what
+                    // the closed-hold sweep books from once Gamma states the result
+                    // (`ghost_settlement::settle_closed_ghost_holds`, run by the
+                    // lifecycle task the redeploy respawns with the new legs) [B65];
+                    // the zombie map entry is dropped by `cleanup_expired_positions`
+                    // or ignored, since `venue_for_token` no longer resolves it.
                     {
+                        // The legs being left behind, gated per market because the
+                        // two rotate independently and this arm fires when EITHER
+                        // changes: the daily maker market survives roughly 23 of
+                        // every 24 hourly rotations, and its quotes are still live.
                         let mut toks: Vec<&crate::venues::core::MarketId> = Vec::new();
                         if new_hourly_condition_id != current_hourly_cid {
                             toks.push(&hourly_yes_token);
@@ -923,10 +902,8 @@ impl Squadron {
                                 toks.push(&mk.no_token);
                             }
                         }
-                        if !toks.is_empty() {
-                            close_ghost_rows_for_market(&asset_lc, &toks).await;
-                        }
-                        // The LIVE twin of the ghost sweep above. The venue has
+                        // The live rows' sweep (simulated rows wait for the
+                        // closed-hold sweep, above). The venue has
                         // just confirmed every resting order cancelled, so an
                         // UNFILLED quote on the market being left behind is an
                         // order that no longer exists: its map entry is a zombie

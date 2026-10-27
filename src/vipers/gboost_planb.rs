@@ -1160,7 +1160,7 @@ impl PlanBModel {
         }
         if self.posture.as_deref().unwrap_or("gates") != posture {
             return Some(format!(
-                "model {} was labeled for the {} exit, and the engine's posture is {}; a model for the configured posture is needed",
+                "model {} was labeled for the {} exit, and the engine's posture is {} (the gboost_planb_exit_posture knob); a model for the configured posture is needed, which the in-engine pipeline trains on its next pass when training is enabled",
                 self.version, self.posture.as_deref().unwrap_or("gates"), posture,
             ));
         }
@@ -2120,10 +2120,16 @@ impl Strategy for GboostPlanBStrategy {
             return Ok(StrategySignal::NoSignal);
         }
         let Some(model) = model else {
-            match crate::vipers::gboost_planb_train::status_line(&asset) {
-                Some(line) => idle(&format!("no model in service; {line}")),
-                None => idle("no model in service and the training pipeline is not running on this build"),
-            }
+            // The pipeline's status line belongs on the card's detail line
+            // (`detail_line`, refreshed above), not in the refusal reason: it
+            // carries timestamps and counts, so every change minted a new ledger
+            // key that `normalize_reason` printed as `last cycle # #:# ET`
+            // (customer ticket, 2026-10-26).
+            idle(if crate::vipers::gboost_planb_train::status_line(&asset).is_some() {
+                "no model in service; the training pipeline's status is on the detail line"
+            } else {
+                "no model in service and the training pipeline is not running on this build"
+            });
             return Ok(StrategySignal::NoSignal);
         };
         // Both fetches are kicked off in the same tick: serialized, a slow Binance
@@ -2740,6 +2746,7 @@ mod tests {
         // instance, and one from before the stamp existed reads as gates.
         let why = m(Some(REFERENCE_PLAN)).plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "settlement", TRAINED_FORM).expect("a gates model is refused for a settlement posture");
         assert!(why.contains("labeled for the gates exit") && why.contains("posture is settlement"), "{why}");
+        assert!(why.contains("gboost_planb_exit_posture"), "the reason names the knob that set the posture: {why}");
         let mut held = m(Some(REFERENCE_PLAN));
         held.posture = Some("settlement".to_string());
         assert!(held.plan_mismatch(0.20, 0.11, 0.43, 0.75, "e2", "settlement", TRAINED_FORM).is_none());

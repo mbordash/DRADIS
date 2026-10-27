@@ -1410,6 +1410,19 @@ async fn trade_one_market(
                     }
                 }
                 release_swept_positions(&positions).await;
+                release_operator_closed_positions(&positions).await;
+                // Simulated holds carried through an earlier market's close, booked
+                // from their rows once the venue states the result [B65].
+                if let Some(p) = &pool {
+                    let mut live = vec![pair.long.clone(), pair.short.clone()];
+                    if let Some(mk) = &maker_pair {
+                        live.push(mk.long.clone());
+                        live.push(mk.short.clone());
+                    }
+                    crate::helpers::ghost_settlement::settle_closed_ghost_holds(
+                        venue.as_ref(), &positions, p, &scope, asset, &squadron_id, &live,
+                    ).await;
+                }
                 // Pick up any Control Tower config edits for this squadron.
                 dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;
                 if let Ok(mut live) = live_cfg.write() { *live = (*dyn_cfg).clone(); }
@@ -2338,6 +2351,29 @@ async fn dispatch_signal(
             if exit_retry_backed_off(strategy_name, params.token_id.as_str()) {
                 return false;
             }
+            // One sale per token at a time: hold the claim for this exit so a
+            // Close Now clicked while the order is in flight is refused, and
+            // stand aside while the operator holds it. Taken before the release
+            // check below so a Close Now cannot finish in between. Released when
+            // this arm returns, by Drop [B73].
+            let Some(_exit_claim) = db::ExitClaim::take(params.token_id.as_str()) else {
+                return false;
+            };
+            // The operator closed this position by hand (the Trade Log's Close
+            // Now) and this loop has not ticked since: the row is gone, so drop
+            // the guard here instead of selling contracts no longer held. Only a
+            // guard opened before the close counts; a re-entry since is a new
+            // position and keeps its guard [B73].
+            {
+                let key = PositionKey::new(squadron_id, strategy_name, params.token_id.clone());
+                let mut map = positions.lock().await;
+                let opened_at = map.get(&key).map(|p| p.opened_at);
+                if opened_at.is_some_and(|t| db::take_operator_release(strategy_name, params.token_id.as_str(), t)) {
+                    map.remove(&key);
+                    info!("🧾 [{strategy_name}] {} was closed by the operator — guard dropped, no exit sent", params.token_id);
+                    return false;
+                }
+            }
             info!("🚪 [{strategy_name}] exit ({reason}): {} @ {:.4}", params.token_id, params.price);
             // Snapshot the entry BEFORE the sell so the round-trip can be booked
             // to the tradelog — the guard is cleared below and there is no second
@@ -3067,6 +3103,24 @@ fn publish_us_strategy_market(
     });
 }
 
+
+/// Drop map entries the operator closed by hand (the Trade Log's Close Now)
+/// since the last tick. Keyed by strategy and token, so another strategy's live
+/// position on the same token is untouched, and consumed only by a loop that
+/// holds the entry, so a sibling squadron's tick cannot take it. The exit arm
+/// checks the same registry before selling, so the 30-second cadence here is
+/// only how long the exposure caps keep counting a closed position [B73].
+async fn release_operator_closed_positions(positions: &Arc<Mutex<PositionMap>>) {
+    let mut map = positions.lock().await;
+    let closed: Vec<PositionKey> = map.iter()
+        .filter(|(k, p)| db::take_operator_release(&k.strategy, k.market.as_str(), p.opened_at))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in closed {
+        map.remove(&k);
+        info!("🧾 Released {}'s in-memory position on {} — the operator closed it from the Trade Log", k.strategy, k.market);
+    }
+}
 
 /// Drop map entries for tokens whose `open_positions` row the settlement
 /// sweep in `sync_dashboard` has just booked and deleted — see the Kalshi

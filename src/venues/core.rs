@@ -174,7 +174,7 @@ pub enum TokenResolution {
     Unknown,
 }
 
-// ─── Settlement probe backoff (Kalshi / Polymarket US) ──────────────────────
+// ─── Settlement probe backoff (every venue's settlement sweeps) ─────────────
 
 /// Base retry delay after a token's first [`TokenResolution::Unknown`] answer.
 ///
@@ -182,7 +182,6 @@ pub enum TokenResolution {
 /// the FIRST retry is not delayed at all relative to the old behavior — a
 /// market that determines within a sweep or two of closing (the normal Kalshi
 /// crypto-hourly case) is still booked within a minute of resolution.
-#[cfg(any(feature = "kalshi", feature = "us_retail"))]
 const PROBE_BASE_DELAY_SECS: u64 = 30;
 
 /// Ceiling on the per-token retry delay, however many misses accumulate.
@@ -194,10 +193,8 @@ const PROBE_BASE_DELAY_SECS: u64 = 30;
 /// an eventually-resolved market within ten minutes of the answer appearing.
 /// The 24h [`crate::helpers::db::SETTLEMENT_DEFER_MAX_SECS`] age bound is
 /// stretched by at most this much, which it can absorb.
-#[cfg(any(feature = "kalshi", feature = "us_retail"))]
 const PROBE_MAX_DELAY_SECS: u64 = 600;
 
-#[cfg(any(feature = "kalshi", feature = "us_retail"))]
 struct ProbeState {
     /// Earliest instant at which the venue may be asked about this token again.
     next_probe: std::time::Instant,
@@ -240,19 +237,16 @@ struct ProbeState {
 /// Process-wide by design: the seven Kalshi squadrons share one SQLite shard,
 /// so each sweeps the same stale rows. A shared gate means the first squadron
 /// to probe a token backs the other six off too.
-#[cfg(any(feature = "kalshi", feature = "us_retail"))]
 pub struct SettlementProbeGate {
     inner: std::sync::Mutex<std::collections::HashMap<String, ProbeState>>,
 }
 
-#[cfg(any(feature = "kalshi", feature = "us_retail"))]
 impl Default for SettlementProbeGate {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(any(feature = "kalshi", feature = "us_retail"))]
 impl SettlementProbeGate {
     pub fn new() -> Self {
         Self { inner: std::sync::Mutex::new(std::collections::HashMap::new()) }
@@ -323,7 +317,7 @@ impl SettlementProbeGate {
     }
 }
 
-#[cfg(all(test, any(feature = "kalshi", feature = "us_retail")))]
+#[cfg(test)]
 mod probe_gate_tests {
     use super::*;
     use std::time::{Duration, Instant};
@@ -645,6 +639,17 @@ pub trait Execution: Send + Sync {
     /// venue could not resolve it, which is a refusal: an intent whose market
     /// cannot be read is one whose posture cannot be checked.
     async fn market_facts(&self, market: &MarketId) -> Result<Option<MarketFacts>>;
+
+    /// Whether `leg` trades on the venue's negative-risk exchange.
+    ///
+    /// An order-routing hint only Polymarket International has
+    /// (`OrderIntent::is_neg_risk` picks the exchange a FAK is signed for);
+    /// every other venue answers `false`. Here so an operator action that sells
+    /// through `place_order` without knowing which venue it is talking to (the
+    /// Trade Log's Close Now, [B73]) can fill the intent on any build.
+    async fn neg_risk(&self, _leg: &MarketId) -> Result<bool> {
+        Ok(false)
+    }
 
     // ── Operator read surfaces ─────────────────────────────────────────────
     //

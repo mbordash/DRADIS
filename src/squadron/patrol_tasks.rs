@@ -764,7 +764,6 @@ pub fn spawn_cleanup_task(
                                 hourly_market_name.clone(),
                                 hourly_yes_token.clone(), hourly_no_token.clone(),
                                 hourly_market_close_time,
-                                &asset,
                             ).await;
                         }
                         if let Some(ref mk) = maker_market_config.as_ref().filter(|_| !single_market) {
@@ -773,7 +772,6 @@ pub fn spawn_cleanup_task(
                                 mk.market_name.clone(),
                                 mk.yes_token.clone(), mk.no_token.clone(),
                                 mk.market_close_time,
-                                &asset,
                             ).await;
                         }
 
@@ -1152,6 +1150,12 @@ pub fn spawn_lifecycle_task(
     positions: Arc<Mutex<crate::state::PositionMap>>,
     cancel:    CancellationToken,
     asset:     String,
+    // For the closed-hold sweep [B65]: the squadron whose simulated rows it
+    // books, the filing scope its settlement rows carry, and the legs this
+    // patrol still trades, which the sweep never asks about.
+    squadron_id: String,
+    scope:     crate::state::TradeScope,
+    live_legs: Vec<crate::venues::core::MarketId>,
 ) {
     const LIFECYCLE_SYNC_SECS: u64 = 30;
     tokio::spawn(async move {
@@ -1162,6 +1166,13 @@ pub fn spawn_lifecycle_task(
                 biased;
                 _ = cancel.cancelled() => return,
                 _ = ticker.tick() => {
+                    // Simulated holds the expiry cleanup dropped from the map,
+                    // booked from their rows once Gamma states the result [B65].
+                    if let Some(pool) = crate::helpers::db::pool_for(&asset) {
+                        crate::helpers::ghost_settlement::settle_closed_ghost_holds(
+                            venue.as_ref(), &positions, &pool, &scope, &asset, &squadron_id, &live_legs,
+                        ).await;
+                    }
                     let flattened = lifecycle.reconcile(venue.as_ref(), &positions).await;
                     for leg in flattened {
                         // Bug #9 hardening: the in-memory position map's avg_entry can be

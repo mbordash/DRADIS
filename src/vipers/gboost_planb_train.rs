@@ -153,6 +153,9 @@ const RESOLUTION_GRACE_SECS: i64 = 900;
 const UNRESOLVED_GIVE_UP_SECS: i64 = 6 * 3600;
 /// How often the loop looks for newly resolved markets.
 const CATCHUP_INTERVAL_SECS: u64 = 300;
+/// How soon a cycle that found too little data is tried again (one hour: the store
+/// grows one market an hour, and the cycle returns before any fit).
+const INSUFFICIENT_DATA_RETRY_SECS: i64 = 3600;
 /// Records older than the window by this much are pruned.
 const PRUNE_SLACK_SECS: i64 = 7 * 86400;
 /// Days of bars kept before the first market (features need an hour, rounding needs a day).
@@ -2488,6 +2491,13 @@ pub struct PipelineStatus {
     /// disk. A persistent failure stays here until it stops failing.
     #[serde(default)]
     pub errors: BTreeMap<String, String>,
+    /// Sources a venue refuses by policy (HTTP 451: Binance's futures host does not
+    /// serve US addresses), by source. Not errors: the pipeline zeroes the columns
+    /// those sources feed (`partial_columns`) and the model it trains matches what
+    /// the instance can serve, so the card states the fact instead of showing a
+    /// "last error" for the life of a US box (customer ticket, 2026-10-26).
+    #[serde(default)]
+    pub region_notes: BTreeMap<String, String>,
     /// The machine's memory (or the container's limit when smaller), the headroom a
     /// fit could take at the last check, and why training is refused when that is too
     /// little (`phase` is then `memory_too_small`).
@@ -2502,14 +2512,25 @@ pub struct PipelineStatus {
 }
 
 impl PipelineStatus {
-    /// Record that `source` is failing now. `last_error` shows it until it heals.
+    /// Record that `source` is failing now. `last_error` shows it until it heals,
+    /// except a region block (HTTP 451), which is filed under `region_notes` and
+    /// never shown as an error.
     pub fn note_error(&mut self, source: &str, message: String) {
+        if is_region_block(&message) {
+            self.region_notes.insert(source.to_string(), message);
+            if self.errors.remove(source).is_some() {
+                self.refresh_last_error();
+            }
+            return;
+        }
+        self.region_notes.remove(source);
         self.errors.insert(source.to_string(), message.clone());
         self.last_error = Some(message);
     }
 
-    /// `source` succeeded: its standing error, if any, is over.
+    /// `source` succeeded: its standing error or region note, if any, is over.
     pub fn clear_error(&mut self, source: &str) {
+        self.region_notes.remove(source);
         if self.errors.remove(source).is_some() {
             self.refresh_last_error();
         }
@@ -2529,6 +2550,21 @@ impl PipelineStatus {
         // With no insertion order kept, any standing error is a fair "current trouble";
         // the map itself is on the status endpoint for the full picture.
         self.last_error = self.errors.values().next_back().cloned();
+    }
+}
+
+/// HTTP 451 is a policy refusal of this address, not a fault that will heal.
+fn is_region_block(message: &str) -> bool {
+    message.contains("HTTP 451")
+}
+
+/// The card's name for a blocked source (`note_error` keys).
+fn region_source_name(source: &str) -> &str {
+    match source {
+        "funding" => "funding history",
+        "metrics" => "futures open interest and taker ratio",
+        "metrics_live" => "live futures open interest and taker ratio",
+        other => other,
     }
 }
 
@@ -2580,8 +2616,12 @@ pub fn status_line(asset: &str) -> Option<String> {
         "adopted" | "shadow_adopted" => format!("last cycle {}: {}", fmt_et(&c.finished_at), c.detail),
         _ => format!("last cycle {} ({}): {}", fmt_et(&c.finished_at), c.decision.replace('_', " "), c.detail),
     });
+    let region = (!st.region_notes.is_empty()).then(|| format!(
+        "not served from this region (HTTP 451): {}; those feature columns stay zero by design",
+        st.region_notes.keys().map(|k| region_source_name(k)).collect::<Vec<_>>().join(", "),
+    ));
     let err = st.last_error.as_ref().map(|e| format!("last error: {e}"));
-    Some([Some(now_line), last, err].into_iter().flatten().collect::<Vec<_>>().join(" | "))
+    Some([Some(now_line), last, region, err].into_iter().flatten().collect::<Vec<_>>().join(" | "))
 }
 
 fn fmt_et(rfc: &str) -> String {
@@ -2908,6 +2948,18 @@ pub fn settled_records(dir: &DataDir, from: i64) -> usize {
     }).count()
 }
 
+/// Seconds after a cycle until the next one is due.
+///
+/// A cycle that found too little data to fit anything (`insufficient_data`) is
+/// retried hourly rather than after `retrain_hours`: it cost no fit, the store
+/// grows one market an hour, and the operator who changed the plan on 2026-10-26
+/// (holdout 0 rows on the immediate retrain) would otherwise have waited the full
+/// interval with no model in service.
+pub(crate) fn retrain_interval_secs(decision: &str, retrain_hours: i64) -> i64 {
+    let scheduled = retrain_hours.max(1) * 3600;
+    if decision == "insufficient_data" { scheduled.min(INSUFFICIENT_DATA_RETRY_SECS) } else { scheduled }
+}
+
 /// The pipeline for one asset. Runs forever; supervised by `main.rs`.
 pub async fn run_pipeline(asset: String) {
     let asset = asset.to_ascii_lowercase();
@@ -2964,8 +3016,7 @@ pub async fn run_pipeline(asset: String) {
         // A refusal is not a cycle: it does not push the schedule.
         let due_at = last_cycle.as_ref()
             .filter(|c| c.decision != "refused")
-            .and_then(|c| DateTime::parse_from_rfc3339(&c.finished_at).ok())
-            .map(|t| t.timestamp() + knobs.retrain_hours * 3600);
+            .and_then(|c| DateTime::parse_from_rfc3339(&c.finished_at).ok().map(|t| t.timestamp() + retrain_interval_secs(&c.decision, knobs.retrain_hours)));
         let due = complete && (plan_changed || due_at.is_none_or(|t| now >= t));
         update_status(&asset, |s| {
             s.phase = if complete { "idle".into() } else { s.phase.clone() };
@@ -3043,7 +3094,8 @@ pub async fn run_pipeline(asset: String) {
                 warn!("GBoost plan-B pipeline [{asset}]: cannot write status.json: {e}");
             }
             last_cycle = Some(report.clone());
-            update_status(&asset, |s| { s.phase = "idle".into(); s.last_cycle = Some(report); s.next_train_at = Some(rfc3339(Utc::now().timestamp() + knobs.retrain_hours * 3600)); });
+            let next_at = Utc::now().timestamp() + retrain_interval_secs(&report.decision, knobs.retrain_hours);
+            update_status(&asset, |s| { s.phase = "idle".into(); s.last_cycle = Some(report); s.next_train_at = Some(rfc3339(next_at)); });
         }
         tokio::time::sleep(Duration::from_secs(CATCHUP_INTERVAL_SECS)).await;
     }
@@ -3859,11 +3911,11 @@ mod tests {
         assert_eq!(st.last_error.as_deref(), Some("a: HTTP 429"));
         assert_eq!(st.errors.len(), 1);
         // A persistent funding failure stays until funding succeeds, whatever the markets do.
-        st.note_error("funding", "funding history unavailable: HTTP 451".into());
+        st.note_error("funding", "funding history unavailable: HTTP 503".into());
         st.reconcile_market_errors(|_| true);
-        assert_eq!(st.last_error.as_deref(), Some("funding history unavailable: HTTP 451"));
+        assert_eq!(st.last_error.as_deref(), Some("funding history unavailable: HTTP 503"));
         st.clear_error("bars"); // clearing a source that is not failing changes nothing
-        assert_eq!(st.last_error.as_deref(), Some("funding history unavailable: HTTP 451"));
+        assert_eq!(st.last_error.as_deref(), Some("funding history unavailable: HTTP 503"));
         st.clear_error("funding");
         assert!(st.last_error.is_none() && st.errors.is_empty());
         // The card line drops the error once it is gone.
@@ -3871,6 +3923,50 @@ mod tests {
         assert!(status_line("testerr").unwrap().contains("last error: Binance bars"));
         update_status("testerr", |s| s.clear_error("bars"));
         assert_eq!(status_line("testerr").as_deref(), Some("data current"));
+    }
+
+    /// Customer ticket, 2026-10-26: a US-hosted instance showed "last error: live
+    /// futures metrics unavailable: HTTP 451" for the life of the box. A region block
+    /// is a note, not an error; it leaves with its source like any other, and a
+    /// source that was blocked and now fails another way is an error again.
+    #[test]
+    fn a_region_block_is_a_note_not_an_error() {
+        let mut st = PipelineStatus::default();
+        st.note_error("metrics_live", "live futures metrics unavailable: HTTP 451 Unavailable For Legal Reasons".into());
+        assert!(st.last_error.is_none() && st.errors.is_empty(), "{:?}", st.last_error);
+        assert_eq!(st.region_notes.len(), 1);
+        st.note_error("funding", "funding history unavailable: HTTP 451 Unavailable For Legal Reasons".into());
+        st.note_error("bars", "Binance bars for 2026-10-26 unavailable: timeout".into());
+        assert_eq!(st.last_error.as_deref(), Some("Binance bars for 2026-10-26 unavailable: timeout"));
+        assert_eq!(st.region_notes.len(), 2);
+        st.note_error("funding", "funding history unavailable: HTTP 503".into());
+        assert_eq!(st.region_notes.len(), 1);
+        assert!(st.errors.contains_key("funding"));
+        st.note_error("funding", "funding history unavailable: HTTP 451 Unavailable For Legal Reasons".into());
+        assert!(!st.errors.contains_key("funding"), "blocked again: no longer an error");
+        assert_eq!(st.last_error.as_deref(), Some("Binance bars for 2026-10-26 unavailable: timeout"));
+        st.clear_error("metrics_live");
+        st.clear_error("funding");
+        assert!(st.region_notes.is_empty());
+        update_status("testregion", |s| {
+            s.phase = "idle".into();
+            s.note_error("funding", "funding history unavailable: HTTP 451 Unavailable For Legal Reasons".into());
+            s.note_error("metrics_live", "live futures metrics unavailable: HTTP 451 Unavailable For Legal Reasons".into());
+        });
+        let line = status_line("testregion").unwrap();
+        assert!(line.contains("not served from this region (HTTP 451): funding history, live futures open interest and taker ratio"), "{line}");
+        assert!(!line.contains("last error"), "{line}");
+    }
+
+    /// An insufficient-data cycle is retried within the hour; every other outcome
+    /// waits the configured interval, and a zero knob still means one hour.
+    #[test]
+    fn insufficient_data_is_retried_hourly() {
+        assert_eq!(retrain_interval_secs("adopted", 24), 24 * 3600);
+        assert_eq!(retrain_interval_secs("rejected", 6), 6 * 3600);
+        assert_eq!(retrain_interval_secs("insufficient_data", 24), 3600);
+        assert_eq!(retrain_interval_secs("insufficient_data", 1), 3600);
+        assert_eq!(retrain_interval_secs("error", 0), 3600);
     }
 
     /// Production, 2026-09-13, engine v1.1.6: a t3.medium (the template's default and

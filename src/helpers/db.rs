@@ -4919,6 +4919,65 @@ pub fn forget_unclaimed_holding(squadron_id: &str, token_id: &str) {
     }
 }
 
+/// A simulated hold as its `open_positions` row remembers it, for the closed-hold
+/// sweep (`ghost_settlement::settle_closed_ghost_holds`, [B65]): on Kalshi and
+/// Polymarket US the row is the only record that outlives the market loop.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GhostHoldRow {
+    pub strategy: String,
+    pub token_id: String,
+    pub market: String,
+    pub side: String,
+    pub entry_price: Decimal,
+    pub shares: Decimal,
+    /// The fee stamped at fill ([B67]); `None` on a row written before the stamp.
+    pub entry_fee: Option<Decimal>,
+    pub opened_at: DateTime<Utc>,
+}
+
+/// This squadron's confirmed simulated rows from this session. A row with no
+/// squadron (a writer that predates squadrons) belongs to no sweep and is left
+/// alone, an earlier session's rows are the startup sweep's, and a row whose
+/// price or size does not parse is skipped rather than booked from a guess.
+pub async fn ghost_open_rows(pool: &SqlitePool, squadron_id: &str) -> Result<Vec<GhostHoldRow>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, String, String, String, String, String, Option<String>, String)>(
+        "SELECT strategy, token_id, market, side, entry_price, shares, entry_fee, ts FROM open_positions
+          WHERE ghost_mode = 1 AND squadron_id = ? AND session_id = ?
+            AND COALESCE(status,'confirmed') = 'confirmed'
+          ORDER BY id"
+    )
+    .bind(squadron_id)
+    .bind(current_session_id())
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().filter_map(|(strategy, token_id, market, side, entry, shares, fee, ts)| {
+        Some(GhostHoldRow {
+            strategy, token_id, market, side,
+            entry_price: entry.parse::<Decimal>().ok()?,
+            shares: shares.parse::<Decimal>().ok()?,
+            entry_fee: fee.and_then(|f| f.parse::<Decimal>().ok()),
+            opened_at: opened_at_or_dawn(&ts),
+        })
+    }).collect())
+}
+
+/// Close ONE squadron's simulated row for a strategy's token, for the closed-hold
+/// sweep: `close_open_position` would take every squadron's row on the token, and
+/// `close_ghost_open_position` every strategy's.
+pub async fn close_ghost_open_position_for(pool: &SqlitePool, squadron_id: &str, strategy: &str, token_id: &str) {
+    if let Err(e) = sqlx::query(
+        "DELETE FROM open_positions WHERE ghost_mode = 1 AND squadron_id = ? AND strategy = ? AND token_id = ?"
+    )
+    .bind(squadron_id)
+    .bind(strategy)
+    .bind(token_id)
+    .execute(pool)
+    .await
+    {
+        error!("❌ DB close_ghost_open_position_for failed: {}", e);
+    }
+}
+
 pub async fn confirmed_open_positions(pool: &SqlitePool) -> Vec<(String, String)> {
     sqlx::query_as::<_, (String, String)>(
         "SELECT token_id, ts FROM open_positions
@@ -5065,6 +5124,104 @@ pub fn take_released_positions() -> Vec<String> {
     match released_positions().lock() {
         Ok(mut reg) => reg.drain().collect(),
         Err(_) => Vec::new(),
+    }
+}
+
+/// Tokens with an exit in flight right now, by whoever is selling: a trading
+/// loop's own exit arm or the Trade Log's Close Now (`api::server::manual_exit`).
+///
+/// One sale per token at a time. Without it a stop firing while the operator's
+/// order was in flight, or the other way round, sold the same contracts twice;
+/// on a netting venue (Kalshi, Polymarket US) the second sale opens the opposite
+/// leg rather than bouncing. Process-global like the registries above; a claim
+/// is released by [`ExitClaim`]'s Drop on every path out ([B73]).
+fn exit_claims() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static REG: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn begin_exit_claim(token_id: &str) -> bool {
+    match exit_claims().lock() {
+        Ok(mut reg) => reg.insert(token_id.to_string()),
+        Err(_) => false,
+    }
+}
+
+fn end_exit_claim(token_id: &str) {
+    if let Ok(mut reg) = exit_claims().lock() {
+        reg.remove(token_id);
+    }
+}
+
+/// Whether some exit on `token_id` is in flight right now.
+pub fn exit_claimed(token_id: &str) -> bool {
+    exit_claims().lock().map(|reg| reg.contains(token_id)).unwrap_or(false)
+}
+
+/// The claim one exit holds on a token while it runs; released by Drop on every
+/// return path, so no error leaves the token locked.
+pub struct ExitClaim(String);
+
+impl ExitClaim {
+    /// Claim `token_id` for an exit. `None` when another exit holds it.
+    pub fn take(token_id: &str) -> Option<Self> {
+        begin_exit_claim(token_id).then(|| Self(token_id.to_string()))
+    }
+}
+
+impl Drop for ExitClaim {
+    fn drop(&mut self) { end_exit_claim(&self.0); }
+}
+
+/// Positions the operator closed by hand (`POST /api/positions/manual-exit`),
+/// by strategy and token, waiting for the trading loop that holds the guard to
+/// drop it.
+///
+/// Distinct from [`take_released_positions`] on purpose: that set is drained
+/// whole by whichever loop ticks first and clears every strategy's entry for the
+/// token, which is right for a settlement (every holder is done) and wrong for
+/// an operator closing ONE strategy's position while another still holds the
+/// same token. A loop consumes only the entries whose key it holds, so a sibling
+/// squadron's tick cannot take them. Entries nobody consumes (the loop ended)
+/// are pruned after an hour ([B73]).
+fn operator_releases() -> &'static std::sync::Mutex<std::collections::HashMap<(String, String), DateTime<Utc>>> {
+    static REG: OnceLock<std::sync::Mutex<std::collections::HashMap<(String, String), DateTime<Utc>>>> = OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+const OPERATOR_RELEASE_TTL_SECS: i64 = 3600;
+
+/// Record that the operator closed `strategy`'s position on `token_id` now.
+pub fn note_operator_release(strategy: &str, token_id: &str) {
+    note_operator_release_at(strategy, token_id, Utc::now());
+}
+
+fn note_operator_release_at(strategy: &str, token_id: &str, at: DateTime<Utc>) {
+    if let Ok(mut reg) = operator_releases().lock() {
+        reg.retain(|_, t| (at - *t).num_seconds() < OPERATOR_RELEASE_TTL_SECS);
+        reg.insert((strategy.to_string(), token_id.to_string()), at);
+    }
+}
+
+/// Consume the operator's close of `strategy`'s position on `token_id`, if the
+/// guard the caller holds was opened BEFORE the operator closed it. `true` means
+/// that guard is for a position that no longer exists and must be dropped rather
+/// than acted on.
+///
+/// The time check is what keeps a leftover release from eating a new position:
+/// a loop that held no guard when the operator closed (after a restart, a
+/// rotation, or on a market it had left) consumes nothing, and when the same
+/// strategy re-enters the token later, its new guard is younger than the release
+/// and is left alone; the stale entry then ages out.
+pub fn take_operator_release(strategy: &str, token_id: &str, guard_opened_at: DateTime<Utc>) -> bool {
+    let key = (strategy.to_string(), token_id.to_string());
+    match operator_releases().lock() {
+        Ok(mut reg) => {
+            let applies = reg.get(&key).is_some_and(|released_at| guard_opened_at <= *released_at);
+            if applies { reg.remove(&key); }
+            applies
+        }
+        Err(_) => false,
     }
 }
 
@@ -9699,5 +9856,61 @@ mod released_position_tests {
             ("ArbitrageStrategy".to_string(), "pending".to_string(), 1),
             ("FairValueStrategy".to_string(), "confirmed".to_string(), 0),
         ]);
+    }
+}
+
+#[cfg(test)]
+mod exit_claim_and_operator_release_tests {
+    use super::*;
+
+    /// One exit per token: the second claim fails while the first is held, the
+    /// claim is visible to others, and dropping it frees the token without
+    /// touching another. Names are unique to this test because the set is
+    /// process-wide.
+    #[test]
+    fn an_exit_claim_is_held_once_and_released_on_drop() {
+        let (tok, other) = ("exit-claim-test-token", "exit-claim-test-other");
+        assert!(!exit_claimed(tok), "nothing is claimed before the take");
+        let first = ExitClaim::take(tok).expect("the first claim succeeds");
+        assert!(ExitClaim::take(tok).is_none(), "a second claim on the same token fails");
+        assert!(exit_claimed(tok), "the claim is visible");
+        assert!(!exit_claimed(other), "another token is unaffected");
+        drop(first);
+        assert!(!exit_claimed(tok), "drop releases it");
+        let again = ExitClaim::take(tok).expect("and the token can be claimed again");
+        drop(again);
+    }
+
+    /// An operator release is keyed by strategy and token: the owning strategy
+    /// consumes it exactly once, another strategy on the same token never sees
+    /// it, and nothing is left behind.
+    #[test]
+    fn an_operator_release_is_consumed_once_by_its_own_strategy() {
+        let (tok, a, b) = ("operator-release-test-token", "OperatorReleaseTestA", "OperatorReleaseTestB");
+        let opened = Utc::now() - chrono::Duration::seconds(60);
+        assert!(!take_operator_release(a, tok, opened), "nothing to consume before the note");
+        note_operator_release(a, tok);
+        assert!(!take_operator_release(b, tok, opened), "another strategy's guard on the same token is not released");
+        assert!(take_operator_release(a, tok, opened), "the owning strategy consumes it");
+        assert!(!take_operator_release(a, tok, opened), "exactly once");
+    }
+
+    /// A release only drops a guard opened before the operator closed: a
+    /// position the same strategy opened on the token afterwards keeps its
+    /// guard, and the stale entry ages out after the TTL.
+    #[test]
+    fn a_release_never_drops_a_guard_opened_after_it() {
+        let (tok, a) = ("operator-release-age-test-token", "OperatorReleaseAgeTest");
+        let released_at = Utc::now() - chrono::Duration::seconds(600);
+        note_operator_release_at(a, tok, released_at);
+        let newer = released_at + chrono::Duration::seconds(1);
+        assert!(!take_operator_release(a, tok, newer), "a guard opened after the close is a new position");
+        let older = released_at - chrono::Duration::seconds(1);
+        assert!(take_operator_release(a, tok, older), "a guard opened before the close is the closed one");
+        // Expired entries are pruned when the next release is noted.
+        note_operator_release_at(a, tok, Utc::now() - chrono::Duration::seconds(OPERATOR_RELEASE_TTL_SECS + 1));
+        note_operator_release("OperatorReleaseAgeTestOther", "operator-release-age-test-other");
+        assert!(!take_operator_release(a, tok, older), "an entry older than the TTL is gone");
+        assert!(take_operator_release("OperatorReleaseAgeTestOther", "operator-release-age-test-other", older));
     }
 }

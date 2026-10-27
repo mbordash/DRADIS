@@ -611,9 +611,19 @@ export default function TradelogPage({ availableAssets }: Props) {
         }),
       });
       if (!res.ok) {
-        alert(`Close Now failed: ${await res.text()}`);
+        // Carry the status: a route that does not exist answers 405 with an
+        // empty body, and "Close Now failed: " with nothing after the colon is
+        // what the operator saw for a week on Kalshi [B73].
+        const text = (await res.text()).trim();
+        alert(`Close Now failed (HTTP ${res.status}): ${text || 'the engine gave no detail'}`);
       } else {
-        alert('Position closed! Refreshing…');
+        // The engine answers with what happened, not what was asked: a partial
+        // fill (possible only where the venue rounds the size) leaves shares
+        // open and managed, and the operator should hear that.
+        const body = await res.json().catch(() => null);
+        alert(body?.status === 'partial'
+          ? `Partially closed: ${body.filled_shares} sold, ${body.remaining_shares} still open and managed. Refreshing…`
+          : 'Position closed! Refreshing…');
         window.location.reload();
       }
     } catch (err) {

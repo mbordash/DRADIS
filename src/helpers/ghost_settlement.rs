@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use rust_decimal::Decimal;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::venues::core::MarketId;
 
@@ -210,50 +210,11 @@ pub(crate) async fn book_ghost_settlements(
             }
         }
 
-        // Fee by entry type, mirroring the live settlement paths: a taker entry
-        // paid the venue's quadratic schedule on the opening leg, a post-only
-        // maker entry paid nothing, and the live maker path books
-        // `Decimal::ZERO` with exactly that comment. Charging every strategy
-        // would overstate a simulated Maker or Arbitrage settlement by a fee
-        // the live books never show.
-        let taker_entry = match key.strategy.as_str() {
-            "FairValueStrategy" | "MomentumStrategy" | "GboostStrategy"
-                | "ConvergenceStrategy" | "TrendReversalStrategy" => true,
-            // Anchor buys the cheap side at the ask with a fill-and-kill order.
-            crate::vipers::anchor_impl::STRATEGY_NAME => true,
-            // Read from the constant rather than assumed: Basis enters as a
-            // maker on every shipped profile, but the switch is compile-time,
-            // and a profile that flips it should get the matching fee without
-            // anyone remembering to edit this list.
-            "BasisStrategy" => !crate::config::BASIS_ENTRY_AS_MAKER,
-            // Helm's entry type will be the operator's choice per intent —
-            // taker at the ask or a resting bid — and the intent model that
-            // records it is a later increment. Until this reads the intent,
-            // charge the taker fee: the conservative answer never flatters a
-            // simulated Helm settlement, where booking it fee-free would.
-            crate::vipers::helm_impl::STRATEGY_NAME => true,
-            // Maker, Arbitrage and TimeDecay are maker-entry by construction.
-            _ => false,
-        };
-        let entry_fee = if taker_entry {
-            pos.avg_entry * pos.shares * crate::venues::entry_only_fee_pct(pos.avg_entry)
-        } else {
-            Decimal::ZERO
-        };
+        let entry_fee = simulated_entry_fee(&key.strategy, pos.avg_entry, pos.shares);
         let pnl = (resolved - pos.avg_entry) * pos.shares - entry_fee;
 
         let side = if key.market == *yes_market { "YES" } else { "NO" };
-        let outcome = match source {
-            PriceSource::Tie => "tied or canceled".to_string(),
-            // Not a result: say so in the row rather than dressing a mid-price
-            // up as a win or a tie. A 0.93 mark booked after a day is a genuine
-            // win the trial would otherwise drop from its tally, and a mark is
-            // not the 0.5 category either.
-            PriceSource::MarkFallback => "mark after 24h deferral".to_string(),
-            PriceSource::Resolved => {
-                if resolved > Decimal::new(5, 1) { "won".to_string() } else { "lost".to_string() }
-            }
-        };
+        let outcome = settlement_outcome(resolved, source);
         let reason = format!("Settlement ({outcome} — simulated)");
 
         // `ghost: true` so the row is marked simulated and cannot be read as
@@ -314,6 +275,217 @@ pub(crate) async fn book_ghost_settlements(
     settled
 }
 
+/// Does `strategy` enter as a taker? Fee by entry type, mirroring the live
+/// settlement paths: a taker entry paid the venue's quadratic schedule on the
+/// opening leg, a post-only maker entry paid nothing, and the live maker path
+/// books `Decimal::ZERO` with exactly that comment. Charging every strategy
+/// would overstate a simulated Maker or Arbitrage settlement by a fee the live
+/// books never show.
+pub(crate) fn taker_entry_strategy(strategy: &str) -> bool {
+    match strategy {
+        "FairValueStrategy" | "MomentumStrategy" | "GboostStrategy"
+            | "ConvergenceStrategy" | "TrendReversalStrategy" => true,
+        // Anchor buys the cheap side at the ask with a fill-and-kill order.
+        crate::vipers::anchor_impl::STRATEGY_NAME => true,
+        // Read from the constant rather than assumed: Basis enters as a
+        // maker on every shipped profile, but the switch is compile-time,
+        // and a profile that flips it should get the matching fee without
+        // anyone remembering to edit this list.
+        "BasisStrategy" => !crate::config::BASIS_ENTRY_AS_MAKER,
+        // Helm's entry type will be the operator's choice per intent —
+        // taker at the ask or a resting bid — and the intent model that
+        // records it is a later increment. Until this reads the intent,
+        // charge the taker fee: the conservative answer never flatters a
+        // simulated Helm settlement, where booking it fee-free would.
+        crate::vipers::helm_impl::STRATEGY_NAME => true,
+        // Maker, Arbitrage and TimeDecay are maker-entry by construction.
+        _ => false,
+    }
+}
+
+/// The opening fee a simulated settlement charges when the position carries
+/// none of its own.
+pub(crate) fn simulated_entry_fee(strategy: &str, avg_entry: Decimal, shares: Decimal) -> Decimal {
+    if taker_entry_strategy(strategy) {
+        avg_entry * shares * crate::venues::entry_only_fee_pct(avg_entry)
+    } else {
+        Decimal::ZERO
+    }
+}
+
+/// The word the settlement row carries for its result. A mark is not a result:
+/// say so in the row rather than dressing a mid-price up as a win or a tie. A
+/// 0.93 mark booked after a day is a genuine win the trial would otherwise drop
+/// from its tally, and a mark is not the 0.5 category either.
+pub(crate) fn settlement_outcome(resolved: Decimal, source: PriceSource) -> &'static str {
+    match source {
+        PriceSource::Tie => "tied or canceled",
+        PriceSource::MarkFallback => "mark after 24h deferral",
+        PriceSource::Resolved => if resolved > Decimal::new(5, 1) { "won" } else { "lost" },
+    }
+}
+
+// ─── Simulated holds whose market closed under them [B65] ───────────────────
+
+/// Per-token backoff for the closed-hold probes, separate from the live sweeps'
+/// gates so a simulated row's misses never delay a real settlement.
+static CLOSED_HOLD_PROBES: std::sync::LazyLock<crate::venues::core::SettlementProbeGate> =
+    std::sync::LazyLock::new(crate::venues::core::SettlementProbeGate::new);
+
+/// Venue lookups one pass may make. The probes run inline in the loop's dash
+/// tick (and ahead of the intl lifecycle reconcile), so a backlog of rows is
+/// worked off across passes rather than stalling one.
+const CLOSED_HOLD_PROBES_PER_PASS: usize = 8;
+
+/// Book the simulated holds this squadron carried through a market close, from
+/// their `open_positions` rows, once the venue states the result.
+///
+/// The hole this closes [B65]: simulated settlement reached only pinned event
+/// markets (the venue status probe on Kalshi, Gamma on Polymarket
+/// International). A simulated hold on an hourly or daily market had no
+/// settlement path at all: the Kalshi and Polymarket US position maps die with
+/// the market, and Polymarket International's expiry cleanup dropped the map
+/// entry and deleted the row, so GBoost's settlement posture, FairValue's
+/// settle-hold and every other hold-to-settlement viper went unscored in ghost
+/// mode, for exactly the audience ghost mode exists for.
+///
+/// The row is the record that survives the loop, so the row is the source.
+/// Every confirmed simulated row of this squadron whose token is not one of
+/// `live_legs` (the legs the loop still trades and manages itself) is asked
+/// about through the venue's `resolution`, on the same per-token backoff the
+/// live sweeps use. `Resolved` books it: a position the map still holds goes
+/// through `book_ghost_settlements` and its guards, one the loop has dropped is
+/// booked straight from the row. `NotClosed` (a daily market the squadron
+/// rotated away from) and `Unknown` (closed, not yet determined) leave it for a
+/// later pass. Anchor's rows are skipped: it books its own from its ledger,
+/// keyed differently, and two writers would double book. Only this session's
+/// rows are read; an earlier session's are the startup sweep's
+/// (`close_stale_ghost_positions`). At most `CLOSED_HOLD_PROBES_PER_PASS`
+/// venue lookups per pass.
+///
+/// Returns the number of holds settled this pass.
+pub(crate) async fn settle_closed_ghost_holds<V: crate::venues::core::Execution + ?Sized>(
+    venue: &V,
+    positions: &Arc<Mutex<crate::state::PositionMap>>,
+    pool: &sqlx::SqlitePool,
+    scope: &crate::state::TradeScope,
+    asset: &str,
+    squadron_id: &str,
+    live_legs: &[MarketId],
+) -> usize {
+    use crate::venues::core::TokenResolution as R;
+    let rows = match crate::helpers::db::ghost_open_rows(pool, squadron_id).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!("👻 Closed-hold sweep [{squadron_id}]: cannot read the simulated rows ({e}); trying again next pass");
+            return 0;
+        }
+    };
+    let mut settled = 0usize;
+    let mut probed = 0usize;
+    for row in rows {
+        if row.shares <= Decimal::ZERO || live_legs.iter().any(|l| l.as_str() == row.token_id) {
+            continue;
+        }
+        if row.strategy == crate::vipers::anchor_impl::STRATEGY_NAME {
+            continue;
+        }
+        if !CLOSED_HOLD_PROBES.should_probe(&row.token_id) {
+            continue;
+        }
+        if probed == CLOSED_HOLD_PROBES_PER_PASS {
+            break;
+        }
+        probed += 1;
+        match venue.resolution(&MarketId::new(&row.token_id)).await {
+            Ok(R::Resolved(px)) => {
+                if book_closed_hold(positions, pool, scope, asset, squadron_id, &row, px).await {
+                    CLOSED_HOLD_PROBES.record_decisive(&row.token_id);
+                    settled += 1;
+                } else {
+                    // Resolved but not booked (a real row claims the token, a read
+                    // or a write failed): back off rather than ask, and warn, every tick.
+                    CLOSED_HOLD_PROBES.record_unknown(&row.token_id);
+                }
+            }
+            // Still open (a daily the squadron left before its close) or not yet
+            // determined: nothing is at stake in asking a simulated row again a
+            // few minutes later, so both back off rather than probe every tick.
+            Ok(R::NotClosed) | Ok(R::Unknown) => CLOSED_HOLD_PROBES.record_unknown(&row.token_id),
+            Err(e) => {
+                debug!("👻 Closed-hold sweep [{squadron_id}]: resolution lookup for {} failed ({e}); deferring", row.token_id);
+                CLOSED_HOLD_PROBES.record_unknown(&row.token_id);
+            }
+        }
+    }
+    settled
+}
+
+/// Book one resolved simulated hold. `true` when its settlement is on the books
+/// (written now or by an earlier pass) and its row is closed.
+async fn book_closed_hold(
+    positions: &Arc<Mutex<crate::state::PositionMap>>,
+    pool: &sqlx::SqlitePool,
+    scope: &crate::state::TradeScope,
+    asset: &str,
+    squadron_id: &str,
+    row: &crate::helpers::db::GhostHoldRow,
+    px: Decimal,
+) -> bool {
+    use crate::helpers::db;
+    // A real row on the same token means the live sweep owns it; "could not
+    // tell" is not "simulated" either.
+    match db::open_row_claims_token_in(pool, &row.token_id).await {
+        Ok(false) => {}
+        Ok(true) => {
+            warn!("👻 Closed-hold sweep: a real open-position row claims {} ({}) — not booking it as simulated; the live sweep owns it", row.token_id, row.strategy);
+            return false;
+        }
+        Err(e) => {
+            warn!("👻 Closed-hold sweep: could not tell whether {} is real ({e}) — deferring", row.token_id);
+            return false;
+        }
+    }
+    let source = if px == Decimal::new(5, 1) { PriceSource::Tie } else { PriceSource::Resolved };
+    let token = MarketId::new(&row.token_id);
+    let key = crate::state::PositionKey::new(squadron_id, &row.strategy, token.clone());
+    let candidate = positions.lock().await.get(&key).filter(|p| p.shares > Decimal::ZERO).map(|p| (key.clone(), p.clone()));
+    if let Some(candidate) = candidate {
+        // Still in the map: the guarded path removes it, books it and closes the
+        // row. It labels the side by comparing the token to the YES leg and never
+        // reads the NO leg; the row knows only this token.
+        let prices = std::collections::HashMap::from([(row.token_id.clone(), (px, source))]);
+        let blank = MarketId::new("");
+        let (yes_leg, no_leg) = if row.side.eq_ignore_ascii_case("YES") { (token, blank) } else { (blank, token) };
+        return book_ghost_settlements(positions, pool, asset, scope.market_class.as_deref(), &yes_leg, &no_leg, &prices, vec![candidate]).await > 0;
+    }
+    // The loop that held it is gone: book from the row, the only record left.
+    let entry_fee = row.entry_fee.unwrap_or_else(|| simulated_entry_fee(&row.strategy, row.entry_price, row.shares));
+    let pnl = (px - row.entry_price) * row.shares - entry_fee;
+    let outcome = settlement_outcome(px, source);
+    let reason = format!("Settlement ({outcome} — simulated)");
+    let mut filing = scope.clone();
+    filing.ghost = true;
+    match db::record_settlement_trade_for_token(
+        pool, &filing, Some((&row.token_id, row.opened_at)), &row.strategy, &row.market, &row.side,
+        row.entry_price, px, row.shares, pnl, entry_fee, &reason, None,
+    ).await {
+        db::SettlementWrite::Inserted => info!(
+            "👻 Simulated settlement (after the loop): {} {} {} | {} sh entry=${:.4} → resolved ${:.2} ({}) → pnl=${:.4}",
+            row.strategy, row.market, row.side, row.shares, row.entry_price, px, outcome, pnl,
+        ),
+        db::SettlementWrite::Duplicate => {}
+        db::SettlementWrite::Failed => {
+            error!("❌ Simulated settlement NOT recorded for {} {} — the row stays and is retried next pass", row.strategy, row.market);
+            return false;
+        }
+    }
+    // This squadron's simulated row only: another squadron's same-strategy row
+    // on the token is its own sweep's to book.
+    db::close_ghost_open_position_for(pool, squadron_id, &row.strategy, &row.token_id).await;
+    true
+}
+
 #[cfg(test)]
 mod ghost_settlement_tests {
     use super::{book_ghost_settlements, price_for, resolution_prices, settle_ghost_positions_at, settlement_candidates, PriceSource};
@@ -327,6 +499,168 @@ mod ghost_settlement_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    use super::settle_closed_ghost_holds;
+    use crate::venues::core::{Execution, Fill, OpenOrder, OrderId, OrderIntent, TokenResolution};
+    use async_trait::async_trait;
+
+    /// A venue that answers `resolution` from a table and refuses every other
+    /// question: the closed-hold sweep must read, never trade.
+    struct ResolvingVenue(HashMap<String, TokenResolution>);
+
+    #[async_trait]
+    impl Execution for ResolvingVenue {
+        async fn best_bid(&self, _: &MarketId) -> anyhow::Result<Option<Decimal>> { Ok(None) }
+        async fn market_facts(&self, _: &MarketId) -> anyhow::Result<Option<crate::venues::core::MarketFacts>> { Ok(None) }
+        async fn place_order(&self, _: OrderIntent) -> anyhow::Result<Fill> { unreachable!("the closed-hold sweep never places an order") }
+        async fn place_atomic(&self, _: [OrderIntent; 2]) -> anyhow::Result<[Fill; 2]> { unreachable!("the closed-hold sweep never places an order") }
+        async fn cancel(&self, _: OrderId) -> anyhow::Result<()> { unreachable!("the closed-hold sweep never cancels") }
+        async fn collateral(&self) -> anyhow::Result<Decimal> { unreachable!("the closed-hold sweep does not read collateral") }
+        async fn positions(&self) -> anyhow::Result<Vec<crate::venues::core::Position>> { unreachable!("the closed-hold sweep does not read positions") }
+        async fn open_orders(&self) -> anyhow::Result<Vec<OpenOrder>> { Ok(Vec::new()) }
+        async fn resolution(&self, leg: &MarketId) -> anyhow::Result<TokenResolution> {
+            match self.0.get(leg.as_str()) {
+                Some(r) => Ok(r.clone()),
+                None => unreachable!("the sweep asked about {}, which it must not have", leg.as_str()),
+            }
+        }
+    }
+
+    async fn squadron_ghost_row(p: &sqlx::SqlitePool, squadron: &str, strategy: &str, token: &str, side: &str, entry: &str, shares: &str, fee: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO open_positions (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, squadron_id, entry_fee)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)")
+            .bind(Utc::now().to_rfc3339()).bind(db::current_session_id()).bind(strategy).bind(token)
+            .bind("Bitcoin price at 10pm EDT?").bind(side).bind(entry).bind(shares).bind(squadron).bind(fee)
+            .execute(p).await.unwrap();
+    }
+
+    async fn settlement_rows(p: &sqlx::SqlitePool, token: &str) -> Vec<(String, String, i64)> {
+        sqlx::query_as("SELECT reason, pnl, COALESCE(ghost, 0) FROM trades WHERE token_id = ?")
+            .bind(token).fetch_all(p).await.unwrap()
+    }
+
+    async fn rows_for(p: &sqlx::SqlitePool, token: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM open_positions WHERE token_id = ?").bind(token).fetch_one(p).await.unwrap()
+    }
+
+    fn btc_scope() -> crate::state::TradeScope {
+        crate::state::TradeScope::crypto("btc", "", "btc")
+    }
+
+    /// [B65] The Kalshi and Polymarket US maps die with the market, so a GBoost
+    /// settlement hold in ghost mode survived only as its row and was never
+    /// scored. Once the venue states the result the row is booked as a simulated
+    /// settlement with the fee it was stamped with, and closed; a second pass
+    /// finds nothing to do.
+    #[tokio::test]
+    async fn a_closed_hold_the_loop_dropped_is_booked_from_its_row() {
+        let p = pool().await;
+        const T: &str = "b65-dropped#yes";
+        squadron_ghost_row(&p, "btc-open", "GboostStrategy", T, "YES", "0.40", "5", Some("0.07")).await;
+        let venue = ResolvingVenue(HashMap::from([(T.to_string(), TokenResolution::Resolved(dec!(1)))]));
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(PositionMap::new()));
+
+        let n = settle_closed_ghost_holds(&venue, &map, &p, &btc_scope(), "btc", "btc-open", &[]).await;
+        assert_eq!(n, 1);
+        let rows = settlement_rows(&p, T).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, "Settlement (won — simulated)");
+        assert_eq!(rows[0].1.parse::<Decimal>().unwrap(), dec!(2.93), "(1.00 - 0.40) x 5 less the 0.07 stamped at fill");
+        assert_eq!(rows[0].2, 1, "marked simulated");
+        assert_eq!(rows_for(&p, T).await, 0, "the row is closed");
+
+        assert_eq!(settle_closed_ghost_holds(&venue, &map, &p, &btc_scope(), "btc", "btc-open", &[]).await, 0);
+        assert_eq!(settlement_rows(&p, T).await.len(), 1, "booked once");
+    }
+
+    /// A leg the loop still trades is the loop's, another squadron's row is that
+    /// squadron's, an Anchor row is Anchor's, and a closed market the venue has
+    /// not determined waits. None of them is asked about or touched.
+    #[tokio::test]
+    async fn live_legs_other_squadrons_anchor_and_undetermined_markets_are_left_alone() {
+        let p = pool().await;
+        const LIVE: &str = "b65-live#yes";
+        const OTHER: &str = "b65-other-squadron#yes";
+        const ANCHOR: &str = "b65-anchor#no";
+        const PENDING: &str = "b65-pending#yes";
+        squadron_ghost_row(&p, "btc-open", "FairValueStrategy", LIVE, "YES", "0.55", "4", None).await;
+        squadron_ghost_row(&p, "eth-open", "FairValueStrategy", OTHER, "YES", "0.55", "4", None).await;
+        squadron_ghost_row(&p, "btc-open", crate::vipers::anchor_impl::STRATEGY_NAME, ANCHOR, "NO", "0.38", "5", None).await;
+        squadron_ghost_row(&p, "btc-open", "GboostStrategy", PENDING, "YES", "0.50", "5", None).await;
+        // Only the pending token may be asked about; the venue panics on any other.
+        let venue = ResolvingVenue(HashMap::from([(PENDING.to_string(), TokenResolution::Unknown)]));
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(PositionMap::new()));
+
+        let n = settle_closed_ghost_holds(&venue, &map, &p, &btc_scope(), "btc", "btc-open", &[MarketId::new(LIVE)]).await;
+        assert_eq!(n, 0);
+        for t in [LIVE, OTHER, ANCHOR, PENDING] {
+            assert_eq!(rows_for(&p, t).await, 1, "{t} still open");
+            assert!(settlement_rows(&p, t).await.is_empty(), "{t} booked nothing");
+        }
+    }
+
+    /// A hold the map still carries (Polymarket International between rotation
+    /// and its cleanup) goes through the guarded path: removed from the map,
+    /// booked, row closed. The fee comes from the strategy's entry type when the
+    /// row carries none.
+    #[tokio::test]
+    async fn a_hold_still_in_the_map_is_booked_through_the_guarded_path() {
+        let p = pool().await;
+        const T: &str = "b65-in-map#no";
+        squadron_ghost_row(&p, "btc-open", "MakerStrategy", T, "NO", "0.45", "10", None).await;
+        let k = PositionKey { squadron: "btc-open".into(), strategy: "MakerStrategy".into(), market: MarketId::new(T) };
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(PositionMap::new()));
+        map.lock().await.insert(k.clone(), position(dec!(10), dec!(0.45)));
+        let venue = ResolvingVenue(HashMap::from([(T.to_string(), TokenResolution::Resolved(dec!(0)))]));
+
+        let n = settle_closed_ghost_holds(&venue, &map, &p, &btc_scope(), "btc", "btc-open", &[]).await;
+        assert_eq!(n, 1);
+        assert!(map.lock().await.get(&k).is_none(), "released from the map");
+        let rows = settlement_rows(&p, T).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, "Settlement (lost — simulated)");
+        assert_eq!(rows[0].1.parse::<Decimal>().unwrap(), dec!(-4.50), "a maker entry pays no fee: (0 - 0.45) x 10");
+        assert_eq!(rows_for(&p, T).await, 0);
+    }
+
+    /// A row left by an earlier session is the startup sweep's, not this one's.
+    #[tokio::test]
+    async fn an_earlier_sessions_row_is_not_swept() {
+        let p = pool().await;
+        const T: &str = "b65-old-session#yes";
+        sqlx::query(
+            "INSERT INTO open_positions (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, squadron_id)
+             VALUES (?, 'an-earlier-session', ?, ?, ?, ?, ?, ?, 1, ?)")
+            .bind(Utc::now().to_rfc3339()).bind("GboostStrategy").bind(T)
+            .bind("Bitcoin price at 10pm EDT?").bind("YES").bind("0.40").bind("5").bind("btc-open")
+            .execute(&p).await.unwrap();
+        let venue = ResolvingVenue(HashMap::new()); // asked about nothing
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(PositionMap::new()));
+        assert_eq!(settle_closed_ghost_holds(&venue, &map, &p, &btc_scope(), "btc", "btc-open", &[]).await, 0);
+        assert_eq!(rows_for(&p, T).await, 1);
+    }
+
+    /// A token a real row also claims is the live sweep's, however the simulated
+    /// row reads; the sweep books nothing and closes nothing.
+    #[tokio::test]
+    async fn a_token_a_real_row_claims_is_left_to_the_live_sweep() {
+        let p = pool().await;
+        const T: &str = "b65-real-too#yes";
+        squadron_ghost_row(&p, "btc-open", "GboostStrategy", T, "YES", "0.40", "5", None).await;
+        sqlx::query(
+            "INSERT INTO open_positions (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, squadron_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)")
+            .bind(Utc::now().to_rfc3339()).bind("test-session").bind("FairValueStrategy").bind(T)
+            .bind("Bitcoin price at 10pm EDT?").bind("YES").bind("0.41").bind("5").bind("btc-open")
+            .execute(&p).await.unwrap();
+        let venue = ResolvingVenue(HashMap::from([(T.to_string(), TokenResolution::Resolved(dec!(1)))]));
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(PositionMap::new()));
+
+        assert_eq!(settle_closed_ghost_holds(&venue, &map, &p, &btc_scope(), "btc", "btc-open", &[]).await, 0);
+        assert_eq!(rows_for(&p, T).await, 2, "both rows untouched");
+        assert!(settlement_rows(&p, T).await.is_empty());
+    }
 
     const YES: &str = "yes-token";
     const NO: &str = "no-token";

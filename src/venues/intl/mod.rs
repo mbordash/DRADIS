@@ -124,11 +124,23 @@ fn matched_shares(side: Side, making: Decimal, taking: Decimal) -> Decimal {
 /// (2026-10-06: 5.0 requested, 5.0684 received). Callers book this figure, so
 /// the lifecycle's naked-leg flatten booked the requested size of a sale.
 ///
-/// When nothing matched immediately the requested size is kept, unchanged from
-/// before: a resting order has not filled yet and reports what it was placed
+/// A resting order (GTC, GTD) that matched nothing keeps the requested size,
+/// unchanged from before: it has not filled yet and reports what it was placed
 /// for, and callers that care treat that case through their own fallbacks.
-fn reported_filled(matched: Decimal, requested: Decimal) -> Decimal {
-    if matched > Decimal::ZERO { matched } else { requested }
+///
+/// An immediate order (FAK, FOK) that matched nothing is gone, so it reports
+/// zero. Echoing the requested size there told the Trade Log's Close Now that
+/// an unfilled fill-or-kill had sold the whole position, and the row was closed
+/// while the shares were still held ([B73], 2026-10-26). The shared lifecycle's
+/// flatten books nothing on a zero and keeps the leg for the next reconcile
+/// (`flatten_booking`); its re-hedge falls through to the flatten instead of
+/// guarding a leg that was never bought.
+fn reported_filled(matched: Decimal, requested: Decimal, tif: crate::venues::core::TimeInForce) -> Decimal {
+    use crate::venues::core::TimeInForce as T;
+    match tif {
+        T::Fak | T::Fok => matched,
+        T::Gtc | T::Gtd => if matched > Decimal::ZERO { matched } else { requested },
+    }
 }
 
 /// Polymarket's taker fee for a matched order, in USDC.
@@ -355,7 +367,7 @@ impl Execution for IntlClobVenue {
         Ok(Fill {
             order_id: OrderId(order_id),
             market: intent.market,
-            filled: reported_filled(matched_shares, intent.quantity),
+            filled: reported_filled(matched_shares, intent.quantity, intent.tif),
             price: fill_price, fee
         })
     }
@@ -591,6 +603,15 @@ impl Execution for IntlClobVenue {
         Ok(Some(pts))
     }
 
+    /// The CLOB's neg-risk flag for the token, which selects the exchange an
+    /// order is signed for: the same lookup every automated order path does.
+    async fn neg_risk(&self, leg: &MarketId) -> Result<bool> {
+        let token = u256_from_market_id(leg)?;
+        let r = self.trading_client().neg_risk(token).await
+            .map_err(|e| anyhow::anyhow!("neg_risk lookup for {}: {e}", leg.as_str()))?;
+        Ok(r.neg_risk)
+    }
+
     /// Gamma's final price for the leg, through the same reader the settlement
     /// sweep trusts: `Unknown` while UMA is pending or the price is indecisive.
     async fn resolution(&self, leg: &MarketId) -> Result<crate::venues::core::TokenResolution> {
@@ -705,7 +726,7 @@ mod tests {
 #[cfg(test)]
 mod reported_fill_tests {
     use super::{matched_shares, reported_filled};
-    use crate::venues::core::Side;
+    use crate::venues::core::{Side, TimeInForce};
     use rust_decimal_macros::dec;
 
     /// 2026-10-06: a BUY requested at 5.0 shares received 5.0684, because a
@@ -716,14 +737,14 @@ mod reported_fill_tests {
         // BUY orientation: making = USDC paid, taking = shares received.
         let m = matched_shares(Side::Buy, dec!(3.65), dec!(5.0684));
         assert_eq!(m, dec!(5.0684));
-        assert_eq!(reported_filled(m, dec!(5.0)), dec!(5.0684));
+        assert_eq!(reported_filled(m, dec!(5.0), TimeInForce::Fak), dec!(5.0684));
     }
 
     /// A request of 6.3796 is signed for whole shares, so 6 trade.
     #[test]
     fn a_whole_share_buy_reports_six_not_the_fraction_requested() {
         let m = matched_shares(Side::Buy, dec!(3.42), dec!(6));
-        assert_eq!(reported_filled(m, dec!(6.3796)), dec!(6));
+        assert_eq!(reported_filled(m, dec!(6.3796), TimeInForce::Fak), dec!(6));
     }
 
     /// SELL orientation: making = shares given up. A stop that sold 5.06 of a
@@ -731,16 +752,28 @@ mod reported_fill_tests {
     #[test]
     fn a_sell_reports_the_shares_given_up() {
         let m = matched_shares(Side::Sell, dec!(5.06), dec!(3.0866));
-        assert_eq!(reported_filled(m, dec!(5.0684)), dec!(5.06));
+        assert_eq!(reported_filled(m, dec!(5.0684), TimeInForce::Fak), dec!(5.06));
     }
 
-    /// Nothing matched: the requested size is kept, exactly as before, so a
-    /// resting order and callers' own fallbacks behave unchanged.
+    /// Nothing matched on a RESTING order: the requested size is kept, exactly
+    /// as before, so a GTC/GTD placement and callers' own fallbacks behave
+    /// unchanged.
     #[test]
-    fn an_unmatched_order_keeps_the_requested_size() {
+    fn an_unmatched_resting_order_keeps_the_requested_size() {
         let m = matched_shares(Side::Buy, dec!(0), dec!(0));
         assert_eq!(m, dec!(0));
-        assert_eq!(reported_filled(m, dec!(5.0)), dec!(5.0));
+        assert_eq!(reported_filled(m, dec!(5.0), TimeInForce::Gtc), dec!(5.0));
+        assert_eq!(reported_filled(m, dec!(5.0), TimeInForce::Gtd), dec!(5.0));
         assert_eq!(matched_shares(Side::Sell, dec!(5), dec!(0)), dec!(0), "half a pair is not a match");
+    }
+
+    /// Nothing matched on an IMMEDIATE order: it is gone, so it reports zero.
+    /// Echoing the requested size here booked an unfilled fill-or-kill as a
+    /// full close of a position still held ([B73]).
+    #[test]
+    fn an_unmatched_immediate_order_reports_zero() {
+        let m = matched_shares(Side::Sell, dec!(0), dec!(0));
+        assert_eq!(reported_filled(m, dec!(5.0), TimeInForce::Fak), dec!(0));
+        assert_eq!(reported_filled(m, dec!(5.0), TimeInForce::Fok), dec!(0));
     }
 }

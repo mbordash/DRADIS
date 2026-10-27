@@ -1121,24 +1121,20 @@ impl UsRetailVenue {
     }
 }
 
-/// Resolve a venue-acknowledged fill quantity, honoring resting semantics.
+/// Resolve a venue-acknowledged fill quantity: what the ack says, never more.
 ///
 /// Resting (`Gtc`/`Gtd`) orders report their **real** filled amount (0 = still
 /// resting on the book) so the US lifecycle reconciler confirms the actual fill
-/// later from the positions endpoint — never fabricating one. Immediate
-/// (`Fak`/`Fok`) acks that report 0 fall back to the requested size, since a
-/// success on an immediate order means it took liquidity.
-fn resolve_filled(filled_quantity: u64, intent: &OrderIntent) -> Decimal {
-    match intent.tif {
-        TimeInForce::Gtc | TimeInForce::Gtd => Decimal::from(filled_quantity),
-        TimeInForce::Fak | TimeInForce::Fok => {
-            if filled_quantity > 0 {
-                Decimal::from(filled_quantity)
-            } else {
-                intent.quantity
-            }
-        }
-    }
+/// later from the positions endpoint, never fabricating one. Immediate
+/// (`Fak`/`Fok`) acks report the same figure: an ack of zero used to fall back
+/// to the requested size on the argument that a 2xx on an immediate order means
+/// it took liquidity, which is not true of a fill-or-kill that was killed, and
+/// is exactly what booked an unfilled Close Now as a full exit ([B73]). If the
+/// gateway ever acks a filled immediate order with a zero quantity, the trader
+/// books nothing and the reconciler adopts the position from the venue, which
+/// is the honest direction (`#[B43]`).
+fn resolve_filled(filled_quantity: u64, _intent: &OrderIntent) -> Decimal {
+    Decimal::from(filled_quantity)
 }
 
 #[cfg(test)]
@@ -1386,8 +1382,10 @@ mod tests {
         assert_eq!(resolve_filled(0, &intent(TimeInForce::Gtd)), dec!(0));
         // Resting partial fill is reported as-is.
         assert_eq!(resolve_filled(40, &intent(TimeInForce::Gtc)), dec!(40));
-        // Immediate (FAK/FOK) acks reporting 0 fall back to requested size.
-        assert_eq!(resolve_filled(0, &intent(TimeInForce::Fok)), dec!(100));
+        // Immediate (FAK/FOK) acks report what the venue says, zero included:
+        // a killed fill-or-kill sold nothing, whatever size it asked for [B73].
+        assert_eq!(resolve_filled(0, &intent(TimeInForce::Fok)), dec!(0));
+        assert_eq!(resolve_filled(0, &intent(TimeInForce::Fak)), dec!(0));
         assert_eq!(resolve_filled(25, &intent(TimeInForce::Fak)), dec!(25));
     }
 }

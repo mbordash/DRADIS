@@ -341,17 +341,15 @@ async fn detect_condition_collateral<P: Provider + Clone>(
     PUSD_COLLATERAL
 }
 
-/// Remove all positions for a market that has expired or is expiring within 60s.
+/// Remove all positions for a market that has expired or is expiring within 60s
+/// from the map. Their rows stay: a real one for the chain reconciler, a
+/// simulated one for the closed-hold sweep [B65].
 pub async fn cleanup_expired_positions(
     positions: Arc<Mutex<PositionMap>>,
     market_name: String,
     yes_token: MarketId,
     no_token: MarketId,
     close_time: Option<DateTime<Utc>>,
-    // Asset shard whose `open_positions` rows belong to this market, so a dropped
-    // SIMULATED position can have its row closed too. See below for why only
-    // ghost rows are touched here.
-    asset: &str,
 ) {
     crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::Cleanup);
     let mut pos_map = positions.lock().await;
@@ -366,34 +364,16 @@ pub async fn cleanup_expired_positions(
         let is_expiring_soon = (ct - now).num_seconds() < 60;
 
         if is_expired || is_expiring_soon {
-            // Simulated positions being dropped need their DB row closed HERE,
-            // because nothing else will ever close it.
-            //
-            // A real position's row is reconciled against the chain and swept by
-            // `purge_stale_open_positions`. A ghost row is excluded from both by
-            // design (the chain has no opinion about a simulation), so dropping it
-            // from the map without closing the row leaks it permanently: it stays
-            // open, keeps contributing to portfolio value at its last mark, and
-            // survives the market resolving worthless. One leak per rotation that
-            // ends with a ghost position still held, which is ordinary ghost
-            // operation, not an edge case.
-            let expiring_ghosts: Vec<String> = pos_map
-                .iter()
-                .filter(|(k, _)| k.market == yes_market || k.market == no_market)
-                .filter_map(|(k, p)| p.fill_confirmed_at.map(|_| k.market.to_string()))
-                .collect();
-
+            // A simulated position dropped here KEEPS its `open_positions` row:
+            // the row is what the closed-hold sweep books from once Gamma states
+            // the result (`ghost_settlement::settle_closed_ghost_holds`, run by
+            // the lifecycle task) [B65]. Until 1.5.4 this deleted the row, so a
+            // ghost hold through an hourly close vanished with no trade and no
+            // P&L. A real position's row is reconciled against the chain and
+            // swept by `purge_stale_open_positions`, as before.
             let before = pos_map.len();
             pos_map.retain(|k, _| k.market != yes_market && k.market != no_market);
             let removed = before - pos_map.len();
-
-            if !expiring_ghosts.is_empty() {
-                if let Some(pool) = crate::helpers::db::pool_for(asset) {
-                    for token in &expiring_ghosts {
-                        crate::helpers::db::close_ghost_open_position(&pool, token).await;
-                    }
-                }
-            }
 
             if removed > 0 {
                 warn!(" Cleaned up {} position(s) for market \"{}\" (expires {})",

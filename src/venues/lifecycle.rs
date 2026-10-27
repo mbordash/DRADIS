@@ -144,6 +144,11 @@ pub struct OrderLifecycle {
     /// Squadron whose positions this engine reconciles. See `new`.
     squadron_id: String,
     tracked: Mutex<Vec<TrackedLeg>>,
+    /// Legs whose last flatten the venue reported killed. A killed report can be
+    /// wrong (Kalshi answers zero when the acknowledgment carries no count it
+    /// recognizes; an intl order accepted into delayed matching reports zero),
+    /// so such a leg is sold again only while the venue still shows it held.
+    killed_flattens: Mutex<HashSet<String>>,
 }
 
 impl OrderLifecycle {
@@ -152,7 +157,7 @@ impl OrderLifecycle {
     /// clearing a guard reaches the position belonging to THIS squadron rather
     /// than another squadron's position on the same token.
     pub fn new(cfg: LifecycleConfig, squadron_id: impl Into<String>) -> Self {
-        Self { cfg, squadron_id: squadron_id.into(), tracked: Mutex::new(Vec::new()) }
+        Self { cfg, squadron_id: squadron_id.into(), tracked: Mutex::new(Vec::new()), killed_flattens: Mutex::new(HashSet::new()) }
     }
 
     /// Register a freshly placed order so the reconciler manages its lifecycle.
@@ -274,6 +279,32 @@ impl OrderLifecycle {
                 })
                 .collect()
         };
+        // A leg whose last flatten the venue reported killed, and which the venue
+        // no longer shows: the first sale was real. It is not an orphan any more
+        // (the list above needs the venue to show the leg), so it would never be
+        // sold again, but its guard would sit in the map as a fill-confirmed entry
+        // for shares that no longer exist, blocking re-entry and open to a later
+        // map-driven settlement. The guard goes with nothing booked; the
+        // account-level sweep books what the venue shows. The set is read before
+        // the map is locked, so the two locks never nest.
+        let sold_after_kill: Vec<(String, MarketId)> = {
+            let killed = self.killed_flattens.lock().await.clone();
+            if killed.is_empty() {
+                Vec::new()
+            } else {
+                let map = positions.lock().await;
+                map.iter()
+                    .filter(|(k, _)| k.squadron == self.squadron_id && killed.contains(k.market.as_str()))
+                    .filter(|(k, _)| held.get(k.market.as_str()).copied().unwrap_or_default() <= Decimal::ZERO)
+                    .map(|(k, _)| (k.strategy.clone(), k.market.clone()))
+                    .collect()
+            }
+        };
+        for (strategy, token) in sold_after_kill {
+            warn!("[{strategy}] {token}: the venue no longer shows the leg after a flatten it reported killed — the sale was real; clearing the guard without a second sell");
+            self.killed_flattens.lock().await.remove(token.as_str());
+            clear_guard(positions, &self.squadron_id, &strategy, &token).await;
+        }
         let mut flattened: Vec<FlattenedLeg> = Vec::new();
         for (strategy, token, shares, market_name, avg_entry, partner) in orphans {
             warn!("️ [{strategy}] naked leg: {token} filled but partner neither filled nor resting — attempting re-hedge");
@@ -348,15 +379,20 @@ impl OrderLifecycle {
                 fee_bps: 0,
             };
             match venue.place_order(intent).await {
-                Ok(f)  => {
+                Ok(f) => {
                     // Record the ACTUAL fill price/qty from the venue, not the
                     // flatten *limit*. Booking the 0.01 limit overstated losses:
                     // e.g. Jun 19 trade id 50 booked −$2.94 at exit 0.01 when the
-                    // FAK sell actually crossed near the prevailing bid. Fall back
-                    // to the configured limit / intended shares only if the venue
-                    // doesn't report them.
-                    let exit_price  = if f.price  > dec!(0) { f.price }  else { self.cfg.flatten_sell_limit };
-                    let exit_shares = if f.filled > dec!(0) { f.filled } else { shares };
+                    // FAK sell actually crossed near the prevailing bid. Every
+                    // venue reports an unfilled immediate order as zero filled
+                    // ([B73]), so a killed sell books nothing: the leg is still
+                    // held, stays in the map, and is tried again next reconcile.
+                    let Some((exit_shares, exit_price)) = flatten_booking(f.filled, f.price, self.cfg.flatten_sell_limit) else {
+                        warn!("[{strategy}] flatten of {token} killed unfilled (order {}) — {shares} shares still held, will retry next reconcile while the venue shows them", f.order_id);
+                        self.killed_flattens.lock().await.insert(token.as_str().to_string());
+                        continue;
+                    };
+                    self.killed_flattens.lock().await.remove(token.as_str());
                     info!("️ [{strategy}] flattened naked leg {token} (order {}) — {exit_shares} @ {exit_price:.4}", f.order_id);
                     flattened.push(FlattenedLeg {
                         strategy: strategy.clone(),
@@ -448,6 +484,22 @@ async fn clear_guard(positions: &Arc<Mutex<PositionMap>>, squadron: &str, strate
     positions.lock().await.remove(&PositionKey::new(squadron, strategy, token.clone()));
 }
 
+/// What a flatten order's acknowledgment books: `(shares, price)`, or `None`
+/// when the venue reports nothing filled.
+///
+/// Before B73 the intl and US venues echoed the requested size for an unfilled
+/// immediate order, so this path could not tell a kill from a fill and booked
+/// the intended shares either way; a killed flatten then closed the row while
+/// the leg stayed at the venue. Every venue now reports the honest count, so
+/// zero means the leg is still held and nothing is booked. A fill with no
+/// reported price books at the limit sent, as before.
+fn flatten_booking(filled: Decimal, price: Decimal, limit_sent: Decimal) -> Option<(Decimal, Decimal)> {
+    if filled <= Decimal::ZERO {
+        return None;
+    }
+    Some((filled, if price > Decimal::ZERO { price } else { limit_sent }))
+}
+
 /// Naked-leg re-hedge economics (mirrors intl's ARB ARBITER, `balance.rs`).
 ///
 /// Buying the missing partner at `ask + 1 tick` completes the pair, which pays
@@ -490,6 +542,16 @@ mod tests {
     fn rehedge_rejected_on_degenerate_ask() {
         assert_eq!(rehedge_limit_if_viable(Decimal::ZERO, dec!(0.40), BUF), None);
         assert_eq!(rehedge_limit_if_viable(dec!(-0.05), dec!(0.40), BUF), None);
+    }
+
+    /// A flatten the venue killed unfilled books nothing; a fill books the
+    /// venue's count and price, falling back to the limit sent only for the price.
+    #[test]
+    fn a_killed_flatten_books_nothing_and_a_fill_books_the_venue_figures() {
+        assert_eq!(flatten_booking(Decimal::ZERO, Decimal::ZERO, dec!(0.01)), None);
+        assert_eq!(flatten_booking(Decimal::ZERO, dec!(0.37), dec!(0.01)), None, "a price with no fill is not a sale");
+        assert_eq!(flatten_booking(dec!(5), dec!(0.37), dec!(0.01)), Some((dec!(5), dec!(0.37))));
+        assert_eq!(flatten_booking(dec!(3), Decimal::ZERO, dec!(0.01)), Some((dec!(3), dec!(0.01))), "no reported price books the limit sent");
     }
 }
 
