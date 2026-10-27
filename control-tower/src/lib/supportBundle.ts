@@ -32,13 +32,15 @@
  * venue, edition, which integrations are configured, never their values), the
  * session status (raptor feed health, dark market feeds), the squadrons, the
  * Viper status registry with its refusal ledger, the DynamicConfig (risk knobs;
- * it carries no credentials by construction) and the engine's log ring. Nothing
+ * it carries no credentials by construction) as the instance-wide row and as
+ * each squadron's own row, and the engine's log ring. Nothing
  * reads a credential, a wallet, or a key. Each section degrades to a one-line
  * note when its endpoint is unavailable, so a half-configured or unauthenticated
  * instance still produces a useful file.
  */
 
-import { getConfig, getLogs, getSquadrons, getStatus, getVipersStatus, type ViperStatusRow } from './api';
+import { getConfig, getLogs, getSquadronConfig, getSquadrons, getStatus, getVipersStatus, type ViperStatusRow } from './api';
+import type { DynamicConfig, SquadronSummary } from './types';
 import { getSetupStatus } from './setupApi';
 
 /** Log lines to include: the engine's whole ring buffer. */
@@ -97,6 +99,59 @@ async function allViperRows(): Promise<ViperStatusRow[]> {
   return [...seen.values()].sort((x, y) => x.asset.localeCompare(y.asset) || x.strategy.localeCompare(y.strategy));
 }
 
+/** A config key that switches a Viper or a mode on or off. */
+function isSwitch(key: string): boolean {
+  return /^enable_/.test(key) || /_enabled$/.test(key) || key === 'ghost_mode';
+}
+
+type SquadronConfigRow = { squadron: SquadronSummary; config: DynamicConfig | null; error?: string };
+
+/**
+ * Every squadron's own config row beside the instance-wide one.
+ *
+ * The third support request (2026-10-27) carried a bundle whose Viper status
+ * said eight Vipers were "disabled in config" while its config section showed
+ * every `enable_*` flag true. Both were right: the status came from the
+ * squadron's row, the config section printed only the instance-wide row, and a
+ * squadron's row is what its loop reads. Printing the squadron rows ends that
+ * contradiction: every on/off switch with its effective value, then whatever
+ * else the squadron overrides, so a reader sees at once which Vipers can trade.
+ */
+async function squadronConfigs(): Promise<{ global: DynamicConfig; rows: SquadronConfigRow[] }> {
+  const [global, squadrons] = await Promise.all([getConfig(), getSquadrons()]);
+  const rows = await Promise.all(squadrons.map(async squadron => {
+    try {
+      return { squadron, config: await getSquadronConfig(squadron.id) };
+    } catch (e) {
+      return { squadron, config: null, error: e instanceof Error ? e.message : String(e) };
+    }
+  }));
+  return { global, rows };
+}
+
+function renderSquadronConfigs({ global, rows }: { global: DynamicConfig; rows: SquadronConfigRow[] }): string {
+  if (rows.length === 0) return 'no squadrons deployed';
+  const g = global as unknown as Record<string, unknown>;
+  return rows.map(({ squadron, config, error }) => {
+    const head = `${squadron.id} (${squadron.asset ?? '-'}, ${squadron.state})`;
+    if (!config) return `${head}
+  unavailable: ${error ?? 'no config row'}`;
+    const c = config as unknown as Record<string, unknown>;
+    const keys = Object.keys(c).sort();
+    const switches = keys.filter(isSwitch).map(k => `  ${k}: ${JSON.stringify(c[k])}`);
+    const overrides = keys
+      .filter(k => !isSwitch(k) && JSON.stringify(c[k]) !== JSON.stringify(g[k]))
+      .map(k => `  ${k}: ${JSON.stringify(c[k])} (instance-wide: ${JSON.stringify(g[k])})`);
+    return [
+      head,
+      '  switches (what this squadron\'s loop reads):',
+      ...(switches.length ? switches : ['  (none)']),
+      '  other differences from the instance-wide row:',
+      ...(overrides.length ? overrides : ['  none']),
+    ].join('\n');
+  }).join('\n');
+}
+
 export interface SupportBundle {
   filename: string;
   text: string;
@@ -112,7 +167,7 @@ export async function buildSupportBundle(now = new Date()): Promise<SupportBundl
     `llm_provider:     ${s.llm_provider || 'none'} (enabled: ${s.llm_enabled ?? 'n/a'}, ready: ${s.llm_provider_ready ?? 'n/a'})`,
   ].join('\n'));
 
-  const [status, squadrons, vipers, config, logs] = await Promise.all([
+  const [status, squadrons, vipers, config, squadronConfig, logs] = await Promise.all([
     section('Session', getStatus, s => {
       const raptors = s.raptors
         ? Object.entries(s.raptors).map(([asset, h]) => `  ${asset}: ${JSON.stringify(h)}`).join('\n')
@@ -131,7 +186,8 @@ export async function buildSupportBundle(now = new Date()): Promise<SupportBundl
       ? 'none deployed'
       : rows.map(s => `${s.id.padEnd(16)} ${(s.asset ?? '-').padEnd(8)} ${s.state.padEnd(11)} ${s.market_class ?? '-'} | ${s.market_name ?? '-'}${s.maker_market_name ? ` | maker: ${s.maker_market_name}` : ''}`).join('\n')),
     section('Viper status (holding reasons and refusal ledger)', allViperRows, renderVipers),
-    section('Dynamic config (risk knobs, no credentials)', getConfig, c => JSON.stringify(c, null, 2)),
+    section('Dynamic config, instance-wide row (risk knobs, no credentials)', getConfig, c => JSON.stringify(c, null, 2)),
+    section('Squadron config (each squadron\'s own row: every switch, then its other differences)', squadronConfigs, renderSquadronConfigs),
     section(`Engine log (last ${LOG_TAIL} lines of the ring buffer)`, () => getLogs(LOG_TAIL), l => l.lines.join('\n')),
   ]);
 
@@ -139,11 +195,11 @@ export async function buildSupportBundle(now = new Date()): Promise<SupportBundl
     'DRADIS support bundle',
     `generated_at: ${now.toISOString()}`,
     `control_tower: ${typeof navigator !== 'undefined' ? navigator.userAgent : 'n/a'}`,
-    'contents: instance, session, squadrons, viper status, dynamic config, engine log. No credentials.',
+    'contents: instance, session, squadrons, viper status, instance-wide config, each squadron\'s config, engine log. No credentials.',
     'send to: the support form at https://dradis.live or a reply to your support thread.',
   ].join('\n');
 
-  const sections = [setup, status, squadrons, vipers, config, logs];
+  const sections = [setup, status, squadrons, vipers, config, squadronConfig, logs];
   const text = header + sections.map(s => rule(s.title) + s.body + '\n').join('');
 
   const version = /app_version:\s+(\S+)/.exec(setup.body)?.[1] ?? 'unknown';

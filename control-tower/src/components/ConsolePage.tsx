@@ -139,7 +139,7 @@ export default function ConsolePage() {
             className={pill(false)}
             onClick={downloadBundle}
             disabled={bundle === 'building'}
-            title="Save one text file with the version, venue, squadrons, every Viper's holding reason, the risk knobs and this log, to attach to a support request. No credentials."
+            title="Save one text file with the version, venue, squadrons, every Viper's holding reason, the risk knobs (instance-wide and per squadron) and this log, to attach to a support request. No credentials."
           >
             {bundle === 'building' ? '… Building bundle' : bundle === 'saved' ? '✓ Bundle saved' : bundle === 'failed' ? '✗ Bundle failed' : '⬇ Support bundle'}
           </button>
