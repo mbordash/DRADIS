@@ -343,8 +343,17 @@ ssh_try_file() {
 
 # ── 4. Upload clean source + provision ───────────────────────────────────────
 echo "Uploading source (git archive HEAD)…"
-git archive --format=tar.gz HEAD \
-    | "${SSH[@]}" "mkdir -p /tmp/dradis-src && tar xz -C /tmp/dradis-src"
+# From a local file, not a pipe, so a dropped connection can be retried from the
+# start, and verified before anything runs on it: on 2026-10-27 two builds in a
+# row lost the connection during this upload, the pipeline's failure went
+# unnoticed, and the detached provision then failed with "provision.sh: No such
+# file or directory" after the builder had been paid for.
+SRC_TGZ="$(mktemp)"
+git archive --format=tar.gz HEAD > "$SRC_TGZ"
+ssh_try_file "$SRC_TGZ" "rm -rf /tmp/dradis-src && mkdir -p /tmp/dradis-src && tar xz -C /tmp/dradis-src" || exit 1
+rm -f "$SRC_TGZ"
+ssh_try "test -f /tmp/dradis-src/deploy/ami/provision.sh" \
+    || { echo "❌ The source tree did not arrive on the builder (provision.sh missing after the upload)."; exit 1; }
 
 # A three-venue build runs for the better part of an hour with long silent
 # stretches. Holding one SSH session open for all of it is fragile — any NAT
