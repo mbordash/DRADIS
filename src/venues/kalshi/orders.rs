@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use rust_decimal::Decimal;
 
 use crate::venues::core::{
-    Execution, Fill, MarketFacts, MarketId, OpenOrder, OrderId, OrderIntent, Position, Side,
+    Execution, Fill, MarketFacts, MarketId, OpenOrder, OrderId, OrderIntent, OrderState, Position, Side,
     TimeInForce,
 };
 
@@ -365,11 +365,25 @@ impl Execution for KalshiVenue {
     }
 
     async fn open_orders(&self) -> Result<Vec<OpenOrder>> {
-        let resp: types::OrdersResponse = self
-            .get_json("/portfolio/orders?status=resting&limit=200")
-            .await?;
+        // Every page, not the first alone: the lifecycle reads a tracked
+        // order's absence from this list as "no longer working" (then asks the
+        // order itself), so a quote on a later page must not look gone [B74].
+        let mut orders = Vec::new();
+        let mut cursor = String::new();
+        for _page in 0..LOOKUP_MAX_PAGES {
+            let path = if cursor.is_empty() {
+                "/portfolio/orders?status=resting&limit=200".to_string()
+            } else {
+                format!("/portfolio/orders?status=resting&limit=200&cursor={cursor}")
+            };
+            let resp: types::OrdersResponse = self.get_json(&path).await?;
+            let more = !resp.cursor.is_empty() && !resp.orders.is_empty();
+            cursor = resp.cursor;
+            orders.extend(resp.orders);
+            if !more { break; }
+        }
         let mut out = Vec::new();
-        for o in resp.orders {
+        for o in orders {
             self.order_tickers.insert(o.order_id.clone(), o.ticker.clone());
             let total = o.requested_count().unwrap_or_default();
             let filled = o.filled_count().unwrap_or_default();
@@ -393,6 +407,19 @@ impl Execution for KalshiVenue {
             });
         }
         Ok(out)
+    }
+
+    async fn order_state(&self, id: &OrderId) -> Result<Option<OrderState>> {
+        // `GET /portfolio/orders/{id}` answers for a resting, executed or
+        // cancelled order alike, wrapped as `{"order": {...}}`. Only what Kalshi
+        // states is returned: the fill count it writes (a cancelled order has
+        // nothing remaining, so `requested − remaining` would call it filled)
+        // and its own status word [B74]. Whether this read is routed to an
+        // exchange shard like a cancel is, and whether it carries a stated fill
+        // count, is to be confirmed on the live account; a failed or empty
+        // answer leaves the lifecycle waiting, never guessing.
+        let resp: types::OrderResponse = self.get_json(&format!("/portfolio/orders/{}", id.0)).await?;
+        Ok(Some(OrderState { filled: resp.order.explicit_fill_count(), resting: resp.order.is_resting() }))
     }
 
     fn subscribe_fills(&self) -> Option<crate::venues::core::FillStream> {

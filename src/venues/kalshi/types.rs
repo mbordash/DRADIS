@@ -492,6 +492,8 @@ pub struct KalshiOrder {
     /// absent from the resting-orders listing.
     #[serde(default)]
     pub fill_count: String,
+    #[serde(default)]
+    pub fill_count_fp: String,
     /// Volume-weighted fill price **in YES-book terms**, regardless of which leg
     /// the intent named — a NO buy at $0.33 reports `0.6700`.
     #[serde(default)]
@@ -522,11 +524,32 @@ impl KalshiOrder {
     /// only when both of those are present. Returns `None` when the shape is
     /// unrecognized — callers must treat that as "unknown", never as "filled".
     pub fn filled_count(&self) -> Option<Decimal> {
-        if let Some(f) = fp(&self.fill_count) {
-            return Some(f.max(Decimal::ZERO));
+        if let Some(f) = self.explicit_fill_count() {
+            return Some(f);
         }
         match (self.requested_count(), self.remaining()) {
             (Some(total), Some(rem)) => Some((total - rem).max(Decimal::ZERO)),
+            _ => None,
+        }
+    }
+
+    /// The fill count Kalshi STATED (`fill_count_fp`, else `fill_count`), and
+    /// nothing derived. `requested − remaining` is a fill only while the order
+    /// rests: a cancelled or expired order reports nothing remaining, so the
+    /// derivation would call an unfilled quote fully filled [B74]. The lifecycle
+    /// reads a single order by id through this, and treats `None` as "the
+    /// venue did not say".
+    pub fn explicit_fill_count(&self) -> Option<Decimal> {
+        fp(&self.fill_count_fp).or_else(|| fp(&self.fill_count)).map(|f| f.max(Decimal::ZERO))
+    }
+
+    /// Does the order still work on the book, by Kalshi's own status word?
+    /// `None` for a status this code does not know, so the lifecycle treats it
+    /// as unanswered rather than guessing either way [B74].
+    pub fn is_resting(&self) -> Option<bool> {
+        match self.status.as_str() {
+            "resting" | "pending" => Some(true),
+            "executed" | "canceled" | "cancelled" | "expired" => Some(false),
             _ => None,
         }
     }
@@ -548,6 +571,32 @@ impl KalshiOrder {
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+
+    /// [B74] A cancelled or expired order reports nothing remaining. The derived
+    /// `requested − remaining` would read that as fully filled; the stated fill
+    /// count is the only figure the lifecycle may trust for a single order.
+    #[test]
+    fn a_cancelled_order_without_a_stated_fill_count_states_nothing() {
+        let cancelled: KalshiOrder = serde_json::from_str(r#"{"order_id":"01a1","ticker":"KXBTCD-26OCT2917-T80499.99",
+            "side":"yes","status":"canceled","count_fp":"26.67","remaining_count_fp":"0.00","price_dollars":"0.3000"}"#).unwrap();
+        assert_eq!(cancelled.explicit_fill_count(), None, "nothing stated: the lifecycle must not infer a fill");
+        assert_eq!(cancelled.is_resting(), Some(false));
+        assert_eq!(cancelled.filled_count(), Some(dec!(26.67)), "the derived count is what the old accessor says, which is why order_fill does not use it");
+
+        let executed: KalshiOrder = serde_json::from_str(r#"{"order_id":"01a2","status":"executed","count_fp":"26.67",
+            "remaining_count_fp":"0.00","fill_count_fp":"26.67"}"#).unwrap();
+        assert_eq!(executed.explicit_fill_count(), Some(dec!(26.67)));
+        assert_eq!(executed.is_resting(), Some(false));
+        let resting: KalshiOrder = serde_json::from_str(r#"{"order_id":"01a4","status":"resting","count_fp":"26.67","remaining_count_fp":"26.67","fill_count_fp":"0.00"}"#).unwrap();
+        assert_eq!(resting.is_resting(), Some(true));
+        assert_eq!(resting.explicit_fill_count(), Some(Decimal::ZERO));
+        let odd: KalshiOrder = serde_json::from_str(r#"{"order_id":"01a5","status":"something_new"}"#).unwrap();
+        assert_eq!(odd.is_resting(), None, "an unknown status is not a guess either way");
+
+        let partial: KalshiOrder = serde_json::from_str(r#"{"order_id":"01a3","status":"canceled","count":"26.67",
+            "remaining_count":"0.00","fill_count":"10.00"}"#).unwrap();
+        assert_eq!(partial.explicit_fill_count(), Some(dec!(10)), "the bare spelling counts too");
+    }
 
     /// The balance Kalshi reports is the sum over every exchange shard, so the
     /// pools must come from the breakdown, with the shards Kalshi opens markets

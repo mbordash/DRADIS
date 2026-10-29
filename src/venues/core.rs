@@ -439,6 +439,17 @@ pub struct AllocationTarget {
 /// legs — uniformly across venues. Intl sources it from the CLOB user feed /
 /// open-orders query; US from `/v1/trading/orders`. The manager never learns
 /// which scheme produced it.
+/// What a venue states about one of this engine's own orders when asked by id.
+/// Every field is what the venue SAID; nothing here is derived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrderState {
+    /// Contracts traded so far, when the venue states a count.
+    pub filled: Option<Decimal>,
+    /// Whether the order still works on the book: `Some(false)` once executed,
+    /// cancelled or expired, `None` when the venue's status is not understood.
+    pub resting: Option<bool>,
+}
+
 #[derive(Clone, Debug)]
 pub struct OpenOrder {
     pub order_id: OrderId,
@@ -572,6 +583,18 @@ pub trait Execution: Send + Sync {
     /// sweep, because it reports success.
     async fn open_orders(&self) -> Result<Vec<OpenOrder>> {
         anyhow::bail!("this venue does not implement open_orders()")
+    }
+
+    /// What the venue says about ONE of this engine's own orders, by id, or
+    /// `Ok(None)` when the venue does not report single orders. The lifecycle
+    /// asks after a cancel (did part of the quote trade before the cancel
+    /// landed? did the cancel land at all?) and when a tracked quote is no
+    /// longer among the open orders (filled, expired, pulled by the venue, or
+    /// just not on the page that was read?), because the leg's holdings cannot
+    /// answer either: another viper or squadron may hold the same leg.
+    /// Default: not reported [B74].
+    async fn order_state(&self, _id: &OrderId) -> Result<Option<OrderState>> {
+        Ok(None)
     }
 
     /// Subscribe to the venue's fill-event feed, if it has one.

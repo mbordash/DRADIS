@@ -5228,13 +5228,15 @@ pub fn take_operator_release(strategy: &str, token_id: &str, guard_opened_at: Da
 /// Delete ONE strategy's LIVE `pending` row for `token_id`: its resting order
 /// was cancelled (rotation, stand-down, the viper's pull, an exit on a quote,
 /// or the lifecycle's stale backstop) before it filled, so the row describes an
-/// order that no longer exists. Scoped to the strategy because two vipers can
-/// rest on the same leg; the whole-token form below is the rotation sweep's.
+/// order that no longer exists. Scoped to the squadron and the strategy because
+/// two vipers can rest on the same leg and two squadrons can fly the same daily
+/// maker market; the whole-token form below is the intl rotation sweep's.
 /// Ghost rows have their own path [B74].
-pub async fn close_pending_open_position_for(pool: &SqlitePool, strategy: &str, token_id: &str) {
+pub async fn close_pending_open_position_for(pool: &SqlitePool, squadron_id: &str, strategy: &str, token_id: &str) {
     match sqlx::query(
-        "DELETE FROM open_positions WHERE strategy = ? AND token_id = ? AND status = 'pending' AND ghost_mode = 0"
+        "DELETE FROM open_positions WHERE squadron_id = ? AND strategy = ? AND token_id = ? AND status = 'pending' AND ghost_mode = 0"
     )
+        .bind(squadron_id)
         .bind(strategy)
         .bind(token_id)
         .execute(pool)
@@ -5248,21 +5250,40 @@ pub async fn close_pending_open_position_for(pool: &SqlitePool, strategy: &str, 
     }
 }
 
+/// Mark ONE squadron's live row for a strategy's leg confirmed: the lifecycle
+/// saw the order trade. The unscoped `confirm_position_status` is the dashboard
+/// sync's, which only ever reaches rows the venue's holdings vouch for; a
+/// lifecycle confirmation is for the order's own row and must not promote the
+/// pending quote another squadron rests on the same leg [B74].
+pub async fn confirm_position_status_for(pool: &SqlitePool, squadron_id: &str, strategy: &str, token_id: &str) {
+    note_confirmation(token_id);
+    if let Err(e) = sqlx::query(
+        "UPDATE open_positions SET status = 'confirmed' WHERE squadron_id = ? AND strategy = ? AND token_id = ? AND ghost_mode = 0"
+    )
+    .bind(squadron_id)
+    .bind(strategy)
+    .bind(token_id)
+    .execute(pool)
+    .await {
+        error!("❌ DB confirm_position_status_for failed: {e}");
+    }
+}
+
 /// Size a strategy's row to what the venue's fill feed says traded on its
 /// resting order, and the price it traded at. The row was written at placement
 /// with the size and limit asked for; a quote that is lifted in part holds
 /// fewer contracts than that, and the settlement sweep books from the row's
 /// count. Only an engine-attributed, live row; a wallet-sized or simulated row
 /// is not this engine's fill to resize [B74].
-pub async fn set_open_position_fill(pool: &SqlitePool, strategy: &str, token_id: &str, shares: Decimal, price: Decimal) {
+pub async fn set_open_position_fill(pool: &SqlitePool, squadron_id: &str, strategy: &str, token_id: &str, shares: Decimal, price: Decimal) {
     let sql = if price > Decimal::ZERO {
-        "UPDATE open_positions SET shares = ?, entry_price = ? WHERE strategy = ? AND token_id = ? AND ghost_mode = 0 AND engine_attributed = 1"
+        "UPDATE open_positions SET shares = ?, entry_price = ? WHERE squadron_id = ? AND strategy = ? AND token_id = ? AND ghost_mode = 0 AND engine_attributed = 1"
     } else {
-        "UPDATE open_positions SET shares = ?, entry_price = entry_price WHERE strategy = ? AND token_id = ? AND ghost_mode = 0 AND engine_attributed = 1"
+        "UPDATE open_positions SET shares = ?, entry_price = entry_price WHERE squadron_id = ? AND strategy = ? AND token_id = ? AND ghost_mode = 0 AND engine_attributed = 1"
     };
     let mut q = sqlx::query(sql).bind(shares.to_string());
     if price > Decimal::ZERO { q = q.bind(price.to_string()); }
-    if let Err(e) = q.bind(strategy).bind(token_id).execute(pool).await {
+    if let Err(e) = q.bind(squadron_id).bind(strategy).bind(token_id).execute(pool).await {
         error!("❌ DB set_open_position_fill failed: {e}");
     }
 }
@@ -7245,13 +7266,19 @@ mod reconcile_tests {
         record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", LEG, "Bitcoin price on Oct 29, 2026?", "YES", dec_of("0.28"), dec_of("10"), false, "pending").await;
         record_open_position_with_status(&pool, &scope, "btc-open", "FairValueStrategy", LEG, "Bitcoin price on Oct 29, 2026?", "YES", dec_of("0.31"), dec_of("5"), false, "confirmed").await;
 
-        close_pending_open_position_for(&pool, "MakerStrategy", LEG).await;
+        record_open_position_with_status(&pool, &scope, "eth-open", "MakerStrategy", LEG, "the same daily, another squadron", "YES", dec_of("0.30"), dec_of("8"), false, "pending").await;
 
-        let left: Vec<(String, String)> = sqlx::query_as("SELECT strategy, status FROM open_positions ORDER BY strategy").fetch_all(&pool).await.unwrap();
-        assert_eq!(left, vec![("FairValueStrategy".to_string(), "confirmed".to_string()), ("TimeDecayStrategy".to_string(), "pending".to_string())]);
+        close_pending_open_position_for(&pool, "btc-open", "MakerStrategy", LEG).await;
+
+        let left: Vec<(String, String, String)> = sqlx::query_as("SELECT squadron_id, strategy, status FROM open_positions ORDER BY squadron_id, strategy").fetch_all(&pool).await.unwrap();
+        assert_eq!(left, vec![
+            ("btc-open".to_string(), "FairValueStrategy".to_string(), "confirmed".to_string()),
+            ("btc-open".to_string(), "TimeDecayStrategy".to_string(), "pending".to_string()),
+            ("eth-open".to_string(), "MakerStrategy".to_string(), "pending".to_string()),
+        ], "another squadron's quote on the same leg is not this squadron's to close");
 
         // A confirmed row is a position, not a quote: releasing never touches it.
-        close_pending_open_position_for(&pool, "FairValueStrategy", LEG).await;
+        close_pending_open_position_for(&pool, "btc-open", "FairValueStrategy", LEG).await;
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions WHERE strategy = 'FairValueStrategy'").fetch_one(&pool).await.unwrap();
         assert_eq!(n, 1);
     }
@@ -7267,8 +7294,8 @@ mod reconcile_tests {
         record_open_position_with_status(&pool, &scope, "btc-open", "MakerStrategy", LEG, "m", "YES", dec_of("0.30"), dec_of("26.67"), false, "pending").await;
         record_adopted_position(&pool, &scope, "politics-open", "ChainAdopted", "adopted#yes", "adopted#yes", "YES", dec_of("0.30"), dec_of("26.67")).await;
 
-        set_open_position_fill(&pool, "MakerStrategy", LEG, dec_of("10"), dec_of("0.29")).await;
-        set_open_position_fill(&pool, "ChainAdopted", "adopted#yes", dec_of("1"), dec_of("0.99")).await;
+        set_open_position_fill(&pool, "btc-open", "MakerStrategy", LEG, dec_of("10"), dec_of("0.29")).await;
+        set_open_position_fill(&pool, "politics-open", "ChainAdopted", "adopted#yes", dec_of("1"), dec_of("0.99")).await;
 
         let rows: Vec<(String, String, String)> = sqlx::query_as("SELECT strategy, shares, entry_price FROM open_positions ORDER BY strategy").fetch_all(&pool).await.unwrap();
         assert_eq!(rows[0], ("ChainAdopted".to_string(), "26.67".to_string(), "0.30".to_string()), "a wallet-sized row is left alone");
@@ -7276,10 +7303,17 @@ mod reconcile_tests {
         assert_eq!(dec_of(&rows[1].1), dec_of("10"));
         assert_eq!(dec_of(&rows[1].2), dec_of("0.29"));
 
-        set_open_position_fill(&pool, "MakerStrategy", LEG, dec_of("12"), Decimal::ZERO).await;
+        set_open_position_fill(&pool, "btc-open", "MakerStrategy", LEG, dec_of("12"), Decimal::ZERO).await;
         let (sh, px): (String, String) = sqlx::query_as("SELECT shares, entry_price FROM open_positions WHERE strategy = 'MakerStrategy'").fetch_one(&pool).await.unwrap();
         assert_eq!(dec_of(&sh), dec_of("12"));
         assert_eq!(dec_of(&px), dec_of("0.29"), "no reported price keeps the one on the row");
+
+        // Confirming is squadron-scoped too: another squadron's pending quote
+        // on the same leg stays pending.
+        record_open_position_with_status(&pool, &scope, "eth-open", "MakerStrategy", LEG, "m", "YES", dec_of("0.30"), dec_of("8"), false, "pending").await;
+        confirm_position_status_for(&pool, "btc-open", "MakerStrategy", LEG).await;
+        let st: Vec<(String, String)> = sqlx::query_as("SELECT squadron_id, status FROM open_positions WHERE strategy = 'MakerStrategy' ORDER BY squadron_id").fetch_all(&pool).await.unwrap();
+        assert_eq!(st, vec![("btc-open".to_string(), "confirmed".to_string()), ("eth-open".to_string(), "pending".to_string())]);
     }
 
     /// A database created before the filing columns reached `open_positions`

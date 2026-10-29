@@ -912,6 +912,15 @@ impl Execution for UsRetailVenue {
         Ok(out)
     }
 
+    // `order_state` stays at the trait default (`Ok(None)`): the SDK's
+    // `orders().retrieve` deserializes `/v1/order/{id}` into the create-order
+    // response type, whose `filled_quantity` defaults to zero when the field
+    // is spelled otherwise, and a zero that was never stated would release a
+    // quote that had in fact traded. Until one live call has shown the shape,
+    // the lifecycle treats this venue as not reporting single orders: a
+    // vanished quote waits out the fill-feed grace and is then released for
+    // the account sweep [B74].
+
     async fn cancel(&self, id: OrderId) -> Result<()> {
         let ack = self
             .client

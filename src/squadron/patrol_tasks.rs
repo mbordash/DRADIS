@@ -1174,6 +1174,17 @@ pub fn spawn_lifecycle_task(
                         ).await;
                     }
                     let flattened = lifecycle.reconcile(venue.as_ref(), &positions).await;
+                    // [B74] This venue tracks only paired legs, whose stale
+                    // cancel clears the guard without reporting a release, and
+                    // it has no fill feed; both lists are drained so they
+                    // cannot grow, and a release, should one ever be reported,
+                    // closes its pending row as at rotation.
+                    for q in lifecycle.take_released().await {
+                        if let Some(p) = crate::helpers::db::pool_for(&asset) {
+                            crate::helpers::db::close_pending_open_position_for(&p, lifecycle.squadron_id(), &q.strategy, q.market.as_str()).await;
+                        }
+                    }
+                    lifecycle.take_confirmed().await;
                     for leg in flattened {
                         // Bug #9 hardening: the in-memory position map's avg_entry can be
                         // stale (e.g. adopted/topped-up fills). Cross-check against the DB

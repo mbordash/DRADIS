@@ -49,7 +49,7 @@ use tracing::{info, warn};
 
 use crate::state::{PositionKey, PositionMap};
 use crate::venues::core::{
-    Execution, Fill, FillEvent, MarketId, OpenOrder, OrderId, OrderIntent, Side, TimeInForce,
+    Execution, Fill, FillEvent, MarketId, OpenOrder, OrderId, OrderIntent, OrderState, Side, TimeInForce,
 };
 
 /// Does a venue acknowledgment with nothing filled describe an order that now
@@ -152,6 +152,25 @@ struct TrackedLeg {
     /// A paired arbitrage leg takes the venue's `stale_order_secs`; a lone
     /// quote that is meant to rest takes [`RESTING_QUOTE_STALE_SECS`].
     stale_after_secs: u64,
+    /// A resting quote (tracked unfilled through `track_resting`), as opposed
+    /// to a paired leg that filled at placement. A quote is never confirmed by
+    /// the leg's holdings, which may be another viper's; only by its own order.
+    is_quote: bool,
+    /// First reconcile pass that found this quote missing from the venue's
+    /// open orders with no answer about its fill, or the moment its cancel was
+    /// confirmed with no answer about its fill. See
+    /// [`VANISHED_QUOTE_GRACE_SECS`].
+    missing_since: Option<Instant>,
+    /// The venue confirmed this order cancelled, but could not yet say what
+    /// traded before the cancel. The order is no longer working: it blocks
+    /// neither a new quote nor an exit of what its guard holds, and the
+    /// reconciler asks the venue again until the grace runs out.
+    cancelled: bool,
+    /// When this order was tracked. The guard it was opened for was in the map
+    /// by then; a guard opened later on the same leg belongs to a later order
+    /// (a re-quote after this one was sold or released), and what the venue
+    /// says about THIS order must never size, confirm or release that guard.
+    guard_opened_by: chrono::DateTime<Utc>,
     /// Partner leg's market for a paired (arbitrage) entry — lets the reconciler
     /// detect a naked leg when this one fills but the partner doesn't.
     #[allow(dead_code)]
@@ -172,6 +191,15 @@ struct TrackedLeg {
 /// tick until the account ran out of collateral.
 pub const RESTING_QUOTE_STALE_SECS: u64 = 1800;
 
+/// A tracked quote no longer among the venue's open orders, whose fill the
+/// venue cannot report by id: filled (the fill feed is late), expired (a
+/// good-till-date quote), or pulled by the venue (its market closed). The
+/// lifecycle waits this long for the fill feed, then releases the guard: a fill
+/// that never reported is adopted by the account sweep as a venue holding,
+/// which loses nothing, whereas confirming the guard from the leg's holdings
+/// could claim another viper's contracts and sell them twice.
+pub const VANISHED_QUOTE_GRACE_SECS: u64 = 60;
+
 /// A resting quote the lifecycle released without a fill: cancelled at
 /// rotation or stand-down, pulled by the viper, or cancelled as stale. The
 /// caller closes its `pending` row; the lifecycle has no database access.
@@ -190,6 +218,17 @@ pub struct ConfirmedFill {
     pub market: MarketId,
     pub filled: Decimal,
     pub price: Decimal,
+}
+
+/// What a confirmed cancel left behind, once the venue was asked what traded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CancelOutcome {
+    /// Nothing traded: the guard is gone and the quote reported for its row.
+    Released,
+    /// Part or all traded before the cancel: the guard is a sized position.
+    Traded,
+    /// The venue could not say: the order stays tracked for the reconciler.
+    Unknown,
 }
 
 /// Shared, venue-neutral order lifecycle engine.
@@ -225,6 +264,36 @@ impl OrderLifecycle {
         }
     }
 
+    /// The squadron this engine reconciles for; the loops key their row
+    /// writes by it.
+    pub fn squadron_id(&self) -> &str {
+        &self.squadron_id
+    }
+
+    /// Does this squadron hold anything, counting a guard that is still an
+    /// unfilled quote with a tracked order as nothing? The rotation loops ask
+    /// before leaving a market: a resting bid is cancelled by the rotation
+    /// itself and must not pin the squadron to the market forever [B74]. A
+    /// paired leg (an arbitrage or Time Decay entry) is a holding even before
+    /// the reconciler confirms it, as it always was.
+    pub async fn holds_anything(&self, positions: &Arc<Mutex<PositionMap>>) -> bool {
+        let unconfirmed: Vec<(String, MarketId)> = {
+            let map = positions.lock().await;
+            let mut quotes = Vec::new();
+            for (k, p) in map.iter().filter(|(k, _)| k.squadron == self.squadron_id) {
+                if p.fill_confirmed_at.is_some() { return true; }
+                quotes.push((k.strategy.clone(), k.market.clone()));
+            }
+            quotes
+        };
+        for (strategy, market) in unconfirmed {
+            let is_quote = self.tracked.lock().await.iter()
+                .any(|o| o.strategy == strategy && o.market == market && o.is_quote);
+            if !is_quote { return true; }
+        }
+        false
+    }
+
     /// Register a freshly placed order so the reconciler manages its lifecycle.
     /// No-op for immediate (`Fak`/`Fok`) orders, which fill or kill within their ack.
     pub async fn track(
@@ -234,7 +303,7 @@ impl OrderLifecycle {
         tif: TimeInForce,
         pair_market: Option<MarketId>,
     ) {
-        self.track_with_stale(fill, strategy, tif, pair_market, self.cfg.stale_order_secs).await;
+        self.track_with_stale(fill, strategy, tif, pair_market, self.cfg.stale_order_secs, false).await;
     }
 
     /// Register a resting quote the venue acknowledged UNFILLED (`filled` on
@@ -249,7 +318,7 @@ impl OrderLifecycle {
         tif: TimeInForce,
         pair_market: Option<MarketId>,
     ) {
-        self.track_with_stale(fill, strategy, tif, pair_market, RESTING_QUOTE_STALE_SECS).await;
+        self.track_with_stale(fill, strategy, tif, pair_market, RESTING_QUOTE_STALE_SECS, true).await;
     }
 
     async fn track_with_stale(
@@ -259,6 +328,7 @@ impl OrderLifecycle {
         tif: TimeInForce,
         pair_market: Option<MarketId>,
         stale_after_secs: u64,
+        is_quote: bool,
     ) {
         if !matches!(tif, TimeInForce::Gtc | TimeInForce::Gtd) {
             return;
@@ -270,8 +340,178 @@ impl OrderLifecycle {
             placed_at: Instant::now(),
             quantity: fill.filled,
             stale_after_secs,
+            is_quote,
+            missing_since: None,
+            cancelled: false,
+            guard_opened_by: Utc::now(),
             pair_market,
         });
+    }
+
+    /// Ids of every tracked order, for a loop that has to leave a market with
+    /// orders it could not settle and must say so.
+    pub async fn tracked_ids(&self) -> Vec<String> {
+        self.tracked.lock().await.iter().map(|o| format!("{} ({} on {})", o.id, o.strategy, o.market)).collect()
+    }
+
+    /// Mark a tracked order cancelled at the venue with its fill still unknown,
+    /// and start its grace clock.
+    async fn mark_cancelled(&self, id: &OrderId) {
+        for o in self.tracked.lock().await.iter_mut().filter(|o| &o.id == id) {
+            o.cancelled = true;
+            o.missing_since.get_or_insert_with(Instant::now);
+        }
+    }
+
+    /// Does this strategy have a tracked order still WORKING on `market`: one
+    /// the venue has not confirmed cancelled? The dispatchers ask before
+    /// placing another quote on the leg and before selling what the guard
+    /// holds; a cancelled order whose fill is still being read blocks neither.
+    pub async fn working_for(&self, strategy: &str, market: &MarketId) -> bool {
+        self.tracked.lock().await.iter().any(|o| o.strategy == strategy && &o.market == market && !o.cancelled)
+    }
+
+    /// Does this engine track any order at all? Rotation waits for none: an
+    /// order whose cancel or fill read failed must not be forgotten with the
+    /// market's lifecycle.
+    pub async fn tracks_anything(&self) -> bool {
+        !self.tracked.lock().await.is_empty()
+    }
+
+    /// Which strategy's tracked order this id is, if this engine tracks it. The
+    /// Maker's account-wide quote pull asks before cancelling an order it finds
+    /// on the leg, so another viper's live quote is left alone.
+    pub async fn tracked_owner(&self, id: &OrderId) -> Option<String> {
+        self.tracked.lock().await.iter().find(|o| &o.id == id).map(|o| o.strategy.clone())
+    }
+
+    /// Size a guard to what the venue says traded on its order and mark it
+    /// confirmed, and queue the figure for the caller's row. Always the venue's
+    /// cumulative count, never above what was placed, whether the guard was
+    /// unconfirmed (a quote carrying the size placed) or already confirmed (a
+    /// quote lifted in part, then in more).
+    async fn size_and_confirm(&self, positions: &Arc<Mutex<PositionMap>>, ord: &TrackedLeg, traded: Decimal, price: Decimal) -> bool {
+        let mut filled = if traded > Decimal::ZERO { traded.min(ord.quantity) } else { ord.quantity };
+        let found = {
+            let mut map = positions.lock().await;
+            match map.get_mut(&PositionKey::new(&self.squadron_id, &ord.strategy, ord.market.clone())).filter(|p| owns_guard(ord, p)) {
+                Some(p) => {
+                    if p.fill_confirmed_at.is_none() {
+                        p.shares = filled;
+                        if price > Decimal::ZERO { p.avg_entry = price; }
+                        p.fill_confirmed_at = Some(Utc::now());
+                        info!("✅ [{}] fill confirmed: {} — {filled} @ {:.4} (order {})", ord.strategy, ord.market, p.avg_entry, ord.id);
+                    } else {
+                        // Two sources size the same order (the fill feed and a
+                        // reconcile reading taken a moment earlier); the larger
+                        // count is the later truth, and a guard never shrinks
+                        // below contracts the venue already reported.
+                        filled = p.shares.max(filled).min(ord.quantity);
+                        p.shares = filled;
+                        if price > Decimal::ZERO { p.avg_entry = price; }
+                    }
+                    true
+                }
+                None => false,
+            }
+        };
+        // A figure for a guard that is gone (the viper exited meanwhile) would
+        // land on whatever row that strategy writes on the leg next.
+        if found {
+            self.confirmed.lock().await.push(ConfirmedFill {
+                strategy: ord.strategy.clone(), market: ord.market.clone(), filled, price,
+            });
+        }
+        found
+    }
+
+    /// Release a quote that never filled: its unconfirmed guard leaves the map
+    /// and the caller is told to close its row. A confirmed guard is a position
+    /// and is left alone.
+    async fn release_quote(&self, positions: &Arc<Mutex<PositionMap>>, ord: &TrackedLeg, why: &str) -> bool {
+        // Check and remove under one lock: a fill event confirming the guard
+        // between the two would otherwise lose a position.
+        let removed = {
+            let mut map = positions.lock().await;
+            let key = PositionKey::new(&self.squadron_id, &ord.strategy, ord.market.clone());
+            if map.get(&key).is_some_and(|p| owns_guard(ord, p) && p.fill_confirmed_at.is_none()) { map.remove(&key).is_some() } else { false }
+        };
+        if !removed {
+            return false;
+        }
+        info!("🧹 [{}] quote {} on {} released — {why}", ord.strategy, ord.id, ord.market);
+        self.released.lock().await.push(ReleasedQuote { strategy: ord.strategy.clone(), market: ord.market.clone() });
+        true
+    }
+
+    /// After the venue REFUSED a cancel (it filled, which is the usual reason,
+    /// it is gone, or the call failed): ask the order. Traded contracts confirm
+    /// and size the guard; nothing traded releases it (the order was already
+    /// gone); no answer leaves it tracked and working for the next attempt.
+    async fn settle_refused_cancel<V: Execution + ?Sized>(&self, venue: &V, positions: &Arc<Mutex<PositionMap>>, ord: &TrackedLeg, refusal: &str) -> Option<CancelOutcome> {
+        match venue.order_state(&ord.id).await {
+            // Still on the book: the cancel never landed (a timeout, a rate
+            // limit, a routing miss). The order works on, tracked, and the
+            // next attempt cancels it.
+            Ok(Some(st)) if st.resting == Some(true) => {
+                warn!("[{}] cancel for {} ({}) did not go through and the order still rests: {refusal} — stays tracked and working", ord.strategy, ord.id, ord.market);
+                None
+            }
+            Ok(Some(st)) => {
+                let gone = st.resting == Some(false);
+                match st.filled {
+                    Some(traded) if traded > Decimal::ZERO => {
+                        info!("[{}] cancel of {} ({}) refused: {traded} of {} had traded — kept as a position", ord.strategy, ord.id, ord.market, ord.quantity);
+                        self.size_and_confirm(positions, ord, traded, Decimal::ZERO).await;
+                        // Sizing is always safe; dropping the order is not until
+                        // the venue says it no longer works.
+                        gone.then_some(CancelOutcome::Traded)
+                    }
+                    Some(_) if gone => Some(if self.release_quote(positions, ord, "cancel refused and nothing traded (already gone)").await { CancelOutcome::Released } else { CancelOutcome::Traded }),
+                    _ => {
+                        // Done at the venue but with no stated count: no longer
+                        // working, so it must not block a quote or an exit; the
+                        // reconciler keeps asking until the grace runs out.
+                        if gone { self.mark_cancelled(&ord.id).await; }
+                        warn!("[{}] cancel for {} ({}) did not go through and the venue's answer settles nothing: {refusal} — order stays tracked{}", ord.strategy, ord.id, ord.market, if gone { ", no longer working" } else { "" });
+                        None
+                    }
+                }
+            }
+            _ => {
+                warn!("[{}] cancel for {} ({}) did not go through: {refusal} — order stays tracked", ord.strategy, ord.id, ord.market);
+                None
+            }
+        }
+    }
+
+    /// After the venue confirmed a cancel: a cancel of a partly traded order
+    /// succeeds for the remainder, so ask what traded before calling the quote
+    /// unfilled. Traded contracts confirm and size the guard; nothing traded
+    /// (or a venue that does not report single orders) releases it; a failed
+    /// read settles nothing, and the caller keeps the order tracked for the
+    /// next reconcile pass, where an unconfirmed tracked guard is inert.
+    async fn settle_cancel<V: Execution + ?Sized>(&self, venue: &V, positions: &Arc<Mutex<PositionMap>>, ord: &TrackedLeg, why: &str) -> CancelOutcome {
+        match venue.order_state(&ord.id).await {
+            Ok(Some(OrderState { filled: Some(traded), .. })) if traded > Decimal::ZERO => {
+                info!("[{}] order {} on {} had traded {traded} of {} before the cancel — kept as a position", ord.strategy, ord.id, ord.market, ord.quantity);
+                self.size_and_confirm(positions, ord, traded, Decimal::ZERO).await;
+                CancelOutcome::Traded
+            }
+            // Nothing traded, or a venue that does not report single orders.
+            Ok(Some(OrderState { filled: Some(_), .. })) | Ok(None) => {
+                if self.release_quote(positions, ord, why).await { CancelOutcome::Released } else { CancelOutcome::Traded }
+            }
+            // Reported, but without a fill count: as good as no answer.
+            Ok(Some(_)) => {
+                warn!("[{}] order {} was read after its cancel but the venue stated no fill count — kept tracked for the next reconcile pass", ord.strategy, ord.id);
+                CancelOutcome::Unknown
+            }
+            Err(e) => {
+                warn!("[{}] could not read order {} after its cancel: {e} — kept tracked for the next reconcile pass", ord.strategy, ord.id);
+                CancelOutcome::Unknown
+            }
+        }
     }
 
     /// Does this strategy have a tracked order still resting on `market`?
@@ -283,22 +523,42 @@ impl OrderLifecycle {
 
     /// Cancel every tracked order this strategy has resting on `market` (the
     /// viper's quote-pull, or an exit signalled on a quote that never filled).
-    /// Returns how many the venue confirmed cancelled; those leave tracking and
-    /// are reported through [`take_released`](Self::take_released). An order
-    /// the venue refuses to cancel has filled or is already gone: it stays
-    /// tracked for the reconciler to settle.
-    pub async fn cancel_resting_for<V: Execution + ?Sized>(&self, venue: &V, strategy: &str, market: &MarketId) -> usize {
+    /// Returns how many the venue confirmed cancelled. A cancelled quote that
+    /// never traded is released (guard cleared, row reported through
+    /// [`take_released`](Self::take_released)); one that traded in part before
+    /// the cancel is confirmed at the traded size. A cancel the venue does not
+    /// confirm (it filled, it is gone, or the call failed) leaves the order
+    /// tracked and its guard in place for the fill feed or the reconciler.
+    pub async fn cancel_resting_for<V: Execution + ?Sized>(
+        &self,
+        venue: &V,
+        positions: &Arc<Mutex<PositionMap>>,
+        strategy: &str,
+        market: &MarketId,
+    ) -> usize {
+        // An order already cancelled at the venue, whose fill the reconciler is
+        // still reading, is not cancelled again: that costs a routing lookup
+        // and a refused call every tick while the book stays toxic.
         let mine: Vec<TrackedLeg> = self.tracked.lock().await
-            .iter().filter(|o| o.strategy == strategy && &o.market == market).cloned().collect();
+            .iter().filter(|o| o.strategy == strategy && &o.market == market && !o.cancelled).cloned().collect();
         let mut cancelled = 0;
         for ord in mine {
             match venue.cancel(ord.id.clone()).await {
                 Ok(()) => {
+                    // Tracked until what traded is known, so a fill event that
+                    // lands meanwhile still finds its order and sizes the guard.
                     cancelled += 1;
-                    self.tracked.lock().await.retain(|o| o.id != ord.id);
-                    self.released.lock().await.push(ReleasedQuote { strategy: ord.strategy.clone(), market: ord.market.clone() });
+                    if self.settle_cancel(venue, positions, &ord, "pulled by the viper").await == CancelOutcome::Unknown {
+                        self.mark_cancelled(&ord.id).await;
+                    } else {
+                        self.tracked.lock().await.retain(|o| o.id != ord.id);
+                    }
                 }
-                Err(e) => warn!("[{strategy}] quote-pull cancel refused for {} ({}): {e} — it has filled or is gone; the reconciler settles it", ord.id, ord.market),
+                Err(e) => {
+                    if self.settle_refused_cancel(venue, positions, &ord, &e.to_string()).await.is_some() {
+                        self.tracked.lock().await.retain(|o| o.id != ord.id);
+                    }
+                }
             }
         }
         cancelled
@@ -351,12 +611,19 @@ impl OrderLifecycle {
             }
         };
 
-        // Venue-reported resting orders (empty for venues that stub open_orders()):
-        // the markets they rest on, for the naked-leg pass, and each order's
-        // filled count by id, so a tracked order the venue still lists as
-        // working is never mistaken for a fill because some OTHER guard holds
-        // the same leg (`positions()` is per leg, not per order).
-        let venue_open: Vec<OpenOrder> = venue.open_orders().await.unwrap_or_default();
+        // Venue-reported resting orders: the markets they rest on, for the
+        // naked-leg pass, and each order's filled count by id, so a tracked
+        // order the venue still lists as working is never mistaken for a fill
+        // because some OTHER guard holds the same leg (`positions()` is per
+        // leg, not per order). A failed read is not "no orders": the quotes
+        // wait for the next pass, the way the positions read above is treated.
+        let (venue_open, open_known): (Vec<OpenOrder>, bool) = match venue.open_orders().await {
+            Ok(v) => (v, true),
+            Err(e) => {
+                warn!("Order lifecycle reconcile: open-orders query failed — resting quotes wait for the next pass: {e}");
+                (Vec::new(), false)
+            }
+        };
         let venue_resting: HashSet<String> = venue_open
             .iter()
             .filter(|o| o.is_resting() && o.remaining_qty() > Decimal::ZERO)
@@ -367,36 +634,157 @@ impl OrderLifecycle {
             .map(|o| (o.order_id.0.clone(), o.filled_qty))
             .collect();
 
-        // Pass 1 — fill-confirm or stale-cancel each tracked order.
+        // Pass 1 — fill-confirm or stale-cancel each tracked order. Orders that
+        // settle leave tracking by id at the end; the list itself is not
+        // replaced, so an order the fill listener settled meanwhile, or one the
+        // loop tracked meanwhile, is neither resurrected nor lost.
         let snapshot: Vec<TrackedLeg> = self.tracked.lock().await.clone();
+        let snapshot_ids: HashSet<String> = snapshot.iter().map(|o| o.id.0.clone()).collect();
         let mut keep: Vec<TrackedLeg> = Vec::with_capacity(snapshot.len());
-        for ord in snapshot {
-            let still_open = venue_open_filled.get(&ord.id.0).copied();
-            let filled = match still_open {
-                // Listed as working with part of it traded: the leg is held.
-                Some(part) if part > Decimal::ZERO => true,
-                // Listed as working, nothing traded: not a fill, whoever else
-                // holds the leg.
-                Some(_) => false,
-                // Not listed (or the venue reports no orders): the venue's
-                // holdings decide, as they always have.
-                None => held.get(ord.market.as_str()).copied().unwrap_or(Decimal::ZERO) > Decimal::ZERO,
-            };
-            if filled {
-                confirm_guard(positions, &self.squadron_id, &ord.strategy, &ord.market).await;
-                // A partly traded order still works for the rest; it stays
-                // tracked so the fill feed can finish sizing it and rotation
-                // still cancels the remainder.
-                if still_open.is_some_and(|part| part < ord.quantity) { keep.push(ord); }
+        for mut ord in snapshot {
+            let listed = venue_open_filled.get(&ord.id.0).copied();
+            let stale = ord.placed_at.elapsed().as_secs() >= ord.stale_after_secs;
+            if ord.is_quote {
+                // A resting quote is confirmed only by its OWN order, never by
+                // the leg's holdings [B74].
+                //
+                // Cancelled at the venue with its fill still unknown: ask
+                // again. Every answer that is not a count runs the grace clock
+                // down, a failed read included, because the order is not
+                // working and nothing else will ever settle it. At the end an
+                // unconfirmed guard is released for the account sweep; a
+                // confirmed one is kept at its size and the order forgotten.
+                if ord.cancelled {
+                    match venue.order_state(&ord.id).await {
+                        Ok(Some(OrderState { filled: Some(traded), .. })) if traded > Decimal::ZERO => { self.size_and_confirm(positions, &ord, traded, Decimal::ZERO).await; }
+                        Ok(Some(OrderState { filled: Some(_), .. })) => { self.release_quote(positions, &ord, "cancelled and nothing traded").await; }
+                        other => {
+                            if let Err(e) = other { warn!("[{}] could not read cancelled order {} ({}): {e}", ord.strategy, ord.id, ord.market); }
+                            let since = *ord.missing_since.get_or_insert_with(Instant::now);
+                            if since.elapsed().as_secs() >= VANISHED_QUOTE_GRACE_SECS {
+                                if !self.release_quote(positions, &ord, "cancelled; the venue never said what traded").await {
+                                    warn!("[{}] cancelled order {} ({}) never answered about its fill — its confirmed guard is kept as sized and the order forgotten", ord.strategy, ord.id, ord.market);
+                                }
+                            } else {
+                                keep.push(ord);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if !open_known { keep.push(ord); continue; }
+                match listed {
+                    // Working, part of it traded: a position for that part; the
+                    // rest keeps working until it fills, is pulled, or goes stale.
+                    Some(part) if part > Decimal::ZERO => {
+                        // Seen working: an earlier pass that missed it is forgotten.
+                        ord.missing_since = None;
+                        self.size_and_confirm(positions, &ord, part, Decimal::ZERO).await;
+                        if part >= ord.quantity { continue; }
+                        if stale {
+                            match venue.cancel(ord.id.clone()).await {
+                                Ok(()) => {
+                                    info!("[{}] cancelled the stale remainder of order {} ({}) — {part} of {} had traded at the listing", ord.strategy, ord.id, ord.market, ord.quantity);
+                                    // More may have traded between the listing and the cancel.
+                                    if self.settle_cancel(venue, positions, &ord, "stale remainder").await != CancelOutcome::Unknown { continue; }
+                                    ord.cancelled = true;
+                                    ord.missing_since.get_or_insert_with(Instant::now);
+                                }
+                                Err(e) => warn!("[{}] stale cancel of the remainder of {} ({}) did not go through: {e} — stays tracked", ord.strategy, ord.id, ord.market),
+                            }
+                        }
+                        keep.push(ord);
+                    }
+                    // Working, nothing traded.
+                    Some(_) => {
+                        ord.missing_since = None;
+                        if stale {
+                            match venue.cancel(ord.id.clone()).await {
+                                Ok(()) => {
+                                    info!("[{}] cancelled stale resting order {} ({})", ord.strategy, ord.id, ord.market);
+                                    if self.settle_cancel(venue, positions, &ord, "stale").await != CancelOutcome::Unknown { continue; }
+                                    ord.cancelled = true;
+                                    ord.missing_since.get_or_insert_with(Instant::now);
+                                }
+                                Err(e) => warn!("[{}] stale cancel for {} ({}) did not go through: {e} — stays tracked", ord.strategy, ord.id, ord.market),
+                            }
+                        }
+                        keep.push(ord);
+                    }
+                    // No longer among the open orders: filled, expired, or pulled
+                    // by the venue. Ask the order itself. A venue that does not
+                    // report single orders gets the fill feed's grace, then the
+                    // guard is released for the account sweep; a failed read
+                    // settles nothing and the order waits. Never the leg's
+                    // holdings, which may be another viper's.
+                    None => match venue.order_state(&ord.id).await {
+                        // Working after all, though not on the listing read:
+                        // treated as listed, with what the venue says traded and
+                        // the same stale backstop.
+                        Ok(Some(st)) if st.resting == Some(true) => {
+                            ord.missing_since = None;
+                            if let Some(part) = st.filled.filter(|p| *p > Decimal::ZERO) {
+                                self.size_and_confirm(positions, &ord, part, Decimal::ZERO).await;
+                                if part >= ord.quantity { continue; }
+                            }
+                            if stale {
+                                match venue.cancel(ord.id.clone()).await {
+                                    Ok(()) => {
+                                        info!("[{}] cancelled stale resting order {} ({}) the listing had missed", ord.strategy, ord.id, ord.market);
+                                        if self.settle_cancel(venue, positions, &ord, "stale").await != CancelOutcome::Unknown { continue; }
+                                        ord.cancelled = true;
+                                        ord.missing_since.get_or_insert_with(Instant::now);
+                                    }
+                                    Err(e) => warn!("[{}] stale cancel for {} ({}) did not go through: {e} — stays tracked", ord.strategy, ord.id, ord.market),
+                                }
+                            }
+                            keep.push(ord);
+                        }
+                        Ok(Some(OrderState { filled: Some(traded), .. })) if traded > Decimal::ZERO => {
+                            self.size_and_confirm(positions, &ord, traded, Decimal::ZERO).await;
+                        }
+                        Ok(Some(OrderState { filled: Some(_), resting: Some(false) })) => {
+                            self.release_quote(positions, &ord, "no longer open at the venue and nothing traded (expired or pulled)").await;
+                        }
+                        // No usable answer (the venue does not report single
+                        // orders, stated nothing, or the read failed): the
+                        // order is not on the book, so nothing but this clock
+                        // will ever settle it. After the grace an unconfirmed
+                        // guard is released for the account sweep and a
+                        // confirmed one kept at its size, the order forgotten.
+                        other => {
+                            if let Err(e) = other { warn!("[{}] could not read order {} ({}): {e}", ord.strategy, ord.id, ord.market); }
+                            let since = *ord.missing_since.get_or_insert_with(Instant::now);
+                            if since.elapsed().as_secs() >= VANISHED_QUOTE_GRACE_SECS {
+                                if !self.release_quote(positions, &ord, "vanished without a reported fill").await {
+                                    warn!("[{}] order {} on {} is no longer open and never answered about its fill — its confirmed guard is kept as sized and the order forgotten", ord.strategy, ord.id, ord.market);
+                                } else {
+                                    warn!("[{}] order {} on {} was no longer open and the venue reported no fill for {}s — guard released; a fill will be adopted by the account sweep",
+                                        ord.strategy, ord.id, ord.market, VANISHED_QUOTE_GRACE_SECS);
+                                }
+                            } else {
+                                keep.push(ord);
+                            }
+                        }
+                    },
+                }
                 continue;
             }
-            if ord.placed_at.elapsed().as_secs() >= ord.stale_after_secs {
+            // A paired leg that filled at placement: the venue's holdings
+            // decide, as they always have. Not the listing: the intl CLOB lists
+            // every resting order with a zero fill count it does not know, and a
+            // partly filled leg still on the book is held all the same.
+            let filled = held.get(ord.market.as_str()).copied().unwrap_or(Decimal::ZERO) > Decimal::ZERO;
+            if filled {
+                confirm_guard(positions, &self.squadron_id, &ord.strategy, &ord.market).await;
+                continue;
+            }
+            if stale {
                 match venue.cancel(ord.id.clone()).await {
                     Ok(_)  => info!(" [{}] cancelled stale resting order {} ({})", ord.strategy, ord.id, ord.market),
                     Err(e) => warn!("[{}] stale cancel failed for {} ({}): {e}", ord.strategy, ord.id, ord.market),
                 }
                 clear_guard(positions, &self.squadron_id, &ord.strategy, &ord.market).await;
-                self.released.lock().await.push(ReleasedQuote { strategy: ord.strategy.clone(), market: ord.market.clone() });
                 continue;
             }
             keep.push(ord);
@@ -405,7 +793,19 @@ impl OrderLifecycle {
         let mut resting_tokens: HashSet<String> =
             keep.iter().map(|o| o.market.as_str().to_string()).collect();
         resting_tokens.extend(venue_resting);
-        *self.tracked.lock().await = keep;
+        {
+            let kept: HashMap<String, (Option<Instant>, bool)> = keep.iter().map(|o| (o.id.0.clone(), (o.missing_since, o.cancelled))).collect();
+            let mut tracked = self.tracked.lock().await;
+            // Settled = in the snapshot and not kept. Tracked since the
+            // snapshot = not in the snapshot: left alone.
+            tracked.retain(|o| !snapshot_ids.contains(&o.id.0) || kept.contains_key(&o.id.0));
+            for o in tracked.iter_mut() {
+                if let Some((ms, cancelled)) = kept.get(&o.id.0) {
+                    o.missing_since = *ms;
+                    o.cancelled |= *cancelled;
+                }
+            }
+        }
 
         // Pass 2 — naked-leg detection. A confirmed paired leg whose partner is
         // neither held nor still resting is directionally exposed. Try to
@@ -581,24 +981,38 @@ impl OrderLifecycle {
         venue: &V,
         positions: &Arc<Mutex<PositionMap>>,
     ) -> Vec<ReleasedQuote> {
-        let orders: Vec<TrackedLeg> = std::mem::take(&mut *self.tracked.lock().await);
+        // Orders stay tracked while the venue is asked about them, so a fill
+        // event landing meanwhile still finds its order; settled ones leave
+        // tracking by id at the end.
+        let orders: Vec<TrackedLeg> = self.tracked.lock().await.clone();
         let mut released = Vec::new();
+        let mut settled: HashSet<String> = HashSet::new();
         for ord in orders {
             match venue.cancel(ord.id.clone()).await {
-                Ok(()) => {
-                    let unfilled = positions.lock().await
-                        .get(&PositionKey::new(&self.squadron_id, &ord.strategy, ord.market.clone()))
-                        .is_some_and(|p| p.fill_confirmed_at.is_none());
-                    if unfilled {
-                        clear_guard(positions, &self.squadron_id, &ord.strategy, &ord.market).await;
-                        info!("🧹 [{}] resting order {} on {} cancelled unfilled — quote released", ord.strategy, ord.id, ord.market);
+                Ok(()) => match self.settle_cancel(venue, positions, &ord, "cancelled at rotation or stand-down").await {
+                    CancelOutcome::Released => {
                         released.push(ReleasedQuote { strategy: ord.strategy.clone(), market: ord.market.clone() });
+                        settled.insert(ord.id.0.clone());
                     }
-                }
-                Err(e) => warn!("stand-down cancel failed for {} ({}): {e}", ord.id, ord.market),
+                    CancelOutcome::Traded => { settled.insert(ord.id.0.clone()); }
+                    CancelOutcome::Unknown => { self.mark_cancelled(&ord.id).await; }
+                },
+                // Not confirmed cancelled: it filled (the usual reason a venue
+                // refuses), it is gone, or the call failed. Ask the order; when
+                // it cannot say, the order stays tracked and its guard stays,
+                // inert, and the caller must not leave the market while any
+                // order is tracked.
+                Err(e) => match self.settle_refused_cancel(venue, positions, &ord, &e.to_string()).await {
+                    Some(CancelOutcome::Released) => {
+                        released.push(ReleasedQuote { strategy: ord.strategy.clone(), market: ord.market.clone() });
+                        settled.insert(ord.id.0.clone());
+                    }
+                    Some(_) => { settled.insert(ord.id.0.clone()); }
+                    None => {}
+                },
             }
         }
-        self.released.lock().await.extend(released.iter().cloned());
+        self.tracked.lock().await.retain(|o| !settled.contains(&o.id.0));
         released
     }
 
@@ -653,37 +1067,29 @@ impl OrderLifecycle {
     async fn confirm_on_fill(&self, positions: &Arc<Mutex<PositionMap>>, ev: &FillEvent) {
         let tracked = self.tracked.lock().await.iter().find(|o| o.id == ev.order_id).cloned();
         let Some(ord) = tracked else {
-            {
-                let mut map = positions.lock().await;
-                for (k, p) in map.iter_mut() {
-                    if k.squadron == self.squadron_id && k.market == ev.market && p.fill_confirmed_at.is_none() {
-                        p.fill_confirmed_at = Some(Utc::now());
-                    }
+            // A sale confirms no buy guard. And a leg with a tracked quote on
+            // it belongs to that quote's order: someone else's fill on the leg
+            // (another viper's taker entry or exit, an operator's Close Now)
+            // says nothing about whether the quote traded.
+            if matches!(ev.side, Side::Sell) {
+                return;
+            }
+            let quoted: HashSet<(String, String)> = self.tracked.lock().await.iter()
+                .filter(|o| o.market == ev.market)
+                .map(|o| (o.strategy.clone(), o.market.as_str().to_string()))
+                .collect();
+            let mut map = positions.lock().await;
+            for (k, p) in map.iter_mut() {
+                if k.squadron == self.squadron_id && k.market == ev.market && p.fill_confirmed_at.is_none()
+                    && !quoted.contains(&(k.strategy.clone(), k.market.as_str().to_string()))
+                {
+                    p.fill_confirmed_at = Some(Utc::now());
                 }
             }
-            self.tracked.lock().await.retain(|o| o.market != ev.market);
             return;
         };
+        self.size_and_confirm(positions, &ord, ev.filled, ev.price).await;
         let filled = if ev.filled > Decimal::ZERO { ev.filled.min(ord.quantity) } else { ord.quantity };
-        {
-            let mut map = positions.lock().await;
-            if let Some(p) = map.get_mut(&PositionKey::new(&self.squadron_id, &ord.strategy, ord.market.clone())) {
-                if p.fill_confirmed_at.is_none() {
-                    // A resting quote's guard carried the size placed; the
-                    // venue has now said what traded.
-                    p.shares = filled;
-                    if ev.price > Decimal::ZERO { p.avg_entry = ev.price; }
-                    p.fill_confirmed_at = Some(Utc::now());
-                    info!("✅ [{}] fill confirmed: {} — {filled} @ {:.4} (order {})", ord.strategy, ord.market, p.avg_entry, ord.id);
-                } else if filled > p.shares {
-                    // A later event on a partly traded quote: more of it traded.
-                    p.shares = filled;
-                }
-            }
-        }
-        self.confirmed.lock().await.push(ConfirmedFill {
-            strategy: ord.strategy.clone(), market: ord.market.clone(), filled, price: ev.price,
-        });
         if filled >= ord.quantity || ev.complete {
             self.tracked.lock().await.retain(|o| o.id != ord.id);
         }
@@ -698,6 +1104,12 @@ async fn confirm_guard(positions: &Arc<Mutex<PositionMap>>, squadron: &str, stra
             info!("✅ [{strategy}] fill confirmed: {token}");
         }
     }
+}
+
+/// Is this guard the one the tracked order was opened for? A guard opened
+/// after the order was tracked belongs to a later order on the same leg.
+fn owns_guard(ord: &TrackedLeg, p: &crate::state::Position) -> bool {
+    p.opened_at <= ord.guard_opened_by
 }
 
 /// Drop a strategy's position guard for a token (so the viper may re-enter).
@@ -811,11 +1223,21 @@ mod resting_quote_tests {
         refuse: Vec<String>,
         held: Vec<Held>,
         open: Vec<OpenOrder>,
+        /// `order_state` answers: an id's traded count (status unknown). An id
+        /// in neither map answers `None` (not reported), as the default trait
+        /// method does.
+        fills: HashMap<String, Decimal>,
+        /// `order_state` answers with a status word too.
+        states: HashMap<String, OrderState>,
+        /// `open_orders` fails.
+        open_err: bool,
+        /// `order_fill` fails.
+        fill_err: bool,
     }
 
     impl QuoteVenue {
         fn new() -> Self {
-            Self { cancelled: StdMutex::new(Vec::new()), refuse: Vec::new(), held: Vec::new(), open: Vec::new() }
+            Self { cancelled: StdMutex::new(Vec::new()), refuse: Vec::new(), held: Vec::new(), open: Vec::new(), fills: HashMap::new(), states: HashMap::new(), open_err: false, fill_err: false }
         }
         fn cancelled(&self) -> Vec<String> { self.cancelled.lock().unwrap().clone() }
     }
@@ -831,7 +1253,15 @@ mod resting_quote_tests {
         }
         async fn collateral(&self) -> anyhow::Result<Decimal> { unreachable!("these tests read no collateral") }
         async fn positions(&self) -> anyhow::Result<Vec<Held>> { Ok(self.held.clone()) }
-        async fn open_orders(&self) -> anyhow::Result<Vec<OpenOrder>> { Ok(self.open.clone()) }
+        async fn open_orders(&self) -> anyhow::Result<Vec<OpenOrder>> {
+            if self.open_err { anyhow::bail!("HTTP 429 Too Many Requests"); }
+            Ok(self.open.clone())
+        }
+        async fn order_state(&self, id: &OrderId) -> anyhow::Result<Option<OrderState>> {
+            if self.fill_err { anyhow::bail!("HTTP 429 Too Many Requests"); }
+            if let Some(st) = self.states.get(&id.0) { return Ok(Some(*st)); }
+            Ok(self.fills.get(&id.0).map(|n| OrderState { filled: Some(*n), resting: None }))
+        }
         async fn best_bid(&self, _: &MarketId) -> anyhow::Result<Option<Decimal>> { Ok(None) }
         async fn market_facts(&self, _: &MarketId) -> anyhow::Result<Option<MarketFacts>> { Ok(None) }
     }
@@ -926,6 +1356,398 @@ mod resting_quote_tests {
         assert!(lc.take_confirmed().await.is_empty(), "nothing tracked, nothing to resize");
     }
 
+    /// Someone else's fill on the leg says nothing about a quote resting there:
+    /// FairValue's take-profit sale, or Anchor's taker buy, must not confirm
+    /// the Maker's unfilled bid or drop it from tracking (it would then be sold
+    /// as if held, and left on the book at rotation).
+    #[tokio::test]
+    async fn another_vipers_fill_on_the_leg_leaves_a_resting_quote_alone() {
+        let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
+        guard(&mut *map.lock().await, "AnchorStrategy", LEG, dec!(5), dec!(0.31), false);
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+
+        let mut sell = event("fv-tp", LEG, dec!(5), dec!(0.40));
+        sell.side = Side::Sell;
+        lc.confirm_on_fill(&map, &sell).await;
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(26.67), false)), "a sale confirms no buy guard");
+        assert_eq!(shares_of(&map, "AnchorStrategy").await, Some((dec!(5), false)));
+
+        lc.confirm_on_fill(&map, &event("anchor-fak", LEG, dec!(5), dec!(0.31))).await;
+        assert_eq!(shares_of(&map, "AnchorStrategy").await, Some((dec!(5), true)), "the untracked taker fill confirms its own guard");
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(26.67), false)), "the quote is still a quote");
+        assert!(lc.resting_for("MakerStrategy", &MarketId::new(LEG)).await, "and still tracked");
+    }
+
+    /// A quote the venue no longer lists is settled by its own order, never by
+    /// the leg's holdings: traded contracts confirm it at the traded size, a
+    /// cancelled or expired order releases it, and when the venue cannot say
+    /// the guard waits out the fill-feed grace instead of being confirmed from
+    /// someone else's holding. A failed open-orders read changes nothing.
+    #[tokio::test]
+    async fn a_vanished_quote_is_settled_by_its_own_order_not_the_legs_holdings() {
+        let mk = || {
+            let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
+            let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+            (lc, map)
+        };
+        let mut venue = QuoteVenue::new();
+        venue.held = vec![Held { market: MarketId::new(LEG), shares: dec!(5), avg_price: dec!(0.31) }]; // FairValue's
+
+        // Traded in full before vanishing.
+        let (lc, map) = mk();
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        venue.fills.insert("q1".into(), dec!(26.67));
+        lc.reconcile(&venue, &map).await;
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(26.67), true)));
+        assert!(!lc.resting_for("MakerStrategy", &MarketId::new(LEG)).await);
+        assert_eq!(lc.take_confirmed().await.len(), 1);
+
+        // Traded in part: sized to what traded.
+        let (lc, map) = mk();
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        venue.fills.insert("q1".into(), dec!(10));
+        lc.reconcile(&venue, &map).await;
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(10), true)), "the guard carries what traded, not what was placed");
+
+        // Nothing traded and the venue says the order is done (expired, or
+        // pulled by the venue): released. A zero with no status word is not
+        // enough: that waits out the grace below.
+        let (lc, map) = mk();
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        venue.fills.remove("q1");
+        venue.states.insert("q1".into(), OrderState { filled: Some(Decimal::ZERO), resting: Some(false) });
+        lc.reconcile(&venue, &map).await;
+        assert_eq!(shares_of(&map, "MakerStrategy").await, None);
+        assert_eq!(lc.take_released().await, vec![ReleasedQuote { strategy: "MakerStrategy".into(), market: MarketId::new(LEG) }]);
+        venue.states.remove("q1");
+
+        // The venue cannot say: the guard waits, unconfirmed, inside the grace.
+        let (lc, map) = mk();
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        venue.fills.remove("q1");
+        lc.reconcile(&venue, &map).await;
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(26.67), false)), "FairValue's five contracts never confirm the Maker's quote");
+        assert!(lc.resting_for("MakerStrategy", &MarketId::new(LEG)).await);
+
+        // A failed open-orders read: nothing moves.
+        venue.open_err = true;
+        lc.reconcile(&venue, &map).await;
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(26.67), false)));
+        assert!(lc.resting_for("MakerStrategy", &MarketId::new(LEG)).await);
+        assert!(venue.cancelled().is_empty());
+    }
+
+    /// The reconciler confirming a working quote in part sizes the guard to that
+    /// part, and a later fill event never grows it past what the venue reports.
+    #[tokio::test]
+    async fn a_reconcile_confirm_is_sized_and_a_later_event_keeps_the_venues_count() {
+        let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
+        let mut venue = QuoteVenue::new();
+        venue.held = vec![Held { market: MarketId::new(LEG), shares: dec!(10), avg_price: dec!(0.30) }];
+        venue.open = vec![open("q1", LEG, dec!(26.67), dec!(10))];
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+
+        lc.reconcile(&venue, &map).await;
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(10), true)), "confirmed at the ten that traded, not the 26.67 placed");
+        assert_eq!(lc.take_confirmed().await, vec![ConfirmedFill { strategy: "MakerStrategy".into(), market: MarketId::new(LEG), filled: dec!(10), price: Decimal::ZERO }]);
+
+        lc.confirm_on_fill(&map, &event("q1", LEG, dec!(10), dec!(0.30))).await;
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(10), true)));
+        lc.confirm_on_fill(&map, &event("q1", LEG, dec!(12), dec!(0.30))).await;
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(12), true)), "more traded: the guard follows the venue");
+    }
+
+    /// A cancel the venue does not confirm at stand-down leaves the quote
+    /// tracked and its guard in place, so nothing downstream sells it as held
+    /// and nothing forgets it on the book; a cancel that succeeds after part
+    /// of the quote traded keeps that part as a position.
+    #[tokio::test]
+    async fn stand_down_keeps_a_quote_whose_cancel_failed_and_what_traded_before_a_cancel() {
+        let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
+        let mut venue = QuoteVenue::new();
+        venue.refuse = vec!["q1".into()];
+        venue.fills.insert("q2".into(), dec!(7));
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
+        guard(&mut *map.lock().await, "TimeDecayStrategy", LEG, dec!(10), dec!(0.28), false);
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        lc.track_resting(&ack("q2", LEG, dec!(10), dec!(0.28)), "TimeDecayStrategy", TimeInForce::Gtc, None).await;
+
+        let released = lc.cancel_all(&venue, &map).await;
+        assert!(released.is_empty(), "nothing was cancelled unfilled: {released:?}");
+        assert!(lc.resting_for("MakerStrategy", &MarketId::new(LEG)).await, "the refused cancel keeps the quote tracked");
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(26.67), false)), "and its guard in place, still a quote");
+        assert_eq!(shares_of(&map, "TimeDecayStrategy").await, Some((dec!(7), true)), "the seven that traded before the cancel are a position");
+        assert!(!lc.resting_for("TimeDecayStrategy", &MarketId::new(LEG)).await);
+        assert_eq!(lc.take_confirmed().await.len(), 1);
+    }
+
+    /// A paired leg (an arbitrage entry that filled at placement) is confirmed
+    /// by the venue's holdings as it always was, even when the venue lists its
+    /// order with a fill count it does not know: the intl CLOB lists every
+    /// resting order with zero.
+    #[tokio::test]
+    async fn a_paired_leg_is_confirmed_by_holdings_whatever_the_listing_says() {
+        let lc = OrderLifecycle::new(LifecycleConfig::intl(), SQ);
+        let mut venue = QuoteVenue::new();
+        venue.held = vec![Held { market: MarketId::new(LEG), shares: dec!(5), avg_price: dec!(0.40) }];
+        venue.open = vec![open("arb-1", LEG, dec!(5), Decimal::ZERO)];
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+        guard(&mut *map.lock().await, "ArbitrageStrategy", LEG, dec!(5), dec!(0.40), false);
+        lc.track(&ack("arb-1", LEG, dec!(5), dec!(0.40)), "ArbitrageStrategy", TimeInForce::Gtc, Some(MarketId::new("other#no"))).await;
+        lc.reconcile(&venue, &map).await;
+        assert_eq!(shares_of(&map, "ArbitrageStrategy").await, Some((dec!(5), true)));
+        assert!(!lc.resting_for("ArbitrageStrategy", &MarketId::new(LEG)).await);
+    }
+
+    /// A venue that cannot answer about a cancelled or vanished order settles
+    /// nothing: the order stays tracked, its guard stays an inert quote, and
+    /// nothing is released or confirmed until the venue answers.
+    #[tokio::test]
+    async fn a_failed_order_read_keeps_the_quote_tracked_and_inert() {
+        let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
+        let mut venue = QuoteVenue::new();
+        venue.fill_err = true;
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+
+        assert_eq!(lc.cancel_resting_for(&venue, &map, "MakerStrategy", &MarketId::new(LEG)).await, 1, "cancelled at the venue, but not settled");
+        assert_eq!(venue.cancelled(), vec!["q1".to_string()]);
+        assert!(lc.resting_for("MakerStrategy", &MarketId::new(LEG)).await, "still tracked, so nothing sells it as held");
+        assert!(!lc.working_for("MakerStrategy", &MarketId::new(LEG)).await, "but no longer working: a new quote may be placed and an exit need not wait");
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(26.67), false)));
+        assert!(lc.take_released().await.is_empty());
+
+        // The read keeps failing inside the grace: waits.
+        lc.reconcile(&venue, &map).await;
+        assert!(lc.resting_for("MakerStrategy", &MarketId::new(LEG)).await);
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(26.67), false)));
+        assert!(!lc.holds_anything(&map).await, "an inert quote is not a holding");
+        assert!(lc.tracks_anything().await, "but rotation waits for it to settle");
+
+        // The grace runs out with the venue still not answering: the unfilled
+        // guard is released for the account sweep, and the order forgotten.
+        lc.tracked.lock().await.iter_mut().for_each(|o| o.missing_since = Some(Instant::now() - std::time::Duration::from_secs(VANISHED_QUOTE_GRACE_SECS + 1)));
+        lc.reconcile(&venue, &map).await;
+        assert_eq!(shares_of(&map, "MakerStrategy").await, None);
+        assert!(!lc.tracks_anything().await);
+        assert_eq!(lc.take_released().await, vec![ReleasedQuote { strategy: "MakerStrategy".into(), market: MarketId::new(LEG) }]);
+    }
+
+    /// A cancelled order the venue never answers about, whose guard a fill
+    /// event already confirmed: after the grace the order is forgotten and the
+    /// guard kept at its size, so the stop that was waiting on it can sell.
+    #[tokio::test]
+    async fn a_cancelled_order_never_answered_keeps_its_confirmed_guard_and_is_forgotten() {
+        let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
+        let mut venue = QuoteVenue::new();
+        venue.fill_err = true;
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        lc.confirm_on_fill(&map, &event("q1", LEG, dec!(3), dec!(0.30))).await;
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(3), true)));
+
+        lc.cancel_resting_for(&venue, &map, "MakerStrategy", &MarketId::new(LEG)).await;
+        assert!(!lc.working_for("MakerStrategy", &MarketId::new(LEG)).await, "cancelled: the exit arm may sell the three");
+        assert!(lc.holds_anything(&map).await);
+
+        lc.tracked.lock().await.iter_mut().for_each(|o| o.missing_since = Some(Instant::now() - std::time::Duration::from_secs(VANISHED_QUOTE_GRACE_SECS + 1)));
+        lc.reconcile(&venue, &map).await;
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(3), true)), "the position stays");
+        assert!(!lc.tracks_anything().await, "the order is forgotten");
+        assert!(lc.take_released().await.is_empty());
+    }
+
+    /// What the venue says about an order touches only the guard that order
+    /// was opened for. A cancelled order whose fill the venue answers late must
+    /// not size, confirm or release the guard of the quote that replaced it on
+    /// the same leg.
+    #[tokio::test]
+    async fn a_late_answer_about_an_old_order_never_touches_the_next_quotes_guard() {
+        let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
+        let mut venue = QuoteVenue::new();
+        venue.fill_err = true;
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(10), dec!(0.30), false);
+        lc.track_resting(&ack("q1", LEG, dec!(10), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        lc.confirm_on_fill(&map, &event("q1", LEG, dec!(3), dec!(0.30))).await;
+        assert_eq!(lc.take_confirmed().await.len(), 1, "the event's own confirmation, drained by the loop");
+        lc.cancel_resting_for(&venue, &map, "MakerStrategy", &MarketId::new(LEG)).await;
+        assert!(!lc.working_for("MakerStrategy", &MarketId::new(LEG)).await, "cancelled, fill unknown");
+
+        // The exit sells the three and drops the guard; the viper re-quotes.
+        map.lock().await.remove(&PositionKey::new(SQ, "MakerStrategy", MarketId::new(LEG)));
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.28), false);
+        lc.track_resting(&ack("q2", LEG, dec!(26.67), dec!(0.28)), "MakerStrategy", TimeInForce::Gtc, None).await;
+
+        // The venue finally answers about q1: three traded, long since sold.
+        venue.fill_err = false;
+        venue.states.insert("q1".into(), OrderState { filled: Some(dec!(3)), resting: Some(false) });
+        venue.open = vec![open("q2", LEG, dec!(26.67), Decimal::ZERO)];
+        lc.reconcile(&venue, &map).await;
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(26.67), false)), "q2's guard is untouched by q1's answer");
+        assert!(lc.take_confirmed().await.is_empty());
+        assert!(lc.working_for("MakerStrategy", &MarketId::new(LEG)).await, "q2 works on");
+        assert_eq!(lc.tracked_ids().await.len(), 1, "q1 is forgotten");
+
+        // And an answer of nothing traded about an old cancelled order releases
+        // nothing of the quote that replaced it.
+        let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(10), dec!(0.30), false);
+        lc.track_resting(&ack("q3", LEG, dec!(10), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        lc.mark_cancelled(&OrderId("q3".into())).await;
+        map.lock().await.remove(&PositionKey::new(SQ, "MakerStrategy", MarketId::new(LEG)));
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.28), false);
+        lc.track_resting(&ack("q4", LEG, dec!(26.67), dec!(0.28)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        venue.states.insert("q3".into(), OrderState { filled: Some(Decimal::ZERO), resting: Some(false) });
+        venue.open = vec![open("q4", LEG, dec!(26.67), Decimal::ZERO)];
+        lc.reconcile(&venue, &map).await;
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(26.67), false)), "q4's guard is untouched by q3's answer");
+        assert!(lc.take_released().await.is_empty());
+        assert_eq!(lc.tracked_ids().await.len(), 1, "q3 is forgotten, q4 works on");
+    }
+
+    /// A cancel the venue refused while the order still rests (the call never
+    /// landed) leaves the order tracked and working: nothing is released, no
+    /// second quote is placed, and the next attempt cancels it.
+    #[tokio::test]
+    async fn a_refused_cancel_on_an_order_still_resting_keeps_it_working() {
+        let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
+        let mut venue = QuoteVenue::new();
+        venue.refuse = vec!["q1".into()];
+        venue.states.insert("q1".into(), OrderState { filled: Some(Decimal::ZERO), resting: Some(true) });
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+
+        assert_eq!(lc.cancel_resting_for(&venue, &map, "MakerStrategy", &MarketId::new(LEG)).await, 0);
+        assert!(lc.working_for("MakerStrategy", &MarketId::new(LEG)).await);
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(26.67), false)));
+        assert!(lc.cancel_all(&venue, &map).await.is_empty());
+        assert!(lc.tracks_anything().await, "rotation waits for it");
+        assert!(lc.take_released().await.is_empty());
+
+        // Not on the page the listing returned, yet the venue says it rests:
+        // nothing changes.
+        lc.reconcile(&venue, &map).await;
+        assert!(lc.working_for("MakerStrategy", &MarketId::new(LEG)).await);
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(26.67), false)));
+    }
+
+    /// A quote no longer listed whose read keeps failing is not frozen for
+    /// good: after the grace an unconfirmed guard is released, and a confirmed
+    /// one is kept while the order is forgotten, so an exit can proceed.
+    #[tokio::test]
+    async fn a_vanished_quote_with_a_failing_read_settles_after_the_grace() {
+        let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
+        let mut venue = QuoteVenue::new();
+        venue.fill_err = true;
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
+        guard(&mut *map.lock().await, "TimeDecayStrategy", LEG, dec!(10), dec!(0.28), false);
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        lc.track_resting(&ack("q2", LEG, dec!(10), dec!(0.28)), "TimeDecayStrategy", TimeInForce::Gtc, None).await;
+        lc.confirm_on_fill(&map, &event("q2", LEG, dec!(4), dec!(0.28))).await;
+
+        lc.reconcile(&venue, &map).await;
+        assert!(lc.working_for("MakerStrategy", &MarketId::new(LEG)).await, "inside the grace it waits");
+        lc.tracked.lock().await.iter_mut().for_each(|o| o.missing_since = Some(Instant::now() - std::time::Duration::from_secs(VANISHED_QUOTE_GRACE_SECS + 1)));
+        lc.reconcile(&venue, &map).await;
+        assert_eq!(shares_of(&map, "MakerStrategy").await, None, "the unfilled quote is released for the account sweep");
+        assert_eq!(shares_of(&map, "TimeDecayStrategy").await, Some((dec!(4), true)), "the confirmed four stay");
+        assert!(!lc.tracks_anything().await);
+        assert_eq!(lc.take_released().await, vec![ReleasedQuote { strategy: "MakerStrategy".into(), market: MarketId::new(LEG) }]);
+    }
+
+    /// A quote one pass could not find and could not read starts the grace
+    /// clock; a later pass that sees it working stops that clock, so a single
+    /// later miss cannot release an order that still works.
+    #[tokio::test]
+    async fn seeing_a_quote_work_again_stops_the_grace_clock() {
+        let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
+        let mut venue = QuoteVenue::new();
+        venue.fill_err = true;
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+
+        lc.reconcile(&venue, &map).await; // missed and unreadable: the clock starts
+        lc.tracked.lock().await.iter_mut().for_each(|o| o.missing_since = Some(Instant::now() - std::time::Duration::from_secs(VANISHED_QUOTE_GRACE_SECS - 1)));
+        venue.open = vec![open("q1", LEG, dec!(26.67), Decimal::ZERO)];
+        lc.reconcile(&venue, &map).await; // listed: the clock stops
+        venue.open.clear();
+        lc.reconcile(&venue, &map).await; // missed again, well inside a fresh grace
+        assert!(lc.working_for("MakerStrategy", &MarketId::new(LEG)).await, "a fresh miss starts a fresh clock");
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(26.67), false)));
+
+        // Reported resting though not listed: the same, and a partial it states is sized.
+        venue.fill_err = false;
+        venue.states.insert("q1".into(), OrderState { filled: Some(dec!(4)), resting: Some(true) });
+        lc.reconcile(&venue, &map).await;
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(4), true)));
+        assert!(lc.working_for("MakerStrategy", &MarketId::new(LEG)).await);
+    }
+
+    /// A paired leg (an arbitrage entry) is a holding before the reconciler
+    /// confirms it, so rotation waits for it as it always did; only a quote is
+    /// inert.
+    #[tokio::test]
+    async fn a_paired_leg_is_a_holding_before_it_is_confirmed() {
+        let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+        guard(&mut *map.lock().await, "TimeDecayStrategy", LEG, dec!(5), dec!(0.40), false);
+        lc.track(&ack("td-1", LEG, dec!(5), dec!(0.40)), "TimeDecayStrategy", TimeInForce::Gtc, Some(MarketId::new("other#no"))).await;
+        assert!(lc.holds_anything(&map).await);
+    }
+
+    /// A reconcile reading taken before a fill event never shrinks a guard the
+    /// event already sized: the larger count is the later truth.
+    #[tokio::test]
+    async fn a_stale_listing_never_shrinks_an_event_sized_guard() {
+        let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
+        let mut venue = QuoteVenue::new();
+        venue.open = vec![open("q1", LEG, dec!(26.67), dec!(10))];
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        lc.confirm_on_fill(&map, &event("q1", LEG, dec!(12), dec!(0.30))).await;
+        lc.reconcile(&venue, &map).await;
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(12), true)));
+    }
+
+    /// A refused stand-down cancel that the venue explains as a fill keeps the
+    /// traded contracts as a position; a confirmed position stops rotation,
+    /// a quote never does.
+    #[tokio::test]
+    async fn a_refused_cancel_explained_as_a_fill_becomes_a_position() {
+        let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
+        let mut venue = QuoteVenue::new();
+        venue.refuse = vec!["q1".into()];
+        venue.states.insert("q1".into(), OrderState { filled: Some(dec!(26.67)), resting: Some(false) });
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        assert!(!lc.holds_anything(&map).await, "a working quote does not pin the squadron to its market");
+
+        assert!(lc.cancel_all(&venue, &map).await.is_empty());
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(26.67), true)));
+        assert!(!lc.resting_for("MakerStrategy", &MarketId::new(LEG)).await);
+        assert!(lc.holds_anything(&map).await);
+    }
+
     /// The venue lists the quote as working with nothing traded while another
     /// guard holds the same leg: the reconciler does not call that a fill. Once
     /// the quote's own window runs out it is cancelled, its guard cleared and
@@ -947,7 +1769,7 @@ mod resting_quote_tests {
 
         // The same quote tracked with no window left: the reconciler cancels it.
         let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
-        lc.track_with_stale(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None, 0).await;
+        lc.track_with_stale(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None, 0, true).await;
         lc.reconcile(&venue, &map).await;
         assert_eq!(venue.cancelled(), vec!["q1".to_string()]);
         assert_eq!(shares_of(&map, "MakerStrategy").await, None);
@@ -978,10 +1800,12 @@ mod resting_quote_tests {
     async fn a_quote_pull_cancels_one_vipers_quote_and_a_refused_cancel_keeps_it() {
         let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
         let venue = QuoteVenue::new();
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
         lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
         lc.track_resting(&ack("q2", LEG, dec!(10), dec!(0.28)), "TimeDecayStrategy", TimeInForce::Gtc, None).await;
 
-        assert_eq!(lc.cancel_resting_for(&venue, "MakerStrategy", &MarketId::new(LEG)).await, 1);
+        assert_eq!(lc.cancel_resting_for(&venue, &map, "MakerStrategy", &MarketId::new(LEG)).await, 1);
         assert_eq!(venue.cancelled(), vec!["q1".to_string()]);
         assert!(!lc.resting_for("MakerStrategy", &MarketId::new(LEG)).await);
         assert!(lc.resting_for("TimeDecayStrategy", &MarketId::new(LEG)).await, "the other viper's quote keeps working");
@@ -989,7 +1813,7 @@ mod resting_quote_tests {
 
         let mut refusing = QuoteVenue::new();
         refusing.refuse = vec!["q2".into()];
-        assert_eq!(lc.cancel_resting_for(&refusing, "TimeDecayStrategy", &MarketId::new(LEG)).await, 0);
+        assert_eq!(lc.cancel_resting_for(&refusing, &map, "TimeDecayStrategy", &MarketId::new(LEG)).await, 0);
         assert!(lc.resting_for("TimeDecayStrategy", &MarketId::new(LEG)).await, "a refused cancel means it filled: the reconciler settles it");
         assert!(lc.take_released().await.is_empty());
     }

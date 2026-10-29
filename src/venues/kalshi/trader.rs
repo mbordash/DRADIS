@@ -1457,7 +1457,7 @@ async fn trade_one_market(
     // See `TradeScope::ghost`: the ledger records whether a trade was real.
     scope.ghost = crate::config::GHOST_MODE || dyn_cfg.ghost_mode;
     if let Some(p) = &pool {
-        let (coll, total) = sync_dashboard(&squadron_id, venue.as_ref(), p, &positions, starting, None).await;
+        let (coll, total) = sync_dashboard(&squadron_id, venue.as_ref(), p, &positions, Some(lifecycle.as_ref()), starting, None).await;
         available_collateral = coll;
         if let Some(total) = total {
             session_pnl = if dyn_cfg.ghost_mode { crate::helpers::metrics::realised_session_pnl() } else { total - starting };
@@ -1497,8 +1497,7 @@ async fn trade_one_market(
             biased;
             _ = cancel.cancelled() => {
                 info!("Kalshi trader: cancelled — standing down");
-                lifecycle.cancel_all(venue.as_ref(), &positions).await;
-                settle_lifecycle_reports(&pool, &lifecycle).await;
+                cancel_all_before_leaving(venue.as_ref(), &lifecycle, &positions, &pool, &pair.question).await;
                 // Marked STOOD_DOWN but deliberately LEFT in the registry, so
                 // the operator keeps a record of what they stood down — the
                 // Control Tower lists these under "stood-down / RTB". The other
@@ -1518,7 +1517,7 @@ async fn trade_one_market(
             _ = dash_tick.tick() => {
                 if let Some(p) = &pool {
                     let (coll, total) = sync_dashboard(
-                        &squadron_id, venue.as_ref(), p, &positions, starting, Some(available_collateral),
+                        &squadron_id, venue.as_ref(), p, &positions, Some(lifecycle.as_ref()), starting, Some(available_collateral),
                     ).await;
                     available_collateral = coll;
                     // A pass the venue could not be read leaves session P&L alone:
@@ -1555,8 +1554,9 @@ async fn trade_one_market(
                 if mandate == MarketMandate::Pinned {
                     continue;
                 }
-                // Only rotate when flat.
-                if !positions.lock().await.is_empty() {
+                // Only rotate when flat. A guard that is still an unfilled quote
+                // is not a holding: the rotation itself cancels it [B74].
+                if lifecycle.holds_anything(&positions).await {
                     continue;
                 }
                 let mut candidates = discover_pairs(venue, series).await;
@@ -1585,7 +1585,15 @@ async fn trade_one_market(
                             best.question, best.cadence, best.volume, pair.question, pair.cadence, pair.volume, ROTATION_VOLUME_THRESHOLD
                         );
                         lifecycle.cancel_all(venue.as_ref(), &positions).await;
-                settle_lifecycle_reports(&pool, &lifecycle).await;
+                        settle_lifecycle_reports(&pool, &lifecycle).await;
+                        // The cancels may have found a quote that traded, or an
+                        // order the venue could not settle. Either is this
+                        // market's to manage: leaving now would drop the map
+                        // and the lifecycle that own it [B74].
+                        if lifecycle.holds_anything(&positions).await || lifecycle.tracks_anything().await {
+                            warn!("🔀 Kalshi rotation held: a position landed or an order is unsettled while leaving \"{}\" — staying on to manage it", pair.question);
+                            continue;
+                        }
                         // A rotation is not an ending — the same squadron is
                         // moving to a new market and re-registers under this id
                         // moments later. Marking it STOOD_DOWN and removing it
@@ -1816,10 +1824,10 @@ async fn trade_one_market(
                 // staying on to manage it, and the probes ask again next tick.
                 if venue_retire.is_some() {
                     lifecycle.cancel_all(venue.as_ref(), &positions).await;
-                settle_lifecycle_reports(&pool, &lifecycle).await;
-                    if !positions.lock().await.is_empty() {
+                    settle_lifecycle_reports(&pool, &lifecycle).await;
+                    if !positions.lock().await.is_empty() || lifecycle.tracks_anything().await {
                         warn!(
-                            "🏁 Kalshi market \"{}\": a position landed while retiring — staying on to manage it",
+                            "🏁 Kalshi market \"{}\": a position landed or an order is unsettled while retiring — staying on to manage it",
                             market_cfg.market_name,
                         );
                         continue;
@@ -1851,8 +1859,7 @@ async fn trade_one_market(
                 // unmanaged (no stop, no take-profit) until it expired. That is
                 // how -$3.09 was lost on 2026-08-10, recorded in neither
                 // `trades` nor `entries`.
-                lifecycle.cancel_all(venue.as_ref(), &positions).await;
-                settle_lifecycle_reports(&pool, &lifecycle).await;
+                cancel_all_before_leaving(venue.as_ref(), &lifecycle, &positions, &pool, &market_cfg.market_name).await;
                 flatten_before_stand_down(
                     &squadron_id, venue, &hub, &pool, &scope, &positions, &lifecycle,
                     &market_cfg, maker_cfg.as_ref(), maker_pair.as_ref(), &raptors, status_scope, starting,
@@ -2002,6 +2009,10 @@ async fn trade_one_market(
             continue;
         }
 
+        // [B74] What the fill feed and the reconciler learned about resting
+        // quotes reaches the rows before any signal acts on them, so a figure
+        // for a quote that has since been exited never lands on a newer row.
+        settle_lifecycle_reports(&pool, &lifecycle).await;
         let mut acted = false;
         for (strategy_name, signal) in signals {
             // Inside the RTB window we manage what we hold but take on nothing
@@ -2052,14 +2063,24 @@ async fn flatten_before_stand_down(
     starting: Decimal,
     ghost: bool,
 ) {
-    let held: Vec<(String, MarketId, Decimal)> = {
+    let candidates: Vec<(String, MarketId, Decimal, bool)> = {
         let map = positions.lock().await;
         map.iter()
             .filter(|(_, p)| p.shares > dec!(0))
             .filter(|(k, _)| k.squadron == squadron_id)
-            .map(|(k, p)| (k.strategy.clone(), k.market.clone(), p.shares))
+            .map(|(k, p)| (k.strategy.clone(), k.market.clone(), p.shares, p.fill_confirmed_at.is_some()))
             .collect()
     };
+    // [B74] A guard that is still an unfilled quote with its order tracked (the
+    // stand-down cancel did not go through) holds nothing to sell.
+    let mut held: Vec<(String, MarketId, Decimal)> = Vec::new();
+    for (strategy, token, shares, confirmed) in candidates {
+        if !confirmed && lifecycle.resting_for(&strategy, &token).await {
+            warn!("🏁 [{strategy}] {token}: an unfilled quote whose cancel did not go through — nothing to sell; it stays tracked");
+            continue;
+        }
+        held.push((strategy, token, shares));
+    }
     if held.is_empty() {
         return;
     }
@@ -2124,6 +2145,37 @@ async fn flatten_before_stand_down(
     }
 }
 
+/// Cancel what the lifecycle tracks before leaving a market, trying again for
+/// orders the venue could not settle at once (a refused cancel with no answer,
+/// a failed read), and say which ones are left behind: they stay at the venue
+/// with nothing tracking them, and any fill is adopted by the account sweep as
+/// a venue holding. Bounded, so a venue that never answers cannot hold the
+/// loop [B74].
+async fn cancel_all_before_leaving<V: Execution + ?Sized>(
+    venue: &V,
+    lifecycle: &OrderLifecycle,
+    positions: &Arc<Mutex<PositionMap>>,
+    pool: &Option<sqlx::SqlitePool>,
+    market_name: &str,
+) {
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        lifecycle.cancel_all(venue, positions).await;
+        settle_lifecycle_reports(pool, lifecycle).await;
+        if !lifecycle.tracks_anything().await {
+            return;
+        }
+        if attempt < ATTEMPTS {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+    let left = lifecycle.tracked_ids().await;
+    warn!(
+        "🏁 Leaving \"{market_name}\" with {} order(s) the venue could not settle: {left:?} — they stay at the venue untracked; a fill is adopted by the account sweep",
+        left.len(),
+    );
+}
+
 /// Write what the lifecycle learned about resting quotes to their rows: a quote
 /// released without a fill (cancelled at rotation or stand-down, pulled, or
 /// stale) loses its `pending` row; a tracked order the fill feed confirmed has
@@ -2134,12 +2186,13 @@ async fn settle_lifecycle_reports(pool: &Option<sqlx::SqlitePool>, lifecycle: &O
     let released = lifecycle.take_released().await;
     let confirmed = lifecycle.take_confirmed().await;
     let Some(p) = pool else { return };
+    let squadron = lifecycle.squadron_id();
     for q in released {
-        db::close_pending_open_position_for(p, &q.strategy, q.market.as_str()).await;
+        db::close_pending_open_position_for(p, squadron, &q.strategy, q.market.as_str()).await;
     }
     for c in confirmed {
-        db::set_open_position_fill(p, &c.strategy, c.market.as_str(), c.filled, c.price).await;
-        db::confirm_position_status(p, &c.strategy, c.market.as_str()).await;
+        db::set_open_position_fill(p, squadron, &c.strategy, c.market.as_str(), c.filled, c.price).await;
+        db::confirm_position_status_for(p, squadron, &c.strategy, c.market.as_str()).await;
     }
 }
 
@@ -2370,7 +2423,7 @@ async fn dispatch_signal(
                     lifecycle.track(&b, strategy_name, pp.order_type, Some(params.token_id.clone())).await;
                     record_entry(squadron_id, pool, scope, strategy_name, params, &a).await;
                     record_entry(squadron_id, pool, scope, strategy_name, pp, &b).await;
-                    if let Some(p) = pool { sync_dashboard(squadron_id, venue, p, positions, starting, None).await; }
+                    if let Some(p) = pool { sync_dashboard(squadron_id, venue, p, positions, Some(lifecycle), starting, None).await; }
                     true
                 }
                 Err(e) => {
@@ -2455,20 +2508,25 @@ async fn dispatch_signal(
                 }
                 return acted;
             }
-            // The quotes this engine tracks go first, by order id, and their
-            // pending rows with them [B74]; the account scan below still
-            // catches a quote placed before a restart.
+            // The quotes this engine tracks go first, by order id [B74]: a
+            // cancelled quote that never traded is released, one that traded
+            // before the cancel is kept as the position it is, and a cancel the
+            // venue does not confirm keeps the quote tracked with its guard.
             for tok in tokens {
-                let n = lifecycle.cancel_resting_for(venue, strategy_name, tok).await;
+                let n = lifecycle.cancel_resting_for(venue, positions, strategy_name, tok).await;
                 if n > 0 {
                     info!("🚫 [{strategy_name}] maker quote-pulled: {tok} — {n} tracked resting order(s) cancelled (toxic book)");
-                    if let Some(p) = pool { db::close_pending_open_position_for(p, strategy_name, tok.as_str()).await; }
                     acted = true;
                 }
             }
+            settle_lifecycle_reports(pool, lifecycle).await;
+            // The account scan catches a quote placed before a restart. An
+            // order this engine tracks is a live quote (another viper's, or
+            // this one's that the venue just refused to cancel) and is left alone.
             let open = venue.open_orders().await.unwrap_or_default();
             for tok in tokens {
                 for ord in open.iter().filter(|o| &o.market == tok) {
+                    if lifecycle.tracked_owner(&ord.order_id).await.is_some() { continue; }
                     if let Err(e) = venue.cancel(ord.order_id.clone()).await {
                         warn!("[{strategy_name}] maker quote-pull cancel failed for {} ({}): {e}", ord.order_id, tok);
                     } else {
@@ -2476,7 +2534,14 @@ async fn dispatch_signal(
                         acted = true;
                     }
                 }
-                positions.lock().await.remove(&PositionKey::new(squadron_id, strategy_name, tok.clone()));
+                // The guard goes only when no tracked order remains on the leg
+                // and it is still a quote; a guard the fill feed or the cancel's
+                // own reading confirmed is a position and stays.
+                if !lifecycle.resting_for(strategy_name, tok).await {
+                    let key = PositionKey::new(squadron_id, strategy_name, tok.clone());
+                    let mut map = positions.lock().await;
+                    if map.get(&key).is_some_and(|p| p.fill_confirmed_at.is_none()) { map.remove(&key); }
+                }
             }
             acted
         }
@@ -2530,16 +2595,47 @@ async fn dispatch_signal(
             // is cancelled here and what is held is sold below.
             if lifecycle.resting_for(strategy_name, &params.token_id).await {
                 let key = PositionKey::new(squadron_id, strategy_name, params.token_id.clone());
-                let confirmed = positions.lock().await.get(&key).is_some_and(|p| p.fill_confirmed_at.is_some());
-                let n = lifecycle.cancel_resting_for(venue, strategy_name, &params.token_id).await;
-                if !confirmed && n > 0 {
-                    positions.lock().await.remove(&key);
-                    if let Some(p) = pool { db::close_pending_open_position_for(p, strategy_name, params.token_id.as_str()).await; }
-                    info!("🚫 [{strategy_name}] exit ({reason}) on an unfilled quote {} — resting order cancelled, nothing to sell", params.token_id);
-                    return true;
+                lifecycle.cancel_resting_for(venue, positions, strategy_name, &params.token_id).await;
+                settle_lifecycle_reports(pool, lifecycle).await;
+                // Still working after the cancel attempt (the venue did not
+                // confirm the cancel): nothing is sold this tick whatever the
+                // guard says. A cancelled order whose fill is still being read
+                // no longer works; what its guard holds is the venue's own
+                // figure and may be sold.
+                // Standing down is the exception: the squadron is leaving, so
+                // what the guard holds (the venue's own figure for this order)
+                // is sold now; a remainder the venue would not cancel is logged
+                // by the leaving path and any later fill of it is adopted by
+                // the account sweep.
+                if lifecycle.working_for(strategy_name, &params.token_id).await && reason != "SquadronStandDown" {
+                    warn!("↩️ [{strategy_name}] exit ({reason}) on {} — its resting order could not be cancelled this tick, nothing sold; retrying", params.token_id);
+                    arm_exit_retry_backoff(strategy_name, params.token_id.as_str());
+                    return false;
                 }
-                // A refused cancel means the quote filled: it is a position now
-                // and is sold as one.
+                // What the cancel left behind decides. No guard: the quote was
+                // released, nothing to sell. A guard still unconfirmed: the
+                // cancel did not go through and the quote may still be working,
+                // so nothing is sold this tick. A confirmed guard: part or all
+                // of the quote traded; it is sold at the size the venue reported,
+                // which the viper re-reads from the map on its next tick if the
+                // size it signalled was the one placed.
+                let state = positions.lock().await.get(&key).map(|p| (p.fill_confirmed_at.is_some(), p.shares));
+                match state {
+                    None => {
+                        info!("🚫 [{strategy_name}] exit ({reason}) on an unfilled quote {} — resting order cancelled, nothing to sell", params.token_id);
+                        return true;
+                    }
+                    Some((false, _)) => {
+                        warn!("↩️ [{strategy_name}] exit ({reason}) on quote {} — the cancel did not go through, nothing sold this tick; retrying", params.token_id);
+                        arm_exit_retry_backoff(strategy_name, params.token_id.as_str());
+                        return false;
+                    }
+                    Some((true, held)) if held != params.shares => {
+                        info!("↩️ [{strategy_name}] exit ({reason}) on {}: the quote traded {held}, not the {} signalled — the viper re-emits at the traded size", params.token_id, params.shares);
+                        return false;
+                    }
+                    Some((true, _)) => {}
+                }
             }
             info!("🚪 [{strategy_name}] exit ({reason}): {} @ {:.4}", params.token_id, params.price);
             // Snapshot the entry BEFORE the sell so the round-trip can be booked
@@ -2686,7 +2782,7 @@ async fn dispatch_single(
     // (2026-10-29: five bids in two seconds, then `insufficient_balance`).
     if matches!(side, Side::Buy)
         && matches!(params.order_type, TimeInForce::Gtc | TimeInForce::Gtd)
-        && lifecycle.resting_for(strategy_name, &params.token_id).await
+        && lifecycle.working_for(strategy_name, &params.token_id).await
     {
         debug!("[{strategy_name}] a quote already rests on {} — not placing another", params.token_id);
         return None;
@@ -2713,8 +2809,10 @@ async fn dispatch_single(
                         market: params.token_id.clone(),
                         filled: params.shares.round_dp(2),
                         price: params.price,
-                        // Nothing has traded, so nothing has been charged; a
-                        // post-only quote pays nothing when lifted either.
+                        // Nothing has traded, so nothing has been charged yet.
+                        // The fill feed carries no fee, so a maker fee the venue
+                        // charges when the quote is lifted (Kalshi does on some
+                        // series) is not on the row.
                         fee: Decimal::ZERO,
                     };
                     record_guard(squadron_id, positions, strategy_name, params, None, &resting).await;
@@ -2737,10 +2835,24 @@ async fn dispatch_single(
                 params.token_id, f.price, f.filled, f.order_id);
             if matches!(side, Side::Buy) {
                 record_guard(squadron_id, positions, strategy_name, params, None, &f).await;
-                lifecycle.track(&f, strategy_name, params.order_type, None).await;
+                // [B74] The venue said this much of a good-till-cancelled buy
+                // traded at placement, so the guard is confirmed for it now; what
+                // did not fill keeps working and is tracked for the size PLACED,
+                // the fill feed sizing the guard as it trades. An order filled
+                // in full has nothing left to track.
+                if matches!(params.order_type, TimeInForce::Gtc | TimeInForce::Gtd) {
+                    if let Some(p) = positions.lock().await.get_mut(&PositionKey::new(squadron_id, strategy_name, params.token_id.clone())) {
+                        p.fill_confirmed_at = Some(Utc::now());
+                    }
+                    let placed = params.shares.round_dp(2);
+                    if f.filled < placed && !f.order_id.0.is_empty() {
+                        let working = Fill { filled: placed, ..f.clone() };
+                        lifecycle.track_resting(&working, strategy_name, params.order_type, None).await;
+                    }
+                }
                 record_entry(squadron_id, pool, scope, strategy_name, params, &f).await;
             }
-            if let Some(p) = pool { sync_dashboard(squadron_id, venue, p, positions, starting, None).await; }
+            if let Some(p) = pool { sync_dashboard(squadron_id, venue, p, positions, Some(lifecycle), starting, None).await; }
             Some(f)
         }
         Err(e) => {
@@ -2824,7 +2936,8 @@ async fn holds_opposite_leg(positions: &Arc<Mutex<PositionMap>>, squadron_id: &s
     let (ticker, is_yes) = super::split_market_id(token.as_str());
     let opposite = leg_id(&ticker, !is_yes);
     let map = positions.lock().await;
-    map.iter().any(|(k, p)| k.squadron == squadron_id && k.market.as_str() == opposite && p.shares > Decimal::ZERO)
+    // A guard that is still an unfilled quote holds nothing the venue can net [B74].
+    map.iter().any(|(k, p)| k.squadron == squadron_id && k.market.as_str() == opposite && p.shares > Decimal::ZERO && p.fill_confirmed_at.is_some())
 }
 
 /// May a buy costing `cost` on `token` go to the venue?
@@ -3008,6 +3121,9 @@ async fn sync_dashboard(
     venue: &KalshiVenue,
     pool: &sqlx::SqlitePool,
     guards: &Arc<Mutex<PositionMap>>,
+    // The squadron's order lifecycle, which knows which unconfirmed guards are
+    // quotes still working at the venue [B74].
+    lifecycle: Option<&OrderLifecycle>,
     starting: Decimal,
     // The loop's current available collateral, returned unchanged when the
     // venue cannot be read; `None` on the loop's first sync and on the
@@ -3056,13 +3172,25 @@ async fn sync_dashboard(
     // holding is attributed to the viper that opened it. Holdings with no guard
     // (prior session, manual trade) are adopted under a neutral label rather
     // than being blamed on a viper that never traded them.
-    let owners: HashMap<String, (String, String)> = {
+    let candidates: Vec<(String, String, String, bool)> = {
         let map = guards.lock().await;
         map.iter()
             .filter(|(k, _)| k.squadron == squadron_id)
-            .map(|(k, p)| (k.market.as_str().to_string(), (k.strategy.clone(), p.market_name.clone())))
+            .map(|(k, p)| (k.market.as_str().to_string(), k.strategy.clone(), p.market_name.clone(), p.fill_confirmed_at.is_none()))
             .collect()
     };
+    // [B74] An unfilled quote with its order still working owns nothing the
+    // venue holds: left out, so another viper's (or squadron's) contracts on
+    // the leg never promote the quote's pending row to a confirmed position.
+    let mut owners: HashMap<String, (String, String)> = HashMap::new();
+    for (token, strategy, market_name, unconfirmed) in candidates {
+        if unconfirmed {
+            if let Some(lc) = lifecycle {
+                if lc.resting_for(&strategy, &MarketId::new(token.clone())).await { continue; }
+            }
+        }
+        owners.insert(token, (strategy, market_name));
+    }
 
     let mut live_ids = std::collections::HashSet::new();
     let mut positions_value = Decimal::ZERO;
@@ -3091,7 +3219,7 @@ async fn sync_dashboard(
                 db::record_adopted_position(
                     pool, &adopt_scope, squadron_id, strategy, sym, market_name, side_label(sym), p.avg_price, p.shares,
                 ).await;
-                db::confirm_position_status(pool, strategy, sym).await;
+                db::confirm_position_status_for(pool, squadron_id, strategy, sym).await;
             }
             // `positions()` is the whole account; this map is one squadron,
             // rebuilt on every rotation. A holding some row already claims
