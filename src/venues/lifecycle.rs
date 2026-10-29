@@ -321,6 +321,22 @@ impl OrderLifecycle {
         self.track_with_stale(fill, strategy, tif, pair_market, RESTING_QUOTE_STALE_SECS, true).await;
     }
 
+    /// Register one leg of a paired entry (arbitrage, Time Decay) that the
+    /// venue acknowledged UNFILLED: a resting quote in every respect (confirmed
+    /// and sized by its own order, never by the leg's holdings; released when
+    /// cancelled unfilled) except that it keeps the pair's short stale window,
+    /// because a pair with one leg working alone is the exposure the naked-leg
+    /// pass exists to end [B74].
+    pub async fn track_pair_leg(
+        &self,
+        fill: &Fill,
+        strategy: &str,
+        tif: TimeInForce,
+        pair_market: Option<MarketId>,
+    ) {
+        self.track_with_stale(fill, strategy, tif, pair_market, self.cfg.stale_order_secs, true).await;
+    }
+
     async fn track_with_stale(
         &self,
         fill: &Fill,
@@ -1699,6 +1715,28 @@ mod resting_quote_tests {
         lc.reconcile(&venue, &map).await;
         assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(4), true)));
         assert!(lc.working_for("MakerStrategy", &MarketId::new(LEG)).await);
+    }
+
+    /// A paired leg the venue acknowledged unfilled is a quote: guarded at the
+    /// size placed, sized by its own fill, released when cancelled unfilled,
+    /// and not a holding until it trades. Only its stale window is the pair's.
+    #[tokio::test]
+    async fn a_pair_leg_acknowledged_unfilled_is_a_quote_with_the_pairs_stale_window() {
+        let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
+        let venue = QuoteVenue::new();
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+        guard(&mut *map.lock().await, "TimeDecayStrategy", LEG, dec!(10), dec!(0.40), false);
+        lc.track_pair_leg(&ack("td-1", LEG, dec!(10), dec!(0.40)), "TimeDecayStrategy", TimeInForce::Gtc, Some(MarketId::new("other#no"))).await;
+        assert!(!lc.holds_anything(&map).await, "an unfilled pair leg is a quote, not a holding");
+        assert_eq!(lc.tracked.lock().await[0].stale_after_secs, LifecycleConfig::us().stale_order_secs, "but it keeps the pair's short window");
+
+        lc.confirm_on_fill(&map, &event("td-1", LEG, dec!(4), dec!(0.40))).await;
+        assert_eq!(shares_of(&map, "TimeDecayStrategy").await, Some((dec!(4), true)), "sized by its own fill, not confirmed at zero");
+        assert!(lc.holds_anything(&map).await);
+        assert!(lc.resting_for("TimeDecayStrategy", &MarketId::new(LEG)).await, "the remainder still works");
+
+        assert!(lc.cancel_all(&venue, &map).await.is_empty(), "a confirmed guard is a position, not released");
+        assert_eq!(shares_of(&map, "TimeDecayStrategy").await, Some((dec!(4), true)));
     }
 
     /// A paired leg (an arbitrage entry) is a holding before the reconciler

@@ -2312,14 +2312,33 @@ async fn dispatch_signal(
                 Ok([a, b]) => {
                     info!("✅ [{strategy_name}] entry pair: {} @ {:.4} | {} @ {:.4}",
                         a.order_id, a.price, b.order_id, b.price);
-                    record_guard(squadron_id, positions, strategy_name, params, Some(&pp.token_id), &a).await;
-                    record_guard(squadron_id, positions, strategy_name, pp, Some(&params.token_id), &b).await;
-                    // Track both resting legs so the reconciler manages their
-                    // lifecycle (fill-confirm / stale-cancel / naked-leg hedge).
-                    lifecycle.track(&a, strategy_name, params.order_type, Some(pp.token_id.clone())).await;
-                    lifecycle.track(&b, strategy_name, pp.order_type, Some(params.token_id.clone())).await;
-                    record_entry(squadron_id, pool, scope, strategy_name, params, &a).await;
-                    record_entry(squadron_id, pool, scope, strategy_name, pp, &b).await;
+                    // [B74] A leg the venue acknowledged UNFILLED rests on the
+                    // book: it is guarded and written at the size placed
+                    // (unconfirmed) and tracked as a quote with the pair's stale
+                    // window, so its fill sizes it by order id and a cancel
+                    // releases it. Booking the zero the venue returned guarded
+                    // nothing and tracked a quantity of zero: the first fill
+                    // event then confirmed the leg at zero shares and the rest
+                    // of the order worked on untracked. A leg that traded is
+                    // guarded at its fill and tracked for the size placed.
+                    let placed_a = Fill { filled: params.shares.round_dp(2), ..a.clone() };
+                    let placed_b = Fill { filled: pp.shares.round_dp(2), ..b.clone() };
+                    let a_rests = acknowledged_resting(Side::Buy, params.order_type, a.filled, &a.order_id);
+                    let b_rests = acknowledged_resting(Side::Buy, pp.order_type, b.filled, &b.order_id);
+                    record_guard(squadron_id, positions, strategy_name, params, Some(&pp.token_id), if a_rests { &placed_a } else { &a }).await;
+                    record_guard(squadron_id, positions, strategy_name, pp, Some(&params.token_id), if b_rests { &placed_b } else { &b }).await;
+                    if a_rests {
+                        lifecycle.track_pair_leg(&placed_a, strategy_name, params.order_type, Some(pp.token_id.clone())).await;
+                    } else {
+                        lifecycle.track(&placed_a, strategy_name, params.order_type, Some(pp.token_id.clone())).await;
+                    }
+                    if b_rests {
+                        lifecycle.track_pair_leg(&placed_b, strategy_name, pp.order_type, Some(params.token_id.clone())).await;
+                    } else {
+                        lifecycle.track(&placed_b, strategy_name, pp.order_type, Some(params.token_id.clone())).await;
+                    }
+                    record_entry(squadron_id, pool, scope, strategy_name, params, if a_rests { &placed_a } else { &a }).await;
+                    record_entry(squadron_id, pool, scope, strategy_name, pp, if b_rests { &placed_b } else { &b }).await;
                     if let Some(p) = pool { sync_dashboard(squadron_id, venue, p, Some(positions), Some(lifecycle), starting, None).await; }
                     true
                 }
