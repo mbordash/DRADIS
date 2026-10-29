@@ -3236,10 +3236,15 @@ async fn sync_dashboard(
             // holding is what promotes it out of `pending`. The insert is a no-op
             // for it; it only writes when the viper's row is missing, and then
             // the size is the wallet's, not the fill's.
+            // [B76] Written through the gated adoption, so a holding some
+            // other row already claims (an adopted row, another squadron's
+            // viper) does not gain a second, viper-named wallet-sized row.
             Some((strategy, market_name)) => {
-                db::record_adopted_position(
+                if db::adopt_unclaimed_holding(
                     pool, &adopt_scope, squadron_id, strategy, sym, market_name, side_label(sym), p.avg_price, p.shares,
-                ).await;
+                ).await {
+                    info!("🧾 Kalshi dashboard sync [{squadron_id}]: {strategy} holds {sym} ({} sh @ ${}) with no row of its own — written at the account's size", p.shares, p.avg_price);
+                }
                 db::confirm_position_status_for(pool, squadron_id, strategy, sym).await;
             }
             // `positions()` is the whole account; this map is one squadron,
@@ -3257,11 +3262,16 @@ async fn sync_dashboard(
                     db::forget_unclaimed_holding(squadron_id, sym);
                     debug!("Kalshi dashboard sync [{squadron_id}]: {sym} is already an open-positions row — not adopting");
                 }
+                // [B76] The claim check and the insert run under one process-wide
+                // gate, and the insert refuses when any row claims the token, so
+                // two squadrons passing the grace in the same pass write one row.
                 Ok(false) if db::unclaimed_holding_adoptable(squadron_id, sym) => {
                     db::forget_unclaimed_holding(squadron_id, sym);
-                    db::record_adopted_position(
+                    if db::adopt_unclaimed_holding(
                         pool, &adopt_scope, squadron_id, "ChainAdopted", sym, sym, side_label(sym), p.avg_price, p.shares,
-                    ).await;
+                    ).await {
+                        info!("🧾 Kalshi dashboard sync [{squadron_id}]: adopted {sym} {} sh @ ${} — held by the account, no viper row claims it", p.shares, p.avg_price);
+                    }
                 }
                 Ok(false) => {
                     debug!("Kalshi dashboard sync [{squadron_id}]: {sym} unclaimed — adopting if still so after {}s", db::UNCLAIMED_ADOPT_GRACE_SECS);
@@ -3273,6 +3283,12 @@ async fn sync_dashboard(
                 }
             },
         }
+        // [B75] A row adopted from the account follows the account: a holding
+        // that grew (more untracked fills) or shrank (an operator sale) after
+        // adoption used to keep its first size for good, because the claim
+        // check above never touched a token that already had a row. Rows the
+        // engine wrote from its own fills are never moved by a wallet reading.
+        db::follow_account_holding(sym, p.shares, p.avg_price).await;
         positions_value += p.shares * p.avg_price;
     }
 

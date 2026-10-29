@@ -4919,6 +4919,433 @@ pub fn forget_unclaimed_holding(squadron_id: &str, token_id: &str) {
     }
 }
 
+/// Process-wide gate around adopting an unclaimed holding.
+///
+/// Each squadron's dashboard sweep checks "does any row claim this token?" and
+/// then inserts; two sweeps that both passed the grace window in the same pass
+/// both saw it unclaimed and both wrote (2026-10-29 08:12 ET: sports-open and
+/// politics-open adopted the same 56.16 Kalshi contracts 0.4 ms apart). The
+/// check and the insert now run under one lock, and the insert itself refuses
+/// when ANY non-ghost row claims the token, whatever its strategy or squadron.
+static ADOPTION_GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+fn adoption_gate() -> &'static tokio::sync::Mutex<()> {
+    ADOPTION_GATE.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Adopt a holding no open-positions row claims, once across every squadron
+/// and database file. Returns whether THIS call wrote the row.
+///
+/// `claim_pools` is every pool a claiming row could live in (the squadrons
+/// sharing an account may file to different files); the row is written to
+/// `pool`. The row is wallet-sized (`engine_attributed = 0`), so a later sweep
+/// may resize it to the account through [`follow_account_holding`].
+pub async fn adopt_unclaimed_holding_in(
+    claim_pools: &[SqlitePool],
+    pool: &SqlitePool,
+    scope: &TradeScope,
+    squadron_id: &str,
+    strategy: &str,
+    token_id: &str,
+    market: &str,
+    side: &str,
+    entry_price: Decimal,
+    shares: Decimal,
+) -> bool {
+    let _gate = adoption_gate().lock().await;
+    for p in claim_pools {
+        match open_row_claims_token_in(p, token_id).await {
+            Ok(false) => {}
+            Ok(true) => return false,
+            Err(e) => {
+                warn!("Adoption of {token_id} skipped this pass — open-row lookup failed: {e}");
+                return false;
+            }
+        }
+    }
+    note_confirmation(token_id);
+    let ts = Utc::now().to_rfc3339();
+    let sid = current_session_id();
+    let venue = resolved_venue(scope);
+    match sqlx::query(
+        "INSERT INTO open_positions
+         (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, status, squadron_id,
+          venue, market_class, underlying, engine_attributed)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, 0, 'confirmed', ?, ?, ?, ?, 0
+         WHERE NOT EXISTS (
+             SELECT 1 FROM open_positions WHERE token_id = ? AND ghost_mode = 0
+         )"
+    )
+    .bind(&ts)
+    .bind(sid)
+    .bind(strategy)
+    .bind(token_id)
+    .bind(market)
+    .bind(side)
+    .bind(entry_price.to_string())
+    .bind(shares.to_string())
+    .bind(squadron_id)
+    .bind(venue)
+    .bind(scope.market_class.clone())
+    .bind(scope.underlying.clone())
+    .bind(token_id)
+    .execute(pool)
+    .await {
+        Ok(r) => r.rows_affected() > 0,
+        Err(e) => { error!("❌ DB adopt_unclaimed_holding failed: {}", e); false }
+    }
+}
+
+/// [`adopt_unclaimed_holding_in`] with every registered pool as the claim scan.
+pub async fn adopt_unclaimed_holding(
+    pool: &SqlitePool,
+    scope: &TradeScope,
+    squadron_id: &str,
+    strategy: &str,
+    token_id: &str,
+    market: &str,
+    side: &str,
+    entry_price: Decimal,
+    shares: Decimal,
+) -> bool {
+    let pools = all_pools();
+    adopt_unclaimed_holding_in(&pools, pool, scope, squadron_id, strategy, token_id, market, side, entry_price, shares).await
+}
+
+/// Below this, a row and the account holding are the same size.
+pub const ADOPTED_RESIZE_TOLERANCE: Decimal = Decimal::from_parts(5, 0, 0, false, 3);
+
+/// How long a changed account holding must persist before an adopted row
+/// follows it. A viper's taker entry lands on the account before its row is
+/// written and its exit leaves the account before its row is deleted, and
+/// another squadron's sweep can read the account inside either gap; a change
+/// still there a minute later is real. Same shape as [`UNCLAIMED_ADOPT_GRACE_SECS`].
+pub const RESIZE_GRACE_SECS: u64 = 60;
+
+/// A sighting older than this is forgotten: the token left `positions()` or a
+/// pass ended early, and a fresh change must stand its own grace rather than
+/// inherit a clock from an unrelated earlier one (three sweep intervals).
+pub const RESIZE_SIGHTING_STALE_SECS: u64 = 90;
+
+/// A sighting of a target size for an adopted row: when this target was first
+/// seen and when it was last seen.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sighting { pub target: Decimal, pub since: std::time::Instant, pub last: std::time::Instant }
+
+/// Pure rule behind [`resize_due`]: given the previous sighting, is `target`
+/// due now, and what sighting should be remembered? Due is true once the same
+/// target has stood for `grace`; a different target, or a previous sighting
+/// older than `stale`, starts a new clock.
+pub fn sighting_due(prev: Option<Sighting>, now: std::time::Instant, target: Decimal, grace: std::time::Duration, stale: std::time::Duration) -> (bool, Sighting) {
+    let since = match prev {
+        Some(p) if p.target == target && now.saturating_duration_since(p.last) <= stale => p.since,
+        _ => now,
+    };
+    (now.saturating_duration_since(since) >= grace, Sighting { target, since, last: now })
+}
+
+static RESIZE_SEEN: OnceLock<std::sync::Mutex<std::collections::HashMap<String, Sighting>>> = OnceLock::new();
+
+fn resize_seen() -> &'static std::sync::Mutex<std::collections::HashMap<String, Sighting>> {
+    RESIZE_SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Note that `token_id`'s adopted row should read `target`; true once the same
+/// target has been observed for `grace`. A due sighting is consumed under the
+/// same lock, so two sweeps cannot both find the same change due.
+fn resize_due(token_id: &str, target: Decimal, grace: std::time::Duration) -> bool {
+    let now = std::time::Instant::now();
+    let mut map = match resize_seen().lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    let (due, next) = sighting_due(map.get(token_id).copied(), now, target, grace, std::time::Duration::from_secs(RESIZE_SIGHTING_STALE_SECS));
+    if due { map.remove(token_id); } else { map.insert(token_id.to_string(), next); }
+    due
+}
+
+fn forget_resize(token_id: &str) {
+    if let Ok(mut map) = resize_seen().lock() { map.remove(token_id); }
+}
+
+/// A standing anomaly is warned about once per token per this interval, then
+/// at debug: three squadrons sweeping every thirty seconds would otherwise
+/// print the same line six times a minute until someone fixes the row by hand.
+const ANOMALY_WARN_EVERY_SECS: u64 = 600;
+
+static ANOMALY_WARNED: OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> = OnceLock::new();
+
+fn anomaly_warn_due(key: &str) -> bool {
+    let map = ANOMALY_WARNED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut map = match map.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    let now = std::time::Instant::now();
+    let due = map.get(key).is_none_or(|t| now.saturating_duration_since(*t) >= std::time::Duration::from_secs(ANOMALY_WARN_EVERY_SECS));
+    if due { map.insert(key.to_string(), now); }
+    due
+}
+
+/// One row [`follow_account_holding`] brought into line with the account.
+/// `after` is zero when the row was closed because the account's remaining
+/// contracts are all the engine's own; `booked` is the size booked off-strategy
+/// (the decrement, or the whole row), zero when the row only grew.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdoptedResize {
+    pub squadron_id: String,
+    pub strategy: String,
+    pub before: Decimal,
+    pub after: Decimal,
+    pub price: Decimal,
+    pub booked: Decimal,
+}
+
+/// Where a booking made for an adopted row is filed: as the row was, with the
+/// market's other ledger rows asked when the row carries no venue (same rule
+/// as the purge).
+async fn adopted_row_scope(pool: &SqlitePool, market: &str, venue: &Option<String>, market_class: &Option<String>, underlying: &Option<String>) -> TradeScope {
+    match (venue, market_class) {
+        (Some(v), Some(_)) if !v.is_empty() => TradeScope::new("", v.clone(), market_class.clone(), underlying.clone()),
+        _ => {
+            let looked_up = filing_scope_for_market(pool, market).await;
+            TradeScope::new(
+                "",
+                venue.clone().filter(|v| !v.is_empty()).unwrap_or(looked_up.venue),
+                market_class.clone().or(looked_up.market_class),
+                underlying.clone().or(looked_up.underlying),
+            )
+        }
+    }
+}
+
+/// Book `qty` adopted contracts that left the account, at the row's last mark
+/// (at entry, labelled, with none), net of `fee`. Mirrors the purge's
+/// off-strategy booking; the purge itself never reaches a live token.
+async fn book_adopted_exit(pool: &SqlitePool, scope: &TradeScope, strategy: &str, market: &str, side: &str, entry: Decimal, qty: Decimal, fee: Decimal, mark: Option<Decimal>) -> (Decimal, Decimal) {
+    let (exit_px, reason) = match mark {
+        Some(px) => (px, format!("ChainReconcile: adopted holding left the account (est. @ ${px:.4} last mark)")),
+        None => (entry, "ChainReconcile: adopted holding left the account (exit price unknown: no mark; booked at entry)".to_string()),
+    };
+    let pnl = (exit_px - entry) * qty - fee;
+    record_trade_db(pool, scope, fee, strategy, market, side, entry, exit_px, qty, pnl, &reason, None).await;
+    (exit_px, pnl)
+}
+
+/// Bring the wallet-sized row claiming `token_id` into line with what the
+/// account holds now.
+///
+/// A row adopted from the venue is sized to the account at the moment of
+/// adoption and then, until now, never again: the sweep refused to touch a
+/// token that already had a row (the duplicate-adoption guard), so a holding
+/// that GREW afterwards stayed at its first size. On 2026-10-29 the engine
+/// carried 56.16 adopted contracts while the account held 116.56: three more
+/// untracked bids had filled, collateral fell by $16, and nothing on the board
+/// said why. The intl chain corrector has always resized adopted rows to the
+/// wallet (`ChainCorrection::SharesAndPrice`); this is the same rule for the
+/// venues whose sweep reads the account directly.
+///
+/// Rules, in order:
+/// 1. Duplicate `ChainAdopted` rows for the token (the race this release also
+///    closes) collapse to the oldest; the others are deleted unbooked, because
+///    a duplicate row records nothing the venue holds.
+/// 2. Any failed or unparsable read is "could not tell": nothing is written
+///    this pass, as on the adoption path. A `pending` engine row on the token
+///    (a resting quote, [B74]) also stops the pass: its true filled count is
+///    unknown, so the remainder cannot be computed.
+/// 3. Contracts a CONFIRMED engine-attributed row claims are the viper's and
+///    are never moved; the adopted row gets the remainder, and its price is the
+///    remainder's own cost (the account's total cost less the vipers' rows),
+///    never the blended account average, kept inside (0, 1].
+/// 4. Exactly one wallet-sized row must remain for the token. Two or more
+///    cannot be attributed from a wallet total, so they are left alone (warned)
+///    and the caller is told nothing changed. Engine rows that together claim
+///    MORE than the account holds (Kalshi nets a viper's NO fill against the
+///    YES leg, and the viper's YES row still stands) are the same kind of
+///    unanswerable: warned and left, never booked out.
+/// 5. A change within [`ADOPTED_RESIZE_TOLERANCE`] is not written; a larger
+///    one is written once it has persisted for `grace` ([`RESIZE_GRACE_SECS`]).
+/// 6. A shrink is money that moved: the contracts that left are booked
+///    off-strategy at the row's last mark (at entry, labelled, with none), net
+///    of their share of the entry fee, exactly as the purge books a vanished
+///    holding. A remainder of zero while a viper still holds the leg (an
+///    operator sale of the adopted lot) books the whole row and removes it; the
+///    purge cannot reach it itself, because the token is still live. The row
+///    is removed BEFORE the booking, and the booking only follows a delete
+///    that removed it, so a repeated pass or a racing purge cannot book twice.
+///
+/// Returns what was done, if anything. Ghost rows are never touched.
+pub async fn follow_account_holding_in(
+    pools: &[SqlitePool],
+    token_id: &str,
+    held: Decimal,
+    avg_price: Decimal,
+    grace: std::time::Duration,
+) -> Option<AdoptedResize> {
+    // 1. Collapse duplicate adopted rows (oldest by ts, then id, survives).
+    let mut adopted: Vec<(usize, i64, String)> = Vec::new();
+    for (i, p) in pools.iter().enumerate() {
+        let rows: Vec<(i64, String)> = match sqlx::query_as(
+            "SELECT id, ts FROM open_positions
+              WHERE token_id = ? AND ghost_mode = 0 AND engine_attributed = 0 AND strategy = 'ChainAdopted'"
+        ).bind(token_id).fetch_all(p).await {
+            Ok(r) => r,
+            Err(e) => { debug!("follow_account_holding: read failed for {token_id} — nothing written this pass: {e}"); return None; }
+        };
+        adopted.extend(rows.into_iter().map(|(id, ts)| (i, id, ts)));
+    }
+    if adopted.len() > 1 {
+        adopted.sort_by(|a, b| a.2.cmp(&b.2).then(a.1.cmp(&b.1)));
+        for (i, id, _) in adopted.iter().skip(1) {
+            match sqlx::query("DELETE FROM open_positions WHERE id = ? AND strategy = 'ChainAdopted' AND engine_attributed = 0")
+                .bind(id).execute(&pools[*i]).await
+            {
+                Ok(_) => warn!("🧾 Duplicate adopted row removed: {token_id} id {id} — the same holding was adopted more than once; the oldest row stands"),
+                Err(e) => { error!("❌ DB could not remove duplicate adopted row {id} for {token_id}: {e}"); return None; }
+            }
+        }
+    }
+
+    // 2./3. The engine's confirmed fills, and the wallet-sized rows.
+    type Row = (i64, String, String, String, String, i64, Option<String>, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>);
+    let mut attributed = Decimal::ZERO;
+    let mut attributed_cost = Decimal::ZERO;
+    let mut wallet_rows: Vec<(usize, Row)> = Vec::new();
+    for (i, p) in pools.iter().enumerate() {
+        let rows: Vec<Row> = match sqlx::query_as(
+            "SELECT id, squadron_id, strategy, shares, entry_price, engine_attributed, status, market, side,
+                    current_price, entry_fee, venue, market_class, underlying
+               FROM open_positions WHERE token_id = ? AND ghost_mode = 0"
+        ).bind(token_id).fetch_all(p).await {
+            Ok(r) => r,
+            Err(e) => { debug!("follow_account_holding: read failed for {token_id} — nothing written this pass: {e}"); return None; }
+        };
+        for row in rows {
+            let (Ok(sh), Ok(px)) = (row.3.parse::<Decimal>(), row.4.parse::<Decimal>()) else {
+                debug!("follow_account_holding: row {} on {token_id} has an unparsable size or price — nothing written this pass", row.0);
+                return None;
+            };
+            if row.5 == 1 {
+                if row.6.as_deref() != Some("confirmed") {
+                    // A quote resting on the leg: how much of it traded is not known here.
+                    forget_resize(token_id);
+                    return None;
+                }
+                attributed += sh;
+                attributed_cost += sh * px;
+            } else {
+                wallet_rows.push((i, row));
+            }
+        }
+    }
+    // 4. Exactly one wallet-sized row, and engine rows that fit inside the account.
+    if wallet_rows.len() != 1 {
+        if wallet_rows.len() > 1 {
+            let who = wallet_rows.iter().map(|(_, r)| format!("{}/{}", r.1, r.2)).collect::<Vec<_>>().join(", ");
+            if anomaly_warn_due(&format!("ambiguous:{token_id}")) {
+                warn!("🧾 {} wallet-sized rows claim {token_id} ({who}) — the account's {held} sh cannot be attributed between them; none resized. Correct by hand.", wallet_rows.len());
+            } else {
+                debug!("follow_account_holding: {} wallet-sized rows claim {token_id} ({who}) — none resized", wallet_rows.len());
+            }
+        }
+        forget_resize(token_id);
+        return None;
+    }
+    let remainder = held - attributed;
+    if remainder < -ADOPTED_RESIZE_TOLERANCE {
+        // A viper's own sell reaches the account before its row is deleted
+        // (the post-fill sync runs first), so a leg that just exited reads as
+        // an over-claim for one pass: not an anomaly, not worth an operator line.
+        let just_exited = recently_exited_at(token_id)
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(RESIZE_GRACE_SECS));
+        if !just_exited && anomaly_warn_due(&format!("overclaim:{token_id}")) {
+            warn!("🧾 Engine rows claim {attributed} sh of {token_id} but the account holds {held} — a wallet reading cannot say whose contracts left (a netted opposite-leg fill?); the adopted row is left as it is. Correct by hand.");
+        } else {
+            debug!("follow_account_holding: engine rows claim {attributed} sh of {token_id} against {held} held — nothing written");
+        }
+        forget_resize(token_id);
+        return None;
+    }
+    let (i, row) = wallet_rows.remove(0);
+    let (id, squadron_id, strategy, shares_s, price_s, _, _, market, side, current_price, entry_fee, venue, market_class, underlying) = row;
+    let before: Decimal = shares_s.parse().ok()?;
+    let row_price: Decimal = price_s.parse().ok()?;
+    let target = remainder.max(Decimal::ZERO);
+    // 5. Dust, then the grace (a due sighting is consumed inside `resize_due`).
+    if (target - before).abs() <= ADOPTED_RESIZE_TOLERANCE {
+        forget_resize(token_id);
+        return None;
+    }
+    if !resize_due(token_id, target, grace) {
+        return None;
+    }
+    let pool = &pools[i];
+    let fee = entry_fee.as_deref().and_then(|f| f.parse::<Decimal>().ok()).unwrap_or(Decimal::ZERO);
+    let mark = current_price.as_deref().and_then(|s| s.parse::<Decimal>().ok()).filter(|px| *px > Decimal::ZERO);
+
+    // 6a. The adopted contracts are gone; the engine's own rows hold the rest.
+    if target <= ADOPTED_RESIZE_TOLERANCE {
+        let removed = match sqlx::query("DELETE FROM open_positions WHERE id = ? AND engine_attributed = 0 AND shares = ?").bind(id).bind(&shares_s).execute(pool).await {
+            Ok(r) => r.rows_affected() == 1,
+            Err(e) => { error!("❌ DB could not remove adopted row {id} for {token_id}: {e}"); return None; }
+        };
+        if !removed {
+            debug!("follow_account_holding: adopted row {id} for {token_id} was already gone or changed under this pass — nothing booked");
+            return None;
+        }
+        if row_price > Decimal::ZERO && before > Decimal::ZERO {
+            if recent_exit_covers(pool, &strategy, &market, &side, before).await {
+                info!("🧾 Adopted holding left the account [{squadron_id}/{strategy}] {token_id}: {before} sh already booked by a recent exit on this market and side — row removed, nothing booked twice");
+                return Some(AdoptedResize { squadron_id, strategy, before, after: Decimal::ZERO, price: row_price, booked: Decimal::ZERO });
+            }
+            let scope = adopted_row_scope(pool, &market, &venue, &market_class, &underlying).await;
+            let (exit_px, pnl) = book_adopted_exit(pool, &scope, &strategy, &market, &side, row_price, before, fee, mark).await;
+            warn!("🧾 Adopted holding left the account [{squadron_id}/{strategy}] {token_id}: {before} sh booked off-strategy at ${exit_px:.4} (pnl ${pnl:.4}; {attributed} sh on the leg are the engine's own) — correct by hand from the account's cash move if the mark is stale");
+        } else {
+            warn!("🧾 Adopted holding left the account [{squadron_id}/{strategy}] {token_id}: {before} sh with no cost basis — row removed, nothing booked");
+        }
+        return Some(AdoptedResize { squadron_id, strategy, before, after: Decimal::ZERO, price: row_price, booked: before });
+    }
+
+    // 3. On growth, the remainder's own cost, inside (0, 1]. On a shrink the
+    // row KEEPS its price: the contracts that left are booked at it below, and
+    // re-pricing the survivors from the account's post-sale average would
+    // move cost between the booking and the row, so the lot's total P&L would
+    // no longer add up to what the account made.
+    let one = Decimal::ONE;
+    let price = if target < before {
+        row_price
+    } else if avg_price > Decimal::ZERO {
+        let remainder_cost = ((held * avg_price - attributed_cost) / target).round_dp(6);
+        if remainder_cost > Decimal::ZERO && remainder_cost <= one { remainder_cost }
+        else if avg_price <= one { avg_price }
+        else { row_price }
+    } else {
+        row_price
+    };
+    let price_written = if price > Decimal::ZERO && price <= one { price } else { row_price };
+
+    // 6b. A shrink books the contracts that left; the row keeps its share of the fee.
+    let left = (before - target).max(Decimal::ZERO);
+    let fee_kept = if left > Decimal::ZERO && before > Decimal::ZERO { (fee * target / before).round_dp(6) } else { fee };
+    match sqlx::query("UPDATE open_positions SET shares = ?, entry_price = ?, entry_fee = ?, chain_adopted = 1 WHERE id = ? AND engine_attributed = 0 AND shares = ?")
+        .bind(target.to_string()).bind(price_written.to_string()).bind(fee_kept.to_string()).bind(id).bind(&shares_s).execute(pool).await
+    {
+        Ok(r) if r.rows_affected() == 1 => {}
+        Ok(_) => { debug!("follow_account_holding: adopted row {id} for {token_id} changed under this pass — nothing written"); return None; }
+        Err(e) => { error!("❌ DB follow_account_holding failed for {token_id}: {e}"); return None; }
+    }
+    if left > Decimal::ZERO && row_price > Decimal::ZERO {
+        let scope = adopted_row_scope(pool, &market, &venue, &market_class, &underlying).await;
+        let (exit_px, pnl) = book_adopted_exit(pool, &scope, &strategy, &market, &side, row_price, left, fee - fee_kept, mark).await;
+        warn!("🧾 Adopted holding shrank [{squadron_id}/{strategy}] {token_id}: {before} → {target} sh; the {left} sh that left are booked off-strategy at ${exit_px:.4} (pnl ${pnl:.4}) — correct by hand from the account's cash move if the mark is stale");
+    } else {
+        info!("🧾 Adopted holding resized [{squadron_id}/{strategy}] {token_id}: {before} → {target} sh @ ${price_written} — the account holds {held} sh, {attributed} sh are the engine's own");
+    }
+    Some(AdoptedResize { squadron_id, strategy, before, after: target, price: price_written, booked: left })
+}
+
+/// [`follow_account_holding_in`] across every registered pool with the
+/// production grace.
+pub async fn follow_account_holding(token_id: &str, held: Decimal, avg_price: Decimal) -> Option<AdoptedResize> {
+    let pools = all_pools();
+    follow_account_holding_in(&pools, token_id, held, avg_price, std::time::Duration::from_secs(RESIZE_GRACE_SECS)).await
+}
+
 /// A simulated hold as its `open_positions` row remembers it, for the closed-hold
 /// sweep (`ghost_settlement::settle_closed_ghost_holds`, [B65]): on Kalshi and
 /// Polymarket US the row is the only record that outlives the market loop.
@@ -7314,6 +7741,210 @@ mod reconcile_tests {
         confirm_position_status_for(&pool, "btc-open", "MakerStrategy", LEG).await;
         let st: Vec<(String, String)> = sqlx::query_as("SELECT squadron_id, status FROM open_positions WHERE strategy = 'MakerStrategy' ORDER BY squadron_id").fetch_all(&pool).await.unwrap();
         assert_eq!(st, vec![("btc-open".to_string(), "confirmed".to_string()), ("eth-open".to_string(), "pending".to_string())]);
+    }
+
+
+    /// [B76] Two squadrons' sweeps that both saw a holding unclaimed write ONE
+    /// row between them, and a holding any row claims is never adopted again.
+    #[tokio::test]
+    async fn an_unclaimed_holding_is_adopted_once_across_squadrons() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::new("", "kalshi", None, None);
+        const LEG: &str = "KXBTCD-26OCT2917-T80499.99#yes";
+        let pools = vec![pool.clone()];
+        let (a, b) = tokio::join!(
+            adopt_unclaimed_holding_in(&pools, &pool, &scope, "sports-open", "ChainAdopted", LEG, LEG, "YES", dec_of("0.2849"), dec_of("56.16")),
+            adopt_unclaimed_holding_in(&pools, &pool, &scope, "politics-open", "ChainAdopted", LEG, LEG, "YES", dec_of("0.2849"), dec_of("56.16")),
+        );
+        assert!(a ^ b, "exactly one sweep writes the row");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions WHERE token_id = ?").bind(LEG).fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1);
+        // A third pass, with the row in place, adopts nothing.
+        assert!(!adopt_unclaimed_holding_in(&pools, &pool, &scope, "btc-open", "ChainAdopted", LEG, LEG, "YES", dec_of("0.27"), dec_of("116.56")).await);
+        // A viper's own row on the leg also claims it.
+        const OTHER: &str = "KXBTCD-26OCT2917-T79999.99#yes";
+        record_open_position(&pool, &scope, "btc-open", "MakerStrategy", OTHER, "m", "YES", dec_of("0.30"), dec_of("5"), false).await;
+        assert!(!adopt_unclaimed_holding_in(&pools, &pool, &scope, "sports-open", "ChainAdopted", OTHER, OTHER, "YES", dec_of("0.30"), dec_of("5")).await);
+        // A ghost row claims nothing on the venue.
+        const GHOST: &str = "KXETHD-26OCT2917-T2389.99#yes";
+        record_open_position_with_status(&pool, &scope, "btc-open", "AnchorStrategy", GHOST, "g", "YES", dec_of("0.40"), dec_of("5"), true, "confirmed").await;
+        assert!(adopt_unclaimed_holding_in(&pools, &pool, &scope, "sports-open", "ChainAdopted", GHOST, GHOST, "YES", dec_of("0.40"), dec_of("5")).await);
+    }
+
+    /// [B75] An adopted row follows the account: it grows and shrinks with the
+    /// holding, contracts a confirmed engine row claims are subtracted at
+    /// their own cost, the engine's own row is never moved, a resting quote on
+    /// the leg stops the pass, a change within tolerance is not written, and a
+    /// remainder of zero books the adopted contracts out and removes the row.
+    #[tokio::test]
+    async fn an_adopted_row_follows_the_account_holding() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::new("", "kalshi", None, None);
+        const LEG: &str = "KXBTCD-26OCT2917-T80499.99#yes";
+        let pools = vec![pool.clone()];
+        let now = std::time::Duration::ZERO;
+        record_adopted_position(&pool, &scope, "politics-open", "ChainAdopted", LEG, LEG, "YES", dec_of("0.2849"), dec_of("56.16")).await;
+
+        // 08:33 and 08:55 ET: two more untracked bids fill; the account now holds 116.56.
+        let r = follow_account_holding_in(&pools, LEG, dec_of("116.56"), dec_of("0.2745"), now).await.expect("resized");
+        assert_eq!((r.before, r.after, r.price), (dec_of("56.16"), dec_of("116.56"), dec_of("0.2745")));
+        let (sh, px, ca): (String, String, i64) = sqlx::query_as("SELECT shares, entry_price, chain_adopted FROM open_positions WHERE token_id = ?").bind(LEG).fetch_one(&pool).await.unwrap();
+        assert_eq!((dec_of(&sh), dec_of(&px), ca), (dec_of("116.56"), dec_of("0.2745"), 1));
+
+        // Same holding again: nothing to write.
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("116.56"), dec_of("0.2745"), now).await.is_none());
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("116.564"), dec_of("0.2745"), now).await.is_none(), "dust is not a resize");
+
+        // The operator sells part by hand: the row shrinks with the account, a zero price keeps the one on
+        // the row, and the 56.56 sh that left are booked off-strategy (no mark here, so at entry, labelled).
+        let r = follow_account_holding_in(&pools, LEG, dec_of("60"), Decimal::ZERO, now).await.expect("shrunk");
+        assert_eq!((r.after, r.booked), (dec_of("60"), dec_of("56.56")));
+        let (sh, px): (String, String) = sqlx::query_as("SELECT shares, entry_price FROM open_positions WHERE token_id = ?").bind(LEG).fetch_one(&pool).await.unwrap();
+        assert_eq!((dec_of(&sh), dec_of(&px)), (dec_of("60"), dec_of("0.2745")));
+        let booked: (String, String, String) = sqlx::query_as("SELECT shares, exit_price, reason FROM trades ORDER BY id DESC LIMIT 1").fetch_one(&pool).await.unwrap();
+        assert_eq!((dec_of(&booked.0), dec_of(&booked.1)), (dec_of("56.56"), dec_of("0.2745")));
+        assert!(booked.2.contains("exit price unknown"), "{}", booked.2);
+
+        // Maker rests a 10-contract bid on the leg [B74]: a pending engine row. Nothing is known
+        // about how much of it traded, so the pass stops, whatever the account says.
+        record_open_position_with_status(&pool, &scope, "btc-open", "MakerStrategy", LEG, "m", "YES", dec_of("0.31"), dec_of("10"), false, "pending").await;
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("60"), dec_of("0.28"), now).await.is_none(), "a resting quote is not a fill to subtract");
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("70"), dec_of("0.28"), now).await.is_none());
+        let sh: String = sqlx::query_scalar("SELECT shares FROM open_positions WHERE strategy = 'ChainAdopted'").fetch_one(&pool).await.unwrap();
+        assert_eq!(dec_of(&sh), dec_of("60"));
+
+        // The bid fills: the row is confirmed at 10 @ 0.31 and the account holds 70. The adopted row stays at 60.
+        set_open_position_fill(&pool, "btc-open", "MakerStrategy", LEG, dec_of("10"), dec_of("0.31")).await;
+        confirm_position_status_for(&pool, "btc-open", "MakerStrategy", LEG).await;
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("70"), dec_of("0.28"), now).await.is_none());
+        // The account grows to 80 with no new engine fill: the adopted row takes the extra 10 at the
+        // remainder's own cost, (80 × 0.28 − 10 × 0.31) / 70, not the blended average; the viper's row does not move.
+        let r = follow_account_holding_in(&pools, LEG, dec_of("80"), dec_of("0.28"), now).await.expect("resized");
+        assert_eq!((r.strategy.as_str(), r.after), ("ChainAdopted", dec_of("70")));
+        assert_eq!(r.price.round_dp(4), dec_of("0.2757"));
+        let maker: (String, String) = sqlx::query_as("SELECT shares, entry_price FROM open_positions WHERE strategy = 'MakerStrategy'").fetch_one(&pool).await.unwrap();
+        assert_eq!((dec_of(&maker.0), dec_of(&maker.1)), (dec_of("10"), dec_of("0.31")), "the engine's own row is never resized from a wallet reading");
+
+        // The operator sells 10 of the adopted 70 by hand: the account reports 70 at a new average, the
+        // 10 that left are booked at the ROW's price and the surviving 60 keep it (the lot's cost is conserved;
+        // re-pricing the survivors from the post-sale average would move cost between booking and row).
+        sqlx::query("UPDATE open_positions SET current_price = '0.30' WHERE strategy = 'ChainAdopted'").execute(&pool).await.unwrap();
+        let r = follow_account_holding_in(&pools, LEG, dec_of("70"), dec_of("0.279"), now).await.expect("shrunk");
+        assert_eq!((r.before, r.after, r.booked), (dec_of("70"), dec_of("60"), dec_of("10")));
+        assert_eq!(r.price.round_dp(4), dec_of("0.2757"), "a shrink keeps the row's price");
+        let booked: (String, String, String) = sqlx::query_as("SELECT shares, entry_price, exit_price FROM trades ORDER BY id DESC LIMIT 1").fetch_one(&pool).await.unwrap();
+        assert_eq!((dec_of(&booked.0), dec_of(&booked.1).round_dp(4), dec_of(&booked.2)), (dec_of("10"), dec_of("0.2757"), dec_of("0.30")));
+
+        // The operator sells the rest; the account holds the Maker's 10 and the token stays live, so the
+        // purge cannot see it. The adopted row is booked out at its last mark and removed.
+        let r = follow_account_holding_in(&pools, LEG, dec_of("10"), dec_of("0.31"), now).await.expect("closed");
+        assert_eq!((r.before, r.after), (dec_of("60"), Decimal::ZERO));
+        let left: Vec<(String,)> = sqlx::query_as("SELECT strategy FROM open_positions WHERE token_id = ?").bind(LEG).fetch_all(&pool).await.unwrap();
+        assert_eq!(left, vec![("MakerStrategy".to_string(),)]);
+        let booked: (String, String, String, String) = sqlx::query_as("SELECT strategy, shares, exit_price, reason FROM trades ORDER BY id DESC LIMIT 1").fetch_one(&pool).await.unwrap();
+        assert_eq!((booked.0.as_str(), dec_of(&booked.1), dec_of(&booked.2)), ("ChainAdopted", dec_of("60"), dec_of("0.30")));
+        assert!(booked.3.contains("left the account"), "{}", booked.3);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE reason LIKE 'ChainReconcile%'").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 3, "one booking per shrink, one for the close");
+
+        // Nothing wallet-sized is left: the engine's own row alone is never touched.
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("25"), dec_of("0.31"), now).await.is_none());
+        let maker: String = sqlx::query_scalar("SELECT shares FROM open_positions WHERE strategy = 'MakerStrategy'").fetch_one(&pool).await.unwrap();
+        assert_eq!(dec_of(&maker), dec_of("10"));
+    }
+
+    /// [B75] Engine rows that claim more than the account holds (Kalshi nets a
+    /// viper's NO fill against the YES leg while the viper's YES row stands) are
+    /// unanswerable from a wallet total: the adopted row is left, never booked out.
+    #[tokio::test]
+    async fn an_overclaimed_leg_leaves_the_adopted_row_alone() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::new("", "kalshi", None, None);
+        const LEG: &str = "KXBTCD-26OCT2917-T80499.99#net";
+        let pools = vec![pool.clone()];
+        record_adopted_position(&pool, &scope, "politics-open", "ChainAdopted", LEG, LEG, "YES", dec_of("0.28"), dec_of("5")).await;
+        record_open_position(&pool, &scope, "btc-open", "MakerStrategy", LEG, "m", "YES", dec_of("0.31"), dec_of("10"), false).await;
+        confirm_position_status_for(&pool, "btc-open", "MakerStrategy", LEG).await;
+        // The account nets to 5 YES after Maker's NO fills: the engine rows claim 10 of 5.
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("5"), dec_of("0.28"), std::time::Duration::ZERO).await.is_none());
+        let rows: Vec<(String, String)> = sqlx::query_as("SELECT strategy, shares FROM open_positions WHERE token_id = ? ORDER BY strategy").bind(LEG).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows, vec![("ChainAdopted".to_string(), "5".to_string()), ("MakerStrategy".to_string(), "10".to_string())]);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0, "nothing is booked from a reading that cannot be attributed");
+    }
+
+    /// [B75] The pure sighting rule: a target is due once it has stood for the
+    /// grace, a different target restarts the clock, and a sighting older than
+    /// the stale bound does not lend its clock to a new change.
+    #[test]
+    fn a_target_is_due_after_the_grace_and_a_stale_sighting_restarts() {
+        let grace = std::time::Duration::from_secs(60);
+        let stale = std::time::Duration::from_secs(90);
+        let t0 = std::time::Instant::now();
+        let (due, s1) = sighting_due(None, t0, dec_of("116.56"), grace, stale);
+        assert!(!due); assert_eq!(s1.since, t0);
+        let t1 = t0 + std::time::Duration::from_secs(30);
+        let (due, s2) = sighting_due(Some(s1), t1, dec_of("116.56"), grace, stale);
+        assert!(!due); assert_eq!(s2.since, t0);
+        let t2 = t0 + grace;
+        let (due, _) = sighting_due(Some(s2), t2, dec_of("116.56"), grace, stale);
+        assert!(due);
+        // A different target restarts.
+        let (due, s3) = sighting_due(Some(s2), t2, dec_of("60"), grace, stale);
+        assert!(!due); assert_eq!(s3.since, t2);
+        // A sighting last seen longer than the stale bound ago restarts even for the same target.
+        let t3 = t2 + stale + std::time::Duration::from_secs(1);
+        let (due, s4) = sighting_due(Some(s3), t3, dec_of("60"), grace, stale);
+        assert!(!due); assert_eq!(s4.since, t3);
+    }
+
+    /// [B75] A changed holding is written only once it has persisted for the
+    /// grace: the first sighting inside a viper's write gap changes nothing.
+    #[tokio::test]
+    async fn a_changed_holding_follows_only_after_the_grace() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::new("", "kalshi", None, None);
+        const LEG: &str = "KXBTCD-26OCT2917-T80499.99#grace";
+        let pools = vec![pool.clone()];
+        record_adopted_position(&pool, &scope, "politics-open", "ChainAdopted", LEG, LEG, "YES", dec_of("0.2849"), dec_of("56.16")).await;
+        let grace = std::time::Duration::from_secs(60);
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("116.56"), dec_of("0.2745"), grace).await.is_none());
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("116.56"), dec_of("0.2745"), grace).await.is_none());
+        let sh: String = sqlx::query_scalar("SELECT shares FROM open_positions WHERE token_id = ?").bind(LEG).fetch_one(&pool).await.unwrap();
+        assert_eq!(dec_of(&sh), dec_of("56.16"), "a sighting younger than the grace writes nothing");
+        // A holding that went back to the row's size forgets the sighting.
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("56.16"), dec_of("0.2849"), grace).await.is_none());
+        // With the grace elapsed (zero here) the same target is written.
+        let r = follow_account_holding_in(&pools, LEG, dec_of("116.56"), dec_of("0.2745"), std::time::Duration::ZERO).await.expect("resized");
+        assert_eq!(r.after, dec_of("116.56"));
+    }
+
+    /// [B76] Rows a past race already duplicated collapse to the oldest when
+    /// the sweep next follows the holding; a second wallet-sized row under a
+    /// viper's name is not a duplicate and blocks the resize instead.
+    #[tokio::test]
+    async fn duplicate_adopted_rows_collapse_to_the_oldest() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::new("", "kalshi", None, None);
+        const LEG: &str = "KXBTCD-26OCT2917-T80499.99#dup";
+        let pools = vec![pool.clone()];
+        let now = std::time::Duration::ZERO;
+        // The pre-fix insert keyed on (token, strategy, squadron), so two squadrons could each write one.
+        record_adopted_position(&pool, &scope, "sports-open", "ChainAdopted", LEG, LEG, "YES", dec_of("0.2849"), dec_of("56.16")).await;
+        record_adopted_position(&pool, &scope, "politics-open", "ChainAdopted", LEG, LEG, "YES", dec_of("0.2849"), dec_of("56.16")).await;
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions WHERE token_id = ?").bind(LEG).fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 2, "the old insert wrote both");
+
+        let r = follow_account_holding_in(&pools, LEG, dec_of("116.56"), dec_of("0.2745"), now).await.expect("collapsed and resized");
+        assert_eq!(r.squadron_id, "sports-open", "the oldest row survives");
+        let rows: Vec<(String, String)> = sqlx::query_as("SELECT squadron_id, shares FROM open_positions WHERE token_id = ?").bind(LEG).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows, vec![("sports-open".to_string(), "116.56".to_string())]);
+
+        // A wallet-sized row under a viper's name beside it is ambiguous: nothing is resized, nothing deleted.
+        record_adopted_position(&pool, &scope, "btc-open", "MakerStrategy", LEG, LEG, "YES", dec_of("0.30"), dec_of("5")).await;
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("200"), dec_of("0.29"), now).await.is_none());
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions WHERE token_id = ?").bind(LEG).fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 2);
     }
 
     /// A database created before the filing columns reached `open_positions`
