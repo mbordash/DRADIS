@@ -97,7 +97,9 @@ function EngineVersion() {
   );
 }
 
-/** Shared page footer: branding line + venue latency meter + engine version. */
+/** Shared page footer: branding line + venue latency meter + engine version.
+ * The branding is venue-neutral: the same Control Tower fronts every venue build,
+ * and the latency pill beside it names the venue this engine trades. */
 export default function Footer() {
   return (
     <footer className="text-center text-xs text-gray-700 pb-4 font-mono space-y-2">
@@ -105,7 +107,7 @@ export default function Footer() {
         <LatencyMeter />
       </div>
       <div>
-        DRADIS Control Tower  Polymarket CLOB Orchestrator{' '}
+        DRADIS Trading Automation Control Tower{' '}
         <span className="text-gray-600">So say we all.</span>{' '}
         <EngineVersion />
       </div>

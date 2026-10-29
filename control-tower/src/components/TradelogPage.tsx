@@ -385,7 +385,7 @@ function RtbModal({
             <p className="text-orange-300 font-semibold mb-1">⚠️ What this does:</p>
             <ul className="text-xs text-gray-400 space-y-1 list-disc list-inside">
               <li>Sells the <strong>whole position immediately</strong> at the live bid with a fill-or-kill market order (FAK)</li>
-              <li>Taker fees apply (~2% on Polymarket)</li>
+              <li>Venue taker fees apply</li>
               <li>The squadron keeps patrolling — this closes one position, it does not stand anything down</li>
               <li>Alternative: let the position settle naturally (no fees)</li>
             </ul>

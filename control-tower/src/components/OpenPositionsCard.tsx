@@ -409,7 +409,7 @@ export default function OpenPositionsCard({ positions, trades, isLoading, asset 
                 <p className="text-orange-300 font-semibold mb-1">⚠️ Warning:</p>
                 <ul className="text-xs text-gray-400 space-y-1 list-disc list-inside">
                   <li>This will place a <strong>market order (FAK)</strong></li>
-                  <li>Taker fees apply (~2% on Polymarket)</li>
+                  <li>Venue taker fees apply</li>
                   <li>Alternative: Let position settle naturally (no fees)</li>
                 </ul>
               </div>

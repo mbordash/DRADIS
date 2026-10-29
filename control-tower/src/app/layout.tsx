@@ -21,7 +21,7 @@ import { DEMO_MODE } from '@/lib/demo';
 
 export const metadata: Metadata = {
   title: 'DRADIS Control Tower',
-  description: 'Polymarket strategy orchestration dashboard',
+  description: 'Prediction-market trading automation dashboard',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
