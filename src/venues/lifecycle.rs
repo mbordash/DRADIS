@@ -37,7 +37,7 @@
 //! [`spawn_fill_listener`]: OrderLifecycle::spawn_fill_listener
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
 use chrono::Utc;
 use rust_decimal::Decimal;
@@ -248,7 +248,56 @@ pub struct OrderLifecycle {
     confirmed: Mutex<Vec<ConfirmedFill>>,
 }
 
+/// The fill listener's task, aborted when dropped. A market loop that returns
+/// drops it, which ends the task and releases the lifecycle it held; before
+/// this the task ran until the venue's feed closed (never), so every rotated
+/// market's lifecycle stayed alive, with whatever `cancel_all_before_leaving`
+/// could not settle still tracked.
+pub struct FillListener(JoinHandle<()>);
+
+impl Drop for FillListener {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Every lifecycle built through [`OrderLifecycle::shared`], so a question
+/// about a leg can be put to all of them [B77]: the account sweep of one
+/// squadron must not adopt contracts another squadron's order is still
+/// filling. Weak, so a squadron that stood down leaves nothing behind.
+fn registry() -> &'static std::sync::Mutex<Vec<Weak<OrderLifecycle>>> {
+    static REG: OnceLock<std::sync::Mutex<Vec<Weak<OrderLifecycle>>>> = OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Does ANY registered lifecycle track an order on `market`? See
+/// [`OrderLifecycle::tracks_leg`]. False when no lifecycle is registered.
+pub async fn any_lifecycle_tracks_leg(market: &MarketId) -> bool {
+    let live: Vec<Arc<OrderLifecycle>> = match registry().lock() {
+        Ok(mut reg) => {
+            reg.retain(|w| w.strong_count() > 0);
+            reg.iter().filter_map(Weak::upgrade).collect()
+        }
+        Err(_) => return false,
+    };
+    for lc in live {
+        if lc.tracks_leg(market).await { return true; }
+    }
+    false
+}
+
 impl OrderLifecycle {
+    /// [`new`](Self::new), shared and registered, so that
+    /// [`any_lifecycle_tracks_leg`] can ask it. The loops build theirs this way.
+    pub fn shared(cfg: LifecycleConfig, squadron_id: impl Into<String>) -> Arc<Self> {
+        let lc = Arc::new(Self::new(cfg, squadron_id));
+        if let Ok(mut reg) = registry().lock() {
+            reg.retain(|w| w.strong_count() > 0);
+            reg.push(Arc::downgrade(&lc));
+        }
+        lc
+    }
+
     /// `squadron_id` identifies the squadron this engine reconciles for. It is
     /// part of every `PositionKey` the engine touches, so that confirming or
     /// clearing a guard reaches the position belonging to THIS squadron rather
@@ -535,6 +584,28 @@ impl OrderLifecycle {
     /// before selling a position whose guard is an unfilled quote.
     pub async fn resting_for(&self, strategy: &str, market: &MarketId) -> bool {
         self.tracked.lock().await.iter().any(|o| o.strategy == strategy && &o.market == market)
+    }
+
+    /// Forget this strategy's CANCELLED orders on `market` [B78]. After a sell
+    /// that filled in part, the guard is the live holding less what sold; a
+    /// late fill read on an order the venue has already cancelled would size
+    /// the guard back up to that order's cumulative count, as if nothing had
+    /// sold, and the next exit would sell contracts the account no longer
+    /// holds. Contracts such a read would have added show up in the account
+    /// and are adopted by the sweep instead. Returns how many were forgotten.
+    pub async fn forget_cancelled_for(&self, strategy: &str, market: &MarketId) -> usize {
+        let mut t = self.tracked.lock().await;
+        let before = t.len();
+        t.retain(|o| !(o.strategy == strategy && &o.market == market && o.cancelled));
+        before - t.len()
+    }
+
+    /// Does this engine track any order, any strategy's, on `market`? The
+    /// dashboard sweep asks before adopting contracts the account holds above
+    /// the engine's own rows [B77]: while an order works on the leg, how much
+    /// of it has traded is the fill feed's to say, not a wallet reading's.
+    pub async fn tracks_leg(&self, market: &MarketId) -> bool {
+        self.tracked.lock().await.iter().any(|o| &o.market == market)
     }
 
     /// Cancel every tracked order this strategy has resting on `market` (the
@@ -1037,18 +1108,21 @@ impl OrderLifecycle {
     /// replace — [`reconcile`](Self::reconcile), which remains the cancel/flatten
     /// path and the fallback for venues without a feed.
     ///
-    /// Returns `None` when the venue has no feed (poll-only).
+    /// Returns `None` when the venue has no feed (poll-only). The listener
+    /// holds the lifecycle and runs until its handle is dropped: the loop keeps
+    /// the handle for the market it flies, so a lifecycle leaves the registry
+    /// with its loop instead of living on behind a task nothing can reach.
     pub fn spawn_fill_listener<V>(
         self: &Arc<Self>,
         venue: Arc<V>,
         positions: Arc<Mutex<PositionMap>>,
-    ) -> Option<JoinHandle<()>>
+    ) -> Option<FillListener>
     where
         V: Execution + Send + Sync + 'static,
     {
         let mut rx = venue.subscribe_fills()?;
         let lifecycle = Arc::clone(self);
-        Some(tokio::spawn(async move {
+        Some(FillListener(tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(ev) => {
@@ -1063,7 +1137,7 @@ impl OrderLifecycle {
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
-        }))
+        })))
     }
 
     /// Confirm the guard a fill event belongs to. Used by the event-driven fill
@@ -1295,6 +1369,24 @@ mod resting_quote_tests {
 
     fn ack(id: &str, leg: &str, placed: Decimal, price: Decimal) -> Fill {
         Fill { order_id: OrderId(id.into()), market: MarketId::new(leg), filled: placed, price, fee: Decimal::ZERO }
+    }
+
+    /// [B77] A leg with an order working in ANY squadron's lifecycle reads as
+    /// working process-wide; one with none, or whose lifecycle is gone, does not.
+    #[tokio::test]
+    async fn a_leg_tracked_by_any_registered_lifecycle_reads_as_working() {
+        const LEG: &str = "KXBTCD-26OCT3016-T77999.99#yes";
+        const OTHER: &str = "KXBTCD-26OCT3016-T77999.99#no";
+        let a = OrderLifecycle::shared(LifecycleConfig::us(), "btc-open");
+        let b = OrderLifecycle::shared(LifecycleConfig::us(), "sports-open");
+        assert!(!any_lifecycle_tracks_leg(&MarketId::new(LEG)).await);
+        a.track_resting(&ack("q-reg-1", LEG, dec!(10), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        assert!(any_lifecycle_tracks_leg(&MarketId::new(LEG)).await, "a's order is seen from anywhere");
+        assert!(!b.tracks_leg(&MarketId::new(LEG)).await, "b itself tracks nothing on it");
+        assert!(!any_lifecycle_tracks_leg(&MarketId::new(OTHER)).await);
+        drop(a);
+        assert!(!any_lifecycle_tracks_leg(&MarketId::new(LEG)).await, "a stood down: its order is no longer anyone's");
+        drop(b);
     }
 
     fn open(id: &str, leg: &str, placed: Decimal, filled: Decimal) -> OpenOrder {

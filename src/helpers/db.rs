@@ -5169,13 +5169,150 @@ async fn book_adopted_exit(pool: &SqlitePool, scope: &TradeScope, strategy: &str
 ///    that removed it, so a repeated pass or a racing purge cannot book twice.
 ///
 /// Returns what was done, if anything. Ghost rows are never touched.
+/// Legs on which a squadron's guard stands above its rows [B79]: (squadron,
+/// token) → (first seen, last seen). Process-wide, so every sweep holds the
+/// leg off, not only the squadron that can see the gap; each squadron notes
+/// and clears only its own entry, since another squadron's agreement with its
+/// own rows says nothing about this one's; an entry not refreshed for
+/// [`GUARD_GAP_STANDING_SECS`] (the owner stood down) no longer counts.
+type GapKey = (String, String);
+fn guard_gaps() -> &'static std::sync::Mutex<std::collections::HashMap<GapKey, (std::time::Instant, std::time::Instant)>> {
+    static GAPS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<GapKey, (std::time::Instant, std::time::Instant)>>> = std::sync::OnceLock::new();
+    GAPS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// How long a guard gap keeps a leg held off after its owner last saw it.
+pub const GUARD_GAP_STANDING_SECS: u64 = 600;
+
+/// Record that `squadron_id`'s guard stands above its rows on `token_id`;
+/// returns how long this squadron's gap has stood.
+fn note_guard_gap(squadron_id: &str, token_id: &str) -> std::time::Duration {
+    let now = std::time::Instant::now();
+    match guard_gaps().lock() {
+        Ok(mut m) => {
+            let e = m.entry((squadron_id.to_string(), token_id.to_string())).or_insert((now, now));
+            e.1 = now;
+            e.0.elapsed()
+        }
+        Err(_) => std::time::Duration::ZERO,
+    }
+}
+
+/// `squadron_id`'s guards agree with its rows on `token_id` again (or it no
+/// longer guards the leg): its own entry goes, nobody else's.
+fn clear_guard_gap(squadron_id: &str, token_id: &str) {
+    if let Ok(mut m) = guard_gaps().lock() { m.remove(&(squadron_id.to_string(), token_id.to_string())); }
+}
+
+/// Does a guard gap ANY squadron saw on `token_id` still stand?
+fn guard_gap_standing(token_id: &str) -> bool {
+    let fresh = std::time::Duration::from_secs(GUARD_GAP_STANDING_SECS);
+    guard_gaps().lock().ok()
+        .map(|m| m.iter().any(|((_, t), (_, last))| t == token_id && last.elapsed() < fresh))
+        .unwrap_or(false)
+}
+
+/// What the sweeping squadron knows about a leg beyond the account's figure
+/// [B77]: its own in-memory guards for the token, and whether any order of this
+/// engine's still works on the leg.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweepView<'a> {
+    /// The squadron running the sweep.
+    pub squadron_id: &'a str,
+    /// What this squadron's guards hold on the token, per strategy: empty when
+    /// the squadron guards nothing on it, `None` when the caller has no guard
+    /// map at all (the US idle snapshot task). Each guard is compared with the
+    /// squadron's own rows for that strategy: a guard above its rows is a fill
+    /// the rows do not carry (a second entry on a held leg after a restart,
+    /// [B79]), and nothing on the leg is reconciled, by any caller, until they
+    /// agree. Rows above guards are the ordinary state after a restart and
+    /// block nothing. Only a caller with a guard on the leg adopts above the
+    /// engine's claim.
+    pub guards: Option<Vec<(String, Decimal)>>,
+    /// An order of this engine's, any squadron's, is still tracked on the leg
+    /// (`lifecycle::any_lifecycle_tracks_leg`), so its filled count is the fill
+    /// feed's to say: nothing on the leg is written this pass.
+    pub order_working: bool,
+}
+
+impl SweepView<'static> {
+    /// A caller with no guards and no orders of its own: only the adopted-row
+    /// path runs, the excess-above-claim adoption never does.
+    pub fn detached() -> Self {
+        SweepView { squadron_id: "", guards: None, order_working: false }
+    }
+}
+
+/// [B77] With NO wallet-sized row on the token and the engine's confirmed rows
+/// claiming less than the account holds, the excess is adopted: a new
+/// `ChainAdopted` row filed with the claiming viper's squadron, sized to the
+/// excess at its own cost, written once across squadrons under the adoption
+/// gate after the excess has stood for the grace. The caller's [`SweepView`]
+/// holds every write off while an order works on the leg or the caller's own
+/// guards disagree with its rows, as an unconfirmed row does: in both, what the
+/// engine itself holds on the leg is not yet known.
 pub async fn follow_account_holding_in(
     pools: &[SqlitePool],
     token_id: &str,
     held: Decimal,
     avg_price: Decimal,
     grace: std::time::Duration,
+    view: SweepView<'_>,
 ) -> Option<AdoptedResize> {
+    if view.order_working {
+        // An order still working on the leg: how much of it traded is not known here.
+        forget_resize(token_id);
+        return None;
+    }
+    // [B79] The caller's guards against its own rows, strategy by strategy
+    // (every status and flag, ghost rows too: a ghost guard writes a ghost row,
+    // and the owners arm writes a viper's missing row wallet-sized). A guard
+    // ABOVE its rows is a fill the ledger never got: the loops start with an
+    // empty guard map while rows survive a restart, and a second entry on a
+    // leg whose row already exists is dropped by `insert_open_position`. Then
+    // neither the account nor the rows say what the engine holds on the leg,
+    // and nothing is reconciled, by this caller or any other, until they
+    // agree. Rows with no guard (the first lot after a restart) block nothing.
+    if let Some(guards) = &view.guards {
+        let mut gap_found = false;
+        for (strategy, guarded) in guards {
+            let mut claimed = Decimal::ZERO;
+            for p in pools {
+                let rows: Vec<(String,)> = match sqlx::query_as(
+                    "SELECT shares FROM open_positions WHERE token_id = ? AND squadron_id = ? AND strategy = ?"
+                ).bind(token_id).bind(view.squadron_id).bind(strategy).fetch_all(p).await {
+                    Ok(r) => r,
+                    Err(e) => { debug!("follow_account_holding: guard check read failed for {token_id} — nothing written this pass: {e}"); return None; }
+                };
+                for (sh,) in rows {
+                    let Ok(sh) = sh.parse::<Decimal>() else { return None; };
+                    claimed += sh;
+                }
+            }
+            if *guarded > claimed + ADOPTED_RESIZE_TOLERANCE {
+                gap_found = true;
+                let standing = note_guard_gap(view.squadron_id, token_id);
+                // A gap that has stood for the grace is a fill the rows never
+                // got; one seen once is a row and a guard written a moment apart.
+                if standing >= grace && anomaly_warn_due(&format!("guardgap:{}:{strategy}:{token_id}", view.squadron_id)) {
+                    warn!("🧾 [{}/{strategy}] the guard holds {guarded} sh of {token_id} but its rows carry {claimed} — a fill the ledger never recorded (a second entry on a held leg after a restart?); nothing on the leg is reconciled from the account until they agree. Correct the row by hand.", view.squadron_id);
+                } else {
+                    debug!("follow_account_holding: [{}/{strategy}] guard {guarded} vs rows {claimed} on {token_id} — waiting", view.squadron_id);
+                }
+            }
+        }
+        if gap_found {
+            forget_resize(token_id);
+            return None;
+        }
+        clear_guard_gap(view.squadron_id, token_id);
+    }
+    // Some squadron's sweep found its guards above its rows on this leg and
+    // the gap still stands: nothing on the leg is written from here either.
+    if guard_gap_standing(token_id) {
+        forget_resize(token_id);
+        return None;
+    }
     // 1. Collapse duplicate adopted rows (oldest by ts, then id, survives).
     let mut adopted: Vec<(usize, i64, String)> = Vec::new();
     for (i, p) in pools.iter().enumerate() {
@@ -5201,15 +5338,16 @@ pub async fn follow_account_holding_in(
     }
 
     // 2./3. The engine's confirmed fills, and the wallet-sized rows.
-    type Row = (i64, String, String, String, String, i64, Option<String>, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>);
+    type Row = (i64, String, String, String, String, i64, Option<String>, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, String);
     let mut attributed = Decimal::ZERO;
     let mut attributed_cost = Decimal::ZERO;
     let mut wallet_rows: Vec<(usize, Row)> = Vec::new();
+    let mut engine_rows: Vec<(usize, Row)> = Vec::new();
     for (i, p) in pools.iter().enumerate() {
         let rows: Vec<Row> = match sqlx::query_as(
             "SELECT id, squadron_id, strategy, shares, entry_price, engine_attributed, status, market, side,
-                    current_price, entry_fee, venue, market_class, underlying
-               FROM open_positions WHERE token_id = ? AND ghost_mode = 0"
+                    current_price, entry_fee, venue, market_class, underlying, ts
+               FROM open_positions WHERE token_id = ? AND ghost_mode = 0 ORDER BY ts, id"
         ).bind(token_id).fetch_all(p).await {
             Ok(r) => r,
             Err(e) => { debug!("follow_account_holding: read failed for {token_id} — nothing written this pass: {e}"); return None; }
@@ -5227,20 +5365,19 @@ pub async fn follow_account_holding_in(
                 }
                 attributed += sh;
                 attributed_cost += sh * px;
+                engine_rows.push((i, row));
             } else {
                 wallet_rows.push((i, row));
             }
         }
     }
-    // 4. Exactly one wallet-sized row, and engine rows that fit inside the account.
-    if wallet_rows.len() != 1 {
-        if wallet_rows.len() > 1 {
-            let who = wallet_rows.iter().map(|(_, r)| format!("{}/{}", r.1, r.2)).collect::<Vec<_>>().join(", ");
-            if anomaly_warn_due(&format!("ambiguous:{token_id}")) {
-                warn!("🧾 {} wallet-sized rows claim {token_id} ({who}) — the account's {held} sh cannot be attributed between them; none resized. Correct by hand.", wallet_rows.len());
-            } else {
-                debug!("follow_account_holding: {} wallet-sized rows claim {token_id} ({who}) — none resized", wallet_rows.len());
-            }
+    // 4. At most one wallet-sized row, and engine rows that fit inside the account.
+    if wallet_rows.len() > 1 {
+        let who = wallet_rows.iter().map(|(_, r)| format!("{}/{}", r.1, r.2)).collect::<Vec<_>>().join(", ");
+        if anomaly_warn_due(&format!("ambiguous:{token_id}")) {
+            warn!("🧾 {} wallet-sized rows claim {token_id} ({who}) — the account's {held} sh cannot be attributed between them; none resized. Correct by hand.", wallet_rows.len());
+        } else {
+            debug!("follow_account_holding: {} wallet-sized rows claim {token_id} ({who}) — none resized", wallet_rows.len());
         }
         forget_resize(token_id);
         return None;
@@ -5260,8 +5397,96 @@ pub async fn follow_account_holding_in(
         forget_resize(token_id);
         return None;
     }
+    // [B77] Contracts above what the engine's own rows claim, with no wallet-
+    // sized row to carry them. This case used to return with nothing written,
+    // so a leg a viper held through its own fill could carry any number of
+    // untracked contracts (an operator buy, a fill from a quote the engine had
+    // lost) with collateral the only sign. The viper's row is not touched; the
+    // excess becomes a ChainAdopted row filed with the viper's squadron, sized
+    // and priced as a growth of an adopted row is, once it has stood for the
+    // grace, and once across squadrons under the adoption gate.
+    if wallet_rows.is_empty() {
+        if attributed <= Decimal::ZERO || remainder <= ADOPTED_RESIZE_TOLERANCE {
+            forget_resize(token_id);
+            return None;
+        }
+        // The caller must hold a guard on the leg for this: with none (another
+        // squadron, the US idle snapshot task) the excess cannot be told from
+        // a fill the rows lack.
+        if !view.guards.as_ref().is_some_and(|g| !g.is_empty()) {
+            forget_resize(token_id);
+            return None;
+        }
+        // The excess at its own cost, inside (0, 1]; else the account's average.
+        // With neither, the row would be written at a price of zero, which a
+        // settlement would later score as a full dollar of profit: better to
+        // wait for an average and say so.
+        let one = Decimal::ONE;
+        let price = if avg_price > Decimal::ZERO {
+            let remainder_cost = ((held * avg_price - attributed_cost) / remainder).round_dp(6);
+            if remainder_cost > Decimal::ZERO && remainder_cost <= one { Some(remainder_cost) }
+            else if avg_price <= one { Some(avg_price) }
+            else { None }
+        } else {
+            None
+        };
+        let Some(price) = price else {
+            if anomaly_warn_due(&format!("noprice:{token_id}")) {
+                warn!("🧾 The account holds {held} sh of {token_id} against {attributed} the engine's rows claim, but reports no usable average price (${avg_price}) — the excess is not adopted until it does");
+            }
+            forget_resize(token_id);
+            return None;
+        };
+        if !resize_due(token_id, remainder, grace) {
+            return None;
+        }
+        let claimants = engine_rows.iter().map(|(_, r)| format!("{} {}", r.2, r.3)).collect::<Vec<_>>().join(", ");
+        // The oldest engine row across every pool files the new row.
+        engine_rows.sort_by(|a, b| a.1.14.cmp(&b.1.14).then(a.1.0.cmp(&b.1.0)));
+        let (i, row) = engine_rows.into_iter().next()?;
+        let (_, squadron_id, _, _, _, _, _, market, side, _, _, venue, market_class, underlying, _) = row;
+        let pool = &pools[i];
+        let scope = adopted_row_scope(pool, &market, &venue, &market_class, &underlying).await;
+        let _gate = adoption_gate().lock().await;
+        // Under the gate, look again: another squadron's sweep may have written
+        // a wallet-sized row for the leg since the scan above.
+        for p in pools {
+            match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM open_positions WHERE token_id = ? AND ghost_mode = 0 AND engine_attributed = 0")
+                .bind(token_id).fetch_one(p).await
+            {
+                Ok(0) => {}
+                Ok(_) => { debug!("follow_account_holding: a wallet-sized row for {token_id} appeared under the gate — nothing written"); return None; }
+                Err(e) => { debug!("follow_account_holding: re-read failed for {token_id} — nothing written this pass: {e}"); return None; }
+            }
+        }
+        let ts = Utc::now().to_rfc3339();
+        let sid = current_session_id();
+        let venue_s = resolved_venue(&scope);
+        let written = match sqlx::query(
+            "INSERT INTO open_positions
+             (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, status, squadron_id,
+              venue, market_class, underlying, engine_attributed, chain_adopted)
+             SELECT ?, ?, 'ChainAdopted', ?, ?, ?, ?, ?, 0, 'confirmed', ?, ?, ?, ?, 0, 1
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM open_positions WHERE token_id = ? AND ghost_mode = 0 AND engine_attributed = 0
+             )"
+        )
+        .bind(&ts).bind(sid).bind(token_id).bind(&market).bind(&side).bind(price.to_string()).bind(remainder.to_string())
+        .bind(&squadron_id).bind(venue_s).bind(scope.market_class.clone()).bind(scope.underlying.clone()).bind(token_id)
+        .execute(pool).await
+        {
+            Ok(r) => r.rows_affected() == 1,
+            Err(e) => { error!("❌ DB could not adopt the {remainder} sh above the engine's claim on {token_id}: {e}"); false }
+        };
+        if !written {
+            return None;
+        }
+        note_confirmation(token_id);
+        warn!("🧾 Adopted {remainder} sh above the engine's claim on {token_id} [{squadron_id}]: the account holds {held} sh, the engine's own rows {attributed} ({claimants}); the rest came from no order this engine tracked (an operator buy, or a quote it lost) and is filed as ChainAdopted @ ${price}");
+        return Some(AdoptedResize { squadron_id, strategy: "ChainAdopted".to_string(), before: Decimal::ZERO, after: remainder, price, booked: Decimal::ZERO });
+    }
     let (i, row) = wallet_rows.remove(0);
-    let (id, squadron_id, strategy, shares_s, price_s, _, _, market, side, current_price, entry_fee, venue, market_class, underlying) = row;
+    let (id, squadron_id, strategy, shares_s, price_s, _, _, market, side, current_price, entry_fee, venue, market_class, underlying, _) = row;
     let before: Decimal = shares_s.parse().ok()?;
     let row_price: Decimal = price_s.parse().ok()?;
     let target = remainder.max(Decimal::ZERO);
@@ -5341,9 +5566,23 @@ pub async fn follow_account_holding_in(
 
 /// [`follow_account_holding_in`] across every registered pool with the
 /// production grace.
-pub async fn follow_account_holding(token_id: &str, held: Decimal, avg_price: Decimal) -> Option<AdoptedResize> {
+pub async fn follow_account_holding(token_id: &str, held: Decimal, avg_price: Decimal, view: SweepView<'_>) -> Option<AdoptedResize> {
     let pools = all_pools();
-    follow_account_holding_in(&pools, token_id, held, avg_price, std::time::Duration::from_secs(RESIZE_GRACE_SECS)).await
+    follow_account_holding_in(&pools, token_id, held, avg_price, std::time::Duration::from_secs(RESIZE_GRACE_SECS), view).await
+}
+
+/// [B78] Size a viper's own row down to what is still held after a sell the
+/// venue filled in part, keeping the entry fee's share of the remainder. The
+/// row is matched by squadron, strategy and token whatever its attribution
+/// flag: the owners arm writes a viper's missing row wallet-sized, and a
+/// shrink that skipped it would leave a row the adopted-row path then books out
+/// a second time.
+pub async fn shrink_engine_position(pool: &SqlitePool, squadron_id: &str, strategy: &str, token_id: &str, shares: Decimal, entry_fee: Decimal) {
+    if let Err(e) = sqlx::query(
+        "UPDATE open_positions SET shares = ?, entry_fee = ? WHERE squadron_id = ? AND strategy = ? AND token_id = ? AND strategy <> 'ChainAdopted'"
+    ).bind(shares.to_string()).bind(entry_fee.to_string()).bind(squadron_id).bind(strategy).bind(token_id).execute(pool).await {
+        error!("❌ DB shrink_engine_position failed for {token_id}: {e}");
+    }
 }
 
 /// A simulated hold as its `open_positions` row remembers it, for the closed-hold
@@ -7786,18 +8025,18 @@ mod reconcile_tests {
         record_adopted_position(&pool, &scope, "politics-open", "ChainAdopted", LEG, LEG, "YES", dec_of("0.2849"), dec_of("56.16")).await;
 
         // 08:33 and 08:55 ET: two more untracked bids fill; the account now holds 116.56.
-        let r = follow_account_holding_in(&pools, LEG, dec_of("116.56"), dec_of("0.2745"), now).await.expect("resized");
+        let r = follow_account_holding_in(&pools, LEG, dec_of("116.56"), dec_of("0.2745"), now, SweepView::detached()).await.expect("resized");
         assert_eq!((r.before, r.after, r.price), (dec_of("56.16"), dec_of("116.56"), dec_of("0.2745")));
         let (sh, px, ca): (String, String, i64) = sqlx::query_as("SELECT shares, entry_price, chain_adopted FROM open_positions WHERE token_id = ?").bind(LEG).fetch_one(&pool).await.unwrap();
         assert_eq!((dec_of(&sh), dec_of(&px), ca), (dec_of("116.56"), dec_of("0.2745"), 1));
 
         // Same holding again: nothing to write.
-        assert!(follow_account_holding_in(&pools, LEG, dec_of("116.56"), dec_of("0.2745"), now).await.is_none());
-        assert!(follow_account_holding_in(&pools, LEG, dec_of("116.564"), dec_of("0.2745"), now).await.is_none(), "dust is not a resize");
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("116.56"), dec_of("0.2745"), now, SweepView::detached()).await.is_none());
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("116.564"), dec_of("0.2745"), now, SweepView::detached()).await.is_none(), "dust is not a resize");
 
         // The operator sells part by hand: the row shrinks with the account, a zero price keeps the one on
         // the row, and the 56.56 sh that left are booked off-strategy (no mark here, so at entry, labelled).
-        let r = follow_account_holding_in(&pools, LEG, dec_of("60"), Decimal::ZERO, now).await.expect("shrunk");
+        let r = follow_account_holding_in(&pools, LEG, dec_of("60"), Decimal::ZERO, now, SweepView::detached()).await.expect("shrunk");
         assert_eq!((r.after, r.booked), (dec_of("60"), dec_of("56.56")));
         let (sh, px): (String, String) = sqlx::query_as("SELECT shares, entry_price FROM open_positions WHERE token_id = ?").bind(LEG).fetch_one(&pool).await.unwrap();
         assert_eq!((dec_of(&sh), dec_of(&px)), (dec_of("60"), dec_of("0.2745")));
@@ -7808,18 +8047,18 @@ mod reconcile_tests {
         // Maker rests a 10-contract bid on the leg [B74]: a pending engine row. Nothing is known
         // about how much of it traded, so the pass stops, whatever the account says.
         record_open_position_with_status(&pool, &scope, "btc-open", "MakerStrategy", LEG, "m", "YES", dec_of("0.31"), dec_of("10"), false, "pending").await;
-        assert!(follow_account_holding_in(&pools, LEG, dec_of("60"), dec_of("0.28"), now).await.is_none(), "a resting quote is not a fill to subtract");
-        assert!(follow_account_holding_in(&pools, LEG, dec_of("70"), dec_of("0.28"), now).await.is_none());
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("60"), dec_of("0.28"), now, SweepView::detached()).await.is_none(), "a resting quote is not a fill to subtract");
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("70"), dec_of("0.28"), now, SweepView::detached()).await.is_none());
         let sh: String = sqlx::query_scalar("SELECT shares FROM open_positions WHERE strategy = 'ChainAdopted'").fetch_one(&pool).await.unwrap();
         assert_eq!(dec_of(&sh), dec_of("60"));
 
         // The bid fills: the row is confirmed at 10 @ 0.31 and the account holds 70. The adopted row stays at 60.
         set_open_position_fill(&pool, "btc-open", "MakerStrategy", LEG, dec_of("10"), dec_of("0.31")).await;
         confirm_position_status_for(&pool, "btc-open", "MakerStrategy", LEG).await;
-        assert!(follow_account_holding_in(&pools, LEG, dec_of("70"), dec_of("0.28"), now).await.is_none());
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("70"), dec_of("0.28"), now, SweepView::detached()).await.is_none());
         // The account grows to 80 with no new engine fill: the adopted row takes the extra 10 at the
         // remainder's own cost, (80 × 0.28 − 10 × 0.31) / 70, not the blended average; the viper's row does not move.
-        let r = follow_account_holding_in(&pools, LEG, dec_of("80"), dec_of("0.28"), now).await.expect("resized");
+        let r = follow_account_holding_in(&pools, LEG, dec_of("80"), dec_of("0.28"), now, SweepView::detached()).await.expect("resized");
         assert_eq!((r.strategy.as_str(), r.after), ("ChainAdopted", dec_of("70")));
         assert_eq!(r.price.round_dp(4), dec_of("0.2757"));
         let maker: (String, String) = sqlx::query_as("SELECT shares, entry_price FROM open_positions WHERE strategy = 'MakerStrategy'").fetch_one(&pool).await.unwrap();
@@ -7829,7 +8068,7 @@ mod reconcile_tests {
         // 10 that left are booked at the ROW's price and the surviving 60 keep it (the lot's cost is conserved;
         // re-pricing the survivors from the post-sale average would move cost between booking and row).
         sqlx::query("UPDATE open_positions SET current_price = '0.30' WHERE strategy = 'ChainAdopted'").execute(&pool).await.unwrap();
-        let r = follow_account_holding_in(&pools, LEG, dec_of("70"), dec_of("0.279"), now).await.expect("shrunk");
+        let r = follow_account_holding_in(&pools, LEG, dec_of("70"), dec_of("0.279"), now, SweepView::detached()).await.expect("shrunk");
         assert_eq!((r.before, r.after, r.booked), (dec_of("70"), dec_of("60"), dec_of("10")));
         assert_eq!(r.price.round_dp(4), dec_of("0.2757"), "a shrink keeps the row's price");
         let booked: (String, String, String) = sqlx::query_as("SELECT shares, entry_price, exit_price FROM trades ORDER BY id DESC LIMIT 1").fetch_one(&pool).await.unwrap();
@@ -7837,7 +8076,7 @@ mod reconcile_tests {
 
         // The operator sells the rest; the account holds the Maker's 10 and the token stays live, so the
         // purge cannot see it. The adopted row is booked out at its last mark and removed.
-        let r = follow_account_holding_in(&pools, LEG, dec_of("10"), dec_of("0.31"), now).await.expect("closed");
+        let r = follow_account_holding_in(&pools, LEG, dec_of("10"), dec_of("0.31"), now, SweepView::detached()).await.expect("closed");
         assert_eq!((r.before, r.after), (dec_of("60"), Decimal::ZERO));
         let left: Vec<(String,)> = sqlx::query_as("SELECT strategy FROM open_positions WHERE token_id = ?").bind(LEG).fetch_all(&pool).await.unwrap();
         assert_eq!(left, vec![("MakerStrategy".to_string(),)]);
@@ -7847,10 +8086,136 @@ mod reconcile_tests {
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE reason LIKE 'ChainReconcile%'").fetch_one(&pool).await.unwrap();
         assert_eq!(n, 3, "one booking per shrink, one for the close");
 
-        // Nothing wallet-sized is left: the engine's own row alone is never touched.
-        assert!(follow_account_holding_in(&pools, LEG, dec_of("25"), dec_of("0.31"), now).await.is_none());
+        // [B77] Nothing wallet-sized is left and the account comes to hold 25 against the Maker's 10: the 15
+        // above the engine's claim are adopted at their own cost ((25 × 0.31 − 10 × 0.31) / 15); the Maker's
+        // own row is still never touched.
+        let btc = SweepView { squadron_id: "btc-open", guards: Some(vec![("MakerStrategy".to_string(), dec_of("10"))]), order_working: false };
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("25"), dec_of("0.31"), now, SweepView::detached()).await.is_none(), "a caller with no guard view never adopts above a claim");
+        let r = follow_account_holding_in(&pools, LEG, dec_of("25"), dec_of("0.31"), now, btc).await.expect("adopted above the claim");
+        assert_eq!((r.strategy.as_str(), r.before, r.after, r.price), ("ChainAdopted", Decimal::ZERO, dec_of("15"), dec_of("0.31")));
         let maker: String = sqlx::query_scalar("SELECT shares FROM open_positions WHERE strategy = 'MakerStrategy'").fetch_one(&pool).await.unwrap();
         assert_eq!(dec_of(&maker), dec_of("10"));
+    }
+
+    /// [B77] Contracts the account holds above a viper's own confirmed claim, with
+    /// no wallet-sized row on the leg, are adopted: once the excess has stood for
+    /// the grace, once across concurrent sweeps, filed with the viper's squadron at
+    /// the excess's own cost, with the viper's row never moved. An unconfirmed row
+    /// or an order still working on the leg holds the adoption off, a token with no
+    /// engine row is not this helper's business, and the adopted row then follows
+    /// the account like any other.
+    #[tokio::test]
+    async fn contracts_above_a_vipers_claim_are_adopted_once() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::new("", "kalshi", None, None);
+        const LEG: &str = "KXBTCD-26OCT3015-T77499.99#yes";
+        let pools = vec![pool.clone()];
+        let now = std::time::Duration::ZERO;
+        let grace = std::time::Duration::from_secs(60);
+        let btc = || SweepView { squadron_id: "btc-open", guards: Some(vec![("MakerStrategy".to_string(), dec_of("10"))]), order_working: false };
+        // No row at all on the leg: the orphan arm adopts, not this helper.
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("30"), dec_of("0.29"), now, SweepView { squadron_id: "btc-open", guards: Some(vec![]), order_working: false }).await.is_none());
+        record_open_position_with_status(&pool, &scope, "btc-open", "MakerStrategy", LEG, "m", "YES", dec_of("0.31"), dec_of("10"), false, "pending").await;
+        // The Maker's row is still pending (its quote rests): the filled count is not known here.
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("30"), dec_of("0.29"), now, btc()).await.is_none());
+        confirm_position_status_for(&pool, "btc-open", "MakerStrategy", LEG).await;
+        // An order of this engine's still working on the leg holds everything off.
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("30"), dec_of("0.29"), now, SweepView { squadron_id: "btc-open", guards: Some(vec![("MakerStrategy".to_string(), dec_of("10"))]), order_working: true }).await.is_none());
+        // Within tolerance of the claim, and a claim that fits the account exactly: nothing.
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("10.004"), dec_of("0.31"), now, btc()).await.is_none());
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("10"), dec_of("0.31"), now, btc()).await.is_none());
+        // Above the claim, but not yet for the grace: nothing this pass.
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("30"), dec_of("0.29"), grace, btc()).await.is_none());
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions WHERE token_id = ?").bind(LEG).fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1, "the Maker's row alone, so far");
+        // [B79] The caller's guards disagree with its rows (15 guarded, 10 on the row): a fill the ledger
+        // never got, so nothing on the leg is reconciled and the excess is not adopted.
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("30"), dec_of("0.29"), now, SweepView { squadron_id: "btc-open", guards: Some(vec![("MakerStrategy".to_string(), dec_of("15"))]), order_working: false }).await.is_none());
+        // No usable average from the account: the excess waits rather than taking a price of zero.
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("30"), Decimal::ZERO, now, btc()).await.is_none());
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions WHERE token_id = ?").bind(LEG).fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1, "still the Maker's row alone");
+        // Two sweeps that both find the excess due write ONE row between them.
+        let (a, b) = tokio::join!(
+            follow_account_holding_in(&pools, LEG, dec_of("30"), dec_of("0.29"), now, btc()),
+            follow_account_holding_in(&pools, LEG, dec_of("30"), dec_of("0.29"), now, btc()),
+        );
+        assert!(a.is_none() || b.is_none(), "exactly one sweep adopts");
+        let r = a.or(b).expect("one adoption");
+        // (30 × 0.29 − 10 × 0.31) / 20 = 0.28: the excess at its own cost, not the account's blend.
+        assert_eq!((r.squadron_id.as_str(), r.strategy.as_str(), r.before, r.after, r.price), ("btc-open", "ChainAdopted", Decimal::ZERO, dec_of("20"), dec_of("0.28")));
+        let rows: Vec<(String, String, String, i64, i64)> = sqlx::query_as(
+            "SELECT strategy, shares, entry_price, engine_attributed, chain_adopted FROM open_positions WHERE token_id = ? ORDER BY strategy"
+        ).bind(LEG).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows, vec![
+            ("ChainAdopted".to_string(), "20".to_string(), "0.28".to_string(), 0, 1),
+            ("MakerStrategy".to_string(), "10".to_string(), "0.31".to_string(), 1, 0),
+        ]);
+        // Same holding again: nothing. Then the adopted row follows the account as any adopted row does.
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("30"), dec_of("0.29"), now, btc()).await.is_none());
+        let r = follow_account_holding_in(&pools, LEG, dec_of("35"), dec_of("0.29"), now, btc()).await.expect("resized");
+        assert_eq!((r.strategy.as_str(), r.before, r.after), ("ChainAdopted", dec_of("20"), dec_of("25")));
+        let maker: String = sqlx::query_scalar("SELECT shares FROM open_positions WHERE strategy = 'MakerStrategy'").fetch_one(&pool).await.unwrap();
+        assert_eq!(dec_of(&maker), dec_of("10"), "the engine's own row is never resized from a wallet reading");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0, "an adoption books nothing");
+        // A row with no guard (another strategy's lot carried across a restart) is not a gap: it only
+        // adds to the engine's claim. Account 45 = Maker 10 + Anchor 5 + 30 above the claim.
+        record_open_position(&pool, &scope, "btc-open", "AnchorStrategy", LEG, "m", "YES", dec_of("0.40"), dec_of("5"), false).await;
+        let r = follow_account_holding_in(&pools, LEG, dec_of("45"), dec_of("0.29"), now, btc()).await.expect("rows above guards block nothing");
+        assert_eq!((r.strategy.as_str(), r.before, r.after), ("ChainAdopted", dec_of("25"), dec_of("30")));
+    }
+
+    /// [B79] A guard above its rows holds the leg off for every caller until the
+    /// rows catch up; a viper's row the owners arm wrote wallet-sized counts as
+    /// its row, and a partial-exit shrink reaches that row too [B78].
+    #[tokio::test]
+    async fn a_guard_above_its_rows_holds_the_leg_off_for_every_sweep() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::new("", "kalshi", None, None);
+        const LEG: &str = "KXBTCD-26OCT3017-T78499.99#yes";
+        let pools = vec![pool.clone()];
+        let now = std::time::Duration::ZERO;
+        let maker = |g: &str| SweepView { squadron_id: "btc-open", guards: Some(vec![("MakerStrategy".to_string(), dec_of(g))]), order_working: false };
+        // Another squadron's adopted row on the leg, which the B75 path would otherwise follow.
+        record_adopted_position(&pool, &scope, "politics-open", "ChainAdopted", LEG, LEG, "YES", dec_of("0.30"), dec_of("20")).await;
+        // btc-open guards 10 for the Maker with no Maker row: a fill the ledger never got.
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("30"), dec_of("0.30"), now, maker("10")).await.is_none());
+        assert!(guard_gap_standing(LEG));
+        // The gap stands process-wide: a sweep with no view of those guards writes nothing either.
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("30"), dec_of("0.30"), now, SweepView::detached()).await.is_none());
+        // Another squadron whose guards agree with its rows clears only ITS entry: btc-open's gap stands.
+        record_open_position(&pool, &scope, "sports-open", "AnchorStrategy", LEG, "m", "YES", dec_of("0.40"), dec_of("5"), false).await;
+        let sports = SweepView { squadron_id: "sports-open", guards: Some(vec![("AnchorStrategy".to_string(), dec_of("5"))]), order_working: false };
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("35"), dec_of("0.30"), now, sports.clone()).await.is_none());
+        assert!(guard_gap_standing(LEG), "a second squadron's clean check does not clear the first's gap");
+        // A squadron with a guard map but no guard on the leg clears only its own (absent) entry, and never adopts.
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("35"), dec_of("0.30"), now, SweepView { squadron_id: "politics-open", guards: Some(vec![]), order_working: false }).await.is_none());
+        assert!(guard_gap_standing(LEG));
+        let sh: String = sqlx::query_scalar("SELECT shares FROM open_positions WHERE strategy = 'ChainAdopted'").fetch_one(&pool).await.unwrap();
+        assert_eq!(dec_of(&sh), dec_of("20"), "nothing resized while the gap stands");
+        // The Maker's row arrives (as the owners arm would write it, or the entry recorded late): the gap clears,
+        // and the detached sweep follows the adopted row again: 35 held − (10 Maker + 5 Anchor) = 20, no change.
+        record_open_position(&pool, &scope, "btc-open", "MakerStrategy", LEG, "m", "YES", dec_of("0.31"), dec_of("10"), false).await;
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("35"), dec_of("0.30"), now, maker("10")).await.is_none());
+        assert!(!guard_gap_standing(LEG), "the owner's rows caught up");
+        let r = follow_account_holding_in(&pools, LEG, dec_of("40"), dec_of("0.30"), now, SweepView::detached()).await.expect("the leg is reconciled again");
+        assert_eq!((r.strategy.as_str(), r.before, r.after), ("ChainAdopted", dec_of("20"), dec_of("25")));
+        // [B78] A partial exit shrinks the viper's own row, engine-attributed or wallet-sized, never an adopted one.
+        shrink_engine_position(&pool, "btc-open", "MakerStrategy", LEG, dec_of("6"), dec_of("0.1")).await;
+        let (sh, fee): (String, String) = sqlx::query_as("SELECT shares, entry_fee FROM open_positions WHERE strategy = 'MakerStrategy'").fetch_one(&pool).await.unwrap();
+        assert_eq!((dec_of(&sh), dec_of(&fee)), (dec_of("6"), dec_of("0.1")));
+        const LEG2: &str = "KXBTCD-26OCT3017-T78499.99#no";
+        record_adopted_position(&pool, &scope, "btc-open", "MakerStrategy", LEG2, LEG2, "NO", dec_of("0.70"), dec_of("10")).await;
+        // The owners-arm row counts as the Maker's row: guard 10 against it is no gap.
+        assert!(follow_account_holding_in(&pools, LEG2, dec_of("10"), dec_of("0.70"), now, maker("10")).await.is_none());
+        assert!(!guard_gap_standing(LEG2));
+        shrink_engine_position(&pool, "btc-open", "MakerStrategy", LEG2, dec_of("4"), Decimal::ZERO).await;
+        let sh: String = sqlx::query_scalar("SELECT shares FROM open_positions WHERE token_id = ?").bind(LEG2).fetch_one(&pool).await.unwrap();
+        assert_eq!(dec_of(&sh), dec_of("4"), "a wallet-sized row under the viper's name shrinks too");
+        shrink_engine_position(&pool, "politics-open", "ChainAdopted", LEG, dec_of("1"), Decimal::ZERO).await;
+        let sh: String = sqlx::query_scalar("SELECT shares FROM open_positions WHERE strategy = 'ChainAdopted'").fetch_one(&pool).await.unwrap();
+        assert_eq!(dec_of(&sh), dec_of("25"), "an adopted row is never touched by a shrink");
     }
 
     /// [B75] Engine rows that claim more than the account holds (Kalshi nets a
@@ -7866,7 +8231,7 @@ mod reconcile_tests {
         record_open_position(&pool, &scope, "btc-open", "MakerStrategy", LEG, "m", "YES", dec_of("0.31"), dec_of("10"), false).await;
         confirm_position_status_for(&pool, "btc-open", "MakerStrategy", LEG).await;
         // The account nets to 5 YES after Maker's NO fills: the engine rows claim 10 of 5.
-        assert!(follow_account_holding_in(&pools, LEG, dec_of("5"), dec_of("0.28"), std::time::Duration::ZERO).await.is_none());
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("5"), dec_of("0.28"), std::time::Duration::ZERO, SweepView::detached()).await.is_none());
         let rows: Vec<(String, String)> = sqlx::query_as("SELECT strategy, shares FROM open_positions WHERE token_id = ? ORDER BY strategy").bind(LEG).fetch_all(&pool).await.unwrap();
         assert_eq!(rows, vec![("ChainAdopted".to_string(), "5".to_string()), ("MakerStrategy".to_string(), "10".to_string())]);
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades").fetch_one(&pool).await.unwrap();
@@ -7908,14 +8273,14 @@ mod reconcile_tests {
         let pools = vec![pool.clone()];
         record_adopted_position(&pool, &scope, "politics-open", "ChainAdopted", LEG, LEG, "YES", dec_of("0.2849"), dec_of("56.16")).await;
         let grace = std::time::Duration::from_secs(60);
-        assert!(follow_account_holding_in(&pools, LEG, dec_of("116.56"), dec_of("0.2745"), grace).await.is_none());
-        assert!(follow_account_holding_in(&pools, LEG, dec_of("116.56"), dec_of("0.2745"), grace).await.is_none());
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("116.56"), dec_of("0.2745"), grace, SweepView::detached()).await.is_none());
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("116.56"), dec_of("0.2745"), grace, SweepView::detached()).await.is_none());
         let sh: String = sqlx::query_scalar("SELECT shares FROM open_positions WHERE token_id = ?").bind(LEG).fetch_one(&pool).await.unwrap();
         assert_eq!(dec_of(&sh), dec_of("56.16"), "a sighting younger than the grace writes nothing");
         // A holding that went back to the row's size forgets the sighting.
-        assert!(follow_account_holding_in(&pools, LEG, dec_of("56.16"), dec_of("0.2849"), grace).await.is_none());
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("56.16"), dec_of("0.2849"), grace, SweepView::detached()).await.is_none());
         // With the grace elapsed (zero here) the same target is written.
-        let r = follow_account_holding_in(&pools, LEG, dec_of("116.56"), dec_of("0.2745"), std::time::Duration::ZERO).await.expect("resized");
+        let r = follow_account_holding_in(&pools, LEG, dec_of("116.56"), dec_of("0.2745"), std::time::Duration::ZERO, SweepView::detached()).await.expect("resized");
         assert_eq!(r.after, dec_of("116.56"));
     }
 
@@ -7935,14 +8300,14 @@ mod reconcile_tests {
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions WHERE token_id = ?").bind(LEG).fetch_one(&pool).await.unwrap();
         assert_eq!(n, 2, "the old insert wrote both");
 
-        let r = follow_account_holding_in(&pools, LEG, dec_of("116.56"), dec_of("0.2745"), now).await.expect("collapsed and resized");
+        let r = follow_account_holding_in(&pools, LEG, dec_of("116.56"), dec_of("0.2745"), now, SweepView::detached()).await.expect("collapsed and resized");
         assert_eq!(r.squadron_id, "sports-open", "the oldest row survives");
         let rows: Vec<(String, String)> = sqlx::query_as("SELECT squadron_id, shares FROM open_positions WHERE token_id = ?").bind(LEG).fetch_all(&pool).await.unwrap();
         assert_eq!(rows, vec![("sports-open".to_string(), "116.56".to_string())]);
 
         // A wallet-sized row under a viper's name beside it is ambiguous: nothing is resized, nothing deleted.
         record_adopted_position(&pool, &scope, "btc-open", "MakerStrategy", LEG, LEG, "YES", dec_of("0.30"), dec_of("5")).await;
-        assert!(follow_account_holding_in(&pools, LEG, dec_of("200"), dec_of("0.29"), now).await.is_none());
+        assert!(follow_account_holding_in(&pools, LEG, dec_of("200"), dec_of("0.29"), now, SweepView::detached()).await.is_none());
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions WHERE token_id = ?").bind(LEG).fetch_one(&pool).await.unwrap();
         assert_eq!(n, 2);
     }

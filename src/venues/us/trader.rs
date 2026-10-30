@@ -1297,7 +1297,7 @@ async fn trade_one_market(
     let positions: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
     // Shared, venue-neutral order lifecycle engine (Option C). Drives fill-confirm,
     // stale-cancel, and naked-leg flatten off the `Execution` trait surface.
-    let lifecycle = Arc::new(OrderLifecycle::new(LifecycleConfig::us(), squadron_id.clone()));
+    let lifecycle = OrderLifecycle::shared(LifecycleConfig::us(), squadron_id.clone());
     // Upgrade fill confirmation to event-precise via the venue's private
     // account feed (`/v1/ws/private` → `subscribe_fills`); reconcile polling
     // remains the cancel/flatten path and the fallback backstop.
@@ -2346,7 +2346,7 @@ async fn dispatch_signal(
             }
         }
         StrategySignal::Entry { params, pair_params: None } => {
-            dispatch_single(squadron_id, venue, pool, positions, lifecycle, scope, strategy_name, params, Side::Buy, starting).await
+            dispatch_single(squadron_id, venue, pool, positions, lifecycle, scope, strategy_name, params, Side::Buy, starting).await.is_some()
         }
         StrategySignal::MakerQuote { yes, no } => {
             let mut acted = false;
@@ -2380,7 +2380,7 @@ async fn dispatch_signal(
                 if positions.lock().await.contains_key(&PositionKey::new(squadron_id, strategy_name, q.token_id.clone())) {
                     continue;
                 }
-                if dispatch_single(squadron_id, venue, pool, positions, lifecycle, scope, strategy_name, q, Side::Buy, starting).await {
+                if dispatch_single(squadron_id, venue, pool, positions, lifecycle, scope, strategy_name, q, Side::Buy, starting).await.is_some() {
                     acted = true;
                 }
             }
@@ -2554,8 +2554,8 @@ async fn dispatch_signal(
                 .await
                 .get(&PositionKey::new(squadron_id, strategy_name, params.token_id.clone()))
                 .map(|p| (p.avg_entry, p.shares, p.entry_fee));
-            let acted = dispatch_single(squadron_id, venue, pool, positions, lifecycle, scope, strategy_name, params, Side::Sell, starting).await;
-            if !acted {
+            let exit_fill = dispatch_single(squadron_id, venue, pool, positions, lifecycle, scope, strategy_name, params, Side::Sell, starting).await;
+            let Some(exit_fill) = exit_fill else {
                 // Nothing traded (an error or a 0-of-N fill), so we still own the
                 // shares. Dropping the position here left a live stop unmanaged:
                 // local state said flat while the venue said long. Kalshi fixed the
@@ -2565,13 +2565,37 @@ async fn dispatch_signal(
                     params.token_id);
                 arm_exit_retry_backoff(strategy_name, params.token_id.as_str());
                 return false;
-            }
-            record_round_trip(pool, scope, strategy_name, params, entered, reason).await;
+            };
+            // [B78] Book what the venue sold, not what was signalled; a partial
+            // fill keeps its guard and row at the remainder. Same change as Kalshi.
+            let split = crate::venues::core::split_partial_exit(entered.map(|(_, s, f)| (s, f)), exit_fill.filled);
+            let booked = entered.map(|(avg, _, _)| (avg, split.sold, split.fee_sold));
+            let kept = (split.remaining > Decimal::ZERO).then(|| (split.remaining, entered.map(|(_, _, f)| (f - split.fee_sold).max(Decimal::ZERO)).unwrap_or(Decimal::ZERO)));
+            record_round_trip(pool, scope, squadron_id, strategy_name, params, booked, reason, kept).await;
             clear_exit_retry_backoff(strategy_name, params.token_id.as_str());
             // Clear this strategy's guard for the leg (and the paired leg, if any)
             // so it can re-enter later.
             let mut map = positions.lock().await;
-            map.remove(&PositionKey::new(squadron_id, strategy_name, params.token_id.clone()));
+            let key = PositionKey::new(squadron_id, strategy_name, params.token_id.clone());
+            if let Some((remaining, _)) = kept {
+                if let Some(p) = map.get_mut(&key) {
+                    // From the live guard, not the snapshot: a fill event may
+                    // have grown it while the sell was in flight.
+                    p.shares = (p.shares - split.sold).max(Decimal::ZERO);
+                    p.entry_fee = (p.entry_fee - split.fee_sold).max(Decimal::ZERO);
+                }
+                drop(map);
+                // A cancelled order whose fill is still being read must not
+                // size this guard back up past what was just sold.
+                let forgotten = lifecycle.forget_cancelled_for(strategy_name, &params.token_id).await;
+                if forgotten > 0 {
+                    info!("🧾 [{strategy_name}] {forgotten} cancelled order(s) on {} forgotten after the partial sell — any late fill of theirs is adopted from the account", params.token_id);
+                }
+                warn!("⚠️ [{strategy_name}] exit ({reason}) on {} sold {} of {}: {remaining} sh still held — guard and row kept at the remainder, the viper re-emits for it",
+                    params.token_id, split.sold, split.sold + remaining);
+                return true;
+            }
+            map.remove(&key);
             if *exit_pair {
                 let paired: Vec<_> = map.iter()
                     .filter(|(k, p)| k.strategy == strategy_name && k.squadron == squadron_id
@@ -2652,7 +2676,7 @@ async fn dispatch_single(
     params: &OrderParams,
     side: Side,
     starting: Decimal,
-) -> bool {
+) -> Option<Fill> {
     if params.ghost_mode {
         info!("👻 [{strategy_name}] ghost {side:?}: {} @ {:.4} × {:.2}",
             params.token_id, params.price, params.shares);
@@ -2671,7 +2695,7 @@ async fn dispatch_single(
             record_guard(squadron_id, positions, strategy_name, params, None, &ghost).await;
             record_entry(squadron_id, pool, scope, strategy_name, params, &ghost).await;
         }
-        return true;
+        return Some(ghost);
     }
     // [B74] One resting quote per viper per leg: a viper re-emits its quote
     // every tick while its gates hold, and with the first one on the book the
@@ -2681,7 +2705,7 @@ async fn dispatch_single(
         && lifecycle.working_for(strategy_name, &params.token_id).await
     {
         debug!("[{strategy_name}] a quote already rests on {} — not placing another", params.token_id);
-        return false;
+        return None;
     }
     match venue.place_order(order_params_to_intent(params, side)).await {
         Ok(f) => {
@@ -2710,11 +2734,11 @@ async fn dispatch_single(
                     record_entry(squadron_id, pool, scope, strategy_name, params, &resting).await;
                     info!("📝 [{strategy_name}] resting {} @ {:.4} × {:.2} — order {} is on the book, tracked until it fills, is pulled or is cancelled at rotation",
                         params.token_id, params.price, resting.filled, f.order_id);
-                    return false;
+                    return None;
                 }
                 warn!("⚠️ [{strategy_name}] {side:?} {} @ {:.4} filled 0 of {:.2} — no state change (order {})",
                     params.token_id, params.price, params.shares, f.order_id);
-                return false;
+                return None;
             }
             if f.filled < params.shares.round_dp(2) {
                 warn!("⚠️ [{strategy_name}] {side:?} {} partial fill {:.2} of {:.2} — booking what filled; \
@@ -2743,9 +2767,9 @@ async fn dispatch_single(
                 record_entry(squadron_id, pool, scope, strategy_name, params, &f).await;
             }
             if let Some(p) = pool { sync_dashboard(squadron_id, venue, p, Some(positions), Some(lifecycle), starting, None).await; }
-            true
+            Some(f)
         }
-        Err(e) => { warn!("[{strategy_name}] {side:?} order failed: {e}"); false }
+        Err(e) => { warn!("[{strategy_name}] {side:?} order failed: {e}"); None }
     }
 }
 
@@ -2850,10 +2874,14 @@ fn market_fee_bps(pair: &super::markets::UsMarketPair) -> u32 {
 async fn record_round_trip(
     pool: &Option<sqlx::SqlitePool>,
     scope: &TradeScope,
+    squadron_id: &str,
     strategy_name: &str,
     params: &OrderParams,
+    // (average entry, shares SOLD, entry fee's share of them).
     entered: Option<(Decimal, Decimal, Decimal)>,
     reason: &str,
+    // What stays held after a partial sell: (shares, entry fee kept) [B78].
+    kept: Option<(Decimal, Decimal)>,
 ) {
     let Some((avg_entry, shares, entry_fee)) = entered else {
         warn!("⚠️ [{strategy_name}] exit booked for {} with no tracked entry — no trade recorded",
@@ -2888,7 +2916,10 @@ async fn record_round_trip(
         reason.to_string(),
     ).await;
     if let Some(p) = pool {
-        db::close_open_position(p, strategy_name, params.token_id.as_str()).await;
+        match kept {
+            Some((remaining, fee_kept)) => db::shrink_engine_position(p, squadron_id, strategy_name, params.token_id.as_str(), remaining, fee_kept).await,
+            None => db::close_open_position(p, strategy_name, params.token_id.as_str()).await,
+        }
     }
 }
 
@@ -2955,12 +2986,22 @@ async fn sync_dashboard(
     // holding is attributed to the viper that opened it. Holdings with no guard
     // (prior session, manual trade) are adopted under a neutral label rather
     // than being blamed on a viper that never traded them.
-    let candidates: Vec<(String, String, String, bool)> = match guards {
-        Some(g) => g.lock().await.iter()
-            .filter(|(k, _)| k.squadron == squadron_id)
-            .map(|(k, p)| (k.market.as_str().to_string(), k.strategy.clone(), p.market_name.clone(), p.fill_confirmed_at.is_none()))
-            .collect(),
-        None => Vec::new(),
+    // `guards_by_token` is this squadron's guards per token, strategy by
+    // strategy, for the guard-against-rows check [B79]; empty from the snapshot
+    // task, which has no guard map and so never adopts above a claim.
+    let (candidates, guards_by_token): (Vec<(String, String, String, bool)>, HashMap<String, Vec<(String, Decimal)>>) = match guards {
+        Some(g) => {
+            let map = g.lock().await;
+            let mut totals: HashMap<String, Vec<(String, Decimal)>> = HashMap::new();
+            for (k, p) in map.iter().filter(|(k, _)| k.squadron == squadron_id) {
+                totals.entry(k.market.as_str().to_string()).or_default().push((k.strategy.clone(), p.shares));
+            }
+            (map.iter()
+                .filter(|(k, _)| k.squadron == squadron_id)
+                .map(|(k, p)| (k.market.as_str().to_string(), k.strategy.clone(), p.market_name.clone(), p.fill_confirmed_at.is_none()))
+                .collect(), totals)
+        }
+        None => (Vec::new(), HashMap::new()),
     };
     // [B74] An unfilled quote with its order still working owns nothing the
     // venue holds: left out, so another viper's (or squadron's) contracts on
@@ -3051,7 +3092,14 @@ async fn sync_dashboard(
         // adoption used to keep its first size for good, because the claim
         // check above never touched a token that already had a row. Rows the
         // engine wrote from its own fills are never moved by a wallet reading.
-        db::follow_account_holding(sym, p.shares, p.avg_price).await;
+        // [B77] Contracts above the engine's own claim on a leg no adopted row
+        // carries are adopted by the same call; not while an order of this
+        // engine's, any squadron's, still works on the leg (its filled count is
+        // the fill feed's), and not while this squadron's guards and rows
+        // disagree about what it holds there [B79].
+        let order_working = crate::venues::lifecycle::any_lifecycle_tracks_leg(&MarketId::new(sym.to_string())).await;
+        let view = db::SweepView { squadron_id, guards: guards.map(|_| guards_by_token.get(sym).cloned().unwrap_or_default()), order_working };
+        db::follow_account_holding(sym, p.shares, p.avg_price, view).await;
         positions_value += p.shares * p.avg_price;
     }
     // ── Settled positions the venue already cash-settled ────────────────────

@@ -937,6 +937,65 @@ pub async fn starting_collateral<V: Execution + ?Sized>(
 /// squadrons those vipers sat on a phantom empty account two thirds of the
 /// time (production, 2026-10-22 and 2026-10-23). `None` is the first sync of
 /// a loop, where the starting reading is the only figure there is.
+/// How a sell that the venue filled in part is booked [B78].
+///
+/// `sold` is what left the account and is booked as the round trip, never more
+/// than the guard held; `fee_sold` is the entry fee's share of it, so the
+/// remainder keeps the rest of the fee for its own exit; `remaining` is what the
+/// guard and its row keep (dust below half a cent is treated as gone). With no
+/// guard to compare against, everything the venue reports filled is booked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExitSplit {
+    pub sold: Decimal,
+    pub fee_sold: Decimal,
+    pub remaining: Decimal,
+}
+
+/// Split a sell's booking between what filled and what is still held. `held`
+/// is the guard's (shares, entry fee), `filled` what the venue reported sold.
+pub fn split_partial_exit(held: Option<(Decimal, Decimal)>, filled: Decimal) -> ExitSplit {
+    let filled = filled.max(Decimal::ZERO);
+    let Some((shares, entry_fee)) = held else {
+        return ExitSplit { sold: filled, fee_sold: Decimal::ZERO, remaining: Decimal::ZERO };
+    };
+    let shares = shares.max(Decimal::ZERO);
+    let sold = filled.min(shares);
+    let mut remaining = shares - sold;
+    if remaining < Decimal::new(5, 3) { remaining = Decimal::ZERO; }
+    let fee_sold = if shares > Decimal::ZERO && remaining > Decimal::ZERO {
+        (entry_fee * sold / shares).round_dp(6)
+    } else {
+        entry_fee
+    };
+    ExitSplit { sold, fee_sold, remaining }
+}
+
+#[cfg(test)]
+mod exit_split_tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    /// [B78] A FAK sell the venue filled in part books what filled, with the
+    /// entry fee's share of it, and leaves the rest held; a full fill books the
+    /// whole guard and fee; a fill above the guard books only the guard; dust
+    /// left behind is treated as sold; with no guard the fill is booked as is.
+    #[test]
+    fn a_partial_sell_books_what_filled_and_keeps_the_rest() {
+        let s = split_partial_exit(Some((dec!(10), dec!(0.20))), dec!(4));
+        assert_eq!(s, ExitSplit { sold: dec!(4), fee_sold: dec!(0.08), remaining: dec!(6) });
+        let s = split_partial_exit(Some((dec!(10), dec!(0.20))), dec!(10));
+        assert_eq!(s, ExitSplit { sold: dec!(10), fee_sold: dec!(0.20), remaining: Decimal::ZERO });
+        let s = split_partial_exit(Some((dec!(10), dec!(0.20))), dec!(12));
+        assert_eq!(s, ExitSplit { sold: dec!(10), fee_sold: dec!(0.20), remaining: Decimal::ZERO });
+        let s = split_partial_exit(Some((dec!(10), dec!(0.20))), dec!(9.998));
+        assert_eq!((s.sold, s.remaining, s.fee_sold), (dec!(9.998), Decimal::ZERO, dec!(0.20)));
+        let s = split_partial_exit(None, dec!(3));
+        assert_eq!(s, ExitSplit { sold: dec!(3), fee_sold: Decimal::ZERO, remaining: Decimal::ZERO });
+        let s = split_partial_exit(Some((dec!(10), dec!(0.20))), dec!(-1));
+        assert_eq!((s.sold, s.remaining), (Decimal::ZERO, dec!(10)));
+    }
+}
+
 pub fn collateral_after_failed_read(last: Option<Decimal>, starting: Decimal) -> Decimal {
     last.unwrap_or(starting)
 }

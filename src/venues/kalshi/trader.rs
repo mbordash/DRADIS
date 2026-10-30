@@ -1384,7 +1384,7 @@ async fn trade_one_market(
         no_fee_bps: KALSHI_FEE_BPS as u32,
     });
     let positions: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-    let lifecycle = Arc::new(OrderLifecycle::new(LifecycleConfig::us(), squadron_id.clone()));
+    let lifecycle = OrderLifecycle::shared(LifecycleConfig::us(), squadron_id.clone());
     let _fill_listener = lifecycle.spawn_fill_listener(Arc::clone(venue), Arc::clone(&positions));
     let market_started_at = Utc::now();
 
@@ -2679,10 +2679,38 @@ async fn dispatch_signal(
                 arm_exit_retry_backoff(strategy_name, params.token_id.as_str());
                 return false;
             };
-            record_round_trip(pool, scope, strategy_name, params, entered, exit_fill.fee, reason).await;
+            // [B78] Book what the venue sold, not what was signalled. A FAK that
+            // filled in part used to book the whole guard and drop it, leaving
+            // the unsold contracts in the account with no row: they came back
+            // as an adopted holding and were booked a second time when they
+            // left. The remainder now keeps its guard and row, and the viper
+            // re-emits for it.
+            let split = crate::venues::core::split_partial_exit(entered.map(|(_, s, f)| (s, f)), exit_fill.filled);
+            let booked = entered.map(|(avg, _, _)| (avg, split.sold, split.fee_sold));
+            let kept = (split.remaining > Decimal::ZERO).then(|| (split.remaining, entered.map(|(_, _, f)| (f - split.fee_sold).max(Decimal::ZERO)).unwrap_or(Decimal::ZERO)));
+            record_round_trip(pool, scope, squadron_id, strategy_name, params, booked, exit_fill.fee, reason, kept).await;
             clear_exit_retry_backoff(strategy_name, params.token_id.as_str());
             let mut map = positions.lock().await;
-            map.remove(&PositionKey::new(squadron_id, strategy_name, params.token_id.clone()));
+            let key = PositionKey::new(squadron_id, strategy_name, params.token_id.clone());
+            if let Some((remaining, _)) = kept {
+                if let Some(p) = map.get_mut(&key) {
+                    // From the live guard, not the snapshot: a fill event may
+                    // have grown it while the sell was in flight.
+                    p.shares = (p.shares - split.sold).max(Decimal::ZERO);
+                    p.entry_fee = (p.entry_fee - split.fee_sold).max(Decimal::ZERO);
+                }
+                drop(map);
+                // A cancelled order whose fill is still being read must not
+                // size this guard back up past what was just sold.
+                let forgotten = lifecycle.forget_cancelled_for(strategy_name, &params.token_id).await;
+                if forgotten > 0 {
+                    info!("🧾 [{strategy_name}] {forgotten} cancelled order(s) on {} forgotten after the partial sell — any late fill of theirs is adopted from the account", params.token_id);
+                }
+                warn!("⚠️ [{strategy_name}] exit ({reason}) on {} sold {} of {}: {remaining} sh still held — guard and row kept at the remainder, the viper re-emits for it",
+                    params.token_id, split.sold, split.sold + remaining);
+                return true;
+            }
+            map.remove(&key);
             if *exit_pair {
                 let paired: Vec<_> = map.iter()
                     .filter(|(k, p)| k.strategy == strategy_name && k.squadron == squadron_id
@@ -3094,11 +3122,15 @@ async fn record_entry(
 async fn record_round_trip(
     pool: &Option<sqlx::SqlitePool>,
     scope: &TradeScope,
+    squadron_id: &str,
     strategy_name: &str,
     params: &OrderParams,
+    // (average entry, shares SOLD, entry fee's share of them).
     entered: Option<(Decimal, Decimal, Decimal)>,
     exit_fee: Decimal,
     reason: &str,
+    // What stays held after a partial sell: (shares, entry fee kept) [B78].
+    kept: Option<(Decimal, Decimal)>,
 ) {
     let Some((avg_entry, shares, entry_fee)) = entered else {
         warn!("⚠️ [{strategy_name}] exit booked for {} with no tracked entry — no trade recorded",
@@ -3132,7 +3164,10 @@ async fn record_round_trip(
         reason.to_string(),
     ).await;
     if let Some(p) = pool {
-        db::close_open_position(p, strategy_name, params.token_id.as_str()).await;
+        match kept {
+            Some((remaining, fee_kept)) => db::shrink_engine_position(p, squadron_id, strategy_name, params.token_id.as_str(), remaining, fee_kept).await,
+            None => db::close_open_position(p, strategy_name, params.token_id.as_str()).await,
+        }
     }
 }
 
@@ -3193,12 +3228,18 @@ async fn sync_dashboard(
     // holding is attributed to the viper that opened it. Holdings with no guard
     // (prior session, manual trade) are adopted under a neutral label rather
     // than being blamed on a viper that never traded them.
-    let candidates: Vec<(String, String, String, bool)> = {
+    // `guards_by_token` is this squadron's guards per token, strategy by
+    // strategy, for the guard-against-rows check [B79].
+    let (candidates, guards_by_token): (Vec<(String, String, String, bool)>, HashMap<String, Vec<(String, Decimal)>>) = {
         let map = guards.lock().await;
-        map.iter()
+        let mut totals: HashMap<String, Vec<(String, Decimal)>> = HashMap::new();
+        for (k, p) in map.iter().filter(|(k, _)| k.squadron == squadron_id) {
+            totals.entry(k.market.as_str().to_string()).or_default().push((k.strategy.clone(), p.shares));
+        }
+        (map.iter()
             .filter(|(k, _)| k.squadron == squadron_id)
             .map(|(k, p)| (k.market.as_str().to_string(), k.strategy.clone(), p.market_name.clone(), p.fill_confirmed_at.is_none()))
-            .collect()
+            .collect(), totals)
     };
     // [B74] An unfilled quote with its order still working owns nothing the
     // venue holds: left out, so another viper's (or squadron's) contracts on
@@ -3288,7 +3329,14 @@ async fn sync_dashboard(
         // adoption used to keep its first size for good, because the claim
         // check above never touched a token that already had a row. Rows the
         // engine wrote from its own fills are never moved by a wallet reading.
-        db::follow_account_holding(sym, p.shares, p.avg_price).await;
+        // [B77] Contracts above the engine's own claim on a leg no adopted row
+        // carries are adopted by the same call; not while an order of this
+        // engine's, any squadron's, still works on the leg (its filled count is
+        // the fill feed's), and not while this squadron's guards and rows
+        // disagree about what it holds there [B79].
+        let order_working = crate::venues::lifecycle::any_lifecycle_tracks_leg(&MarketId::new(sym.to_string())).await;
+        let view = db::SweepView { squadron_id, guards: Some(guards_by_token.get(sym).cloned().unwrap_or_default()), order_working };
+        db::follow_account_holding(sym, p.shares, p.avg_price, view).await;
         positions_value += p.shares * p.avg_price;
     }
 
