@@ -99,7 +99,7 @@ services:
   # Control Tower directly: Basic Auth over plaintext puts the login and every
   # credential entered in Setup on the wire in readable form.
   proxy:
-    image: nginx:alpine
+    image: dradis-proxy:latest
     container_name: dradis-proxy
     restart: always
     ports:

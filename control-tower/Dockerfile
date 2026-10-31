@@ -1,12 +1,12 @@
 # ── Stage 1: install dependencies ─────────────────────────────────────────────
-FROM node:20-alpine AS deps
+FROM node:22-alpine AS deps
 RUN apk add --no-cache libc6-compat
 WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm ci
 
 # ── Stage 2: build the Next.js app ────────────────────────────────────────────
-FROM node:20-alpine AS builder
+FROM node:22-alpine AS builder
 RUN apk add --no-cache libc6-compat
 WORKDIR /app
 
@@ -34,8 +34,12 @@ ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
 # ── Stage 3: minimal production runner ────────────────────────────────────────
-FROM node:20-alpine AS runner
-RUN apk add --no-cache libc6-compat
+# Node 22, not 20: Node 20 reached end of life in April 2026 and carries the
+# Brotli decoder flaw CVE-2026-111497 (bundled copy, no 20.x fix; the
+# Marketplace scanner refused the 2026-10-31 AMI for it). The apk upgrade takes
+# Alpine's own fixes the node image has not yet been rebuilt with.
+FROM node:22-alpine AS runner
+RUN apk upgrade --no-cache && apk add --no-cache libc6-compat
 WORKDIR /app
 
 ENV NODE_ENV=production

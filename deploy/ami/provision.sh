@@ -30,7 +30,18 @@ for v in $VENUES; do
     esac
 done
 
-echo "── [1/4] Installing Docker Engine ──────────────────────────────────────"
+echo "── [1/4] Patching the OS and installing Docker Engine ──────────────────"
+# Canonical's base AMI is days to weeks behind noble-security, and the
+# Marketplace scanner refuses an image carrying a CVE that already has a fix
+# (2026-10-31: libbrotli1 1.1.0-2build2, CVE-2026-111497, fixed in
+# 1.1.0-2ubuntu0.1 five days earlier). Bring every package current before
+# anything else is installed; dist-upgrade rather than upgrade so a kernel
+# with a new ABI name is taken too. The AMI is never rebooted here; the
+# customer's first boot runs the new kernel.
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get dist-upgrade -y -qq \
+    -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+DEBIAN_FRONTEND=noninteractive apt-get autoremove -y -qq
 if ! command -v docker >/dev/null 2>&1; then
     apt-get update -qq
     apt-get install -y -qq ca-certificates curl gnupg
@@ -78,8 +89,10 @@ chmod 0644 /tmp/dradis-debuginfo.tar.gz
 echo "     symbols: $(du -h /tmp/dradis-debuginfo.tar.gz | cut -f1) at /tmp/dradis-debuginfo.tar.gz"
 # Baked in rather than pulled on the customer's first boot: a fresh instance
 # should come up without needing egress to Docker Hub, and without a pull delay
-# on the very first thing a buyer does.
-docker pull nginx:alpine
+# on the very first thing a buyer does. Built from proxy.Dockerfile rather than
+# pulled as-is: the published nginx:alpine lags Alpine's security fixes (see the
+# comment there), and the scanner holds the AMI to Alpine's current package set.
+docker build --pull -t dradis-proxy:latest -f deploy/ami/proxy.Dockerfile deploy/ami
 
 # Fail the build here rather than shipping an AMI that is missing a venue the
 # Setup view will happily offer.
@@ -90,8 +103,11 @@ for v in $VENUES; do
 done
 echo "     ✓ verified binaries present for: $VENUES"
 # The stack will not serve at all without this — nginx is the only listener.
-docker image inspect nginx:alpine >/dev/null 2>&1 \
-    || { echo "❌ nginx:alpine was not baked into the image"; exit 1; }
+docker image inspect dradis-proxy:latest >/dev/null 2>&1 \
+    || { echo "❌ dradis-proxy:latest was not baked into the image"; exit 1; }
+# And it must carry no package Alpine has since fixed: the scanner would.
+docker run --rm --entrypoint /bin/sh dradis-proxy:latest -c 'apk upgrade --simulate --no-cache 2>/dev/null | grep -q "^(" && exit 1 || exit 0' \
+    || { echo "❌ dradis-proxy:latest still has upgradable Alpine packages"; exit 1; }
 
 echo "── [3/4] Installing /opt/dradis runtime ────────────────────────────────"
 mkdir -p /opt/dradis/data

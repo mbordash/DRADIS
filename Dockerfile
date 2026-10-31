@@ -106,7 +106,9 @@ COPY --from=builder /out/debug /
 CMD ["/dev/null"]
 
 FROM alpine:latest
-RUN apk --no-cache add ca-certificates tzdata
+# upgrade first: alpine:latest can lag a security fix by days, and the
+# Marketplace scanner holds the image to Alpine's current package set.
+RUN apk --no-cache upgrade && apk --no-cache add ca-certificates tzdata
 ENV TZ=America/New_York
 WORKDIR /app
 # Control Tower REST API (axum)

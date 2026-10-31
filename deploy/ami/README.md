@@ -127,6 +127,18 @@ Marketplace ingests and scans AMIs from **us-east-1**, which is the script's
 default region; `--region` exists for test builds elsewhere, and an image built
 elsewhere cannot be published.
 
+The scan refuses an AMI carrying any CVE that already has a fix, in the OS
+packages and in the baked container images alike, and the only remedy is a
+new AMI. So `provision.sh` runs `apt-get dist-upgrade` before installing
+anything, the engine and Control Tower Dockerfiles `apk upgrade` their runtime
+stage, and the proxy is built from `proxy.Dockerfile` (nginx:alpine plus
+`apk upgrade`) instead of pulled as published, because the official nginx
+image lags Alpine's fixes by days or weeks. The first v1.5.6 image was refused
+(2026-10-31, CVE-2026-111497 in Brotli: the Ubuntu base image from eight days
+earlier, Node 20's bundled copy, and nginx:alpine's brotli-libs all carried
+it). Build from a current base: the script resolves Canonical's latest AMI
+at run time, but the upgrade step is what makes the result current.
+
 `iam-policy.json` in this directory is the least-privilege policy the build
 needs — EC2 builder lifecycle, image creation, the Marketplace image-sharing
 attribute, read access to Canonical's public SSM parameter for the Ubuntu

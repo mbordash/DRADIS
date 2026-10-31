@@ -110,6 +110,7 @@ REQUIRED_IN_ARCHIVE=(
     deploy/ami/provision.sh
     deploy/ami/docker-compose.yml
     deploy/ami/nginx.conf
+    deploy/ami/proxy.Dockerfile
     deploy/ami/dradis-firstboot.sh
     deploy/ami/dradis.service
 )
