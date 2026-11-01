@@ -357,7 +357,8 @@ before trusting a result.
 | `/api/config` | GET | Current DynamicConfig as JSON |
 | `/api/config` | PATCH | JSON merge-patch — hot-reloads strategies |
 | `/api/config/schema` | GET | Editable-config field schema |
-| `/api/pnl/history` | GET | Recent P&L snapshots |
+| `/api/pnl/history` | GET | P&L snapshots, `?hours=` window (default 24), `?limit=` points spread across it |
+| `/api/pnl/span` | GET | Oldest P&L snapshot timestamp, bounds the chart's range control |
 | `/api/trades` | GET | Recent completed trades |
 | `/api/positions` | GET | Current open positions |
 | `/api/squadrons` | GET | List all active squadrons |

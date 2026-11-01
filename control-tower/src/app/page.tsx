@@ -38,7 +38,11 @@ import SeededConfigNotice from '@/components/SeededConfigNotice';
 import ErrorBoundary   from '@/components/ErrorBoundary';
 import Footer          from '@/components/Footer';
 import { ViperHealthStrip } from '@/components/ViperHealthStrip';
-import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, getPortfolioValue, getVenueIncome, getSquadrons, refusalText } from '@/lib/api';
+import { getAssets, getConfig, getPnlHistory, getPnlSpan, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, getPortfolioValue, getVenueIncome, getSquadrons, refusalText } from '@/lib/api';
+import {
+  type PnlRange, PNL_HISTORY_POINTS, PNL_RANGE_STORE_KEY, isPnlRange, availableHours, hoursForRange,
+  rangeEnabled, tradeLimitForHours,
+} from '@/lib/pnlRange';
 import { DEMO_MODE } from '@/lib/demo';
 import { getSetupStatus } from '@/lib/setupApi';
 import type { DynamicConfig, SquadronSummary, PortfolioValue, VenueIncome, AvailableMarket, OddsFeedHealth } from '@/lib/types';
@@ -667,9 +671,36 @@ export default function DashboardPage() {
   const { data: config, mutate: refreshConfig, isLoading: configLoading } =
     useSWR('config', getConfig, { refreshInterval: 0, revalidateOnFocus: false });
 
-  // CAG-level P&L history: fetch global aggregated history (all assets) for main dashboard
+  // Portfolio chart window. The page owns it because the history fetch key
+  // depends on it; the chart renders the control. Remembered per browser as
+  // a convenience only (B43: the data itself never comes from storage).
+  const [pnlRange, setPnlRange] = useState<PnlRange>('24h');
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(PNL_RANGE_STORE_KEY);
+      if (isPnlRange(saved)) setPnlRange(saved);
+    } catch { /* storage unavailable: keep the default */ }
+  }, []);
+  const changePnlRange = useCallback((r: PnlRange) => {
+    setPnlRange(r);
+    try { localStorage.setItem(PNL_RANGE_STORE_KEY, r); } catch { /* ignore */ }
+  }, []);
+  const { data: pnlSpan } =
+    useSWR('pnl-span', getPnlSpan, { refreshInterval: 300_000 });
+  const pnlAvail = availableHours(pnlSpan?.first_ts);
+  // A remembered window the instance cannot fill (a fresh box, or a restored
+  // backup with less history) falls back to the day rather than showing a
+  // "30d" chart of two days.
+  useEffect(() => {
+    if (pnlSpan && !rangeEnabled(pnlRange, pnlAvail)) setPnlRange('24h');
+  }, [pnlSpan, pnlRange, pnlAvail]);
+  const pnlHours = hoursForRange(pnlRange, pnlAvail);
+
+  // CAG-level P&L history: fetch global aggregated history (all assets) for main dashboard.
+  // `keepPreviousData`: switching the window redraws from the old series to
+  // the new one instead of flashing the loading card.
   const { data: pnl, isLoading: pnlLoading, error: pnlError } =
-    useSWR('pnl-global', () => getPnlHistory(1440), { refreshInterval: 60_000 });
+    useSWR(['pnl-global', pnlHours], () => getPnlHistory(PNL_HISTORY_POINTS, undefined, pnlHours), { refreshInterval: 60_000, keepPreviousData: true });
 
   const { data: trades, isLoading: tradesLoading } =
     useSWR(['trades', asset], () => getTrades(60, asset), { refreshInterval: 15_000 });
@@ -681,11 +712,15 @@ export default function DashboardPage() {
   // For chart markers: fetch ALL trades/positions across all assets (not filtered by selected asset).
   // The asset list is part of the SWR key: a static key would cache the initial []
   // result (assets not loaded yet) and markers wouldn't render until the 15s refresh.
+  // The per-asset limit follows the chart window (sixty for a day, the API's
+  // cap beyond), and `truncated` records when a shard returned a full page,
+  // so the chart can say that older exits in the window have no marker.
+  const chartTradeLimit = tradeLimitForHours(pnlHours);
   const { data: allTrades } =
-    useSWR(availableAssets.length > 0 ? ['trades-all', ...availableAssets] : null, async () => {
-      const results = await Promise.all(availableAssets.map(a => getTrades(60, a)));
-      return results.flat();
-    }, { refreshInterval: 15_000 });
+    useSWR(availableAssets.length > 0 ? ['trades-all', chartTradeLimit, ...availableAssets] : null, async () => {
+      const results = await Promise.all(availableAssets.map(a => getTrades(chartTradeLimit, a)));
+      return { rows: results.flat(), truncated: results.some(r => r.length >= chartTradeLimit) };
+    }, { refreshInterval: 15_000, keepPreviousData: true });
 
   const { data: allOpenPositions } =
     useSWR(availableAssets.length > 0 ? ['positions-all', ...availableAssets] : null, async () => {
@@ -1100,8 +1135,13 @@ export default function DashboardPage() {
               startingBalance={startingBal}
               ghostMode={config?.ghost_mode}
               currentPortfolio={portfolio}
-              trades={allTrades ?? []}
+              trades={allTrades?.rows ?? []}
+              tradesTruncated={allTrades?.truncated ?? false}
               openPositions={allOpenPositions ?? []}
+              range={pnlRange}
+              onRangeChange={changePnlRange}
+              rangeHours={pnlHours}
+              historyStart={pnlSpan?.first_ts ?? null}
             />
           </ChunkBoundary>
         )}

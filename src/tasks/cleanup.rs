@@ -1066,7 +1066,7 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
                 .map(|p| p.current_value)
                 .sum();
             // Get the most recent collateral and session_pnl from DB for the snapshot.
-            if let Some(latest_snap) = db::get_pnl_history(&pool, 1).await.into_iter().next() {
+            if let Some(latest_snap) = db::get_pnl_history(&pool, 1, 24).await.into_iter().next() {
                 if let Ok(collateral) = latest_snap.collateral.parse::<Decimal>() {
                     if collateral > Decimal::ZERO {
                         // Ask the ledger rather than copying the previous row's value

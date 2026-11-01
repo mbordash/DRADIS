@@ -6729,14 +6729,19 @@ pub struct ConfigHistoryRow {
     pub new_value: String,
 }
 
-/// Return the most recent `limit` P&L snapshots, newest first.
-/// Now also filters to only include data from the last 24 hours.
-pub async fn get_pnl_history(pool: &SqlitePool, limit: i64) -> Vec<PnlSnapshotRow> {
-    // Calculate timestamp for 24 hours ago
-    let cutoff = Utc::now() - chrono::Duration::hours(24);
+/// Longest history window the chart may ask for, in hours (one year).
+pub const PNL_HISTORY_MAX_HOURS: i64 = 24 * 366;
+
+/// Return up to `limit` P&L snapshots from the last `hours` hours, newest
+/// first, spread evenly across the window (see below). `hours` is clamped to
+/// `1..=PNL_HISTORY_MAX_HOURS`; the chart's range control picks it, 24 by
+/// default.
+pub async fn get_pnl_history(pool: &SqlitePool, limit: i64, hours: i64) -> Vec<PnlSnapshotRow> {
+    let hours = hours.clamp(1, PNL_HISTORY_MAX_HOURS);
+    let cutoff = Utc::now() - chrono::Duration::hours(hours);
     let cutoff_str = cutoff.to_rfc3339();
 
-    // Spread `limit` points across the whole 24 hours rather than returning the
+    // Spread `limit` points across the whole window rather than returning the
     // newest `limit` rows.
     //
     // Snapshots land every few seconds, so a day is tens of thousands of rows.
@@ -6782,6 +6787,19 @@ pub async fn get_pnl_history(pool: &SqlitePool, limit: i64) -> Vec<PnlSnapshotRo
             total_value: r.try_get::<String, _>(3).ok(),
         })).collect(),
         Err(e) => { error!("❌ DB get_pnl_history failed: {}", e); vec![] }
+    }
+}
+
+/// Timestamp of the oldest P&L snapshot in this shard, `None` when there is
+/// none. The chart's range control greys out the windows the instance has not
+/// been running long enough to fill, so this is the honest bound for them.
+pub async fn first_pnl_snapshot_ts(pool: &SqlitePool) -> Option<String> {
+    match sqlx::query_scalar::<_, Option<String>>("SELECT MIN(ts) FROM pnl_snapshots")
+        .fetch_one(pool)
+        .await
+    {
+        Ok(ts) => ts,
+        Err(e) => { error!("❌ DB first_pnl_snapshot_ts failed: {}", e); None }
     }
 }
 
@@ -10864,7 +10882,7 @@ mod pnl_history_window_tests {
                 .execute(&pool).await.unwrap();
         }
 
-        let rows = get_pnl_history(&pool, 1000).await;
+        let rows = get_pnl_history(&pool, 1000, 24).await;
         assert!(!rows.is_empty(), "history must not be empty");
         assert!(rows.len() <= 1000, "must respect the point budget, got {}", rows.len());
 
@@ -10877,6 +10895,55 @@ mod pnl_history_window_tests {
             "history spans only {}h — a trade older than that would not be plottable",
             span.num_hours(),
         );
+    }
+
+    /// The window follows the hours the chart asked for, and the first
+    /// snapshot's timestamp is what bounds the range control.
+    ///
+    /// The chart used to be fixed at 24 hours. An operator wanting the week
+    /// or the month asks with `hours`, and the control greys out the windows
+    /// the instance has not run long enough to fill, so both the window and
+    /// the oldest timestamp have to be exact, not approximate.
+    #[tokio::test]
+    async fn history_window_follows_the_requested_hours() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE pnl_snapshots (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
+                 session_pnl TEXT NOT NULL, collateral TEXT NOT NULL, total_value TEXT)",
+        ).execute(&pool).await.unwrap();
+
+        assert_eq!(first_pnl_snapshot_ts(&pool).await, None, "an empty shard has no first snapshot");
+
+        let now = Utc::now();
+        let old = (now - chrono::Duration::hours(50)).to_rfc3339();
+        let mid = (now - chrono::Duration::hours(30)).to_rfc3339();
+        let young = (now - chrono::Duration::hours(2)).to_rfc3339();
+        for (ts, coll) in [(&old, "90"), (&mid, "95"), (&young, "100")] {
+            sqlx::query("INSERT INTO pnl_snapshots (ts, session_pnl, collateral, total_value) VALUES (?,?,?,?)")
+                .bind(ts).bind("0").bind(coll).bind(coll)
+                .execute(&pool).await.unwrap();
+        }
+
+        let day = get_pnl_history(&pool, 1000, 24).await;
+        assert_eq!(day.iter().map(|r| r.collateral.as_str()).collect::<Vec<_>>(), vec!["100"], "24 h shows only the young row");
+
+        let two_days = get_pnl_history(&pool, 1000, 48).await;
+        assert_eq!(two_days.iter().map(|r| r.collateral.as_str()).collect::<Vec<_>>(), vec!["100", "95"], "48 h adds the 30 h row, newest first");
+
+        let week = get_pnl_history(&pool, 1000, 24 * 7).await;
+        assert_eq!(week.len(), 3, "a week shows all three");
+
+        // Out-of-range requests are clamped, never rejected: a zero or negative
+        // window reads as one hour, an absurd one as the yearly cap.
+        assert_eq!(get_pnl_history(&pool, 1000, 0).await.len(), 0, "one hour holds none of the rows");
+        assert_eq!(get_pnl_history(&pool, 1000, i64::MAX).await.len(), 3, "the cap still covers everything");
+
+        assert_eq!(first_pnl_snapshot_ts(&pool).await.as_deref(), Some(old.as_str()), "the first snapshot is the 50 h row");
     }
 }
 

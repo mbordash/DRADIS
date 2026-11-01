@@ -22,6 +22,9 @@ import {
   ResponsiveContainer, ReferenceLine,
 } from 'recharts';
 import type { PnlSnapshotRow, PortfolioValue, TradeRow, OpenPositionRow } from '@/lib/types';
+import {
+  PNL_RANGES, type PnlRange, rangeEnabled, availableHours, formatPointTime, formatHistoryStart,
+} from '@/lib/pnlRange';
 
 interface Props {
   data: PnlSnapshotRow[];
@@ -36,12 +39,15 @@ interface Props {
   openPositions?: OpenPositionRow[];
   /** Set when the history request failed, so an empty chart is not read as "no data yet". */
   loadError?: string;
-}
-
-function fmt(iso: string) {
-  return new Date(iso).toLocaleTimeString('en-US', {
-    hour: '2-digit', minute: '2-digit', hour12: false,
-  });
+  /** Selected history window; the page owns it because the fetch key depends on it. */
+  range: PnlRange;
+  onRangeChange: (range: PnlRange) => void;
+  /** Hours the current `data` was requested for; drives the time labels. */
+  rangeHours: number;
+  /** Oldest snapshot on the instance (`/api/pnl/span`); null while unknown or when none exists. */
+  historyStart?: string | null;
+  /** True when the trade list hit its request cap, so older exits have no marker. */
+  tradesTruncated?: boolean;
 }
 
 /** One trade close snapped to a chart point. */
@@ -196,10 +202,26 @@ function PositionEntryTip({ events, label }: { events: PositionEvent[]; label: s
   );
 }
 
-export default function PnlChart({ data, startingBalance, ghostMode, currentPortfolio, trades, openPositions, loadError }: Props) {
+export default function PnlChart({
+  data, startingBalance, ghostMode, currentPortfolio, trades, openPositions, loadError,
+  range, onRangeChange, rangeHours, historyStart, tradesTruncated,
+}: Props) {
   // API returns newest-first — reverse for chronological chart display
   const base = startingBalance ?? 0;
   const reversedData = [...data].reverse();
+  const avail = availableHours(historyStart);
+
+  // Where the plotted history actually begins, when that is later than the
+  // window asked for: a "30d" chart on an instance twelve days old is a
+  // twelve-day chart, and the label has to say so rather than let the
+  // left edge read as a month ago. Five percent of the window absorbs the
+  // sampling stride and the span's own refresh lag. "All" always says it.
+  const oldestMs = reversedData[0] ? new Date(reversedData[0].ts).getTime() : null;
+  const windowStartMs = Date.now() - rangeHours * 3_600_000;
+  const historyShort = oldestMs !== null && (oldestMs - windowStartMs) > rangeHours * 3_600_000 * 0.05;
+  const beginsLabel = reversedData[0] && (historyShort || range === 'all')
+    ? `History begins ${formatHistoryStart(reversedData[0].ts)}`
+    : null;
 
   // Birdeye-style: track hovered point to show value in header area.
   //
@@ -279,7 +301,7 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
     }
 
     return {
-      time: fmt(row.ts),
+      time: formatPointTime(row.ts, rangeHours),
       ts: row.ts, // Keep raw timestamp for marker matching
       cash,
       totalValue,
@@ -311,7 +333,7 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
 
   // Build marker lookup maps keyed by the chart point's RAW timestamp.
   //
-  // Not `point.time`: that is `fmt()`ed to HH:MM, while snapshots are written
+  // Not `point.time`: that is formatted to HH:MM, while snapshots are written
   // every DASHBOARD_SYNC_SECS (30s). Two points per minute therefore share one
   // `time` string, and since the dot is painted on every point whose key is in
   // the map, a single trade rendered *two* overlay markers. `ts` is unique per
@@ -372,12 +394,48 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
   const tradeEvents = tradesInRange;
   const positionEvents = positionsInRange;
 
+  const rangeControl = (
+    <div className="flex items-center gap-0.5 rounded border border-[#1e1e32] bg-[#0d0d1a] p-0.5" role="group" aria-label="History window">
+      {PNL_RANGES.map(r => {
+        const enabled = rangeEnabled(r.id, avail);
+        const active = r.id === range;
+        return (
+          <button
+            key={r.id}
+            type="button"
+            disabled={!enabled}
+            aria-pressed={active}
+            onClick={() => { if (enabled && !active) onRangeChange(r.id); }}
+            title={enabled
+              ? (r.hours === null ? 'Show everything recorded' : `Show the last ${r.label}`)
+              : (historyStart ? `Not enough history yet: it begins ${formatHistoryStart(historyStart)}` : 'Not enough history yet')}
+            className={`px-2 py-0.5 rounded text-[10px] font-mono transition-colors ${
+              active ? 'bg-indigo-500/25 text-indigo-200'
+              : enabled ? 'text-gray-400 hover:text-gray-200 hover:bg-[#15152a]'
+              : 'text-gray-700 cursor-not-allowed'
+            }`}
+          >
+            {r.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+
   if (chartData.length === 0) {
     return (
-      <div className="card p-6 flex items-center justify-center h-48 text-gray-600 text-sm">
-        {loadError
-          ? <span className="text-red-400">Couldn&apos;t load balance history: {loadError}</span>
-          : 'No balance data yet — snapshots are recorded every 60 s.'}
+      <div className="card p-6 h-48 flex flex-col">
+        <div className="flex items-start justify-between">
+          <p className="label-muted text-[10px]">Portfolio Overview</p>
+          {rangeControl}
+        </div>
+        <div className="flex-1 flex items-center justify-center text-gray-600 text-sm">
+          {loadError
+            ? <span className="text-red-400">Couldn&apos;t load balance history: {loadError}</span>
+            : range === '24h'
+              ? 'No balance data yet — snapshots are recorded every 60 s.'
+              : 'No snapshots in this window.'}
+        </div>
       </div>
     );
   }
@@ -434,8 +492,13 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
               })()
             )}
           </div>
+          {beginsLabel && (
+            <p className="mt-0.5 text-[10px] font-mono text-gray-600">{beginsLabel}</p>
+          )}
         </div>
-        <div className="flex items-center gap-3 text-[10px] font-mono mt-1">
+        <div className="flex flex-col items-end gap-1.5 mt-1">
+        {rangeControl}
+        <div className="flex items-center gap-3 text-[10px] font-mono">
           <div className="flex items-center gap-1.5">
             <div className="w-3 h-0.5 bg-emerald-400" />
             <span className="text-gray-500">Total Value</span>
@@ -456,6 +519,7 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
               <span className="text-gray-500">Exits ({tradeEvents.length})</span>
             </div>
           )}
+        </div>
         </div>
       </div>
       
@@ -651,6 +715,12 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
                 {' '}(showing {positionsInRange.length + tradesInRange.length} of {(trades?.length ?? 0) + (openPositions?.length ?? 0)} events in range)
               </span>
             )}
+          </>
+        )}
+        {tradesTruncated && (
+          <>
+            {' · '}
+            <span className="text-amber-500/80">exit markers cover only the newest trades the trade list returned; older exits in this window have none</span>
           </>
         )}
       </div>

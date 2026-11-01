@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License along
 // with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import type { DynamicConfig, ConfigFieldSchema, PnlSnapshotRow, TradeRow, TradeStats, OpenPositionRow, LlmRecommendationRow, LlmActionRow, ViperDef, StatusResponse, PortfolioValue, CollateralPoolsResponse, VenueIncome, PositionQuote, SquadronSummary, TelemetrySnapshot, TelemetrySample } from './types';
+import type { DynamicConfig, ConfigFieldSchema, PnlSnapshotRow, PnlSpan, TradeRow, TradeStats, OpenPositionRow, LlmRecommendationRow, LlmActionRow, ViperDef, StatusResponse, PortfolioValue, CollateralPoolsResponse, VenueIncome, PositionQuote, SquadronSummary, TelemetrySnapshot, TelemetrySample } from './types';
 
 // In development, NEXT_PUBLIC_API_URL=http://localhost:9000 (set in .env.local)
 // hits the DRADIS API directly.
@@ -83,10 +83,18 @@ export async function patchConfig(patch: Partial<DynamicConfig>): Promise<Dynami
   return res.json();
 }
 
-export async function getPnlHistory(limit = 200, asset?: string): Promise<PnlSnapshotRow[]> {
-  const url = withAsset(`${BASE}/api/pnl/history?limit=${limit}`, asset);
+/** `limit` points spread across the last `hours` hours (default a day; the server caps at a year). */
+export async function getPnlHistory(limit = 200, asset?: string, hours = 24): Promise<PnlSnapshotRow[]> {
+  const url = withAsset(`${BASE}/api/pnl/history?limit=${limit}&hours=${Math.max(1, Math.round(hours))}`, asset);
   const res = await fetch(url, { cache: 'no-store' });
   if (!res.ok) throw new Error(`GET /api/pnl/history → ${res.status}`);
+  return res.json();
+}
+
+/** Oldest P&L snapshot on the instance, for the chart's range control. */
+export async function getPnlSpan(): Promise<PnlSpan> {
+  const res = await fetch(`${BASE}/api/pnl/span`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/pnl/span → ${res.status}`);
   return res.json();
 }
 

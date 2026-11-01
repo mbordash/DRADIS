@@ -97,7 +97,7 @@ async fn newest_pnl_snapshot_across_shards() -> Option<db::PnlSnapshotRow> {
     let mut newest: Option<db::PnlSnapshotRow> = None;
     for asset in db::available_assets() {
         let Some(pool) = db::pool_for(&asset) else { continue };
-        let Some(row) = db::get_pnl_history(&pool, 1).await.into_iter().next() else { continue };
+        let Some(row) = db::get_pnl_history(&pool, 1, 24).await.into_iter().next() else { continue };
         let replace = match &newest {
             None => true,
             Some(best) => row.ts > best.ts,

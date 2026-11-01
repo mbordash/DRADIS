@@ -371,6 +371,11 @@ export interface PnlSnapshotRow {
   total_value?: string; // Decimal string (Phase 3f-7: cash + positions)
 }
 
+/** GET /api/pnl/span: oldest P&L snapshot on any shard; null until one is written (B43). */
+export interface PnlSpan {
+  first_ts: string | null;
+}
+
 /**
  * Lifetime aggregates over a shard's entire trade history, from
  * `GET /api/trades/stats`.

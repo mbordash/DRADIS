@@ -4,6 +4,10 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
+## 1.5.7 (unreleased)
+
+- Control Tower: the portfolio chart has a range control. It showed the last 24 hours and nothing else; it now offers 24h, 3d, 7d, 30d and All, greys out the windows the instance has not been running long enough to fill, says where the history begins when a window reaches past the first snapshot, and labels the time axis with the date once the window is longer than a day. The engine serves any window up to a year (`/api/pnl/history?hours=`) at the same point budget as before, so a month draws as quickly as a day, and reports the oldest snapshot it holds (`/api/pnl/span`). Exit markers on the longer windows come from a larger trade list, and the chart says when that list was cut short.
+
 ## 1.5.6 (2026-10-31)
 
 - Kalshi and Polymarket US: contracts the account holds above what a strategy bought through its own orders are now adopted. When a strategy held a leg through its own fill and the account came to hold more on that leg (an operator buy, or a fill from a quote the engine had lost track of), the extra contracts belonged to no row: not the strategy's, which is sized from its own fills and is never moved by a wallet reading, and not an adopted one, because the adoption sweep only ran on legs no row claimed at all. Collateral was the only sign. The extra contracts are now adopted as a ChainAdopted position under the strategy's squadron once the difference has stood for a minute and no order is still working on the leg, at the cost the account's average implies for them, and from then on they follow the account like any other adopted position. The engine also now holds every account-side reconciliation on a leg off while any of its own orders is still working there, whichever squadron placed it, and while a squadron's in-memory position and its ledger row disagree about what it holds, which is logged after a minute as a fill the ledger never recorded.

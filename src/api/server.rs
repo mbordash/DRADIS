@@ -595,6 +595,10 @@ async fn enforce_read_only(
 struct AssetQuery {
     asset: Option<String>,
     limit: Option<i64>,
+    /// History window in hours for `/api/pnl/history` (default 24, clamped to
+    /// `db::PNL_HISTORY_MAX_HOURS`). The portfolio chart's range control sets
+    /// it; `limit` points are spread across whatever window is asked for.
+    hours: Option<i64>,
     /// `?fresh=1` bypasses the quote cache for this request.
     ///
     /// Only the intl-gated quotes endpoint reads it, so it is dead on the other
@@ -1065,9 +1069,10 @@ fn nearest_snapshot(
         .map(|(_, s)| s)
 }
 
-/// GET /api/pnl/history?limit=200&asset=btc
+/// GET /api/pnl/history?limit=200&asset=btc&hours=24
 ///
-/// Returns up to `limit` P&L snapshots, newest first.
+/// Returns up to `limit` P&L snapshots from the last `hours` hours (default
+/// 24), newest first, spread evenly across the window.
 /// Each row: { ts, session_pnl, collateral, total_value }
 ///
 /// When `asset` query param is omitted, returns aggregated global P&L history
@@ -1079,12 +1084,13 @@ async fn get_pnl_history(Query(q): Query<AssetQuery>) -> Response {
     // count off the end of the table, so honouring the request costs nothing —
     // the server downsamples to fit (see db::get_pnl_history).
     let limit = q.limit.unwrap_or(200).clamp(1, 2000);
+    let hours = q.hours.unwrap_or(24).clamp(1, db::PNL_HISTORY_MAX_HOURS);
 
     // If asset is specified, return single-asset history (legacy behavior)
     if let Some(asset_name) = q.asset.as_deref() {
         match db::pool_for_opt_retry(Some(asset_name)).await {
             Some(pool) => {
-                let history = db::get_pnl_history(&pool, limit).await;
+                let history = db::get_pnl_history(&pool, limit, hours).await;
                 debug!("Successfully retrieved PNL history for asset: {}", asset_name);
                 return Json(history).into_response();
             },
@@ -1109,7 +1115,7 @@ async fn get_pnl_history(Query(q): Query<AssetQuery>) -> Response {
     let mut all_snapshots: Vec<(String, Vec<db::PnlSnapshotRow>)> = vec![];
     for asset in &assets {
         if let Some(pool) = db::pool_for(asset) {
-            let snaps = db::get_pnl_history(&pool, limit).await;
+            let snaps = db::get_pnl_history(&pool, limit, hours).await;
             all_snapshots.push((asset.clone(), snaps));
         }
     }
@@ -1152,7 +1158,14 @@ async fn get_pnl_history(Query(q): Query<AssetQuery>) -> Response {
         // positions. The snapshots themselves were correct throughout
         // (19:36:15 recorded 61.71 + 2.73 = 64.43); only this join was wrong.
         // Nearest-match keeps cash and positions on the same clock.
-        let window_secs: i64 = 120;
+        //
+        // The window scales with the sample stride. Each shard is downsampled
+        // to `limit` points across `hours` independently, so on a 30-day chart
+        // the shards' points sit up to half an hour apart; a fixed 120 s window
+        // would then find no match and silently drop every other asset's
+        // positions from the total. Half a stride either side is the tightest
+        // window that always holds the neighbouring sample.
+        let window_secs: i64 = (hours * 3600 / limit.max(1)).max(120);
         let primary_time = chrono::DateTime::parse_from_rfc3339(ts)
             .map(|dt| dt.timestamp())
             .unwrap_or(0);
@@ -1203,6 +1216,28 @@ async fn get_pnl_history(Query(q): Query<AssetQuery>) -> Response {
 
     debug!("Successfully retrieved global aggregated PNL history ({} points)", aggregated.len());
     Json(aggregated).into_response()
+}
+
+/// GET /api/pnl/span
+///
+/// `{ "first_ts": "<RFC3339>" | null }`: the oldest P&L snapshot on any shard,
+/// so the portfolio chart's range control can grey out the windows this
+/// instance has not been running long enough to fill. `null` when no snapshot
+/// has been written yet (B43: unknown is null, not a guess).
+async fn get_pnl_span() -> Response {
+    let mut first: Option<String> = None;
+    for asset in db::available_assets() {
+        if let Some(pool) = db::pool_for(&asset) {
+            if let Some(ts) = db::first_pnl_snapshot_ts(&pool).await {
+                // RFC3339 UTC strings from `Utc::now().to_rfc3339()` compare
+                // correctly as text; the DB query already relies on that.
+                if first.as_deref().is_none_or(|f| ts.as_str() < f) {
+                    first = Some(ts);
+                }
+            }
+        }
+    }
+    Json(serde_json::json!({ "first_ts": first })).into_response()
 }
 
 /// GET /api/status
@@ -2495,7 +2530,7 @@ async fn approve_llm_action(
     match DynamicConfig::apply_squadron_patch_as(&squadron_id, &patch, "llm_approved").await {
         Ok(_) => {
             let inverse = serde_json::json!({ change.key.clone(): change.from.clone() }).to_string();
-            let pnl = db::get_pnl_history(&pool, 1).await.first()
+            let pnl = db::get_pnl_history(&pool, 1, 24).await.first()
                 .and_then(|p| p.session_pnl.parse::<f64>().ok())
                 .unwrap_or(0.0);
             let detail = format!(
@@ -2727,7 +2762,7 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
         // Collateral is wallet-global, not asset-scoped. Each asset DB stores the
         // same wallet cash snapshot, so we keep only the freshest one (but we'll
         // prefer live_collateral from CLOB if available).
-        let pnl_snapshots = db::get_pnl_history(&pool, 1).await;
+        let pnl_snapshots = db::get_pnl_history(&pool, 1, 24).await;
         if let Some(snap) = pnl_snapshots.first() {
             if let Ok(collateral) = Decimal::from_str(&snap.collateral) {
                 match &latest_collateral {
@@ -4791,6 +4826,7 @@ pub async fn run_api_server(
         .route("/api/config",                get(get_config).patch(patch_config))
         .route("/api/config/schema",         get(get_config_schema))
         .route("/api/pnl/history",           get(get_pnl_history))
+        .route("/api/pnl/span",              get(get_pnl_span))
         .route("/api/trades",                get(get_trades))
         .route("/api/trades/stats",          get(get_trade_stats))
         .route("/api/venue-income",          get(get_venue_income))
