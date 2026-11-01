@@ -24,10 +24,18 @@ import {
 import type { PnlSnapshotRow, PortfolioValue, TradeRow, OpenPositionRow } from '@/lib/types';
 import {
   PNL_RANGES, type PnlRange, rangeEnabled, availableHours, formatPointTime, formatHistoryStart,
+  historyBeginsAfterWindow,
 } from '@/lib/pnlRange';
 
 interface Props {
   data: PnlSnapshotRow[];
+  /**
+   * Collateral at the first point in view: the dashed baseline, and in ghost
+   * mode the base the virtual cash series is built on. It moves with the
+   * window (it is the oldest snapshot fetched), hence "Window start", not
+   * "Session start": the engine's session is the process run, which a deploy
+   * resets, and this value is a week old on the 7d view.
+   */
   startingBalance?: number;
   /** When true, compute balance as startingBalance + session_pnl (ghost mode — on-chain balance is flat). */
   ghostMode?: boolean;
@@ -214,11 +222,9 @@ export default function PnlChart({
   // Where the plotted history actually begins, when that is later than the
   // window asked for: a "30d" chart on an instance twelve days old is a
   // twelve-day chart, and the label has to say so rather than let the
-  // left edge read as a month ago. Five percent of the window absorbs the
-  // sampling stride and the span's own refresh lag. "All" always says it.
-  const oldestMs = reversedData[0] ? new Date(reversedData[0].ts).getTime() : null;
-  const windowStartMs = Date.now() - rangeHours * 3_600_000;
-  const historyShort = oldestMs !== null && (oldestMs - windowStartMs) > rangeHours * 3_600_000 * 0.05;
+  // left edge read as a month ago. "All" always says it. Same rule as the
+  // banner's delta label (`windowLabel`), so the two agree on the left edge.
+  const historyShort = historyBeginsAfterWindow(reversedData[0]?.ts, rangeHours);
   const beginsLabel = reversedData[0] && (historyShort || range === 'all')
     ? `History begins ${formatHistoryStart(reversedData[0].ts)}`
     : null;
@@ -581,7 +587,7 @@ export default function PnlChart({
                 y={startingBalance}
                 stroke="#374151"
                 strokeDasharray="4 4"
-                label={{ value: 'Session Start', position: 'insideTopRight', fill: '#6b7280', fontSize: 10 }}
+                label={{ value: `Window start $${startingBalance.toFixed(2)}`, position: 'insideTopRight', fill: '#6b7280', fontSize: 10 }}
               />
             )}
             {/* Total Value - render first so it's behind */}

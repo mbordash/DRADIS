@@ -103,3 +103,30 @@ export function formatPointTime(iso: string, hours: number): string {
 export function formatHistoryStart(iso: string): string {
   return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
+
+/**
+ * True when the plotted history begins materially after the window start: a
+ * "30d" chart on an instance twelve days old is a twelve-day chart. Five
+ * percent of the window absorbs the sampling stride and the span's refresh lag.
+ */
+export function historyBeginsAfterWindow(oldestTs: string | null | undefined, hours: number, now = Date.now()): boolean {
+  if (!oldestTs) return false;
+  const oldest = new Date(oldestTs).getTime();
+  if (!Number.isFinite(oldest)) return false;
+  const windowMs = hours * 3_600_000;
+  return oldest - (now - windowMs) > windowMs * 0.05;
+}
+
+/**
+ * How the banner names the delta's horizon: "over the last 7d" when the
+ * window is full, "since Oct 17" when the history is shorter than the window
+ * or on All. Same rule as the chart's "History begins" caption, so the two
+ * never disagree about what the left edge is.
+ */
+export function windowLabel(range: PnlRange, hours: number, oldestTs: string | null | undefined, now = Date.now()): string {
+  const def = PNL_RANGES.find(r => r.id === range);
+  if (oldestTs && (range === 'all' || historyBeginsAfterWindow(oldestTs, hours, now))) {
+    return `since ${formatHistoryStart(oldestTs)}`;
+  }
+  return `over the last ${def?.label ?? `${hours}h`}`;
+}

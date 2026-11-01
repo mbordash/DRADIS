@@ -41,7 +41,7 @@ import { ViperHealthStrip } from '@/components/ViperHealthStrip';
 import { getAssets, getConfig, getPnlHistory, getPnlSpan, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, getPortfolioValue, getVenueIncome, getSquadrons, refusalText } from '@/lib/api';
 import {
   type PnlRange, PNL_HISTORY_POINTS, PNL_RANGE_STORE_KEY, isPnlRange, availableHours, hoursForRange,
-  rangeEnabled, tradeLimitForHours,
+  rangeEnabled, tradeLimitForHours, windowLabel,
 } from '@/lib/pnlRange';
 import { DEMO_MODE } from '@/lib/demo';
 import { getSetupStatus } from '@/lib/setupApi';
@@ -357,11 +357,18 @@ function AssetTabs({
  * there is one.
  */
 function PortfolioValueBanner({
-  portfolio, sessionPnl, ghostMode, isLoading, unreachable,
+  portfolio, sessionPnl, windowStart, ghostMode, isLoading, unreachable,
 }: {
   portfolio?: PortfolioValue;
   /** Realized session P&L, or `null` while it is not known yet. */
   sessionPnl: number | null;
+  /**
+   * Portfolio value at the first point of the chart window and how to name
+   * the horizon ("over the last 7d", "since Oct 17"); `null` with no
+   * snapshot. On a live account the delta is measured from here, so the
+   * banner and the chart answer the same question over the same range.
+   */
+  windowStart: { value: number; label: string } | null;
   ghostMode?: boolean;
   isLoading: boolean;
   /** The last poll failed. With `portfolio` set the figures are the previous reading. */
@@ -384,16 +391,38 @@ function PortfolioValueBanner({
   // on a fresh instance, named rather than rendered as an empty wallet.
   const awaitingBalance = !isLoading && !!portfolio && collateral === null;
 
-  // The true session delta is realized P&L + unrealized P&L.
-  // This is correct whether or not positions were carried in from a prior session,
-  // because it does NOT assume the starting portfolio was just cash — it derives
-  // the starting portfolio value as (totalValue - delta) rather than using the
-  // raw collateral snapshot which omits the cost basis of any open positions.
-  // It needs all three figures; with any of them unknown there is no delta.
-  const delta = totalValue !== null && unrealizedPnl !== null && sessionPnl !== null
-    ? sessionPnl + unrealizedPnl
-    : null;
-  const startingPortfolioVal = delta !== null && totalValue !== null ? totalValue - delta : null;
+  // Live account: the delta is the change in portfolio value over the chart
+  // window, from the first snapshot in view to the live total. It used to be
+  // "vs session start", the engine's own session P&L, which on this venue is
+  // the same subtraction measured from the moment the process started; a
+  // deploy or a watchdog restart reset it to $0.00 while the week stood at
+  // +$60 (five restarts in the week to 2026-11-01), and the customer never
+  // sees the restart that changed its meaning. Measured from the window it
+  // moves with the chart's range control and says which range it means.
+  // Transfers count: a deposit reads as a gain, which the tooltip says.
+  //
+  // Ghost mode keeps the session form: the account's value never moves on
+  // simulated fills, so a window delta of it would read 0.00 forever. There
+  // the delta is realized P&L + unrealized P&L, which does not assume the
+  // starting portfolio was just cash (it derives the start as total - delta
+  // rather than reading the raw collateral snapshot, which omits the cost
+  // basis of carried positions). Either form needs every input; with any of
+  // them unknown there is no delta.
+  let delta: number | null = null;
+  let startingPortfolioVal: number | null = null;
+  let deltaLabel = 'vs session start';
+  let deltaTitle = 'Realized plus unrealized P&L since this engine run started.';
+  if (ghostMode) {
+    delta = totalValue !== null && unrealizedPnl !== null && sessionPnl !== null
+      ? sessionPnl + unrealizedPnl
+      : null;
+    startingPortfolioVal = delta !== null && totalValue !== null ? totalValue - delta : null;
+  } else if (windowStart && totalValue !== null) {
+    delta = totalValue - windowStart.value;
+    startingPortfolioVal = windowStart.value;
+    deltaLabel = windowStart.label;
+    deltaTitle = `Change in portfolio value ${windowStart.label}: from the first snapshot in the chart window (${fmt$(windowStart.value)}) to the live value. Deposits and withdrawals count.`;
+  }
   const deltaPct = delta !== null && startingPortfolioVal !== null && startingPortfolioVal > 0
     ? delta / startingPortfolioVal : 0;
   const isPositive = (delta ?? 0) >= 0;
@@ -439,8 +468,8 @@ function PortfolioValueBanner({
           </span>
         )}
         {!isLoading && delta !== null && startingPortfolioVal !== null && startingPortfolioVal > 0 && (
-          <span className={`text-sm font-mono mt-0.5 ${isPositive ? 'text-green-400' : 'text-red-400'}`}>
-            {isPositive ? '▲' : '▼'} {fmt$(Math.abs(delta))} ({fmtPct(Math.abs(deltaPct))}) vs session start
+          <span className={`text-sm font-mono mt-0.5 ${isPositive ? 'text-green-400' : 'text-red-400'}`} title={deltaTitle}>
+            {isPositive ? '▲' : '▼'} {fmt$(Math.abs(delta))} ({fmtPct(Math.abs(deltaPct))}) {deltaLabel}
           </span>
         )}
       </div>
@@ -849,7 +878,21 @@ export default function DashboardPage() {
   const oldestSnap  = pnl?.[pnl.length - 1];
   const startingBal = oldestSnap  ? parseFloat(oldestSnap.collateral)  : 0;
   const sessionPnl  = latestSnap  ? parseFloat(latestSnap.session_pnl) : 0;
-  const sessionPct  = startingBal > 0 ? sessionPnl / startingBal : 0;
+  // Portfolio value at the first point of the chart window, for the banner's
+  // delta. Rows older than the total_value column fall back to collateral,
+  // as the chart does for the same rows.
+  const windowStart = oldestSnap
+    ? {
+        value: parseFloat(oldestSnap.total_value ?? oldestSnap.collateral),
+        label: windowLabel(pnlRange, pnlHours, oldestSnap.ts),
+      }
+    : null;
+  // When this engine run started, for the Session P&L card's caption: the
+  // figure is the engine's own session accounting, which a restart resets,
+  // and the caption has to say so now that the chart can show a month.
+  const sessionStartedLabel = status?.session_started_at
+    ? new Date(status.session_started_at).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })
+    : null;
   // In ghost mode, the on-chain pUSD balance never changes (no real orders are placed),
   // so we derive the virtual current balance as startingBal + accumulated session P&L.
   // In live mode, use the actual on-chain collateral from the latest snapshot.
@@ -1117,6 +1160,7 @@ export default function DashboardPage() {
         <PortfolioValueBanner
           portfolio={portfolio}
           sessionPnl={pnlLoading || !latestSnap ? null : sessionPnl}
+          windowStart={pnlLoading ? null : windowStart}
           ghostMode={config?.ghost_mode}
           isLoading={portfolioLoading}
           unreachable={!!portfolioError}
@@ -1159,10 +1203,15 @@ export default function DashboardPage() {
             value={squadronsUnknown || !squadrons ? '—' : String(squadrons.filter(s => s.state === 'PATROLLING' || s.state === 'DEPLOYED').length)}
             sub={squadronsError && !squadrons ? "couldn't load" : 'deployed + patrolling'}
           />
+          {/* The engine's session figure: what this engine run has made since it
+              started, which a deploy or watchdog restart resets to zero. The old
+              caption was a percentage of the chart window's first collateral,
+              a different clock from the numerator once the window can be a
+              month, so the caption now names the clock instead. */}
           <StatCard
             label="Session P&L"
             value={sessionKnown ? fmt$(sessionPnl) : '—'}
-            sub={sessionKnown ? fmtPct(sessionPct) : 'no snapshot yet'}
+            sub={!sessionKnown ? 'no snapshot yet' : sessionStartedLabel ? `since engine start ${sessionStartedLabel}` : 'since engine start'}
             valueClass={!sessionKnown ? '' : sessionPnl >= 0 ? 'text-green-400' : 'text-red-400'}
           />
           <StatCard
