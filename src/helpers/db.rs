@@ -1334,6 +1334,8 @@ pub struct AnchorShadow {
     pub token_id: String,
     pub market: String,
     pub side: String,
+    /// Best bid seen on the held side while open; `None` until one is seen.
+    pub peak_bid: Option<f64>,
     /// The market's close, which is also its settlement boundary.
     pub close_s: i64,
     pub entry_price: f64,
@@ -1400,9 +1402,9 @@ pub async fn anchor_shadow_open(
 /// read failed: the caller keeps what it knew rather than treating a failed
 /// read as an empty ledger.
 pub async fn anchor_shadow_open_rows(pool: &SqlitePool, asset: &str) -> Option<Vec<AnchorShadow>> {
-    let rows: Vec<(i64, String, String, String, String, String, String, i64, f64, f64, f64, String, Option<i32>, String)> = sqlx::query_as(
+    let rows: Vec<(i64, String, String, String, String, String, String, i64, f64, f64, f64, String, Option<i32>, String, Option<f64>)> = sqlx::query_as(
         "SELECT id, lane, market_key, condition_id, token_id, market, side, close_s, entry_price, shares, entry_fee,
-                squadron_id, ghost, opened_at
+                squadron_id, ghost, opened_at, peak_bid
            FROM anchor_shadow
           WHERE asset = ? AND closed_at IS NULL
           ORDER BY id")
@@ -1412,7 +1414,7 @@ pub async fn anchor_shadow_open_rows(pool: &SqlitePool, asset: &str) -> Option<V
     Some(rows.into_iter().map(|r| AnchorShadow {
         id: r.0, lane: r.1, market_key: r.2, condition_id: r.3, token_id: r.4, market: r.5, side: r.6,
         close_s: r.7, entry_price: r.8, shares: r.9, entry_fee: r.10, squadron_id: r.11, ghost: r.12.map(|g| g != 0),
-        opened_at: r.13,
+        opened_at: r.13, peak_bid: r.14,
     }).collect())
 }
 
@@ -1435,6 +1437,56 @@ pub async fn anchor_settlement_booked(
         .bind(strategy).bind(market).bind(side).bind(ghost as i32).bind(since)
         .fetch_optional(pool).await?;
     Ok(found.is_some())
+}
+
+/// Exits booked against an Anchor holding since it opened: every trade on the
+/// trade list for this strategy, market and side that is not a settlement (the
+/// viper's own take-profit, a Close Now, a stand-down flatten). The trade list
+/// carries no token, so a holding is identified as the settlement check
+/// identifies it: one buy per side per hour. `None` when nothing was sold.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnchorExits {
+    pub shares: f64,
+    pub pnl: f64,
+    /// Share-weighted average exit price.
+    pub avg_price: f64,
+    pub reason: String,
+}
+
+pub async fn anchor_exits_since(
+    pool: &SqlitePool, strategy: &str, market: &str, side: &str, since: &str,
+) -> Result<Option<AnchorExits>, sqlx::Error> {
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT shares, pnl, exit_price, reason FROM trades
+          WHERE strategy = ? AND market = ? AND side = ?
+            AND reason NOT LIKE 'Settlement%' AND ts >= ?
+          ORDER BY id")
+        .bind(strategy).bind(market).bind(side).bind(since)
+        .fetch_all(pool).await?;
+    let p = |s: &str| s.parse::<f64>().unwrap_or(0.0);
+    let (mut shares, mut pnl, mut notional, mut reason) = (0.0, 0.0, 0.0, String::new());
+    for (s, pl, px, r) in rows {
+        shares += p(&s);
+        pnl += p(&pl);
+        notional += p(&px) * p(&s);
+        reason = r;
+    }
+    if shares <= 0.0 { return Ok(None); }
+    Ok(Some(AnchorExits { shares, pnl, avg_price: notional / shares, reason }))
+}
+
+/// Raise a held row's best bid. Only ever raises it, so a late or reordered
+/// write cannot lower the record.
+pub async fn anchor_shadow_peak(pool: &SqlitePool, id: i64, bid: f64, secs_left: i64) -> bool {
+    match sqlx::query(
+        "UPDATE anchor_shadow SET peak_bid = ?, peak_secs_left = ?
+          WHERE id = ? AND closed_at IS NULL AND (peak_bid IS NULL OR peak_bid < ?)")
+        .bind(bid).bind(secs_left).bind(id).bind(bid)
+        .execute(pool).await
+    {
+        Ok(r) => r.rows_affected() > 0,
+        Err(e) => { error!("❌ DB anchor shadow peak failed: {}", e); false }
+    }
 }
 
 /// Whether `lane` already holds `side` of this market. One row per side per hour
@@ -2074,6 +2126,13 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) {
     // NULL on rows written before the columns existed.
     let _ = sqlx::query("ALTER TABLE anchor_shadow ADD COLUMN basis_spread REAL").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE anchor_shadow ADD COLUMN spot_range REAL").execute(pool).await;
+    // `peak_bid`: the best bid seen on the held side while the position was
+    // open, and `peak_secs_left` the seconds to close when it was seen. What a
+    // take-profit could have taken, recorded whether the exit dial is on or off
+    // (1.5.7). NULL on rows written before the columns existed, on control rows,
+    // and on fills never seen with a bid.
+    let _ = sqlx::query("ALTER TABLE anchor_shadow ADD COLUMN peak_bid REAL").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE anchor_shadow ADD COLUMN peak_secs_left INTEGER").execute(pool).await;
     let _ = sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_anchor_shadow_live
              ON anchor_shadow(asset, lane, closed_at)"

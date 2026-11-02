@@ -296,6 +296,9 @@ fn default_anchor_min_samples()        -> i64     { config::ANCHOR_MIN_SAMPLES }
 fn default_anchor_min_span_secs()      -> i64     { config::ANCHOR_MIN_SPAN_SECS }
 fn default_anchor_obi_adverse_block()  -> Decimal { config::ANCHOR_OBI_ADVERSE_BLOCK }
 fn default_anchor_max_vol_annualized() -> Decimal { config::ANCHOR_MAX_VOL_ANNUALIZED }
+fn default_anchor_exit_enabled()       -> bool    { config::ANCHOR_EXIT_ENABLED }
+fn default_anchor_take_profit_pct()    -> Decimal { config::ANCHOR_TAKE_PROFIT_PCT }
+fn default_anchor_exit_fair_edge()     -> Decimal { config::ANCHOR_EXIT_FAIR_EDGE }
 fn default_bookline_max_exposure_usdc() -> Decimal { config::BOOKLINE_MAX_EXPOSURE_USDC }
 fn default_helm_enabled() -> bool { config::HELM_ENABLED }
 fn default_helm_live_enabled() -> bool { config::HELM_LIVE_ENABLED }
@@ -1362,6 +1365,15 @@ pub struct DynamicConfig {
     /// viper holds. See `config::ANCHOR_MAX_VOL_ANNUALIZED`.
     #[serde(default = "default_anchor_max_vol_annualized")]
     pub anchor_max_vol_annualized: Decimal,
+    /// The exit dial: off holds every fill to settlement; on sells a held
+    /// position at the bid when a trigger fires in profit. See
+    /// `config::ANCHOR_EXIT_ENABLED`.
+    #[serde(default = "default_anchor_exit_enabled")]
+    pub anchor_exit_enabled: bool,
+    #[serde(default = "default_anchor_take_profit_pct")]
+    pub anchor_take_profit_pct: Decimal,
+    #[serde(default = "default_anchor_exit_fair_edge")]
+    pub anchor_exit_fair_edge: Decimal,
 
     // ── Helm: the operator's own position ───────────────────────────────────
     /// Kill switch for the path that spends: off freezes every Helm squadron at
@@ -1762,6 +1774,9 @@ impl Default for DynamicConfig {
             anchor_min_span_secs: config::ANCHOR_MIN_SPAN_SECS,
             anchor_obi_adverse_block: config::ANCHOR_OBI_ADVERSE_BLOCK,
             anchor_max_vol_annualized: config::ANCHOR_MAX_VOL_ANNUALIZED,
+            anchor_exit_enabled: config::ANCHOR_EXIT_ENABLED,
+            anchor_take_profit_pct: config::ANCHOR_TAKE_PROFIT_PCT,
+            anchor_exit_fair_edge: config::ANCHOR_EXIT_FAIR_EDGE,
             helm_enabled: config::HELM_ENABLED,
             helm_live_enabled: config::HELM_LIVE_ENABLED,
             helm_max_exposure_usdc: config::HELM_MAX_EXPOSURE_USDC,
@@ -2787,6 +2802,7 @@ mod tests {
             "anchor_min_age_secs", "anchor_max_age_secs", "anchor_min_samples", "anchor_min_span_secs",
             "anchor_obi_adverse_block",
             "anchor_max_vol_annualized",
+            "anchor_exit_enabled", "anchor_take_profit_pct", "anchor_exit_fair_edge",
             "helm_enabled", "helm_live_enabled", "helm_max_exposure_usdc",
             "helm_max_open_intents", "helm_entry_window_secs", "helm_min_secs_to_close",
             "helm_fee_verdict_enforce", "helm_fee_max_ratio", "helm_fee_max_notional_pct",

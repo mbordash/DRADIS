@@ -289,6 +289,9 @@ export interface DynamicConfig {
   anchor_min_span_secs?: number;
   anchor_obi_adverse_block?: string;
   anchor_max_vol_annualized?: string;
+  anchor_exit_enabled?: boolean;
+  anchor_take_profit_pct?: string;
+  anchor_exit_fair_edge?: string;
 
   // ── Helm Viper (the operator's own position, posture-enforced exit) ─────────
   helm_enabled?: boolean;

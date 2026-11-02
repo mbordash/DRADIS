@@ -34,7 +34,8 @@
 //! four cents cheap, bought and held to settlement, returned +2.8c per contract
 //! against −3.4c for the prints it called expensive; the edge sat in minutes 30
 //! to 45, within one sigma of the strike, on the 0.20 to 0.60 side. A resting
-//! take-profit erased it, so the exit is settlement and nothing else.
+//! take-profit erased it, so the default exit is settlement and nothing else;
+//! the exit dial below is the operator's override, tested live.
 //!
 //! # Venue neutrality
 //!
@@ -52,9 +53,22 @@
 //! dispatcher as `StrategySignal::Entry` with a fill-and-kill order, exactly as
 //! GBoost and FairValue send theirs. The dispatcher decides what that means: in
 //! ghost mode it records a simulated fill, otherwise it places the venue order.
-//! Nothing here knows the difference, and nothing here ever emits an exit: the
+//! Nothing here knows the difference. With the exit dial off (the default) the
 //! position rides to settlement, where the venue's own settlement sweep books
 //! the result at $1.00 or $0.00 against this strategy.
+//!
+//! # The exit dial
+//!
+//! `anchor_exit_enabled` turns on a taker sale at the bid, sent as
+//! `StrategySignal::Exit`, when the sale is a profit net of both fees and either
+//! the gain reaches `anchor_take_profit_pct` or the bid net of the exit fee beats
+//! the model's live fair value by `anchor_exit_fair_edge` (`exit_decision`). A
+//! position never in profit still rides to settlement. Added in 1.5.7 after a
+//! live hold ran to +140% and settled at zero. Whether the dial is on or off,
+//! each fill's best bid while held is written to its ledger row (`peak_bid`),
+//! so the two postures can be compared on the same trades. A holding sold
+//! before its close, by this dial or by the operator, is scored on the ledger
+//! from the trade list and never booked again at settlement.
 //!
 //! # The ledger
 //!
@@ -466,6 +480,55 @@ pub fn control_side(r: Reading, secs_left: i64, yes: SideQuote, no: SideQuote, g
     best
 }
 
+// ─── Exit ────────────────────────────────────────────────────────────────────
+
+/// The exit dial's parameters, read from the knobs once per evaluation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExitRule {
+    /// Net gain on cost that sells; zero turns the trigger off.
+    pub take_profit_pct: f64,
+    /// Margin of the net bid over fair value that sells.
+    pub fair_edge: f64,
+}
+
+impl ExitRule {
+    pub fn from_config(dc: &DynamicConfig) -> Option<Self> {
+        dc.anchor_exit_enabled.then(|| Self {
+            take_profit_pct: dc.anchor_take_profit_pct.to_f64().unwrap_or(0.0),
+            fair_edge: dc.anchor_exit_fair_edge.to_f64().unwrap_or(0.0),
+        })
+    }
+}
+
+/// Why a held position is sold.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ExitWhy {
+    /// The net gain reached the take-profit; carries the gain.
+    TakeProfit(f64),
+    /// The net bid beat the model's fair value by the margin; carries the fair.
+    OverFair(f64),
+}
+
+/// Whether to sell a held position at `bid` now. Profit-only: a sale that does
+/// not clear the cost (entry plus entry fee per share) after the exit fee is
+/// never made, whatever the model says; a loser rides to settlement as before.
+/// `fair` is the model's value of the held side, `None` when no anchor has
+/// been readable on this market. Take-profit is checked first: it is the
+/// operator's number and needs no model.
+pub fn exit_decision(entry: f64, entry_fee: f64, bid: f64, exit_fee: f64, fair: Option<f64>, rule: &ExitRule) -> Option<ExitWhy> {
+    let cost = entry + entry_fee;
+    let net = bid - exit_fee;
+    if bid <= 0.0 || cost <= 0.0 || net <= cost { return None; }
+    let gain = (net - cost) / cost;
+    if rule.take_profit_pct > 0.0 && gain >= rule.take_profit_pct {
+        return Some(ExitWhy::TakeProfit(gain));
+    }
+    match fair {
+        Some(f) if net >= f + rule.fair_edge => Some(ExitWhy::OverFair(f)),
+        _ => None,
+    }
+}
+
 /// The model's reading at the moment an entry was sent, held until the fill
 /// shows in the position map so the ledger row carries the price and size that
 /// filled rather than the ask that was asked for.
@@ -533,6 +596,10 @@ struct AnchorState {
     last_read_at: i64,
     /// Logged once when the anchor first becomes readable on this market.
     announced: bool,
+    /// The basis of the last readable anchor. Deep in or out of the money the
+    /// book stops yielding samples and the anchor ages out; the exit rule still
+    /// needs a level there, and the offset moves far slower than the price.
+    last_good_basis: Option<f64>,
 }
 
 #[derive(Default)]
@@ -567,6 +634,13 @@ struct Globals {
     shadow_probed: Mutex<HashMap<String, Instant>>,
     last_sweep: Mutex<Option<Instant>>,
     summary: Mutex<(Option<Instant>, String)>,
+    /// Token → (ledger row id, best bid written to it) for the entry lane's
+    /// open rows, rebuilt by each sweep, so the peak is written only when it
+    /// rises.
+    peaks: Mutex<HashMap<String, (i64, f64)>>,
+    /// Token → when its exit was last logged; the dispatcher backs off a
+    /// failed sale, and the log should too.
+    exit_logged: Mutex<HashMap<String, Instant>>,
 }
 
 fn registry() -> &'static Mutex<HashMap<String, &'static Globals>> {
@@ -618,7 +692,7 @@ fn sample_and_read_anchor(
     map.retain(|_, st| now_s - st.touched_at < 7200);
     let st = map.entry(market_key.to_string()).or_insert_with(|| AnchorState {
         samples: VecDeque::new(), last_sample_at: 0, touched_at: now_s,
-        last_read: None, last_read_at: 0, announced: false,
+        last_read: None, last_read_at: 0, announced: false, last_good_basis: None,
     });
     st.touched_at = now_s;
     let mut landed = false;
@@ -640,6 +714,7 @@ fn sample_and_read_anchor(
         );
         st.last_read_at = now_s;
         if let Some(a) = st.last_read {
+            st.last_good_basis = Some(a.basis);
             if !st.announced {
                 st.announced = true;
                 info!(
@@ -650,6 +725,12 @@ fn sample_and_read_anchor(
         }
     }
     (st.last_read, st.samples.len())
+}
+
+/// The basis the exit rule prices from: the live anchor, else the last one
+/// this market had.
+fn exit_basis(g: &Globals, market_key: &str) -> Option<f64> {
+    lock(&g.anchors).get(market_key).and_then(|st| st.last_read.map(|a| a.basis).or(st.last_good_basis))
 }
 
 fn held_key(lane: &str, market_key: &str, side: &str) -> (String, String, String) {
@@ -841,6 +922,102 @@ impl AnchorStrategy {
         Booked::Ledger
     }
 
+    /// Record the best bid on each held side (whether the exit dial is on or
+    /// off), then, with the dial on, sell a holding at the bid when
+    /// `exit_decision` says so. One signal per tick; the dispatcher backs off a
+    /// sale that did not fill and the next tick asks again.
+    async fn manage_exit(&self, ctx: &StrategyContext) -> Option<StrategySignal> {
+        let dc = &ctx.dynamic_config;
+        let market = &ctx.market;
+        let asset = ctx.crypto_filter.to_lowercase();
+        let g = globals(&asset);
+        let now = Utc::now();
+        if (now - ctx.snapshot.timestamp).num_seconds() > MAX_SNAPSHOT_AGE_SECS { return None; }
+        let secs_left = market.secs_to_close(now)?;
+        if secs_left <= 0 { return None; }
+        // This viper's confirmed holdings on the squadron's market: only a
+        // confirmed fill owns shares that can back a sale.
+        let held: Vec<(MarketId, bool, Decimal, Decimal)> = {
+            let positions = ctx.positions.lock().await;
+            [(&market.yes_token, true), (&market.no_token, false)].into_iter().filter_map(|(tok, is_yes)| {
+                let p = positions.get(&PositionKey::new(&ctx.squadron_id, STRATEGY_NAME, tok.clone()))?;
+                (p.shares > Decimal::ZERO && p.fill_effective_at(dc.ghost_mode).is_some())
+                    .then(|| (tok.clone(), is_yes, p.avg_entry, p.shares))
+            }).collect()
+        };
+        if held.is_empty() { return None; }
+        let pool = crate::helpers::db::pool_for(&asset);
+        let rule = ExitRule::from_config(dc);
+        let fee = |p: f64| crate::venues::taker_fee_per_share(Decimal::try_from(p).unwrap_or(Decimal::ZERO))
+            .to_f64().unwrap_or(0.0);
+        let market_key = crate::vipers::gboost_planb::market_key(market);
+        // Fair YES from the model the entry priced with, when it can be read.
+        let fair_yes = (|| {
+            let spot = ctx.snapshot.oracle_price.to_f64().filter(|s| *s > 0.0)?;
+            let strike = market.strike_price.and_then(|k| k.to_f64()).filter(|k| *k > 0.0)?;
+            let sigma = lock(&g.sigma_cache).0?;
+            let basis = exit_basis(g, &market_key)?;
+            reading(spot, strike, basis, sigma, secs_left as f64, dc.anchor_max_age_secs as f64).map(|r| r.fair_yes)
+        })();
+        for (token, is_yes, avg_entry, shares) in held {
+            let bid_dec = if is_yes { ctx.snapshot.yes_bid } else { ctx.snapshot.no_bid };
+            let Some(bid) = bid_dec.to_f64().filter(|b| *b > 0.0) else { continue };
+            if let Some(pool) = &pool {
+                let mut peaks = lock(&g.peaks);
+                if let Some((id, peak)) = peaks.get_mut(token.as_str()) {
+                    if bid > *peak + 1e-9 {
+                        *peak = bid;
+                        let (pool, id) = (pool.clone(), *id);
+                        tokio::spawn(async move { crate::helpers::db::anchor_shadow_peak(&pool, id, bid, secs_left).await; });
+                    }
+                }
+            }
+            let Some(rule) = rule else { continue };
+            let entry = avg_entry.to_f64().unwrap_or(0.0);
+            let fair = fair_yes.map(|f| if is_yes { f } else { 1.0 - f });
+            let Some(why) = exit_decision(entry, fee(entry), bid, fee(bid), fair, &rule) else { continue };
+            let side = if is_yes { "YES" } else { "NO" };
+            let reason = match why {
+                ExitWhy::TakeProfit(gain) => format!(
+                    "AnchorTP: bid=${bid:.3} entry=${entry:.3}, {:+.0}% net of fees (target {:+.0}%)",
+                    gain * 100.0, rule.take_profit_pct * 100.0,
+                ),
+                ExitWhy::OverFair(f) => format!(
+                    "AnchorFairExit: bid=${bid:.3} over fair ${f:.3} by {:+.3} net of the exit fee, entry=${entry:.3}",
+                    bid - fee(bid) - f,
+                ),
+            };
+            let log_due = {
+                let mut logged = lock(&g.exit_logged);
+                logged.retain(|_, at| at.elapsed().as_secs() < 3600);
+                let due = logged.get(token.as_str()).is_none_or(|at| at.elapsed().as_secs() >= 30);
+                if due { logged.insert(token.as_str().to_string(), Instant::now()); }
+                due
+            };
+            if log_due {
+                info!("⚓ Anchor {side} EXIT on {}: {reason} | {} contracts, T {secs_left}s{}",
+                      market.market_name, shares, if dc.ghost_mode { " (simulated)" } else { "" });
+            }
+            return Some(StrategySignal::Exit {
+                params: OrderParams {
+                    token_id: token,
+                    price: bid_dec,
+                    shares,
+                    fee_bps: (if is_yes { market.yes_fee_bps } else { market.no_fee_bps }) as u16,
+                    is_neg_risk: market.is_neg_risk,
+                    market_name: market.market_name.clone(),
+                    condition_id: market_key,
+                    order_type: TimeInForce::Fak,
+                    post_only: false,
+                    ghost_mode: dc.ghost_mode,
+                },
+                reason,
+                exit_pair: false,
+            });
+        }
+        None
+    }
+
     /// Settle the ledger's open rows through the venue's resolver, rebuild the
     /// in-memory holds from the ledger, and refresh the card's summary line.
     /// Runs whether or not the viper is enabled: a row opened while it was on
@@ -862,8 +1039,42 @@ impl AnchorStrategy {
             *lock(&g.held) = rows.iter().map(|r| held_key(&r.lane, &r.market_key, &r.side)).collect();
             let entries = rows.iter().filter(|r| r.lane == ANCHOR_LANE_ENTRY);
             *lock(&g.ledgered) = entries.clone().map(|r| r.token_id.clone()).collect();
-            *lock(&g.open_notional) = entries.map(|r| r.entry_price * r.shares).sum();
+            *lock(&g.open_notional) = entries.clone().map(|r| r.entry_price * r.shares).sum();
+            {
+                // Keep a higher peak the database has not caught up with.
+                let mut peaks = lock(&g.peaks);
+                let rebuilt: HashMap<String, (i64, f64)> = entries.map(|r| {
+                    let mem = peaks.get(&r.token_id).filter(|(id, _)| *id == r.id).map_or(0.0, |(_, p)| *p);
+                    (r.token_id.clone(), (r.id, r.peak_bid.unwrap_or(0.0).max(mem)))
+                }).collect();
+                *peaks = rebuilt;
+            }
             for row in rows {
+                // A holding sold before its close (this viper's exit, a Close
+                // Now, a stand-down flatten) is scored from the trade list and
+                // not booked again at settlement. A partial sale leaves the rest
+                // to settle, booked and scored for the remainder only.
+                let mut sold: Option<crate::helpers::db::AnchorExits> = None;
+                if row.lane == ANCHOR_LANE_ENTRY {
+                    match crate::helpers::db::anchor_exits_since(&pool, STRATEGY_NAME, &row.market, &row.side, &row.opened_at).await {
+                        Ok(Some(x)) if x.shares + 1e-9 >= row.shares => {
+                            let reason = format!("exit: {}", x.reason);
+                            if crate::helpers::db::anchor_shadow_close(&pool, row.id, x.avg_price, &reason, x.pnl).await {
+                                lock(&g.peaks).remove(&row.token_id);
+                                info!(
+                                    "⚓ Anchor exited [{}] {} bought at ${:.3}, sold at ${:.3} before the close: {:+.2} USD ({})",
+                                    row.market, row.side, row.entry_price, x.avg_price, x.pnl, x.reason,
+                                );
+                            }
+                            continue;
+                        }
+                        Ok(x) => sold = x,
+                        Err(e) => {
+                            warn!("⚓ Anchor could not read exits for {} {} ({e}); its settlement waits", row.market, row.side);
+                            continue;
+                        }
+                    }
+                }
                 if now_s < row.close_s { continue; }
                 let resolved = lock(&g.shadow_resolved).get(&row.token_id).copied();
                 let Some(px) = resolved else {
@@ -907,6 +1118,12 @@ impl AnchorStrategy {
                 tokio::spawn(async move {
                     // Settlement pays no exit fee; the entry fee was charged at the ask.
                     let per_contract = px - row.entry_price - row.entry_fee;
+                    // What a partial sale left is what settles.
+                    let mut row = row;
+                    let sold_pnl = match &sold {
+                        Some(x) => { row.shares = (row.shares - x.shares).max(0.0); x.pnl }
+                        None => 0.0,
+                    };
                     let pnl = per_contract * row.shares;
                     if row.lane != ANCHOR_LANE_ENTRY {
                         if crate::helpers::db::anchor_shadow_close(&pool_c, row.id, px, "settlement", pnl).await {
@@ -916,6 +1133,7 @@ impl AnchorStrategy {
                         return;
                     }
                     let booked = Self::book_settlement(&positions_c, &pool_c, &asset_c, class_c.as_deref(), &row, px, pnl).await;
+                    let pnl = pnl + sold_pnl;
                     let reason = match booked {
                         Booked::Deferred => {
                             // Resolved but not booked: the next sweep asks the
@@ -926,6 +1144,8 @@ impl AnchorStrategy {
                         Booked::Simulated => "settlement (simulated)",
                         Booked::Ledger => "settlement (simulated, booked from the ledger)",
                     };
+                    let reason = if sold.is_some() { format!("{reason}, after a partial exit") } else { reason.to_string() };
+                    let reason = reason.as_str();
                     if !crate::helpers::db::anchor_shadow_close(&pool_c, row.id, px, reason, pnl).await {
                         return;
                     }
@@ -1229,23 +1449,23 @@ impl Strategy for AnchorStrategy {
         })
     }
 
-    /// Never an exit: the position rides to settlement, which the venue's own
-    /// sweep books (or, for a simulated position, this viper's). What runs here
-    /// is the bookkeeping: ledger rows for new fills, settlements for closed ones.
+    /// The bookkeeping (ledger rows for new fills, settlements for closed ones),
+    /// then the exit dial: with it off the position rides to settlement, which
+    /// the venue's own sweep books (or, for a simulated position, this viper's).
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         if ctx.market_class.as_deref().is_some_and(|c| c != "crypto") {
             return Ok(StrategySignal::NoSignal);
         }
         self.ledger_fills(ctx).await;
         self.sweep_ledger(ctx).await;
-        Ok(StrategySignal::NoSignal)
+        Ok(self.manage_exit(ctx).await.unwrap_or(StrategySignal::NoSignal))
     }
 
     fn status(&self) -> StrategyStatus { StrategyStatus::Active }
     fn name(&self) -> String { STRATEGY_NAME.to_string() }
     fn venue(&self) -> &'static str { "Hourly" }
     fn max_exposure(&self) -> Decimal { config::ANCHOR_MAX_EXPOSURE_USDC }
-    fn risk_model(&self) -> &'static str { "Taker at the ask, hold to settlement" }
+    fn risk_model(&self) -> &'static str { "Taker at the ask; hold to settlement, or take profit at the bid when the exit dial is on" }
 }
 
 #[cfg(test)]
@@ -1505,6 +1725,95 @@ mod tests {
         assert_eq!((s.closed, s.wins, s.open), (1, 1, 0));
         assert!((s.net_usd - pnl).abs() < 1e-9);
         assert!((s.net_per_contract - pnl / 10.0).abs() < 1e-9);
+    }
+
+    fn rule(tp: f64, edge: f64) -> ExitRule { ExitRule { take_profit_pct: tp, fair_edge: edge } }
+
+    /// The 2026-11-02 case: bought at 0.34, the bid ran to about 0.82 (+140%
+    /// gross) and the hold went to zero. At +100% the dial sells it.
+    #[test]
+    fn the_take_profit_sells_a_doubled_holding() {
+        let (entry, bid) = (0.34, 0.82);
+        let why = exit_decision(entry, fee(entry), bid, fee(bid), None, &rule(1.0, 0.02));
+        let Some(ExitWhy::TakeProfit(gain)) = why else { panic!("expected a take-profit, got {why:?}") };
+        let cost = entry + fee(entry);
+        assert!((gain - (bid - fee(bid) - cost) / cost).abs() < 1e-12, "gain is net of both fees");
+        assert!(gain > 1.0 && gain < 1.4);
+        // Short of the target, and with no model reading, it holds.
+        assert_eq!(exit_decision(entry, fee(entry), 0.60, fee(0.60), None, &rule(1.0, 0.02)), None);
+        // Zero turns the trigger off.
+        assert_eq!(exit_decision(entry, fee(entry), bid, fee(bid), None, &rule(0.0, 0.02)), None);
+    }
+
+    /// The fair-value trigger sells when the market pays more than the model's
+    /// value by the margin, and not otherwise.
+    #[test]
+    fn the_fair_value_trigger_sells_when_the_market_overpays() {
+        let (entry, bid) = (0.40, 0.70);
+        let net = bid - fee(bid);
+        let r = rule(0.0, 0.02);
+        assert_eq!(exit_decision(entry, fee(entry), bid, fee(bid), Some(net - 0.03), &r), Some(ExitWhy::OverFair(net - 0.03)));
+        assert_eq!(exit_decision(entry, fee(entry), bid, fee(bid), Some(net - 0.01), &r), None, "inside the margin it holds");
+        assert_eq!(exit_decision(entry, fee(entry), bid, fee(bid), Some(0.90), &r), None, "the model says it is worth more");
+    }
+
+    /// Profit-only: the model calling a loser overpriced does not sell it, and
+    /// neither does a bid that only covers the fees.
+    #[test]
+    fn the_exit_never_sells_at_a_loss() {
+        let entry = 0.40;
+        let r = rule(0.01, -0.10);
+        assert_eq!(exit_decision(entry, fee(entry), 0.30, fee(0.30), Some(0.10), &r), None);
+        let breakeven_gross = entry + fee(entry) + 0.001;
+        assert_eq!(exit_decision(entry, fee(entry), breakeven_gross, fee(breakeven_gross), Some(0.0), &r), None,
+                   "the exit fee takes it under cost");
+        assert_eq!(exit_decision(entry, fee(entry), 0.0, 0.0, Some(0.0), &r), None, "no bid, no sale");
+    }
+
+    /// The peak only rises, and a holding sold before its close is found on
+    /// the trade list by market, side and time, settlements excluded.
+    #[tokio::test]
+    async fn the_ledger_keeps_the_peak_and_finds_the_exit() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        use crate::helpers::db;
+        let p = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        db::init_schema(&p).await.unwrap();
+        db::run_migrations(&p).await;
+        let close_s = Utc::now().timestamp() + 900;
+        assert!(db::anchor_shadow_open(
+            &p, "btc", db::ANCHOR_LANE_ENTRY, "btc-open", "cid-1", "cid-1", "tok-no", "Bitcoin price at 3PM", "NO", close_s,
+            0.34, 5.0, fee(0.34), 0.42, 20.0, 4.0e-5, 0.3, 1200, 83_200.0, 83_100.0, 50.0, Some(false), None, None,
+        ).await);
+        let row = db::anchor_shadow_open_rows(&p, "btc").await.unwrap().remove(0);
+        assert_eq!(row.peak_bid, None);
+        assert!(db::anchor_shadow_peak(&p, row.id, 0.82, 700).await);
+        assert!(!db::anchor_shadow_peak(&p, row.id, 0.60, 300).await, "a lower bid does not lower the peak");
+        let row = db::anchor_shadow_open_rows(&p, "btc").await.unwrap().remove(0);
+        assert_eq!(row.peak_bid, Some(0.82));
+
+        let since = row.opened_at.clone();
+        assert_eq!(db::anchor_exits_since(&p, STRATEGY_NAME, &row.market, "NO", &since).await.unwrap(), None);
+        let ins = |strategy: &'static str, side: &'static str, px: &'static str, shares: &'static str, pnl: &'static str, reason: &'static str| {
+            let p = p.clone();
+            async move {
+                sqlx::query("INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason)
+                             VALUES (?, ?, 'Bitcoin price at 3PM', ?, '0.34', ?, ?, ?, ?)")
+                    .bind(Utc::now().to_rfc3339()).bind(strategy).bind(side).bind(px).bind(shares).bind(pnl).bind(reason)
+                    .execute(&p).await.unwrap();
+            }
+        };
+        ins(STRATEGY_NAME, "NO", "1.00", "5", "3.20", "Settlement (won — simulated)").await;
+        ins(STRATEGY_NAME, "YES", "0.80", "5", "2.00", "AnchorTP: other side").await;
+        ins("FairValueStrategy", "NO", "0.80", "5", "2.00", "FairValueTP").await;
+        assert_eq!(db::anchor_exits_since(&p, STRATEGY_NAME, &row.market, "NO", &since).await.unwrap(), None,
+                   "settlements, the other side and other vipers are not this holding's exit");
+        ins(STRATEGY_NAME, "NO", "0.80", "2", "0.85", "AnchorTP: first").await;
+        ins(STRATEGY_NAME, "NO", "0.78", "3", "1.20", "AnchorTP: rest").await;
+        let x = db::anchor_exits_since(&p, STRATEGY_NAME, &row.market, "NO", &since).await.unwrap().unwrap();
+        assert!((x.shares - 5.0).abs() < 1e-12);
+        assert!((x.pnl - 2.05).abs() < 1e-12);
+        assert!((x.avg_price - (0.80 * 2.0 + 0.78 * 3.0) / 5.0).abs() < 1e-12);
+        assert_eq!(x.reason, "AnchorTP: rest");
     }
 
     /// The control lane takes the side the model calls dear by the entry margin,

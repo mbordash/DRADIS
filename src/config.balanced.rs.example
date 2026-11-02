@@ -1015,6 +1015,19 @@ pub const ANCHOR_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.60);
 /// (Polymarket) or inverted (Kalshi). The market reprices a fast tape faster
 /// than a one-to-ten-minute anchor can follow.
 pub const ANCHOR_MAX_VOL_ANNUALIZED: Decimal = dec!(0.35);
+/// The exit dial. Off, every fill rides to settlement (the research posture: a
+/// resting take-profit erased the backtest's edge). On, a held position is sold
+/// at the bid, as a taker, when either trigger fires and the sale is a profit
+/// net of both fees: the gain reaches `ANCHOR_TAKE_PROFIT_PCT`, or the bid net
+/// of the exit fee beats the model's live fair value by `ANCHOR_EXIT_FAIR_EDGE`.
+pub const ANCHOR_EXIT_ENABLED: bool = false;
+/// Net gain on the cost (entry plus entry fee) at which a held position is
+/// sold: 1.00 is +100%. Zero turns this trigger off.
+pub const ANCHOR_TAKE_PROFIT_PCT: Decimal = dec!(1.00);
+/// The fair-value trigger: sell when the bid net of the exit fee is at least
+/// the model's fair value for the held side plus this margin, i.e. the market
+/// pays more than the model thinks the contract is worth.
+pub const ANCHOR_EXIT_FAIR_EDGE: Decimal = dec!(0.02);
 
 
 // ============================================================================

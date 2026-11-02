@@ -1272,6 +1272,21 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
                  above it the model was noise on Polymarket International and inverted on Kalshi, because a fast tape is \
                  repriced by the market faster than a one-to-ten-minute anchor can follow. This is the number that makes \
                  Anchor a sideways-regime viper.").range(0.05, 2.0).step(0.05).classes(&["crypto"]));
+            v.push(F::new(g, e, "anchor_exit_enabled", "Take Profit Exit", "bool", false,
+                "Off: every fill is held to settlement, the posture the research chose (a resting take-profit erased \
+                 the backtest's edge). On: a held position is sold at the bid, as a taker, when either trigger below \
+                 fires and the sale is a profit net of both fees. A position that is never in profit still rides to \
+                 settlement. Each ledger row records the best bid seen while held either way, so the two postures can \
+                 be compared.").classes(&["crypto"]));
+            v.push(F::new(g, e, "anchor_take_profit_pct", "Take Profit At", "pct", false,
+                "Sell once the gain on the cost (entry plus entry fee), net of the exit fee, reaches this: 1.00 is \
+                 +100%, a 0.30 entry sold at about 0.62. Zero turns this trigger off and leaves only the fair-value \
+                 trigger.").range(0.0, 5.0).step(0.05).classes(&["crypto"]));
+            v.push(F::new(g, e, "anchor_exit_fair_edge", "Exit Over Fair Value", "price", true,
+                "The fair-value trigger: sell when the bid, net of the exit fee, is at least the model's live fair \
+                 value for the held side plus this margin, i.e. the market pays more than the model thinks the \
+                 contract will settle at. Needs a readable anchor; late in the hour, deep in the money, the last \
+                 readable anchor is used.").range(-0.10, 0.50).step(0.005).classes(&["crypto"]));
         }
         // ── Bookline (sports, maker-first, ghost-only) ────────────────────────
         // MUST equal the Control Tower card name in `VIPER_DEFS`: both ViperCard and
