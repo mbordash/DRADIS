@@ -1187,7 +1187,16 @@ impl OrderLifecycle {
 }
 
 /// Mark a strategy's position guard fill-confirmed (idempotent).
-async fn confirm_guard(positions: &Arc<Mutex<PositionMap>>, squadron: &str, strategy: &str, token: &MarketId) {
+///
+/// [B82] The Kalshi and Polymarket US dispatchers also call this for a buy the
+/// venue's order response says traded, whatever its time in force. A taker
+/// (FAK) buy used to wait for the fill feed alone, but the feed's event for an
+/// order that trades on arrival can land before the dispatcher has written the
+/// guard; it then finds nothing to confirm, and nothing confirms the guard
+/// afterwards. 2026-11-02 21:41 ET, production: Anchor bought NO at 0.36, the
+/// guard stayed unconfirmed, and the take-profit exit (which sells only a
+/// confirmed holding) watched the bid reach 0.92 without acting.
+pub(crate) async fn confirm_guard(positions: &Arc<Mutex<PositionMap>>, squadron: &str, strategy: &str, token: &MarketId) {
     if let Some(p) = positions.lock().await.get_mut(&PositionKey::new(squadron, strategy, token.clone())) {
         if p.fill_confirmed_at.is_none() {
             p.fill_confirmed_at = Some(Utc::now());
@@ -1462,6 +1471,27 @@ mod resting_quote_tests {
         lc.confirm_on_fill(&map, &event("fak-1", LEG, dec!(5), dec!(0.30))).await;
         assert_eq!(shares_of(&map, "AnchorStrategy").await, Some((dec!(5), true)));
         assert!(lc.take_confirmed().await.is_empty(), "nothing tracked, nothing to resize");
+    }
+
+    /// [B82] The fill feed can report a taker buy before the dispatcher has
+    /// written its guard. That event confirms nothing, so the dispatcher
+    /// confirms the guard from the venue's own order response instead.
+    #[tokio::test]
+    async fn a_taker_buy_whose_feed_event_beat_its_guard_is_confirmed_at_placement() {
+        let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+        // The feed's event arrives first: no guard on the leg yet.
+        lc.confirm_on_fill(&map, &event("anchor-fak", LEG, dec!(5), dec!(0.36))).await;
+        // The order call returns and the dispatcher writes the guard.
+        guard(&mut *map.lock().await, "AnchorStrategy", LEG, dec!(5), dec!(0.36), false);
+        assert_eq!(shares_of(&map, "AnchorStrategy").await, Some((dec!(5), false)), "the race leaves the guard unconfirmed");
+        // The response said 5 traded, so the dispatcher confirms it.
+        confirm_guard(&map, SQ, "AnchorStrategy", &MarketId::new(LEG)).await;
+        assert_eq!(shares_of(&map, "AnchorStrategy").await, Some((dec!(5), true)));
+        // Only that strategy's guard in that squadron.
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(10), dec!(0.30), false);
+        confirm_guard(&map, "eth-open", "MakerStrategy", &MarketId::new(LEG)).await;
+        assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(10), false)));
     }
 
     /// Someone else's fill on the leg says nothing about a quote resting there:

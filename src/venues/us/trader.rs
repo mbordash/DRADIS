@@ -2749,15 +2749,15 @@ async fn dispatch_single(
                 params.token_id, f.price, f.filled, f.order_id);
             if matches!(side, Side::Buy) {
                 record_guard(squadron_id, positions, strategy_name, params, None, &f).await;
-                // [B74] The venue said this much of a good-till-cancelled buy
-                // traded at placement, so the guard is confirmed for it now; what
-                // did not fill keeps working and is tracked for the size PLACED,
-                // the fill feed sizing the guard as it trades. An order filled
-                // in full has nothing left to track.
+                // [B74][B82] The venue's response says this much of the buy
+                // traded, so the guard is confirmed for it now, whatever the
+                // time in force: a taker buy's fill-feed event can arrive before
+                // this guard exists and then confirms nothing. What a resting
+                // order did not fill keeps working and is tracked for the size
+                // PLACED, the fill feed sizing the guard as it trades. An order
+                // filled in full has nothing left to track.
+                crate::venues::lifecycle::confirm_guard(positions, squadron_id, strategy_name, &params.token_id).await;
                 if matches!(params.order_type, TimeInForce::Gtc | TimeInForce::Gtd) {
-                    if let Some(p) = positions.lock().await.get_mut(&PositionKey::new(squadron_id, strategy_name, params.token_id.clone())) {
-                        p.fill_confirmed_at = Some(Utc::now());
-                    }
                     let placed = params.shares.round_dp(2);
                     if f.filled < placed && !f.order_id.0.is_empty() {
                         let working = Fill { filled: placed, ..f.clone() };
