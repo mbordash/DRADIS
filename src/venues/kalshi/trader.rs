@@ -72,8 +72,10 @@ use super::{leg_id, types::KalshiMarket, ws, KalshiVenue};
 const COLLATERAL_RETRY_SECS: u64 = 15;
 
 /// Comma-separated series tickers to hunt (override with `KALSHI_SERIES`).
+/// The rotation loop flies the underlying of the first one only ([B84], see
+/// `rotation_series`).
 const ENV_SERIES: &str = "KALSHI_SERIES";
-const DEFAULT_SERIES: &str = "KXBTC15M,KXBTCD,KXETH15M,KXETHD";
+const DEFAULT_SERIES: &str = "KXBTC15M,KXBTCD";
 /// Optional substring filter (ticker / title) to pick a market.
 const ENV_MARKET_FILTER: &str = "KALSHI_MARKET_FILTER";
 
@@ -320,6 +322,26 @@ fn detect_underlying(ticker: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// [B84] The series the rotation loop hunts: those of ONE underlying, the
+/// first configured series' — `(underlying, kept, ignored)`.
+///
+/// The loop names its squadron after the underlying it flies (`btc-open`) and
+/// loads that squadron's config. Hunting every series by volume let a quiet
+/// hour's first pick land on another underlying: on 2026-11-03 production left
+/// `btc-open` for `eth-open` seven times in fourteen hours, about two minutes
+/// each, retiring the BTC squadron (its vipers stopped evaluating) and running
+/// a squadron the operator never configured, with Anchor and Momentum on real
+/// money and none of the BTC squadron's exit settings, invisible in the
+/// Control Tower except in those two minutes. One rotation loop is one
+/// squadron is one underlying; another underlying is a separate deployment.
+/// Series with no crypto underlying yield no pairs and are ignored too.
+fn rotation_series(series: Vec<String>) -> (Option<&'static str>, Vec<String>, Vec<String>) {
+    let underlying = series.iter().find_map(|s| detect_underlying(s));
+    let (kept, ignored) = series.into_iter()
+        .partition(|s| underlying.is_some() && detect_underlying(s) == underlying);
+    (underlying, kept, ignored)
 }
 
 fn configured_series() -> Vec<String> {
@@ -640,8 +662,14 @@ pub async fn run_kalshi_trader(
     cancel: CancellationToken,
 ) {
     let filter = std::env::var(ENV_MARKET_FILTER).ok().filter(|s| !s.is_empty());
-    let series = configured_series();
-    info!("🏛️ Kalshi trader starting — series={series:?} filter={filter:?}");
+    let (underlying, series, ignored) = rotation_series(configured_series());
+    info!("🏛️ Kalshi trader starting — underlying={underlying:?} series={series:?} filter={filter:?}");
+    if !ignored.is_empty() {
+        warn!(
+            "⚠️ Kalshi rotation flies one underlying ({underlying:?}, the first configured series'); \
+             ignoring {ignored:?} from {ENV_SERIES}. Deploy another underlying as its own squadron."
+        );
+    }
 
     // Register a session with the CAG so the venue-neutral API handlers work.
     //
@@ -1176,12 +1204,13 @@ fn hourly_pinned(current: &KalshiPair, now_s: i64) -> bool {
 /// A better cadence always wins: a one-hour market appearing while the loop
 /// flies a 15-minute one is the market the hour-shaped Vipers exist for. Within
 /// the same cadence an hourly market that has settled (`hourly_pinned`) is held
-/// to its close against the rest of its own ladder; a market of another
-/// underlying is still judged by volume, so a quiet hour's first pick (an ETH
-/// market with twenty contracts) gives way once a BTC strike is clearly busier.
-/// Otherwise the old rule holds: only a clearly hotter market, by
+/// to its close against the rest of its own ladder. A market of another
+/// underlying is never a candidate ([B84]). Otherwise the old rule holds: only a clearly hotter market, by
 /// `ROTATION_VOLUME_THRESHOLD` contracts, is worth the churn of moving.
 fn should_rotate(current: &KalshiPair, best: &KalshiPair, now_s: i64) -> bool {
+    // [B84] Never across underlyings: the series are already narrowed to one
+    // (`rotation_series`); this keeps a stray pair from moving the squadron.
+    if best.underlying != current.underlying { return false; }
     let (cur, new) = (Cadence::primary_rank(current.cadence), Cadence::primary_rank(best.cadence));
     if new < cur { return true; }
     if new > cur { return false; }
@@ -3625,8 +3654,29 @@ mod tests {
         // Default when unset.
         std::env::remove_var(ENV_SERIES);
         let s = configured_series();
-        assert!(s.contains(&"KXBTC15M".to_string()));
-        assert!(s.contains(&"KXETHD".to_string()));
+        assert_eq!(s, vec!["KXBTC15M".to_string(), "KXBTCD".to_string()]);
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
+
+    /// [B84] The rotation hunts the first configured series' underlying only:
+    /// the old default list let a quiet hour's first pick move btc-open to eth-open.
+    #[test]
+    fn the_rotation_hunts_one_underlying_the_first_configured() {
+        let (u, kept, ignored) = rotation_series(strs(&["KXBTC15M", "KXBTCD", "KXETH15M", "KXETHD"]));
+        assert_eq!(u, Some("btc"));
+        assert_eq!(kept, strs(&["KXBTC15M", "KXBTCD"]));
+        assert_eq!(ignored, strs(&["KXETH15M", "KXETHD"]));
+
+        let (u, kept, ignored) = rotation_series(strs(&["KXETHD", "KXBTCD", "KXETH15M"]));
+        assert_eq!((u, kept, ignored), (Some("eth"), strs(&["KXETHD", "KXETH15M"]), strs(&["KXBTCD"])));
+
+        // A leading non-crypto series does not name the underlying; it is ignored.
+        let (u, kept, ignored) = rotation_series(strs(&["FED", "KXSOLD"]));
+        assert_eq!((u, kept, ignored), (Some("sol"), strs(&["KXSOLD"]), strs(&["FED"])));
+
+        let (u, kept, ignored) = rotation_series(strs(&["FED"]));
+        assert_eq!((u, kept.is_empty(), ignored), (None, true, strs(&["FED"])));
     }
 }
 
@@ -4035,14 +4085,18 @@ mod hourly_market_tests {
         let mut nominal = hour.clone();
         nominal.window_secs = None;
         assert!(!should_rotate(&nominal, &hotter, open + HOURLY_SETTLE_SECS) && should_rotate(&nominal, &hotter, open + HOURLY_SETTLE_SECS - 1));
-        // Another underlying is never pinned against: a quiet hour's first pick
-        // (ETH with twenty contracts) gives way once BTC is clearly busier, but
-        // the ETH market holds against its own ladder.
+        // [B84] Another underlying is never a move, however busy or however
+        // early in the window: the squadron flies one underlying.
         let mut eth = pair("KXETHD-HOUR-A", Some(Cadence::Hourly), 20.0);
         eth.underlying = "eth";
         eth.close_time = Some(close);
         let btc_busier = pair("KXBTCD-HOUR-E", Some(Cadence::Hourly), 20.0 + ROTATION_VOLUME_THRESHOLD + 1.0);
-        assert!(should_rotate(&eth, &btc_busier, open + 1800), "a pinned ETH market still gives way to a clearly busier BTC one");
+        assert!(!should_rotate(&eth, &btc_busier, open + 1800), "never across underlyings, settled");
+        assert!(!should_rotate(&eth, &btc_busier, open + 10), "never across underlyings, unsettled");
+        let mut eth_quarter = pair("KXETH15M-A", Some(Cadence::FifteenMin), 50_000.0);
+        eth_quarter.underlying = "eth";
+        let btc_hour = pair("KXBTCD-HOUR-F", Some(Cadence::Hourly), 5.0);
+        assert!(!should_rotate(&eth_quarter, &btc_hour, open + 10), "not even for a better cadence");
         let mut eth_busier = pair("KXETHD-HOUR-B", Some(Cadence::Hourly), 20.0 + ROTATION_VOLUME_THRESHOLD + 1.0);
         eth_busier.underlying = "eth";
         assert!(!should_rotate(&eth, &eth_busier, open + 1800), "but holds against its own ladder");

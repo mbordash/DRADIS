@@ -135,8 +135,84 @@ pub fn short_window_start(
         .map(|(_, p)| p)
 }
 
-/// How often an unusable short-window anchor is written to the log.
+/// How often the count of unconfirmed ticks is summarized in the log (INFO).
 const SHORT_WINDOW_GAP_LOG_SECS: u64 = 60;
+
+/// How long the feed may go without a confirmed 1s velocity, while ticks keep
+/// arriving, before it is a WARN: several missed ticks in a row on the 1000ms
+/// cadence, which a single skipped update (the routine case) never reaches.
+const SHORT_WINDOW_GAP_WARN_SECS: u64 = 5;
+
+/// What the log should say about the short-window anchor on one tick.
+#[derive(Debug, PartialEq)]
+pub enum GapReport {
+    /// The feed has gone `secs` without a confirmed 1s velocity; once per run.
+    Degraded { secs: u64, anchor_age_ms: u128 },
+    /// A confirmed velocity again, after a run that was reported degraded.
+    Recovered { secs: u64 },
+    /// The periodic summary: `gaps` of `ticks` had no anchor, the oldest
+    /// nearest anchor `worst_ms` old.
+    Summary { gaps: u64, ticks: u64, worst_ms: u128 },
+}
+
+/// [B83] Tally of ticks with no usable short-window anchor.
+///
+/// Binance's `@ticker` stream routinely skips an update, leaving the nearest
+/// prior sample ~2,000ms old: the 1s velocity reads 0 (unconfirmed) for that
+/// one tick, by design (see `short_window_start`). Production logged that as a
+/// WARN up to once a minute per asset (402 in 16 hours on 2026-11-03, all but
+/// 5 of them a single missed tick), which is noise. Single gaps are now counted
+/// and summarized at INFO; a WARN is kept for a run of
+/// `SHORT_WINDOW_GAP_WARN_SECS` with no confirmed velocity while ticks arrive,
+/// which is a degraded feed. A feed that stops ticking altogether is the
+/// zombie guard's case, not this one.
+pub struct GapTally {
+    last_confirmed: Instant,
+    warned: bool,
+    window_start: Instant,
+    ticks: u64,
+    gaps: u64,
+    worst_ms: u128,
+}
+
+impl GapTally {
+    pub fn new(now: Instant) -> Self {
+        Self { last_confirmed: now, warned: false, window_start: now, ticks: 0, gaps: 0, worst_ms: 0 }
+    }
+
+    /// Record one tick: `confirmed` is whether it had a usable anchor,
+    /// `anchor_age_ms` the age of the nearest one. Returns at most one report
+    /// for the escalation path and at most one summary.
+    pub fn on_tick(&mut self, now: Instant, confirmed: bool, anchor_age_ms: u128) -> Vec<GapReport> {
+        let mut out = Vec::new();
+        self.ticks += 1;
+        if confirmed {
+            if self.warned {
+                out.push(GapReport::Recovered { secs: now.saturating_duration_since(self.last_confirmed).as_secs() });
+                self.warned = false;
+            }
+            self.last_confirmed = now;
+        } else {
+            self.gaps += 1;
+            self.worst_ms = self.worst_ms.max(anchor_age_ms);
+            let secs = now.saturating_duration_since(self.last_confirmed).as_secs();
+            if !self.warned && secs >= SHORT_WINDOW_GAP_WARN_SECS {
+                self.warned = true;
+                out.push(GapReport::Degraded { secs, anchor_age_ms });
+            }
+        }
+        if now.saturating_duration_since(self.window_start).as_secs() >= SHORT_WINDOW_GAP_LOG_SECS {
+            if self.gaps > 0 {
+                out.push(GapReport::Summary { gaps: self.gaps, ticks: self.ticks, worst_ms: self.worst_ms });
+            }
+            self.window_start = now;
+            self.ticks = 0;
+            self.gaps = 0;
+            self.worst_ms = 0;
+        }
+        out
+    }
+}
 
 /// The currency of the published oracle level.
 ///
@@ -394,8 +470,8 @@ pub async fn run_price_raptor(
     let mut last_vol_log = Instant::now()
         .checked_sub(Duration::from_secs(3600))
         .unwrap_or_else(Instant::now);
-    // Throttle for the short-window gap warning; seeded in the past likewise.
-    let mut last_gap_log = last_vol_log;
+    // [B83] Unconfirmed short-window ticks: summarized, WARN only on a run.
+    let mut gap_tally = GapTally::new(Instant::now());
     // Throttle for the withheld-USD-level warning; seeded in the past likewise.
     let mut last_basis_gap_log = last_vol_log;
 
@@ -503,26 +579,33 @@ pub async fn run_price_raptor(
                                         let window_ms = u128::from(config::MOMENTUM_SHORT_WINDOW_SECS) * 1000;
                                         let anchor = short_window_anchor(&price_history, now, window_ms);
                                         let anchor_age_ms = anchor.map_or(0, |(age, _)| age);
-                                        let velocity_1s = match short_window_start(
+                                        let start_1s = short_window_start(
                                             &price_history, now, window_ms, SHORT_WINDOW_ANCHOR_TOLERANCE_MS,
-                                        ) {
-                                            Some(p) => price - p,
-                                            None => {
-                                                // A gap (or a fresh connection): say so, throttled, so
-                                                // the zero below is not mistaken for a flat second.
-                                                if now.duration_since(last_gap_log).as_secs() >= SHORT_WINDOW_GAP_LOG_SECS {
-                                                    last_gap_log = now;
-                                                    warn!(
-                                                        "⚠️ Price Raptor [{}]: no {}s-window anchor — nearest prior sample is {}ms old \
-                                                         (accepted {}–{}ms); 1s velocity reads 0 (unconfirmed) until the feed catches up",
-                                                        crypto_filter.to_uppercase(), config::MOMENTUM_SHORT_WINDOW_SECS, anchor_age_ms,
-                                                        window_ms.saturating_sub(SHORT_WINDOW_ANCHOR_TOLERANCE_MS),
-                                                        window_ms + SHORT_WINDOW_ANCHOR_TOLERANCE_MS,
-                                                    );
-                                                }
-                                                dec!(0)
+                                        );
+                                        // A gap reads 0 (unconfirmed). [B83] A single skipped
+                                        // update is routine and only counted; a run of them is
+                                        // a degraded feed and a WARN.
+                                        for report in gap_tally.on_tick(now, start_1s.is_some(), anchor_age_ms) {
+                                            let asset = crypto_filter.to_uppercase();
+                                            let lo = window_ms.saturating_sub(SHORT_WINDOW_ANCHOR_TOLERANCE_MS);
+                                            let hi = window_ms + SHORT_WINDOW_ANCHOR_TOLERANCE_MS;
+                                            match report {
+                                                GapReport::Degraded { secs, anchor_age_ms } => warn!(
+                                                    "⚠️ Price Raptor [{asset}]: no confirmed 1s velocity for {secs}s while ticks arrive — \
+                                                     nearest prior sample is {anchor_age_ms}ms old (accepted {lo}–{hi}ms); \
+                                                     1s velocity reads 0 (unconfirmed) until the feed catches up",
+                                                ),
+                                                GapReport::Recovered { secs } => info!(
+                                                    "✅ Price Raptor [{asset}]: 1s velocity confirmed again after {secs}s",
+                                                ),
+                                                GapReport::Summary { gaps, ticks, worst_ms } => info!(
+                                                    "Price Raptor [{asset}]: {gaps} of {ticks} tick(s) in the last minute had no 1s anchor \
+                                                     (skipped updates; oldest nearest sample {worst_ms}ms, accepted {lo}–{hi}ms); \
+                                                     1s velocity read 0 on those ticks",
+                                                ),
                                             }
-                                        };
+                                        }
+                                        let velocity_1s = start_1s.map_or(dec!(0), |p| price - p);
 
                                         // Acceleration: rate of change of velocity
                                         let acceleration = velocity_5s - prev_velocity;
@@ -680,6 +763,54 @@ pub async fn run_price_raptor(
 #[cfg(test)]
 mod short_window_tests {
     use super::*;
+
+    fn at(t0: Instant, ms: u64) -> Instant { t0 + Duration::from_millis(ms) }
+
+    /// [B83] The production pattern: one skipped update in an otherwise
+    /// one-per-second feed is counted, never a WARN, and shows up once in the
+    /// minute's summary.
+    #[test]
+    fn a_single_skipped_tick_is_counted_not_warned() {
+        let t0 = Instant::now();
+        let mut g = GapTally::new(t0);
+        let mut reports = Vec::new();
+        // Ticks every second for a minute, except 30s is skipped (31s is a gap).
+        for s in 1..=60u64 {
+            if s == 30 { continue; }
+            let gap = s == 31;
+            reports.extend(g.on_tick(at(t0, s * 1000), !gap, if gap { 2000 } else { 1000 }));
+        }
+        assert_eq!(reports, vec![GapReport::Summary { gaps: 1, ticks: 59, worst_ms: 2000 }]);
+    }
+
+    /// A quiet minute says nothing at all.
+    #[test]
+    fn a_clean_minute_has_no_summary() {
+        let t0 = Instant::now();
+        let mut g = GapTally::new(t0);
+        let all: Vec<_> = (1..=61u64).flat_map(|s| g.on_tick(at(t0, s * 1000), true, 1000)).collect();
+        assert!(all.is_empty());
+    }
+
+    /// Ticks arriving every two seconds never confirm: that is a degraded feed,
+    /// warned once (not every tick) at the threshold, and its recovery logged.
+    #[test]
+    fn a_run_without_confirmation_warns_once_then_recovers() {
+        let t0 = Instant::now();
+        let mut g = GapTally::new(t0);
+        assert!(g.on_tick(at(t0, 1000), true, 1000).is_empty());
+        let mut warns = 0;
+        for k in 1..=5u64 {
+            for r in g.on_tick(at(t0, 1000 + k * 2000), false, 2000) {
+                assert!(matches!(r, GapReport::Degraded { .. }));
+                warns += 1;
+            }
+        }
+        assert_eq!(warns, 1, "one WARN per run");
+        assert_eq!(g.on_tick(at(t0, 12_000), true, 1000), vec![GapReport::Recovered { secs: 11 }]);
+        // A later run warns again.
+        assert!(g.on_tick(at(t0, 18_000), false, 6000).iter().any(|r| matches!(r, GapReport::Degraded { secs: 6, .. })));
+    }
 
     const TOL: u128 = SHORT_WINDOW_ANCHOR_TOLERANCE_MS;
 

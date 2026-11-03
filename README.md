@@ -190,7 +190,7 @@ KALSHI_API_KEY_ID=<key-id-uuid>          # from account settings (REQUIRED)
 KALSHI_PRIVATE_KEY_PATH=data/kalshi-key.pem  # downloaded PEM (REQUIRED; or KALSHI_PRIVATE_KEY=<pem contents>)
 KALSHI_DEMO=1                            # 1 = demo.kalshi.co paper trading, unset = production
 # optional:
-KALSHI_SERIES=KXBTC15M,KXBTCD,KXETH15M,KXETHD  # crypto series to hunt (default shown)
+KALSHI_SERIES=KXBTC15M,KXBTCD             # crypto series to hunt (default shown); the rotation flies the first series' underlying only, others are ignored
 KALSHI_MARKET_FILTER=bitcoin             # optional ticker/title substring to pick a market
 ASSETS=kalshi                            # keep the dashboard pool tidy (data in logs/kalshi-dradis.db)
 ```
