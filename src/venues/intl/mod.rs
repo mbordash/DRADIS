@@ -24,6 +24,7 @@
 //! [`MarketId`] carries a decimal-`U256` string that we parse only at the
 //! trait boundary (see `docs/VENUE_ABSTRACTION.md`, decision D5).
 
+pub mod data_api;
 pub mod orders;
 
 /// Runtime venue identity persisted on every trade and entry row.
@@ -565,8 +566,9 @@ impl Execution for IntlClobVenue {
     }
 
     async fn recent_prints(&self, market: &MarketId, limit: usize) -> Result<Option<Vec<crate::venues::core::TapePrint>>> {
-        let url = format!("https://data-api.polymarket.com/trades?market={}&limit={}", market.as_str(), limit.clamp(1, 500));
+        let url = format!("{}/trades", crate::helpers::clob_public::DATA_API_V2);
         let v: serde_json::Value = self.shared_http().get(&url)
+            .query(&[("condition", market.as_str().to_string()), ("limit", limit.clamp(1, 500).to_string())])
             .timeout(std::time::Duration::from_secs(5)).send().await?.error_for_status()?.json().await?;
         let mut prints: Vec<crate::venues::core::TapePrint> = crate::helpers::clob_public::parse_trades(&v)
             .into_iter()

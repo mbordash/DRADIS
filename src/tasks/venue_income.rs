@@ -44,7 +44,8 @@ use crate::helpers::db::{self, VenueCredit};
 /// Activity types recorded as venue income, spelled as the API spells them.
 pub const VENUE_INCOME_KINDS: [&str; 3] = ["MAKER_REBATE", "TAKER_REBATE", "REWARD"];
 
-const ACTIVITY_URL: &str = "https://data-api.polymarket.com/activity";
+/// Data API v2 (v1 retired 2026-11-02).
+fn activity_url() -> String { format!("{}/activity", crate::helpers::clob_public::DATA_API_V2) }
 /// Rebates are paid once a day per epoch, so an hourly read is timely enough.
 const POLL_SECS: u64 = 3600;
 const PAGE_SIZE: usize = 500;
@@ -64,20 +65,20 @@ pub fn last_polled_at() -> Option<DateTime<Utc>> {
     *last_poll_cell().lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Venue-income credits from one page of the `/activity` response. Rows of any
-/// other type, or missing an amount, timestamp or transaction hash, are skipped.
+/// Venue-income credits from one page of the `/v2/activity` response. Rows of
+/// any other type, or missing an amount, timestamp or transaction hash, are
+/// skipped.
 pub fn parse_credits(page: &serde_json::Value) -> Vec<VenueCredit> {
-    let Some(rows) = page.as_array() else { return Vec::new() };
-    rows.iter()
+    crate::helpers::clob_public::data_page(page).0.iter()
         .filter_map(|r| {
             let kind = r.get("type")?.as_str()?;
             if !VENUE_INCOME_KINDS.contains(&kind) {
                 return None;
             }
             // The number's own text ("1.2592"), not an f64 round trip.
-            let amount = Decimal::from_str(&r.get("usdcSize")?.as_number()?.to_string()).ok()?;
+            let amount = Decimal::from_str(&r.get("usdc_size")?.as_number()?.to_string()).ok()?;
             let credited_at = Utc.timestamp_opt(r.get("timestamp")?.as_i64()?, 0).single()?;
-            let tx_hash = r.get("transactionHash")?.as_str()?.to_string();
+            let tx_hash = r.get("transaction_hash")?.as_str()?.to_string();
             if tx_hash.is_empty() {
                 return None;
             }
@@ -89,21 +90,24 @@ pub fn parse_credits(page: &serde_json::Value) -> Vec<VenueCredit> {
 /// Read every venue-income credit for `safe` and record the new ones.
 /// Returns `(seen, newly_recorded)`.
 ///
-/// The feed is newest-first with offset paging, so a credit landing between two
-/// page reads shifts the pages and one row can be missed on that pass. Every
-/// poll rescans the whole history, so the next hourly pass records it.
+/// The feed is newest-first with cursor paging; every poll rescans the whole
+/// history (`start=1`: v2 otherwise floors to three years back), so a credit
+/// missed on one pass is recorded on the next.
 pub async fn poll_once(http: &reqwest::Client, safe: Address) -> anyhow::Result<(usize, usize)> {
     let pool = db::pool().ok_or_else(|| anyhow::anyhow!("no database pool yet"))?;
     let kinds = VENUE_INCOME_KINDS.join(",");
     let (mut seen, mut new) = (0usize, 0usize);
-    for page_no in 0..MAX_PAGES {
-        let url = format!(
-            "{ACTIVITY_URL}?user={safe}&type={kinds}&limit={PAGE_SIZE}&offset={}",
-            page_no * PAGE_SIZE
-        );
-        let resp = http.get(&url).send().await?.error_for_status()?;
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let mut q: Vec<(&str, String)> = vec![
+            ("user", safe.to_string()), ("type", kinds.clone()), ("start", "1".into()),
+        ];
+        match &cursor {
+            Some(c) => q.push(("cursor", c.clone())),
+            None => q.push(("limit", PAGE_SIZE.to_string())),
+        }
+        let resp = http.get(activity_url()).query(&q).send().await?.error_for_status()?;
         let page: serde_json::Value = resp.json().await?;
-        let rows = page.as_array().map_or(0, |a| a.len());
         for credit in parse_credits(&page) {
             seen += 1;
             if db::record_venue_credit(pool, crate::venues::intl::INTL_VENUE, &credit).await? {
@@ -114,8 +118,9 @@ pub async fn poll_once(http: &reqwest::Client, safe: Address) -> anyhow::Result<
                 );
             }
         }
-        if rows < PAGE_SIZE {
-            break;
+        match crate::helpers::clob_public::data_page(&page).1 {
+            Some(c) => cursor = Some(c),
+            None => break,
         }
     }
     Ok((seen, new))
@@ -151,19 +156,19 @@ mod tests {
     use super::*;
     use rust_decimal_macros::dec;
 
-    /// A real rebate row from the production wallet (2026-09-03), with the empty
-    /// `conditionId`, `asset` and `side` strings that defeat the SDK's typed parse,
-    /// next to a trade row that must be ignored.
+    /// A real rebate row from the production wallet (2026-09-03), in the v2
+    /// field names, with the empty `condition_id`, `token_id` and `side`
+    /// strings a rebate carries, next to a trade row that must be ignored.
     #[test]
     fn parses_the_venue_rows_and_skips_trades() {
-        let page = serde_json::json!([
-            {"proxyWallet":"0x3a4d0004ad7a5ff5805f6c54ee730e4b23836f30","timestamp":1788396306,
-             "conditionId":"","type":"MAKER_REBATE","size":1.2592,"usdcSize":1.2592,
-             "transactionHash":"0xe69c56e6019aafae1e5148c060b087044c88e05beeb89a6b9ce0f53a9396a424",
-             "price":0,"asset":"","side":"","outcomeIndex":999},
-            {"timestamp":1788396000,"type":"TRADE","usdcSize":3.05,"transactionHash":"0xabc"},
-            {"timestamp":1783633412,"type":"TAKER_REBATE","usdcSize":10,"transactionHash":"0xdef"}
-        ]);
+        let page = serde_json::json!({"data": [
+            {"proxy_wallet":"0x3a4d0004ad7a5ff5805f6c54ee730e4b23836f30","timestamp":1788396306,
+             "condition_id":"","type":"MAKER_REBATE","size":1.2592,"usdc_size":1.2592,
+             "transaction_hash":"0xe69c56e6019aafae1e5148c060b087044c88e05beeb89a6b9ce0f53a9396a424",
+             "price":0,"token_id":"","side":"","outcome_index":999},
+            {"timestamp":1788396000,"type":"TRADE","usdc_size":3.05,"transaction_hash":"0xabc"},
+            {"timestamp":1783633412,"type":"TAKER_REBATE","usdc_size":10,"transaction_hash":"0xdef"}
+        ], "pagination": {"limit": 500, "offset": 0, "has_more": false, "next_cursor": null}});
         let credits = parse_credits(&page);
         assert_eq!(credits.len(), 2);
         assert_eq!(credits[0].kind, "MAKER_REBATE");
@@ -175,11 +180,11 @@ mod tests {
 
     #[test]
     fn rows_missing_what_the_ledger_keys_on_are_skipped() {
-        let page = serde_json::json!([
-            {"timestamp":1788396306,"type":"MAKER_REBATE","usdcSize":1.0,"transactionHash":""},
-            {"timestamp":1788396306,"type":"MAKER_REBATE","transactionHash":"0x1"},
-            {"type":"MAKER_REBATE","usdcSize":1.0,"transactionHash":"0x2"}
-        ]);
+        let page = serde_json::json!({"data": [
+            {"timestamp":1788396306,"type":"MAKER_REBATE","usdc_size":1.0,"transaction_hash":""},
+            {"timestamp":1788396306,"type":"MAKER_REBATE","transaction_hash":"0x1"},
+            {"type":"MAKER_REBATE","usdc_size":1.0,"transaction_hash":"0x2"}
+        ], "pagination": {"limit": 500, "offset": 0, "has_more": false, "next_cursor": null}});
         assert!(parse_credits(&page).is_empty());
         assert!(parse_credits(&serde_json::json!({"error":"bad"})).is_empty());
     }

@@ -26,6 +26,10 @@
 //!
 //! Every parser skips a malformed row rather than zeroing it: a print with no
 //! price is not a print at $0.
+//!
+//! The trade tape is Data API v2 since 2026-11-02, when Polymarket retired v1
+//! (every v1 route answers 410): `{"data": [...], "pagination": {...}}`,
+//! snake_case fields, `condition=` rather than `market=`, cursor paging only.
 
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -51,7 +55,21 @@ fn dec(v: &Value) -> Option<Decimal> {
     }
 }
 
-/// One Data API trade, as `/trades?market=<condition_id>` returns it.
+/// Polymarket Data API v2. v1 (the bare host) was retired on 2026-11-02.
+pub const DATA_API_V2: &str = "https://data-api.polymarket.com/v2";
+
+/// The rows of a Data API v2 page and the cursor of the next one (`None` on
+/// the last page). A page with no `data` list has no rows.
+pub fn data_page(v: &Value) -> (&[Value], Option<String>) {
+    let rows = v.get("data").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+    let next = v.pointer("/pagination/next_cursor").and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+        .map(str::to_string);
+    let more = v.pointer("/pagination/has_more").and_then(Value::as_bool).unwrap_or(next.is_some());
+    (rows, if more { next } else { None })
+}
+
+/// One Data API trade, as `/v2/trades?condition=<condition_id>` returns it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RawPrint {
     pub ts: i64,
@@ -63,14 +81,18 @@ pub struct RawPrint {
     pub size: f64,
 }
 
-/// Trade rows from a `/trades` page. Rows missing any field are skipped.
+/// Trade rows from a `/v2/trades` page. Rows missing any field are skipped,
+/// and so are rows v2 has not labelled with an outcome yet (`outcome_index`
+/// 999): a print on an unknown leg cannot be placed on YES or NO.
 pub fn parse_trades(v: &Value) -> Vec<RawPrint> {
-    let rows = v.as_array().cloned().unwrap_or_default();
-    rows.iter()
+    data_page(v).0.iter()
         .filter_map(|x| {
             let ts = num(&x["timestamp"])? as i64;
             let side = x["side"].as_str()?.to_string();
-            let outcome_index = num(&x["outcomeIndex"])? as u8;
+            let outcome_index = match num(&x["outcome_index"])? as i64 {
+                i @ (0 | 1) => i as u8,
+                _ => return None,
+            };
             let price = num(&x["price"])?;
             let size = num(&x["size"])?;
             Some(RawPrint { ts, side, outcome_index, price, size })
@@ -78,7 +100,6 @@ pub fn parse_trades(v: &Value) -> Vec<RawPrint> {
         .collect()
 }
 
-/// `(t, p)` points of a CLOB `prices-history` response, sorted by time.
 pub fn parse_price_history(v: &Value) -> Vec<(i64, f64)> {
     let mut pts: Vec<(i64, f64)> = v["history"]
         .as_array()
@@ -119,16 +140,36 @@ mod tests {
     /// A row with no price is not a print at zero; it is no print.
     #[test]
     fn trades_with_missing_fields_are_skipped_not_zeroed() {
-        let v = json!([
-            {"timestamp": 1790000000, "side": "BUY", "outcomeIndex": 0, "price": "0.57", "size": 12.5},
-            {"timestamp": 1790000001, "side": "SELL", "outcomeIndex": 1, "size": 3},
-            {"timestamp": "1790000002", "side": "SELL", "outcomeIndex": "1", "price": 0.44, "size": "7"}
-        ]);
+        let v = json!({"data": [
+            {"timestamp": 1790000000, "side": "BUY", "outcome_index": 0, "price": "0.57", "size": 12.5},
+            {"timestamp": 1790000001, "side": "SELL", "outcome_index": 1, "size": 3},
+            {"timestamp": "1790000002", "side": "SELL", "outcome_index": "1", "price": 0.44, "size": "7"},
+            {"timestamp": 1790000003, "side": "BUY", "outcome_index": 999, "price": 0.5, "size": 1}
+        ], "pagination": {"limit": 4, "offset": 0, "has_more": false, "next_cursor": null}});
         let got = parse_trades(&v);
         assert_eq!(got.len(), 2);
         assert_eq!(got[0], RawPrint { ts: 1790000000, side: "BUY".into(), outcome_index: 0, price: 0.57, size: 12.5 });
         assert_eq!(got[1].outcome_index, 1);
         assert_eq!(got[1].price, 0.44);
+    }
+
+    /// The retired v1 shape (a bare array) has no rows: reading it as prints
+    /// would mean the host answered something other than v2.
+    #[test]
+    fn a_v1_bare_array_is_no_page() {
+        let v1 = json!([{"timestamp": 1, "side": "BUY", "outcomeIndex": 0, "price": 0.5, "size": 1}]);
+        assert!(parse_trades(&v1).is_empty());
+        assert_eq!(data_page(&v1).1, None);
+    }
+
+    #[test]
+    fn the_cursor_is_followed_only_while_there_is_more() {
+        let more = json!({"data": [], "pagination": {"has_more": true, "next_cursor": "eyJ+/="}});
+        assert_eq!(data_page(&more).1.as_deref(), Some("eyJ+/="));
+        let last = json!({"data": [], "pagination": {"has_more": false, "next_cursor": "stale"}});
+        assert_eq!(data_page(&last).1, None);
+        let null = json!({"data": null, "pagination": {"has_more": false, "next_cursor": null}});
+        assert!(data_page(&null).0.is_empty());
     }
 
     /// 0.57 is 0.57, not the sixteen digits a binary double carries.

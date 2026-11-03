@@ -42,10 +42,8 @@ use polymarket_client_sdk_v2::clob::Client as ClobClient;
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::Normal;
 use polymarket_client_sdk_v2::clob::types::request::OrdersRequest;
-use polymarket_client_sdk_v2::data::Client as DataClient;
-use polymarket_client_sdk_v2::data::types::request::PositionsRequest;
-use polymarket_client_sdk_v2::data::types::request::ActivityRequest;
-use polymarket_client_sdk_v2::data::types::ActivityType;
+// Data API v2 (v1 retired 2026-11-02; the SDK's data client still calls v1).
+use crate::venues::intl::data_api;
 
 use alloy::primitives::address as alloy_address;
 
@@ -729,12 +727,9 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
         return;
     }
 
-    let data_client = DataClient::default();
-    let req = PositionsRequest::builder().user(safe_address).build();
-
     let live_positions = match tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        data_client.positions(&req),
+        data_api::positions(safe_address),
     ).await {
         Ok(Ok(p))  => p,
         Ok(Err(e)) => { warn!("⚠️ Chain-sync: Polymarket Data API error: {}", e); return; }
@@ -1176,12 +1171,9 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
         }
     };
 
-    let data_client = DataClient::default();
-    let req = PositionsRequest::builder().user(safe_address).build();
-
     let positions = match tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        data_client.positions(&req),
+        data_api::positions(safe_address),
     )
         .await
     {
@@ -1383,7 +1375,7 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
 /// If the condition has only one leg (e.g. an orphaned single-leg position that was
 /// adopted back in), we record it as a single-leg settlement with appropriate PNL.
 async fn record_settled_arb_trade(
-    legs: &[polymarket_client_sdk_v2::data::types::response::Position],
+    legs: &[data_api::Position],
 ) {
     if legs.is_empty() {
         return;
@@ -1618,7 +1610,7 @@ async fn record_settled_arb_trade(
 /// Iterates ALL per-asset pools so secondary assets (ETH, SOL, …) are also purged —
 /// a settled position originally entered via a non-primary asset loop would otherwise
 /// survive in its own DB file until the next chain-sync window.
-async fn purge_settled_legs(legs: &[polymarket_client_sdk_v2::data::types::response::Position]) {
+async fn purge_settled_legs(legs: &[data_api::Position]) {
     let all_assets = db::available_assets();
     if all_assets.is_empty() { return; }
 
@@ -1667,12 +1659,9 @@ pub async fn detect_orphaned_arb_settlements(safe_address: Address, squadron_ass
     use std::collections::HashMap;
 
     // Query Polymarket for current positions to compare against entries
-    let data_client = DataClient::default();
-    let req = PositionsRequest::builder().user(safe_address).build();
-
     let current_positions = match tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        data_client.positions(&req),
+        data_api::positions(safe_address),
     ).await {
         Ok(Ok(p)) => p,
         Ok(Err(e)) => {
@@ -1727,15 +1716,7 @@ pub async fn detect_orphaned_arb_settlements(safe_address: Address, squadron_ass
     let redeem_cutoff = (Utc::now() - chrono::Duration::days(14)).timestamp().max(0) as u64;
     let redemptions = match tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        data_client.activity(
-            &ActivityRequest::builder()
-                .user(safe_address)
-                .activity_types(vec![ActivityType::Redeem])
-                .limit(500)
-                .expect("activity limit 500 is within the 0-500 bound")
-                .start(redeem_cutoff)
-                .build(),
-        ),
+        data_api::redemptions(safe_address, redeem_cutoff),
     ).await {
         Ok(Ok(a)) => a,
         Ok(Err(e)) => {
@@ -1753,7 +1734,7 @@ pub async fn detect_orphaned_arb_settlements(safe_address: Address, squadron_ass
     // but booking a phantom settlement is expensive enough to not rely on that.
     let redeemed_tokens: HashSet<String> = redemptions
         .iter()
-        .filter(|a| a.activity_type == ActivityType::Redeem)
+        .filter(|a| a.activity_type == "REDEEM")
         .filter_map(|a| a.asset.as_ref().map(|t| t.to_string()))
         .collect();
 
@@ -2024,66 +2005,6 @@ pub fn chain_correction_for(
 #[cfg(test)]
 mod settlement_evidence_tests {
     use super::*;
-    // Only the live probe still touches the broken endpoint.
-    use polymarket_client_sdk_v2::data::types::request::ClosedPositionsRequest;
-    use polymarket_client_sdk_v2::data::types::ClosedPositionSortBy;
-
-    /// Live-API probe, `#[ignore]`d so CI never depends on the network:
-    ///
-    /// ```bash
-    /// cargo test --release settlement_evidence -- --ignored --nocapture
-    /// ```
-    ///
-    /// Documents the upstream bug this module works around. `ClosedPosition`
-    /// declares `end_date: DateTime<Utc>` in polymarket_client_sdk_v2 0.7.0, but
-    /// `/closed-positions` returns a date-only `"YYYY-MM-DD"` string, so chrono
-    /// rejects it with "premature end of input" and the call fails 100% of the
-    /// time — 72 of 74 cycles in the 2026-08-15 production log.
-    ///
-    /// If this test ever starts reporting that `closed_positions` SUCCEEDED, the
-    /// SDK has been fixed and the `/activity` workaround below could in principle
-    /// be revisited — though note that `endDate` would still be too coarse to
-    /// serve as redemption evidence (see `redeemed_tokens_via_activity`).
-    #[tokio::test]
-    #[ignore = "hits the live Polymarket data API"]
-    async fn closed_positions_is_still_broken_and_activity_is_not() {
-        let user = std::env::var("DRADIS_PROBE_SAFE_ADDRESS")
-            .expect("set DRADIS_PROBE_SAFE_ADDRESS to a Polymarket proxy wallet to run this probe");
-        let user: Address = user.parse().expect("DRADIS_PROBE_SAFE_ADDRESS must be an 0x address");
-        let client = DataClient::default();
-
-        let closed = client
-            .closed_positions(
-                &ClosedPositionsRequest::builder()
-                    .user(user)
-                    .limit(50)
-                    .expect("limit within bounds")
-                    .sort_by(ClosedPositionSortBy::Timestamp)
-                    .build(),
-            )
-            .await;
-        match &closed {
-            Err(e) => println!("closed_positions FAILED (expected): {e}"),
-            Ok(v) => println!("closed_positions SUCCEEDED with {} rows — SDK may be fixed", v.len()),
-        }
-
-        let acts = client
-            .activity(
-                &ActivityRequest::builder()
-                    .user(user)
-                    .activity_types(vec![ActivityType::Redeem])
-                    .limit(100)
-                    .expect("limit within bounds")
-                    .build(),
-            )
-            .await
-            .expect("activity() must deserialize — it is the replacement evidence source");
-        println!("activity(REDEEM) returned {} rows", acts.len());
-        assert!(
-            acts.iter().all(|a| a.activity_type == ActivityType::Redeem),
-            "the type filter must be honored server-side"
-        );
-    }
 
     /// A market title naming no asset must be recognized as UNROUTABLE, never as
     /// absent from the wallet.

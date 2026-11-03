@@ -138,7 +138,8 @@ const MIN_HIST_POINTS: usize = 20;
 const MIN_RECORDED_HIST_POINTS: usize = 5;
 /// Tape pages fetched per market (the harness cap).
 const TAPE_PAGE: usize = 1000;
-const TAPE_MAX_OFFSET: usize = 9000;
+/// Pages of `TAPE_PAGE` read per market (v1's offset cap of 9000 was ten pages).
+const TAPE_MAX_PAGES: usize = 10;
 /// Pause after every public API call (about one request a second), and the first
 /// backoff after a 429. Production's address also carries the engine's own data-API
 /// position checks, which saw a 429 at startup on 2026-09-13.
@@ -163,7 +164,6 @@ const KLINE_LEAD_DAYS: i64 = 1;
 
 const USER_AGENT: &str = "Mozilla/5.0 (compatible; dradis-engine/1.0)";
 const GAMMA: &str = "https://gamma-api.polymarket.com";
-const DATA_API: &str = "https://data-api.polymarket.com";
 const CLOB: &str = "https://clob.polymarket.com";
 /// Spot kline hosts, in order: Binance's official public data mirror answers
 /// everywhere; the main host does not answer from the US (HTTP 451).
@@ -2227,15 +2227,25 @@ async fn fetch_market(w: i64, now: i64) -> Result<Fetched, String> {
         return Err(format!("{}: market has {} tokens", rec.slug, rec.tokens.len()));
     }
     let cid = rec.condition_id.clone().ok_or("market has no conditionId")?;
-    let mut off = 0usize;
-    loop {
-        let page = get_json(&format!("{DATA_API}/trades?market={cid}&limit={TAPE_PAGE}&offset={off}")).await?;
-        let rows_len = page.as_array().map_or(0, |a| a.len());
+    // Data API v2 (v1 retired 2026-11-02): cursor paging, filters re-sent on
+    // every page, page size fixed by the first.
+    let mut cursor: Option<String> = None;
+    for _ in 0..TAPE_MAX_PAGES {
+        let mut q: Vec<(&str, String)> = vec![("condition", cid.clone())];
+        match &cursor {
+            Some(c) => q.push(("cursor", c.clone())),
+            None => q.push(("limit", TAPE_PAGE.to_string())),
+        }
+        let url = reqwest::Url::parse_with_params(&format!("{}/trades", crate::helpers::clob_public::DATA_API_V2), &q)
+            .map_err(|e| e.to_string())?;
+        let page = get_json(url.as_str()).await?;
         for x in crate::helpers::clob_public::parse_trades(&page) {
             rec.tape.push(Print { ts: x.ts, side: x.side, o: x.outcome_index, p: x.price, s: x.size });
         }
-        if rows_len < TAPE_PAGE || off >= TAPE_MAX_OFFSET { break; }
-        off += TAPE_PAGE;
+        match crate::helpers::clob_public::data_page(&page).1 {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
     }
     for (i, tok) in rec.tokens.iter().enumerate() {
         let h = get_json(&format!("{CLOB}/prices-history?market={tok}&startTs={}&endTs={}&fidelity=1", w - 3600, w + 3900)).await?;
