@@ -111,8 +111,11 @@ export async function getTrades(limit = 60, asset?: string): Promise<TradeRow[]>
  * Use this for any "total" the UI displays. `getTrades` is a bounded recent
  * window for the list view; reducing over it truncates the totals silently.
  */
-export async function getTradeStats(asset?: string): Promise<TradeStats> {
-  const url = withAsset(`${BASE}/api/trades/stats`, asset);
+export async function getTradeStats(asset?: string, hours?: number): Promise<TradeStats> {
+  // [E88] `hours` narrows the aggregates to the trades booked in that many
+  // trailing hours (the portfolio chart's window); omitted, lifetime.
+  const base = hours ? `${BASE}/api/trades/stats?hours=${Math.trunc(hours)}` : `${BASE}/api/trades/stats`;
+  const url = withAsset(base, asset);
   const res = await fetch(url, { cache: 'no-store' });
   if (!res.ok) throw new Error(`GET /api/trades/stats → ${res.status}`);
   return res.json();

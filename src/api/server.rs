@@ -1455,10 +1455,12 @@ async fn get_trades(Query(q): Query<AssetQuery>) -> Response {
     }
 }
 
-/// GET /api/trades/stats?asset=btc
+/// GET /api/trades/stats?asset=btc[&hours=168]
 ///
 /// Lifetime aggregates over the shard's entire trade history — count, wins,
-/// losses, realized P&L, fees. Separate from `/api/trades` on purpose: that
+/// losses, realized P&L, fees — or, with `hours`, over the trades booked in
+/// that many trailing hours ([E88]: the portfolio chart's window, clamped like
+/// `/api/pnl/history`'s). A non-numeric `hours` is a 400 from the extractor. Separate from `/api/trades` on purpose: that
 /// endpoint is a bounded recent window for the trade *list*, and summing it
 /// client-side silently truncated every "total" card on the dashboard.
 async fn get_trade_stats(Query(q): Query<AssetQuery>) -> Response {
@@ -1471,7 +1473,7 @@ async fn get_trade_stats(Query(q): Query<AssetQuery>) -> Response {
             first_ts: None, last_ts: None,
         };
         for pool in db::pools_for_opt(None) {
-            let s = db::get_trade_stats(&pool).await;
+            let s = db::get_trade_stats_window(&pool, q.hours).await;
             agg.count += s.count;
             agg.wins += s.wins;
             agg.losses += s.losses;
@@ -1490,7 +1492,7 @@ async fn get_trade_stats(Query(q): Query<AssetQuery>) -> Response {
         return Json(agg).into_response();
     }
     match db::pool_for_opt_retry(q.asset.as_deref()).await {
-        Some(pool) => Json(db::get_trade_stats(&pool).await).into_response(),
+        Some(pool) => Json(db::get_trade_stats_window(&pool, q.hours).await).into_response(),
         None => {
             log_pool_unavailable(&format!("GET /api/trades/stats (asset={:?})", q.asset), q.asset.as_deref());
             Json(db::TradeStatsRow {

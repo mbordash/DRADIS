@@ -38,7 +38,7 @@ import SeededConfigNotice from '@/components/SeededConfigNotice';
 import ErrorBoundary   from '@/components/ErrorBoundary';
 import Footer          from '@/components/Footer';
 import { ViperHealthStrip } from '@/components/ViperHealthStrip';
-import { getAssets, getConfig, getPnlHistory, getPnlSpan, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, getPortfolioValue, getVenueIncome, getSquadrons, refusalText } from '@/lib/api';
+import { getAssets, getConfig, getPnlHistory, getPnlSpan, getTrades, getTradeStats, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, getPortfolioValue, getVenueIncome, getSquadrons, refusalText } from '@/lib/api';
 import {
   type PnlRange, PNL_HISTORY_POINTS, PNL_RANGE_STORE_KEY, isPnlRange, availableHours, hoursForRange,
   rangeEnabled, tradeLimitForHours, windowLabel,
@@ -734,6 +734,11 @@ export default function DashboardPage() {
   const { data: trades, isLoading: tradesLoading } =
     useSWR(['trades', asset], () => getTrades(60, asset), { refreshInterval: 15_000 });
 
+  // [E88] Realized P&L over the chart's window, across every shard, so the
+  // card beside the banner reads the same clock as the banner and the chart.
+  const { data: windowStats, error: windowStatsError } =
+    useSWR(['trade-stats-window', pnlHours], () => getTradeStats(undefined, pnlHours), { refreshInterval: 60_000, keepPreviousData: true });
+
   // Open positions polled every 15s — same cadence as trades so the activity log stays fresh.
   const { data: openPositions, isLoading: positionsLoading } =
     useSWR(['positions', asset], () => getOpenPositions(asset), { refreshInterval: 15_000 });
@@ -1197,7 +1202,7 @@ export default function DashboardPage() {
             it read as assets, but on Polymarket US and Kalshi they are market
             wings plus the venue's own default shard — so it reported 4 for a
             venue with three wings and no multi-asset ops at all. */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
           <StatCard
             label="Active Squadrons"
             value={squadronsUnknown || !squadrons ? '—' : String(squadrons.filter(s => s.state === 'PATROLLING' || s.state === 'DEPLOYED').length)}
@@ -1213,6 +1218,17 @@ export default function DashboardPage() {
             value={sessionKnown ? fmt$(sessionPnl) : '—'}
             sub={!sessionKnown ? 'no snapshot yet' : sessionStartedLabel ? `since engine start ${sessionStartedLabel}` : 'since engine start'}
             valueClass={!sessionKnown ? '' : sessionPnl >= 0 ? 'text-green-400' : 'text-red-400'}
+          />
+          {/* [E88] Realized P&L over the chart window: booked trades only (open
+              positions and transfers are the banner's), so it no longer resets
+              on a restart the way Session P&L does. */}
+          <StatCard
+            label="Realized P&L"
+            value={windowStats ? fmt$(windowStats.realized_pnl) : '—'}
+            sub={!windowStats
+              ? (windowStatsError ? "couldn't load" : 'loading')
+              : `${windowStats.count} trade${windowStats.count === 1 ? '' : 's'} ${windowStart?.label ?? windowLabel(pnlRange, pnlHours, null)}`}
+            valueClass={!windowStats ? '' : windowStats.realized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}
           />
           <StatCard
             label="Total Squadrons"

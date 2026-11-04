@@ -2228,6 +2228,16 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) {
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_pnl_snapshots_session_ts ON pnl_snapshots(session_id, ts)")
         .execute(pool).await;
 
+    // 4. Time-only index for the portfolio chart, whose queries filter and
+    //    order on `ts` across every session (`get_pnl_history`'s window
+    //    count and read, `first_pnl_snapshot_ts`). The composite index
+    //    above leads with `session_id` and serves none of them: on production
+    //    2026-11-03 each was a full scan of 146k rows (0.31 s for the
+    //    all-history range), growing ~8,700 rows a day. Additive, so an older
+    //    engine on the same file simply ignores it.
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_pnl_snapshots_ts ON pnl_snapshots(ts)")
+        .execute(pool).await;
+
     // Market taxonomy: persist the resolved market class alongside each
     // squadron's config so the UI/resolver can read it without re-classifying.
     let _ = sqlx::query("ALTER TABLE squadron_configs ADD COLUMN market_class TEXT NOT NULL DEFAULT 'unknown'")
@@ -6931,6 +6941,14 @@ pub struct TradeStatsRow {
 /// design, so the dashboard's lifetime count, win/loss and realized P&L would
 /// otherwise silently absorb them.
 pub async fn get_trade_stats_for(pool: &SqlitePool, ghost: bool) -> TradeStatsRow {
+    get_trade_stats_since(pool, ghost, None).await
+}
+
+/// [E88] Trade statistics for trades booked at or after `since` (an RFC 3339
+/// UTC timestamp, the form every `trades.ts` is written in), or over the whole
+/// history when `None`. Backs the dashboard's realized P&L over the portfolio
+/// chart's window, so the card and the chart read the same clock.
+pub async fn get_trade_stats_since(pool: &SqlitePool, ghost: bool, since: Option<&str>) -> TradeStatsRow {
     let empty = TradeStatsRow {
         count: 0, wins: 0, losses: 0, realized_pnl: 0.0, fees: 0.0,
         first_ts: None, last_ts: None,
@@ -6942,9 +6960,11 @@ pub async fn get_trade_stats_for(pool: &SqlitePool, ghost: bool) -> TradeStatsRo
                 COALESCE(SUM(CAST(pnl AS REAL)), 0.0),
                 COALESCE(SUM(CAST(COALESCE(fees, '0') AS REAL)), 0.0),
                 MIN(ts), MAX(ts)
-         FROM trades WHERE COALESCE(ghost, 0) = ?"
+         FROM trades WHERE COALESCE(ghost, 0) = ? AND (? IS NULL OR ts >= ?)"
     )
     .bind(ghost as i32)
+    .bind(since)
+    .bind(since)
     .fetch_one(pool)
     .await {
         Ok(r) => TradeStatsRow {
@@ -7003,6 +7023,13 @@ pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
 /// totals.
 pub async fn get_trade_stats(pool: &SqlitePool) -> TradeStatsRow {
     get_trade_stats_for(pool, crate::helpers::dynamic_config::ghosting_now()).await
+}
+
+/// [E88] The current posture's trade statistics over the last `hours` hours
+/// (clamped like the P&L chart's window), or lifetime when `hours` is `None`.
+pub async fn get_trade_stats_window(pool: &SqlitePool, hours: Option<i64>) -> TradeStatsRow {
+    let since = hours.map(|h| (Utc::now() - chrono::Duration::hours(h.clamp(1, PNL_HISTORY_MAX_HOURS))).to_rfc3339());
+    get_trade_stats_since(pool, crate::helpers::dynamic_config::ghosting_now(), since.as_deref()).await
 }
 
 /// Every completed trade, oldest first — backs the tradelog CSV export
@@ -9925,6 +9952,32 @@ mod reconcile_tests {
         assert!(stats.realized_pnl < 0.0, "while the true lifetime figure is a loss");
     }
 
+    /// [E88] With a window, only the trades booked inside it count; without
+    /// one, the whole history. The boundary trade is in.
+    #[tokio::test]
+    async fn trade_stats_over_a_window_count_only_its_trades() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::shard_only("test");
+        let now = Utc::now();
+        // A −$10 loss 30 hours ago, a +$2 win 5 hours ago.
+        for (age_h, pnl) in [(30, Decimal::new(-10, 0)), (5, Decimal::new(2, 0))] {
+            record_trade_db(&pool, &scope, Decimal::ZERO, "S", &format!("M{age_h}"), "YES",
+                Decimal::new(50, 2), Decimal::new(60, 2), Decimal::ONE,
+                pnl, "TP", Some(now - chrono::Duration::hours(age_h))).await;
+        }
+        let day = get_trade_stats_since(&pool, false, Some(&(now - chrono::Duration::hours(24)).to_rfc3339())).await;
+        assert_eq!((day.count, day.wins, day.losses), (1, 1, 0));
+        assert!((day.realized_pnl - 2.0).abs() < 1e-9, "got {}", day.realized_pnl);
+
+        let all = get_trade_stats_since(&pool, false, None).await;
+        assert_eq!(all.count, 2);
+        assert!((all.realized_pnl + 8.0).abs() < 1e-9, "got {}", all.realized_pnl);
+
+        let edge = (now - chrono::Duration::hours(5)).to_rfc3339();
+        let from_edge = get_trade_stats_since(&pool, false, Some(&edge)).await;
+        assert_eq!(from_edge.count, 1, "a trade booked exactly at the window start is inside it");
+    }
+
     /// Exactly-flat trades are neither wins nor losses. Folding them into either
     /// bucket would skew the win rate the squadron page displays.
     #[tokio::test]
@@ -11159,5 +11212,37 @@ mod exit_claim_and_operator_release_tests {
         note_operator_release("OperatorReleaseAgeTestOther", "operator-release-age-test-other");
         assert!(!take_operator_release(a, tok, older), "an entry older than the TTL is gone");
         assert!(take_operator_release("OperatorReleaseAgeTestOther", "operator-release-age-test-other", older));
+    }
+}
+
+#[cfg(test)]
+mod pnl_snapshot_index_tests {
+    use super::*;
+
+    /// The chart's queries seek on `idx_pnl_snapshots_ts` instead of scanning
+    /// the table (146k rows on production 2026-11-03, growing ~8,700 a day).
+    #[tokio::test]
+    async fn the_chart_queries_use_the_ts_index() {
+        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        init_schema(&pool).await.unwrap();
+        run_migrations(&pool).await;
+        let plan = |sql: &'static str| {
+            let pool = pool.clone();
+            async move {
+                let q = format!("EXPLAIN QUERY PLAN {sql}");
+                sqlx::query(&q)
+                    .fetch_all(&pool).await.unwrap()
+                    .iter().map(|r| r.get::<String, _>(3)).collect::<Vec<_>>().join(" / ")
+            }
+        };
+        for sql in [
+            "SELECT COUNT(*) FROM pnl_snapshots WHERE ts >= '2026-11-01'",
+            "SELECT ts FROM pnl_snapshots WHERE ts >= '2026-11-01' ORDER BY ts DESC",
+            "SELECT MIN(ts) FROM pnl_snapshots",
+        ] {
+            let p = plan(sql).await;
+            assert!(p.contains("idx_pnl_snapshots_ts"), "{sql}: {p}");
+            assert!(!p.contains("SCAN pnl_snapshots") || p.contains("USING"), "{sql}: {p}");
+        }
     }
 }
