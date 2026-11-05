@@ -93,6 +93,13 @@ services:
     expose:
       - "3002"
     depends_on: [dradis]
+    # [B88] Same bound as the engine: an unbounded json-file log on a
+    # customer box grows until the disk fills.
+    logging:
+      driver: json-file
+      options:
+        max-size: "32m"
+        max-file: "3"
     networks: [dradis-net]
 
   # TLS terminator. See nginx.conf for why this exists rather than serving the
@@ -109,6 +116,13 @@ services:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - ./data/tls:/etc/dradis/tls:ro
     depends_on: [control-tower]
+    # [B88] Same bound as the engine: an unbounded json-file log on a
+    # customer box grows until the disk fills.
+    logging:
+      driver: json-file
+      options:
+        max-size: "32m"
+        max-file: "3"
     networks: [dradis-net]
 
 networks:

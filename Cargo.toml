@@ -57,7 +57,7 @@ sha2 = "0.10"
 argon2 = { version = "0.5", features = ["std"] }
 base64 = "0.22"
 async-trait = "0.1"
-perpetual = "3.0.0-rc.2"
+perpetual = "=3.0.0-rc.2"  # [E58] exact: a caret range would pull 3.0.0 final on `cargo update`
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }

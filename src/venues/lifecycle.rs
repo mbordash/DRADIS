@@ -191,6 +191,26 @@ struct TrackedLeg {
 /// tick until the account ran out of collateral.
 pub const RESTING_QUOTE_STALE_SECS: u64 = 1800;
 
+/// How long one unfilled leg of a resting pair may rest before the reconciler
+/// cancels it.
+///
+/// A `Repair` pair (Arbitrage) keeps the venue's short `stale_order_secs`: a
+/// pair with one leg working alone is the exposure the naked-leg pass exists to
+/// end [B74]. A `HoldAndManage` pair (Time Decay) leaves its partner bid on the
+/// book until the viper's own exits or rotation end it, so it takes the resting
+/// quote backstop [B87]. Before 2026-11-05 Kalshi and Polymarket US cancelled
+/// Time Decay's partner after 60 s (`LifecycleConfig::us()`): on 2026-11-03
+/// (trade 250) the NO leg filled at 21:34:10 ET, the YES 0.50 partner was
+/// cancelled "stale" at 21:35:12, YES traded back through 0.50 at 21:41, and
+/// the lone NO leg was stopped for −$2.21 instead of completing the pair.
+/// Polymarket International already rested it for 30 minutes.
+pub fn pair_leg_stale_secs(strategy: &str, venue_stale_secs: u64) -> u64 {
+    match crate::state::lone_leg_policy(strategy) {
+        crate::state::LoneLegPolicy::HoldAndManage => venue_stale_secs.max(RESTING_QUOTE_STALE_SECS),
+        crate::state::LoneLegPolicy::Repair => venue_stale_secs,
+    }
+}
+
 /// A tracked quote no longer among the venue's open orders, whose fill the
 /// venue cannot report by id: filled (the fill feed is late), expired (a
 /// good-till-date quote), or pulled by the venue (its market closed). The
@@ -373,9 +393,8 @@ impl OrderLifecycle {
     /// Register one leg of a paired entry (arbitrage, Time Decay) that the
     /// venue acknowledged UNFILLED: a resting quote in every respect (confirmed
     /// and sized by its own order, never by the leg's holdings; released when
-    /// cancelled unfilled) except that it keeps the pair's short stale window,
-    /// because a pair with one leg working alone is the exposure the naked-leg
-    /// pass exists to end [B74].
+    /// cancelled unfilled). Its stale window follows the strategy's lone-leg
+    /// policy (`pair_leg_stale_secs`).
     pub async fn track_pair_leg(
         &self,
         fill: &Fill,
@@ -383,7 +402,8 @@ impl OrderLifecycle {
         tif: TimeInForce,
         pair_market: Option<MarketId>,
     ) {
-        self.track_with_stale(fill, strategy, tif, pair_market, self.cfg.stale_order_secs, true).await;
+        let stale = pair_leg_stale_secs(strategy, self.cfg.stale_order_secs);
+        self.track_with_stale(fill, strategy, tif, pair_market, stale, true).await;
     }
 
     async fn track_with_stale(
@@ -1839,18 +1859,35 @@ mod resting_quote_tests {
         assert!(lc.working_for("MakerStrategy", &MarketId::new(LEG)).await);
     }
 
+    /// [B87] An Arbitrage leg keeps the venue's short naked-leg window; a Time
+    /// Decay partner rests for the quote backstop, on every venue config.
+    #[tokio::test]
+    async fn an_arbitrage_leg_keeps_the_short_window_and_a_time_decay_leg_rests() {
+        for cfg in [LifecycleConfig::us(), LifecycleConfig::intl()] {
+            let venue_secs = cfg.stale_order_secs;
+            let lc = OrderLifecycle::new(cfg, SQ);
+            lc.track_pair_leg(&ack("arb-1", LEG, dec!(10), dec!(0.40)), "ArbitrageStrategy", TimeInForce::Gtc, Some(MarketId::new("other#no"))).await;
+            lc.track_pair_leg(&ack("td-1", LEG, dec!(10), dec!(0.40)), "TimeDecayStrategy", TimeInForce::Gtc, Some(MarketId::new("other#no"))).await;
+            let t = lc.tracked.lock().await;
+            assert_eq!(t[0].stale_after_secs, venue_secs, "arbitrage: the venue's naked-leg window");
+            assert_eq!(t[1].stale_after_secs, RESTING_QUOTE_STALE_SECS.max(venue_secs), "time decay: the partner rests");
+        }
+        assert_eq!(pair_leg_stale_secs("ArbitrageStrategy", 60), 60);
+        assert_eq!(pair_leg_stale_secs("TimeDecayStrategy", 60), RESTING_QUOTE_STALE_SECS);
+    }
+
     /// A paired leg the venue acknowledged unfilled is a quote: guarded at the
     /// size placed, sized by its own fill, released when cancelled unfilled,
-    /// and not a holding until it trades. Only its stale window is the pair's.
+    /// and not a holding until it trades. Its stale window follows the policy.
     #[tokio::test]
-    async fn a_pair_leg_acknowledged_unfilled_is_a_quote_with_the_pairs_stale_window() {
+    async fn a_pair_leg_acknowledged_unfilled_is_a_quote_with_its_policys_stale_window() {
         let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
         let venue = QuoteVenue::new();
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
         guard(&mut *map.lock().await, "TimeDecayStrategy", LEG, dec!(10), dec!(0.40), false);
         lc.track_pair_leg(&ack("td-1", LEG, dec!(10), dec!(0.40)), "TimeDecayStrategy", TimeInForce::Gtc, Some(MarketId::new("other#no"))).await;
         assert!(!lc.holds_anything(&map).await, "an unfilled pair leg is a quote, not a holding");
-        assert_eq!(lc.tracked.lock().await[0].stale_after_secs, LifecycleConfig::us().stale_order_secs, "but it keeps the pair's short window");
+        assert_eq!(lc.tracked.lock().await[0].stale_after_secs, RESTING_QUOTE_STALE_SECS, "a Time Decay partner rests [B87]");
 
         lc.confirm_on_fill(&map, &event("td-1", LEG, dec!(4), dec!(0.40))).await;
         assert_eq!(shares_of(&map, "TimeDecayStrategy").await, Some((dec!(4), true)), "sized by its own fill, not confirmed at zero");
