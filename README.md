@@ -357,9 +357,11 @@ before trusting a result.
 | `/api/config` | GET | Current DynamicConfig as JSON |
 | `/api/config` | PATCH | JSON merge-patch — hot-reloads strategies |
 | `/api/config/schema` | GET | Editable-config field schema |
+| `/api/autoscale` | GET | Capital Auto-Scaler: each viper's record per squadron scope, the multiplier it earns, the factor last applied |
 | `/api/pnl/history` | GET | P&L snapshots, `?hours=` window (default 24), `?limit=` points spread across it |
 | `/api/pnl/span` | GET | Oldest P&L snapshot timestamp, bounds the chart's range control |
 | `/api/trades` | GET | Recent completed trades |
+| `/api/trades/stats` | GET | Trade count, wins, losses, realized P&L and fees; `?hours=` limits it to trades booked in that window (default lifetime) |
 | `/api/positions` | GET | Current open positions |
 | `/api/squadrons` | GET | List all active squadrons |
 | `/api/squadrons/{id}` | GET | Get one squadron by id |
@@ -432,7 +434,7 @@ Twelve specialized Viper strategy classes. Each Viper is an autonomous tactical 
 | **Momentum**     | Hourly       | Detects high-velocity Binance moves and strikes Polymarket before it reprices                                                                                                             |
 | **Maker**        | Window       | Dual-sided passive bids on YES+NO, capturing the spread while managing net exposure                                                                                                       |
 | **Arbitrage**    | Window/Daily | Buys both YES+NO when combined asks are < $1.00 (net of fees)                                                                                                                             |
-| **Time Decay**   | Hourly       | Posts resting GTC maker bids during the theta window; settles at $1.00 at 0% fee                                                                                                          |
+| **Time Decay**   | Hourly       | Posts resting GTC maker bids on both sides during the theta window; a completed pair settles at $1.00. The partner bid rests until the viper's own exits, rotation or close end it (all venues since 1.6.0). The balanced profile enters only when a settled book offers 3¢ or more of theta, sizes $5 a leg and holds a lone leg to settlement rather than stopping it out |
 | **Basis**        | Window       | Fades retail skew using Binance funding rates as smart-money confirmation                                                                                                                 |
 | **GBoost**       | Hourly       | Engine-trained gradient-boosted model (plan B), fitted as a residual over the market mid and licensed for real money only when it out-forecasts the price on a holdout: scores both sides once a minute from Binance klines and funding, enters as a taker when P(win) clears break-even plus a margin, exits by the configured posture (resting take-profit and taker stop, or held to settlement) |
 | **TrendCapture** | Window/Daily | Exploits sustained multi-minute oracle drift (10m + 60m) before Polymarket reprices; Kelly-fractional sizing, OBI veto, trend-reversal exit                                               |
@@ -554,6 +556,19 @@ CRYPTO_FILTER=btc
 
 > Each asset owns its own SQLite DB file (`logs/btc-dradis.db`, `logs/eth-dradis.db`, etc.). The primary asset (first in `ASSETS`) also backs the default REST API view; pass `?asset=eth` query params to scope API responses to a specific asset pool.
 
+### Capital Auto-Scaler
+
+*New in 1.6.0, ships off.* A CAG-level sizing policy (Setup → Risk & Engine) applied to every squadron beneath it: each viper's **entry** orders are scaled by that viper's own recent results in its own squadron.
+
+- **Signal: return on capital**, realized P&L ÷ dollars risked (entry price × shares) over the viper's last *Lookback Trades* (30) closed trades. Not win rate: on a binary a 70% win rate bought at 0.80 loses money.
+- **Scope: viper × squadron.** Anchor on the BTC squadron scales on Anchor's BTC trades only; a losing viper cannot ride a winning one's record. Simulated and real ledgers never mix.
+- **The multiplier** is 1× until *Min Trades* (20), then runs linearly from 1× at zero return to *Max Multiplier* (2×) at *Full-Scale Return* (+10%), and down to *Min Multiplier* (0.5×) at −10%.
+- **Limits on growth:** never past *Max Scaled Order* ($25 per order, both legs of a pair together; 0 = no growth), never past the viper's own Max Exposure counting what it already holds, never while the session drawdown breaker is tripped. A limit only stops growth; it never shrinks the viper's own order. Shrinking never goes below the venue's minimum order size.
+- **Never scaled:** exits, and Helm (the operator's own sizing).
+- **Visible:** while the scaler is on, each viper card on a squadron page carries a 📐 badge with the multiplier it earns there (green above 1×, red below, `1× · 12/20` while it builds its record), with the return and the factor last applied in its tooltip. The Risk & Engine card shows every viper's record, return, multiplier and last applied factor; `GET /api/autoscale` returns the same. Each scaled entry logs `📐 Auto-scaler`.
+
+The settings are instance-wide and are not part of the risk profiles, so applying a profile never arms or retunes the scaler.
+
 ---
 
 ## ️ Control Tower — The Dashboard
@@ -594,6 +609,20 @@ Every parameter in the Viper cards maps directly to the runtime `DynamicConfig`.
 ### Setup Tab — No-Shell Credential Management
 
 The **Setup** tab lets you configure DRADIS entirely from the browser — designed for prosumer deployments (e.g. a prebuilt AWS image) where editing `.env` on the server isn't practical.
+
+Since 1.6.0 it is split into sub-tabs, each linkable as `#setup/<tab>` (Back and Forward move between them):
+
+| Tab | What it holds |
+|---|---|
+| **Venue** | the trading venue, and collateral per exchange shard on Kalshi |
+| **Credentials** | the venue's keys (wallet and RPC, Kalshi, or Polymarket US) |
+| **Signals** | the Raptor signal sources and their feed settings |
+| **Risk & Engine** | the risk profile, the [Capital Auto-Scaler](#capital-auto-scaler), and the instance-wide Deployment, Engine, Helm and GBoost Training settings |
+| **AI & Alerts** | Telegram, the LLM advisor provider, AI autonomy |
+| **Backup & Move** | the config bundle and Move to a New Instance |
+| **Support** | where to get help |
+
+Unsaved credential edits survive a tab switch, a tab holding them shows an amber dot, and the Save / Restart bar is on every tab.
 
 - **First boot**: if no Setup password exists, the tab shows a first-boot wizard — create the password, enter venue credentials, restart.
 - **Two passwords, not one**: the Control Tower login (`CT_USERNAME`/`CT_PASSWORD`; on the Marketplace AMI `admin` / the EC2 instance ID) opens the dashboard, and the **Setup password** you create in the wizard opens this tab. They are independent: the instance ID keeps opening the dashboard after the Setup password exists, and the Setup password is never the instance ID. The login card names which one it wants, and a wrong Setup password is reported as exactly that.
@@ -781,7 +810,8 @@ LLM_OUTCOME_HORIZON_SECS=7200    # when applied changes get outcome-scored
 
 - **Circuit breaker**: Pauses all trading after 3 consecutive execution failures.
 - **TOCTOU-safe entry**: Atomic lock scope prevents duplicate orders.
-- **Orphaned pair detection**: Arbiter waits 5s after first-leg confirm before acting on a missing second leg. TimeDecay GTC bids are given the full theta window (up to 30 min) before a resting order is declared orphaned.
+- **Orphaned pair detection**: Arbiter waits 5s after first-leg confirm before acting on a missing second leg. TimeDecay GTC bids are given the full theta window (up to 30 min) before a resting order is declared orphaned, on every venue since 1.6.0 (Kalshi and Polymarket US cancelled the partner after 60 s before).
+- **Capital Auto-Scaler limits**: when enabled, a scaled-up entry is bounded by a per-order dollar cap and the viper's own runtime Max Exposure, and never grows while the drawdown breaker is tripped (see [Capital Auto-Scaler](#capital-auto-scaler)).
 - **Rescue-profit gate**: Arbitrage entries are blocked when a single-leg failure cannot be rescued into profit (`yes_rescue_cost` or `no_rescue_cost ≥ $1.00` including fees and rehedge buffer).
 - **Fee Gates**: Blocks Taker Vipers from entering high-fee (10%+) markets.
 - **AI autonomy guardrails**: LLM-authored config changes are schema-clamped at every tier, money fields never auto-apply below full autonomy, and a P&L circuit breaker reverts recent AI changes and demotes to recommend-only on a drawdown (see [LLM Advisor](#llm-advisor)).
@@ -880,6 +910,13 @@ POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_API_KEY
 ```bash
 cp src/config.balanced.rs.example src/config.rs
 cargo build --release
+```
+
+The Docker image compiles the **conservative** profile by default (the Marketplace AMI ships it). A non-customer build can choose another with build arguments; the image records what it compiled in `/app/build-profile`:
+
+```bash
+docker build --build-arg DRADIS_PROFILE=balanced -t dradis .                                   # or aggressive
+docker build --build-arg DRADIS_PROFILE=local --build-arg DRADIS_FORCE_GHOST=true -t dradis .  # your own src/config.rs, simulation compiled on
 ```
 
 ---

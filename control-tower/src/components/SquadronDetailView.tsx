@@ -30,9 +30,10 @@ import {
   patchSquadronConfig,
   getConfigSchema,
   standDownSquadron,
+  getAutoscale,
   VIPER_DEFS,
 } from '@/lib/api';
-import ViperCard, { fmtAgo, isTroubled } from '@/components/ViperCard';
+import ViperCard, { fmtAgo, isTroubled, type AutoscaleBadge } from '@/components/ViperCard';
 import { AdvancedRow } from '@/components/AdvancedConfigModal';
 import OpenPositionsCard from '@/components/OpenPositionsCard';
 import HelmIntentsPanel from '@/components/HelmIntentsPanel';
@@ -400,6 +401,27 @@ export default function SquadronDetailView({ squadron, onBack, onOpenMarket }: P
   // Registry rows keyed by `Strategy::name()` — the same key VIPER_DEFS carries.
   const statusByStrategy = new Map((viperStatus ?? []).map((r) => [r.strategy, r]));
 
+  // [E91] The auto-scaler's view of each viper in THIS squadron: its record in
+  // the squadron's scope (class, and underlying for crypto) on the ledger the
+  // instance trades, and the factor last applied here. Shared SWR key with the
+  // Setup table, so one request feeds both.
+  const { data: autoscale } = useSWR('autoscale', getAutoscale, { refreshInterval: 60_000 });
+  const scaleFor = (strategyName: string): AutoscaleBadge | undefined => {
+    if (!autoscale?.enabled) return undefined;
+    const cls = (squadron.market_class ?? '').toLowerCase();
+    const und = cls === 'crypto' ? raptorAsset : null;
+    const rec = autoscale.records.find(r => r.strategy === strategyName && r.market_class === cls
+      && r.underlying === und && r.ghost === autoscale.ghost);
+    const applied = autoscale.applied.find(a => a.squadron === squadron.id && a.strategy === strategyName);
+    return {
+      earned: rec?.multiplier ?? '1',
+      trades: rec?.trades ?? 0,
+      minTrades: autoscale.min_trades ?? 0,
+      returnOnCapital: rec?.return_on_capital ?? null,
+      applied: applied?.factor,
+    };
+  };
+
   // The registry holds every viper the engine has evaluated, which is not
   // necessarily the set that renders as a card (market-class filtering, or a
   // viper with no VIPER_DEFS entry yet). Surface the remainder rather than
@@ -559,6 +581,7 @@ export default function SquadronDetailView({ squadron, onBack, onOpenMarket }: P
                   market={status?.strategy_markets[`${squadron.id}:${v.statusKey}`]}
                   status={statusByStrategy.get(v.strategyName)}
                   marketClass={squadron.market_class}
+                  autoscale={v.strategyName === 'HelmStrategy' ? undefined : scaleFor(v.strategyName)}
                 />
               ))}
             </div>

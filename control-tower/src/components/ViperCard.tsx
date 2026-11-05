@@ -270,6 +270,18 @@ function ParamRow({ field, config, onPatch, disabled }: ParamRowProps) {
 
 // ── ViperCard ─────────────────────────────────────────────────────────────────
 
+/** [E91] What the Capital Auto-Scaler does to this viper in this squadron. */
+export interface AutoscaleBadge {
+  /** Multiplier its record earns now ("1.40"); "1" before it has a record. */
+  earned: string;
+  trades: number;
+  minTrades: number;
+  /** Return on capital over the lookback, as a fraction ("0.1431"). */
+  returnOnCapital: string | null;
+  /** Factor last applied to an entry here, after the limits. */
+  applied?: string;
+}
+
 interface Props {
   viper:   ViperDef;
   config:  DynamicConfig;
@@ -281,9 +293,11 @@ interface Props {
   /** The squadron's market class (crypto, sports, politics). Fields the schema
    *  scopes to other classes are left off this card; unknown shows everything. */
   marketClass?: string | null;
+  /** Set only while the Capital Auto-Scaler is on. */
+  autoscale?: AutoscaleBadge;
 }
 
-export default function ViperCard({ viper, config, onPatch, market, status, marketClass }: Props) {
+export default function ViperCard({ viper, config, onPatch, market, status, marketClass, autoscale }: Props) {
   const [toggling, setToggling] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const enabled  = config[viper.enableKey] as boolean;
@@ -383,6 +397,27 @@ export default function ViperCard({ viper, config, onPatch, market, status, mark
               eval {fmtAgo(status.last_eval_secs_ago)}
             </span>
           )}
+          {enabled && autoscale && (() => {
+            const warming = autoscale.trades < autoscale.minTrades;
+            const m = parseFloat(autoscale.earned);
+            const roc = autoscale.returnOnCapital === null ? null : parseFloat(autoscale.returnOnCapital) * 100;
+            const cls = warming || m === 1
+              ? 'bg-gray-800 text-gray-400 border-gray-700'
+              : m > 1 ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
+              : 'bg-rose-500/10 text-rose-300 border-rose-500/30';
+            const title = [
+              'Capital Auto-Scaler (Setup › Risk & Engine).',
+              warming
+                ? `Sizes at 1× until ${autoscale.minTrades} closed trades in this squadron; ${autoscale.trades} so far.`
+                : `Earns ${m.toFixed(2)}× from ${roc === null ? '—' : `${roc >= 0 ? '+' : ''}${roc.toFixed(1)}%`} return on capital over its last ${autoscale.trades} trades.`,
+              autoscale.applied ? `Last entry here was scaled ${parseFloat(autoscale.applied).toFixed(2)}× after the order and exposure limits.` : 'No entry scaled here yet.',
+            ].join(' ');
+            return (
+              <span className={`text-[11px] font-mono border rounded-full px-2 py-0.5 ${cls}`} title={title}>
+                📐 {warming ? `1× · ${autoscale.trades}/${autoscale.minTrades}` : `${m.toFixed(2)}×`}
+              </span>
+            );
+          })()}
         </div>
 
         {enabled && (
