@@ -221,6 +221,15 @@ fn default_fairvalue_max_stop_losses()     -> u32     { config::FAIRVALUE_MAX_ST
 fn default_fairvalue_edge_noise_multiple() -> Decimal { config::FAIRVALUE_EDGE_NOISE_MULTIPLE         }
 fn default_fairvalue_stop_model_confirm() -> Decimal { config::FAIRVALUE_STOP_MODEL_CONFIRM_FRAC      }
 fn default_intl_taker_fee_rate()           -> Decimal { config::INTL_TAKER_FEE_RATE                   }
+// [E91] Capital auto-scaler: defaults live in `helpers::autoscale`, not the
+// profiles, so a local `src/config.rs` needs no new constants.
+fn default_autoscale_enabled()             -> bool    { crate::helpers::autoscale::DEFAULT_ENABLED }
+fn default_autoscale_min_trades()          -> i64     { crate::helpers::autoscale::DEFAULT_MIN_TRADES }
+fn default_autoscale_lookback_trades()     -> i64     { crate::helpers::autoscale::DEFAULT_LOOKBACK_TRADES }
+fn default_autoscale_full_scale_return()   -> Decimal { crate::helpers::autoscale::DEFAULT_FULL_SCALE_RETURN }
+fn default_autoscale_max_multiplier()      -> Decimal { crate::helpers::autoscale::DEFAULT_MAX_MULTIPLIER }
+fn default_autoscale_min_multiplier()      -> Decimal { crate::helpers::autoscale::DEFAULT_MIN_MULTIPLIER }
+fn default_autoscale_max_order_usdc()      -> Decimal { crate::helpers::autoscale::DEFAULT_MAX_ORDER_USDC }
 fn default_us_taker_fee_rate()             -> Decimal { config::US_TAKER_FEE_RATE                     }
 fn default_convergence_position_size()     -> Decimal { config::CONVERGENCE_POSITION_SIZE_USDC        }
 fn default_convergence_max_exposure()      -> Decimal { config::CONVERGENCE_MAX_EXPOSURE_USDC         }
@@ -487,6 +496,23 @@ pub struct DynamicConfig {
     /// `fee = rate · p · (1 − p) · shares`, charged on entry and exit alike.
     #[serde(default = "default_intl_taker_fee_rate")]
     pub intl_taker_fee_rate: Decimal,
+    /// [E91] Capital auto-scaler (instance-wide, read off the global row by
+    /// `helpers::autoscale`): scale each viper's entry size by its own return
+    /// on capital in its squadron. See that module for the rule and limits.
+    #[serde(default = "default_autoscale_enabled")]
+    pub autoscale_enabled: bool,
+    #[serde(default = "default_autoscale_min_trades")]
+    pub autoscale_min_trades: i64,
+    #[serde(default = "default_autoscale_lookback_trades")]
+    pub autoscale_lookback_trades: i64,
+    #[serde(default = "default_autoscale_full_scale_return")]
+    pub autoscale_full_scale_return: Decimal,
+    #[serde(default = "default_autoscale_max_multiplier")]
+    pub autoscale_max_multiplier: Decimal,
+    #[serde(default = "default_autoscale_min_multiplier")]
+    pub autoscale_min_multiplier: Decimal,
+    #[serde(default = "default_autoscale_max_order_usdc")]
+    pub autoscale_max_order_usdc: Decimal,
     /// Polymarket US taker fee coefficient — `venues::taker_fee_rate()` on that
     /// build, so every price-dependent fee floor and gate reads it. The gateway
     /// publishes a per-market `feeCoefficient` (0.06 everywhere as of
@@ -1494,6 +1520,13 @@ impl Default for DynamicConfig {
             // GHOST_MODE_DEFAULT, not GHOST_MODE: this seeds a fresh install only.
             ghost_mode: config::GHOST_MODE_DEFAULT,
             intl_taker_fee_rate: config::INTL_TAKER_FEE_RATE,
+            autoscale_enabled: default_autoscale_enabled(),
+            autoscale_min_trades: default_autoscale_min_trades(),
+            autoscale_lookback_trades: default_autoscale_lookback_trades(),
+            autoscale_full_scale_return: default_autoscale_full_scale_return(),
+            autoscale_max_multiplier: default_autoscale_max_multiplier(),
+            autoscale_min_multiplier: default_autoscale_min_multiplier(),
+            autoscale_max_order_usdc: default_autoscale_max_order_usdc(),
             us_taker_fee_rate: config::US_TAKER_FEE_RATE,
 
             enable_arbitrage:     config::ENABLE_ARBITRAGE_TRADING,

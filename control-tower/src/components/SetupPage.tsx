@@ -46,7 +46,7 @@ import {
 import { useConfirm } from '@/components/ConfirmDialog';
 import { DEMO_MODE } from '@/lib/demo';
 import useSWR, { useSWRConfig } from 'swr';
-import { getConfig, patchConfig, getConfigSchema, getStatus, getCollateralPools } from '@/lib/api';
+import { getConfig, patchConfig, getConfigSchema, getStatus, getCollateralPools, getAutoscale } from '@/lib/api';
 import type { CollateralPool } from '@/lib/types';
 import { AdvancedRow } from '@/components/AdvancedConfigModal';
 import type { DynamicConfig, ConfigFieldSchema } from '@/lib/types';
@@ -1681,6 +1681,16 @@ function ProfilesPanel({ onAuthError }: { onAuthError: () => void }) {
  */
 const GLOBAL_CONFIG_GROUPS: { group: string; title: string; blurb: string; omit?: string[] }[] = [
   {
+    group: 'Capital Auto-Scaler',
+    title: '📐 Capital Auto-Scaler',
+    blurb: 'Sizes each viper by its own results in its own squadron: entries grow while the viper ' +
+      'makes money on the capital it risks and shrink while it loses, between the min and max ' +
+      'multiplier. Measured as return on capital (realized P&L ÷ dollars risked over the lookback), ' +
+      'not win rate, which on a binary says nothing without the price paid. Nothing moves before Min ' +
+      'Trades; growth stops at Max Scaled Order, the viper\'s own Max Exposure and the drawdown ' +
+      'breaker; exits and Helm are never scaled. A simulating instance scales on its simulated record.',
+  },
+  {
     group: 'Deployment',
     title: 'Deployment',
     blurb: 'Govern which squadrons DRADIS runs and which market it picks for them, ' +
@@ -1723,6 +1733,71 @@ const GLOBAL_CONFIG_GROUPS: { group: string; title: string; blurb: string; omit?
   },
 ];
 
+/**
+ * [E91] What the auto-scaler sees: each viper's record per squadron scope and
+ * the multiplier it earns, plus the factor last applied to a real entry.
+ */
+function AutoscaleTable({ enabled }: { enabled: boolean }) {
+  const { data } = useSWR('autoscale', getAutoscale, { refreshInterval: 60_000 });
+  if (!data) return null;
+  // The ledger the scaler reads: simulated while the instance simulates.
+  const rows = data.records.filter(r => r.ghost === data.ghost);
+  // Matched on the full scope, so a btc row never shows an eth squadron's factor.
+  const applied = (r: { strategy: string; market_class: string; underlying: string | null; ghost: boolean }) =>
+    data.applied.filter(a => a.strategy === r.strategy && a.market_class === r.market_class
+      && a.underlying === r.underlying && a.ghost === r.ghost);
+  const pct = (v: string | null) => v === null ? '—' : `${(parseFloat(v) * 100).toFixed(1)}%`;
+  return (
+    <div className="pt-2 border-t border-[#1e1e32] space-y-2">
+      <p className="text-[11px] text-gray-500">
+        {enabled ? 'Live: entries are being sized by these multipliers.' : 'Off: shown for review, nothing is scaled.'}
+        {' '}Each row is one viper in one squadron scope, over its last {data.lookback ?? '—'} closed trades
+        {data.ghost ? ' (simulated ledger: the instance is in Simulation Mode)' : ''}.
+      </p>
+      {rows.length === 0 ? (
+        <p className="text-[11px] text-gray-600 font-mono">No classified trades yet.</p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-[11px] font-mono">
+            <thead className="text-gray-500 text-left">
+              <tr>
+                <th className="py-1 pr-3">Viper</th>
+                <th className="py-1 pr-3">Scope</th>
+                <th className="py-1 pr-3 text-right">Trades</th>
+                <th className="py-1 pr-3 text-right">P&amp;L</th>
+                <th className="py-1 pr-3 text-right">Risked</th>
+                <th className="py-1 pr-3 text-right">Return</th>
+                <th className="py-1 pr-3 text-right">Earns</th>
+                <th className="py-1 text-right">Last applied</th>
+              </tr>
+            </thead>
+            <tbody className="text-gray-300">
+              {rows.map(r => {
+                const roc = r.return_on_capital === null ? null : parseFloat(r.return_on_capital);
+                const below = data.min_trades !== null && r.trades < data.min_trades;
+                return (
+                  <tr key={`${r.strategy}|${r.market_class}|${r.underlying}|${r.ghost}`} className="border-t border-[#1e1e32]/60">
+                    <td className="py-1 pr-3">{r.strategy.replace(/Strategy$/, '')}</td>
+                    <td className="py-1 pr-3 text-gray-500">{r.market_class}{r.underlying ? `/${r.underlying}` : ''}</td>
+                    <td className={`py-1 pr-3 text-right ${below ? 'text-gray-600' : ''}`}>{r.trades}</td>
+                    <td className="py-1 pr-3 text-right">${r.pnl}</td>
+                    <td className="py-1 pr-3 text-right text-gray-500">${r.risked}</td>
+                    <td className={`py-1 pr-3 text-right ${roc === null ? '' : roc >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>{pct(r.return_on_capital)}</td>
+                    <td className="py-1 pr-3 text-right">{below ? <span className="text-gray-600">1× (min trades)</span> : `${r.multiplier ?? '1'}×`}</td>
+                    <td className="py-1 text-right text-gray-500">
+                      {applied(r).map(a => `${a.squadron} ${a.factor}×`).join(', ') || '—'}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function GlobalConfigPanel() {
   const { data: schema } = useSWR('configSchema', getConfigSchema);
   const { data: config, mutate } = useSWR('dynamic-config', getConfig, { revalidateOnFocus: false });
@@ -1749,6 +1824,7 @@ function GlobalConfigPanel() {
           {g.fields.map(f => (
             <AdvancedRow key={f.key} field={f} config={config} onPatch={patch} disabled={false} />
           ))}
+          {g.group === 'Capital Auto-Scaler' && <AutoscaleTable enabled={config.autoscale_enabled} />}
         </div>
       ))}
     </>
@@ -2293,6 +2369,35 @@ function MigrationPanel({ onAuthError }: { onAuthError: () => void }) {
 
 // ── Main page ─────────────────────────────────────────────────────────────────
 
+// ── Sub-tabs [E90] ────────────────────────────────────────────────────────────
+//
+// Setup grew into one long scroll (venue, credentials, Raptors, profiles, the
+// global config groups, autonomy, bundle, migration, support), so an operator
+// changing one setting scrolled past all the others. Each tab is linkable as
+// `#setup/<id>`; the credential drafts live in SetupPage, so they survive a tab
+// switch, and a tab holding unsaved drafts shows a dot.
+const SETUP_TABS = [
+  { id: 'venue',       label: 'Venue',         icon: '🎯' },
+  { id: 'credentials', label: 'Credentials',   icon: '🔑' },
+  { id: 'signals',     label: 'Signals',       icon: '📡' },
+  { id: 'risk',        label: 'Risk & Engine', icon: '🎛️' },
+  { id: 'ai',          label: 'AI & Alerts',   icon: '🤖' },
+  { id: 'backup',      label: 'Backup & Move', icon: '🚚' },
+  { id: 'support',     label: 'Support',       icon: '🛟' },
+] as const;
+type SetupTab = typeof SETUP_TABS[number]['id'];
+const DEFAULT_SETUP_TAB: SetupTab = 'venue';
+
+/** The sub-tab named in `#setup/<id>`, or null when the hash names none. */
+export function setupTabFromHash(hash: string): SetupTab | null {
+  const [view, tab] = hash.replace(/^#/, '').split('/');
+  if (view !== 'setup' || !tab) return null;
+  return SETUP_TABS.some(t => t.id === tab) ? (tab as SetupTab) : null;
+}
+
+/** Credential groups shown on the AI & Alerts tab rather than Credentials. */
+const isAiGroup = (keys: string[]) => keys.includes('LLM_PROVIDER') || keys.includes('TELEGRAM_BOT_TOKEN');
+
 export default function SetupPage() {
   const [status, setStatus] = useState<SetupStatus | null>(null);
   const [creds, setCreds] = useState<CredentialInfo[] | null>(null);
@@ -2307,7 +2412,22 @@ export default function SetupPage() {
   const [restarting, setRestarting] = useState(false);
   const [notice, setNotice] = useState<{ kind: 'ok' | 'err' | 'info'; text: string } | null>(null);
   const [showChangePw, setShowChangePw] = useState(false);
+  const [tab, setTab] = useState<SetupTab>(DEFAULT_SETUP_TAB);
   const [confirm, confirmDialog] = useConfirm();
+
+  // Follow `#setup/<id>` on first paint and on Back/Forward.
+  useEffect(() => {
+    const apply = () => setTab(setupTabFromHash(window.location.hash) ?? DEFAULT_SETUP_TAB);
+    apply();
+    window.addEventListener('popstate', apply);
+    return () => window.removeEventListener('popstate', apply);
+  }, []);
+
+  const selectTab = useCallback((t: SetupTab) => {
+    setTab(t);
+    const next = `#setup/${t}`;
+    if (window.location.hash !== next) window.history.pushState({ view: 'setup' }, '', next);
+  }, []);
   // Global SWR revalidator, used after a restart to drop every cached
   // dashboard read at once (see `restart` below).
   const { mutate: mutateAll } = useSWRConfig();
@@ -2351,6 +2471,21 @@ export default function SetupPage() {
   useEffect(() => { if (authed) loadCreds(); }, [authed, loadCreds]);
 
   const dirty = useMemo(() => Object.values(drafts).some(v => v.trim() !== ''), [drafts]);
+
+  // Which tabs hold unsaved credential drafts: a key in a venue group belongs to
+  // Credentials, Telegram and LLM keys to AI & Alerts, anything else is a Raptor
+  // key on Signals.
+  const dirtyTabs = useMemo(() => {
+    const out = new Set<SetupTab>();
+    if (!status) return out;
+    const groups = groupsForVenue(status.venue);
+    for (const [k, v] of Object.entries(drafts)) {
+      if (v.trim() === '') continue;
+      const g = groups.find(g => g.keys.includes(k));
+      out.add(!g ? 'signals' : isAiGroup(g.keys) ? 'ai' : 'credentials');
+    }
+    return out;
+  }, [drafts, status]);
 
   const save = async () => {
     const payload: Record<string, string> = {};
@@ -2465,6 +2600,34 @@ export default function SetupPage() {
 
   const groups = groupsForVenue(status.venue);
 
+  /** The credential groups for one tab: venue keys, or Telegram + LLM. */
+  const credentialGrid = (ai: boolean) => creds ? (
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      {groups.filter(g => isAiGroup(g.keys) === ai).map(g => (
+        <CredentialGroup
+          key={g.title}
+          title={g.title}
+          blurb={g.blurb}
+          creds={(g.keys.includes('LLM_PROVIDER')
+                    // Only the fields this provider actually uses.
+                    ? llmFieldsFor(drafts['LLM_PROVIDER']
+                        ?? creds.find(c => c.key === 'LLM_PROVIDER')?.hint
+                        ?? '')
+                    : g.keys)
+            .map(k => creds.find(c => c.key === k))
+            .filter((c): c is CredentialInfo => !!c)}
+          drafts={drafts}
+          onDraft={(k, v) => setDrafts(d => ({ ...d, [k]: v }))}
+          testKind={g.test}
+          help={g.keys.map(k => HELP[k]).find(Boolean)}
+          presets={g.keys.includes('LLM_PROVIDER')}
+        />
+      ))}
+    </div>
+  ) : (
+    <div className="text-center text-gray-500 font-mono text-sm py-8">Loading credentials…</div>
+  );
+
   return (
     // `pb-20` reserves room for the fixed status bar below, so the last control
     // on the page can still be reached and clicked while a notice is showing.
@@ -2473,12 +2636,17 @@ export default function SetupPage() {
         <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl px-4 py-3 text-xs font-mono text-amber-300">
           ⚠️ Venue credentials not configured — DRADIS cannot trade until the{' '}
           {VENUE_META[status.venue].missing} are set.
+          {tab !== 'credentials' && (
+            <button onClick={() => selectTab('credentials')} className="ml-2 underline hover:text-amber-200">
+              Open Credentials
+            </button>
+          )}
         </div>
       )}
 
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-sm font-mono text-gray-200">⚙️ Setup — Credentials</h2>
+          <h2 className="text-sm font-mono text-gray-200">⚙️ Setup</h2>
           <p className="text-xs text-gray-500 mt-0.5">
             Venue: <span className="text-gray-300">{VENUE_META[status.venue].label}</span>
             {' '}· stored in <span className="text-gray-300">data/secrets.env</span> · values are write-only
@@ -2509,55 +2677,71 @@ export default function SetupPage() {
         <PasswordCard mode="create" onDone={() => { setShowChangePw(false); setNotice({ kind: 'ok', text: 'Admin password updated.' }); }} />
       )}
 
-      <VenueCard
-        status={status}
-        onSwitched={text => { setNotice({ kind: 'ok', text }); loadStatus(); }}
-      />
+      <nav
+        role="tablist"
+        aria-label="Setup sections"
+        className="flex gap-1 overflow-x-auto border-b border-[#1e1e32] -mx-1 px-1"
+      >
+        {SETUP_TABS.map(t => (
+          <button
+            key={t.id}
+            role="tab"
+            aria-selected={tab === t.id}
+            onClick={() => selectTab(t.id)}
+            className={`shrink-0 whitespace-nowrap text-xs font-mono px-3 py-2 -mb-px border-b-2 transition-colors ${
+              tab === t.id
+                ? 'border-indigo-400 text-indigo-200'
+                : 'border-transparent text-gray-500 hover:text-gray-300'
+            }`}
+          >
+            <span aria-hidden="true" className="mr-1">{t.icon}</span>
+            {t.label}
+            {dirtyTabs.has(t.id) && (
+              <span className="ml-1.5 inline-block w-1.5 h-1.5 rounded-full bg-amber-400 align-middle" aria-label="unsaved changes" />
+            )}
+          </button>
+        ))}
+      </nav>
 
-      <CollateralPoolsCard />
-
-      {creds ? (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          {groups.map(g => (
-            <CredentialGroup
-              key={g.title}
-              title={g.title}
-              blurb={g.blurb}
-              creds={(g.keys.includes('LLM_PROVIDER')
-                        // Only the fields this provider actually uses.
-                        ? llmFieldsFor(drafts['LLM_PROVIDER']
-                            ?? creds.find(c => c.key === 'LLM_PROVIDER')?.hint
-                            ?? '')
-                        : g.keys)
-                .map(k => creds.find(c => c.key === k))
-                .filter((c): c is CredentialInfo => !!c)}
-              drafts={drafts}
-              onDraft={(k, v) => setDrafts(d => ({ ...d, [k]: v }))}
-              testKind={g.test}
-              help={g.keys.map(k => HELP[k]).find(Boolean)}
-              presets={g.keys.includes('LLM_PROVIDER')}
-            />
-          ))}
-        </div>
-      ) : (
-        <div className="text-center text-gray-500 font-mono text-sm py-8">Loading credentials…</div>
+      {tab === 'venue' && (
+        <>
+          <VenueCard
+            status={status}
+            onSwitched={text => { setNotice({ kind: 'ok', text }); loadStatus(); }}
+          />
+          <CollateralPoolsCard />
+        </>
       )}
 
-      {creds && (
+      {tab === 'credentials' && credentialGrid(false)}
+
+      {tab === 'signals' && (creds ? (
         <RaptorPanel
           creds={creds}
           drafts={drafts}
           onDraft={(k, v) => setDrafts(d => ({ ...d, [k]: v }))}
           onAuthError={sessionLost}
         />
+      ) : (
+        <div className="text-center text-gray-500 font-mono text-sm py-8">Loading signal sources…</div>
+      ))}
+
+      {tab === 'risk' && (
+        <>
+          <ProfilesPanel onAuthError={sessionLost} />
+          <GlobalConfigPanel />
+        </>
       )}
 
-      <ProfilesPanel onAuthError={sessionLost} />
+      {tab === 'ai' && (
+        <>
+          {credentialGrid(true)}
+          <AutonomyPanel onAuthError={sessionLost} />
+        </>
+      )}
 
-      <GlobalConfigPanel />
-
-      <AutonomyPanel onAuthError={sessionLost} />
-
+      {tab === 'backup' && (
+      <>
       {/* ── Config bundle export / import (instance migration) ────────────── */}
       <div className="bg-[#13131f] border border-[#1e1e32] rounded-xl p-4 space-y-3">
         <div>
@@ -2643,13 +2827,15 @@ export default function SetupPage() {
       </div>
 
       <MigrationPanel onAuthError={sessionLost} />
+      </>
+      )}
 
       {/* ── Support policy ─────────────────────────────────────────────────── */}
       {/* Mirrors the risk gate: a customer who paid for this must be pointed at
           real support, and the community wording would be wrong — quite possibly
           rejected — on a Marketplace product. Both surfaces read the same
           `edition` so they can never disagree with each other. */}
-      {status.edition === 'marketplace' ? (
+      {tab === 'support' && (status.edition === 'marketplace' ? (
         <div className="bg-[#13131f] border border-[#1e1e32] rounded-xl p-4 space-y-2">
           <h3 className="text-sm font-mono text-gray-200">🛟 Support</h3>
           <p className="text-xs text-gray-500">
@@ -2691,7 +2877,7 @@ export default function SetupPage() {
             </a>
           </div>
         </div>
-      )}
+      ))}
 
       {/* Sticky rather than parked at the bottom of a long page. The Setup view
           scrolls well past a screen once the Raptor panel is expanded, so an

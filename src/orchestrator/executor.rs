@@ -62,6 +62,8 @@ pub async fn evaluate_strategies(
                     },
                 );
                 if !matches!(signal, StrategySignal::NoSignal) {
+                    // [E91] Size by the viper's own record (no-op while the scaler is off).
+                    let signal = crate::helpers::autoscale::scale_entry(ctx, &strategy_name, signal).await;
                     debug!("📍 {} entry signal: {:?}", strategy_name, signal);
                     entry_signals.push((strategy_name.clone(), signal));
                 }
@@ -318,6 +320,8 @@ pub async fn execute_strategies_concurrent(
                 let signal = suppress_reentry(&strategy_name, signal, &closing_tokens);
                 if !matches!(signal, StrategySignal::NoSignal) {
                     entry_tag = "🟩";
+                    // [E91] Size by the viper's own record (no-op while the scaler is off).
+                    let signal = crate::helpers::autoscale::scale_entry(ctx, &strategy_name, signal).await;
                     // Signal detail at DEBUG — actual placement is logged at INFO by main.rs (📥 ENTRY)
                     debug!("📍 {} entry signal: {:?} ({}ms)", strategy_name, signal, evaluation_time_ms);
                     entry_signals.push((strategy_name.clone(), signal));

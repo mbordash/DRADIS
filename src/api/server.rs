@@ -3203,6 +3203,50 @@ async fn enrich_taxonomy(summary: &mut crate::cag::SquadronSummary) {
 /// every `DynamicConfig` field (group, label, type, unit, min/max, advanced flag).
 /// The Control Tower renders Basic panels + the Advanced modal from this, so new
 /// Rust config fields surface automatically without a hand-maintained frontend list.
+/// GET /api/autoscale [E91]
+///
+/// The capital auto-scaler as it stands: the global settings, each viper's
+/// record per squadron scope (market class, underlying, ghost or real ledger)
+/// with the multiplier it earns, and the factor last applied to an entry per
+/// squadron and viper.
+async fn get_autoscale() -> Response {
+    use crate::helpers::autoscale as a;
+    let settings = a::Settings::current();
+    let records: Vec<serde_json::Value> = a::all_records().into_iter().map(|(k, r)| {
+        let mult = settings.as_ref().map(|s| a::multiplier(&r, s));
+        serde_json::json!({
+            "strategy": k.strategy,
+            "market_class": k.market_class,
+            "underlying": k.underlying,
+            "ghost": k.ghost,
+            "trades": r.trades,
+            "pnl": r.pnl.round_dp(2).to_string(),
+            "risked": r.risked.round_dp(2).to_string(),
+            "return_on_capital": r.return_on_capital().map(|x| x.round_dp(4).to_string()),
+            "multiplier": mult.map(|m| m.round_dp(2).to_string()),
+        })
+    }).collect();
+    // Only while the scaler is on: a factor applied before it was switched off
+    // is history, not what entries are sized by now.
+    let enabled = settings.as_ref().map(|s| s.enabled).unwrap_or(false);
+    let applied: Vec<serde_json::Value> = if !enabled { Vec::new() } else {
+        a::last_applied().into_iter().map(|(sq, st, ap)| serde_json::json!({
+            "squadron": sq, "strategy": st, "factor": ap.factor.round_dp(2).to_string(),
+            "market_class": ap.key.market_class, "underlying": ap.key.underlying, "ghost": ap.key.ghost,
+        })).collect()
+    };
+    Json(serde_json::json!({
+        "enabled": enabled,
+        // Which ledger the scaler reads right now: the order paths' own test.
+        "ghost": crate::config::GHOST_MODE
+            || crate::helpers::dynamic_config::global_config_tx().map(|tx| tx.borrow().ghost_mode).unwrap_or(true),
+        "min_trades": settings.as_ref().map(|s| s.min_trades),
+        "lookback": settings.as_ref().map(|s| s.lookback),
+        "records": records,
+        "applied": applied,
+    })).into_response()
+}
+
 async fn get_config_schema() -> Response {
     debug!("Received GET /api/config/schema");
     Json(crate::api::config_schema::config_schema()).into_response()
@@ -4827,6 +4871,7 @@ pub async fn run_api_server(
     let protected_routes = Router::new()
         .route("/api/config",                get(get_config).patch(patch_config))
         .route("/api/config/schema",         get(get_config_schema))
+        .route("/api/autoscale",             get(get_autoscale))
         .route("/api/pnl/history",           get(get_pnl_history))
         .route("/api/pnl/span",              get(get_pnl_span))
         .route("/api/trades",                get(get_trades))

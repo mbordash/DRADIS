@@ -98,6 +98,9 @@ pub fn scope_for_group(group: &str) -> Option<ConfigScope> {
         // squadron's card and arm Live Orders again for every conviction, told
         // only by a log line that the entry was refused.
         "Helm Instance" => ConfigScope::Global,
+        // [E91] The CAG-level sizing policy: one set of limits for every
+        // squadron, read off the global row by `helpers::autoscale`.
+        "Capital Auto-Scaler" => ConfigScope::Global,
         _ => return None,
     })
 }
@@ -1374,6 +1377,35 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(hi, Some("helm_enabled"), "helm_max_open_intents", "Max Open Intents", "int", false,
             "Most intents that may be open (not closed or superseded) across every Helm squadron at once. \
              Enforced when an intent is created. Two is a conviction; ten is a habit.")
+            .min(1.0).step(1.0));
+
+        // [E91] Capital auto-scaler.
+        let ca = "Capital Auto-Scaler";
+        let ce = Some("autoscale_enabled");
+        v.push(F::new(ca, None, "autoscale_enabled", "Enabled", "bool", false,
+            "Scale each viper's entry size by its own return on capital in its own squadron: larger while it \
+             makes money on what it risks, smaller while it loses. Exits are never scaled. Instance-wide; ships off."));
+        v.push(F::new(ca, ce, "autoscale_max_multiplier", "Max Multiplier", "decimal", false,
+            "Largest factor an entry can be scaled up by, reached at the Full-Scale Return. 1 turns scaling up off.")
+            .range(1.0, 5.0).step(0.1));
+        v.push(F::new(ca, ce, "autoscale_min_multiplier", "Min Multiplier", "decimal", false,
+            "Smallest factor an entry can be scaled down to, reached at the Full-Scale Return negative. 1 turns \
+             scaling down off. Never below the venue's minimum order size.")
+            .range(0.0, 1.0).step(0.05));
+        v.push(F::new(ca, ce, "autoscale_max_order_usdc", "Max Scaled Order", "usd", false,
+            "Global limit: a scaled-up entry never costs more than this (both legs of a pair together); 0 means no \
+             entry is ever scaled up. It never shrinks a viper's own order; it only stops growth. Each viper's own \
+             Max Exposure (its runtime setting, counting what it already holds) also applies.")
+            .min(0.0).step(1.0).unit("USDC"));
+        v.push(F::new(ca, ce, "autoscale_full_scale_return", "Full-Scale Return", "pct", true,
+            "Return on capital (realized P&L ÷ dollars risked over the lookback) at which the multiplier reaches \
+             its max (or, negative, its min). Linear between. 0.10 = +10%.")
+            .range(0.01, 1.0).step(0.01));
+        v.push(F::new(ca, ce, "autoscale_min_trades", "Min Trades", "int", true,
+            "Closed trades a viper needs in a squadron before its size moves at all. Below this it trades at 1×.")
+            .min(1.0).step(1.0));
+        v.push(F::new(ca, ce, "autoscale_lookback_trades", "Lookback Trades", "int", true,
+            "How many of the viper's most recent closed trades in the squadron the return is measured over.")
             .min(1.0).step(1.0));
 
         let hm = "Helm";

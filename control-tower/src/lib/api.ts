@@ -66,6 +66,13 @@ export async function getConfig(): Promise<DynamicConfig> {
 }
 
 /** Editable-config field schema — drives the dynamic Advanced modal. */
+/** GET /api/autoscale [E91]. */
+export async function getAutoscale(): Promise<import('./types').AutoscaleStatus> {
+  const res = await fetch(`${BASE}/api/autoscale`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/autoscale → ${res.status}`);
+  return res.json();
+}
+
 export async function getConfigSchema(): Promise<ConfigFieldSchema[]> {
   const res = await fetch(`${BASE}/api/config/schema`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`GET /api/config/schema → ${res.status}`);

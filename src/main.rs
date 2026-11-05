@@ -510,6 +510,9 @@ async fn run() -> Result<()> {
     // and account-visible. Registering at the point of creation makes it a fact
     // rather than a timing accident.
     dradis::helpers::dynamic_config::register_global_config_tx(Arc::clone(&config_tx));
+    // [E91] Capital auto-scaler: rebuild each viper's record from the ledger
+    // once a minute (a pool that is not open yet is simply read next time).
+    dradis::helpers::autoscale::spawn_refresher();
 
     // ── Strategy→market status channel (feeds /api/status) ───────────────────
     let (markets_tx, markets_rx) = watch::channel::<std::collections::HashMap<String, String>>(std::collections::HashMap::new());

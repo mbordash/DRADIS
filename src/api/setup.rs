@@ -1908,15 +1908,18 @@ mod tests {
                 "sports_ledger_enabled", "sports_ledger_leagues", "sports_ledger_snapshot_offsets_mins",
                 "sports_ledger_credit_reserve", "sports_ledger_quota_reset_day",
             ];
-            const NOT_IN_PROFILES_PREFIX: &str = "bookline_board_";
-            let excluded_key = |k: &str| NOT_IN_PROFILES.contains(&k) || k.starts_with(NOT_IN_PROFILES_PREFIX);
+            // `autoscale_` [E91]: the capital auto-scaler is the operator's sizing
+            // policy across every profile, so applying a profile never arms,
+            // disarms or retunes it.
+            const NOT_IN_PROFILES_PREFIXES: &[&str] = &["bookline_board_", "autoscale_"];
+            let excluded_key = |k: &str| NOT_IN_PROFILES.contains(&k) || NOT_IN_PROFILES_PREFIXES.iter().any(|p| k.starts_with(p));
             let missing: Vec<_> = schema_keys
                 .difference(&keys)
                 .filter(|k| !excluded_key(k))
                 .collect();
             let unknown: Vec<_> = keys.difference(&schema_keys).collect();
-            let leaked: Vec<_> = keys.iter().filter(|k| k.starts_with(NOT_IN_PROFILES_PREFIX)).collect();
-            assert!(leaked.is_empty(), "profile '{name}' declares board-lane keys {leaked:?}, which must never be part of a profile");
+            let leaked: Vec<_> = keys.iter().filter(|k| NOT_IN_PROFILES_PREFIXES.iter().any(|p| k.starts_with(p))).collect();
+            assert!(leaked.is_empty(), "profile '{name}' declares {leaked:?}, which must never be part of a profile");
             for excluded in NOT_IN_PROFILES {
                 assert!(
                     !keys.contains(excluded),

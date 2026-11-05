@@ -21,6 +21,14 @@ export interface DynamicConfig {
   // Global
   ghost_mode: boolean;
   intl_taker_fee_rate: string;
+  // [E91] Capital auto-scaler (instance-wide).
+  autoscale_enabled: boolean;
+  autoscale_min_trades: number;
+  autoscale_lookback_trades: number;
+  autoscale_full_scale_return: string;
+  autoscale_max_multiplier: string;
+  autoscale_min_multiplier: string;
+  autoscale_max_order_usdc: string;
   us_taker_fee_rate: string;
 
   // Viper enable flags
@@ -1220,4 +1228,27 @@ export interface DeploymentStatus {
   squadron_id?: string;
   error?: string;
   created_at: string;
+}
+
+/** GET /api/autoscale [E91]: the auto-scaler's records and last applied factors. */
+export interface AutoscaleRecord {
+  strategy: string;
+  market_class: string;
+  underlying: string | null;
+  ghost: boolean;
+  trades: number;
+  pnl: string;
+  risked: string;
+  return_on_capital: string | null;
+  multiplier: string | null;
+}
+export interface AutoscaleStatus {
+  enabled: boolean;
+  /** True when the instance simulates, so the scaler reads the simulated ledger. */
+  ghost: boolean;
+  min_trades: number | null;
+  lookback: number | null;
+  records: AutoscaleRecord[];
+  /** Empty while the scaler is off. */
+  applied: { squadron: string; strategy: string; factor: string; market_class: string; underlying: string | null; ghost: boolean }[];
 }

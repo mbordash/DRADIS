@@ -46,6 +46,7 @@ pub mod watchdog;
 pub mod logbuf;
 pub mod latency;
 pub mod viper_status;
+pub mod autoscale;
 pub mod redact;
 pub mod shutdown;
 /// Instance migration (E64): retire and back up an instance, or restore a backup.
