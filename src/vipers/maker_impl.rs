@@ -50,7 +50,6 @@ use tokio::sync::Mutex;
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
 use crate::state::PositionKey;
-use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
 use crate::venues::core::TimeInForce;
 use crate::helpers::price::{ceil_to_tick_size, floor_to_tick_size};
@@ -751,7 +750,7 @@ impl Strategy for MakerStrategyImpl {
         }
 
         // ── Global Risk Check ────────────────────────────────────────────────
-        if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
+        if crate::vipers::drawdown_limit_hit(ctx) {
             crate::helpers::viper_status::report_reason(&ctx.crypto_filter, "MakerStrategy", "session drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }

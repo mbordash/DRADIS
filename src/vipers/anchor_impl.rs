@@ -1363,6 +1363,14 @@ impl Strategy for AnchorStrategy {
                 return Ok(StrategySignal::NoSignal);
             }
         };
+        // [B91] The daily drawdown limit binds Anchor as it binds every other
+        // viper. Until 1.6.0 Anchor never asked: on 2026-11-04 it produced the
+        // whole $3.65 loss that paused the rest, and was still free to buy.
+        // Checked after the control lane, which records and never trades.
+        if crate::vipers::drawdown_limit_hit(ctx) {
+            idle("daily drawdown limit hit");
+            return Ok(StrategySignal::NoSignal);
+        }
         let side: &'static str = if pick.is_yes { "YES" } else { "NO" };
         // One buy per side per hour, whether the position is still in the map,
         // already settled out of it, or on the ledger from an earlier session.

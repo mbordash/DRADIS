@@ -109,7 +109,6 @@ use std::time::Instant;
 
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams, MarketConfig, MarketSnapshot, PositionKey};
-use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
 use crate::helpers::volatility::{fair_yes_probability, sigma_per_sqrt_sec};
 use crate::helpers::price::ceil_to_tick_size;
@@ -1786,8 +1785,8 @@ impl Strategy for FairValueStrategyImpl {
             idle("disabled in config");
             return Ok(StrategySignal::NoSignal);
         }
-        if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
-            idle("session drawdown limit hit");
+        if crate::vipers::drawdown_limit_hit(ctx) {
+            idle("daily drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }
 

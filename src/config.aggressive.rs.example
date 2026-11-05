@@ -2024,7 +2024,7 @@ pub const ARBITRAGE_POSITION_SIZE_USDC: Decimal = dec!(20.0);
 pub const TIME_DECAY_MAX_EXPOSURE_USDC: Decimal = dec!(80);
 pub const BASIS_MAX_EXPOSURE_USDC: Decimal = dec!(30);
 
-/// Session drawdown limit: 6% of collateral with $15 minimum.
+/// Daily drawdown limit (session P&L since midnight ET, B90): 6% of collateral with $15 minimum.
 /// Higher than balanced/conservative — allows more recovery room before lockout.
 pub fn max_session_drawdown(collateral: Decimal) -> Decimal {
     (collateral * dec!(0.06)).max(dec!(15.00))

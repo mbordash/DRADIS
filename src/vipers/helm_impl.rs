@@ -561,7 +561,7 @@ impl HelmStrategy {
             ghost: dc.ghost_mode,
             helm_enabled: dc.helm_enabled,
             live_enabled: dc.helm_live_enabled,
-            drawdown_hit: crate::vipers::is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral),
+            drawdown_hit: crate::vipers::drawdown_limit_hit(ctx),
             side_is_yes,
             bid,
             ask,

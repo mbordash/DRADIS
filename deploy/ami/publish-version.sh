@@ -182,6 +182,19 @@ groups = [
     for g in rec.get("SecurityGroups", [])
 ]
 notes = open(notes_path, encoding="utf-8").read().strip("\n")
+# The Marketplace refuses release notes with characters outside its set: the
+# first v1.6.0 change set failed INVALID_RELEASE_NOTES on "→ … ×". Every
+# accepted release so far was plain ASCII, so the notes are folded to ASCII
+# and anything without a fold stops the submission here, before AWS sees it.
+FOLD = {"→": "->", "←": "<-", "…": "...", "×": "x", "¢": "c", "—": "-", "–": "-",
+        "‘": "'", "’": "'", "“": '"', "”": '"', "≥": ">=", "≤": "<=", "≈": "~",
+        "σ": "sigma", "Δ": "delta", "·": "-", "\u00a0": " "}
+notes = "".join(FOLD.get(c, c) for c in notes)
+left = sorted({c for c in notes if ord(c) > 127})
+if left:
+    sys.stderr.write(f"release notes still hold non-ASCII characters {left}; "
+                     "add them to FOLD or reword docs/RELEASES.md\n")
+    sys.exit(1)
 usage = open(usage_path, encoding="utf-8").read().strip("\n")
 ami_details = {
     "AmiSource": {

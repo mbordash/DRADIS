@@ -87,19 +87,110 @@ pub fn gate_log_permitted(strategy: &str, asset: &str, key: &str, interval_secs:
     true
 }
 
-/// Shared risk utility for all strategies to check global drawdown.
-pub fn is_drawdown_limit_hit(session_pnl: Decimal, starting_collateral: Decimal) -> bool {
+/// Shared risk utility: is `pnl` a loss at or past the drawdown limit?
+/// Strategies call `drawdown_limit_hit(ctx)`, which passes the day's P&L.
+pub fn is_drawdown_limit_hit(pnl: Decimal, starting_collateral: Decimal) -> bool {
     let max_dd = config::max_session_drawdown(starting_collateral);
-    if session_pnl <= -max_dd {
+    if pnl <= -max_dd {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let last = LAST_DRAWDOWN_REJECT_LOG.load(Ordering::Relaxed);
         if now >= last + 60 { // Rate limit: 1 minute
             LAST_DRAWDOWN_REJECT_LOG.store(now, Ordering::Relaxed);
-            info!("🛡️ Risk Reject: Global Session Drawdown ${:.2} >= Max ${:.2}", session_pnl.abs(), max_dd);
+            info!("🛡️ Risk Reject: Daily Drawdown ${:.2} since 00:00 ET >= Max ${:.2} (clears at midnight ET)", pnl.abs(), max_dd);
         }
         return true;
     }
     false
+}
+
+/// [B90] The drawdown limit counts the ET calendar day, not the process.
+///
+/// Session P&L runs from process start (`venues::core::starting_collateral`),
+/// and until 1.6.0 the guard compared that figure against the limit, so once
+/// it tripped it held until someone restarted the engine. On 2026-11-04 a $3.64
+/// loss at 20:02 ET paused every viper on production for 19 hours, until the
+/// next deploy happened to clear it. The guard now measures the session P&L
+/// gained or lost since the first tick after midnight ET: a bad evening costs
+/// the rest of that day, and the next day starts with the full allowance.
+/// Session P&L as reported (dashboard, snapshots, advisor) is unchanged.
+///
+/// Keyed by the squadron's asset because on Polymarket International each
+/// asset runs its own `SessionState` with its own P&L; on Kalshi and US the
+/// figure is account-wide and every key sees the same numbers. A key first seen
+/// on the day the process started anchors at zero (the whole session is that
+/// day); a key first seen on a later day anchors at its first reading.
+struct DayAnchor { day: chrono::NaiveDate, anchor: Decimal }
+
+static DAY_ANCHORS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, DayAnchor>>> =
+    std::sync::LazyLock::new(Default::default);
+static FIRST_DAY: std::sync::OnceLock<chrono::NaiveDate> = std::sync::OnceLock::new();
+
+fn day_pnl_in(
+    anchors: &mut std::collections::HashMap<String, DayAnchor>,
+    first_day: chrono::NaiveDate,
+    scope: &str,
+    session_pnl: Decimal,
+    today: chrono::NaiveDate,
+) -> Decimal {
+    let a = anchors.entry(scope.to_string()).or_insert_with(|| DayAnchor {
+        day: today,
+        anchor: if today == first_day { Decimal::ZERO } else { session_pnl },
+    });
+    if a.day != today {
+        a.day = today;
+        a.anchor = session_pnl;
+    }
+    session_pnl - a.anchor
+}
+
+/// Session P&L since midnight ET for this squadron's scope [B90].
+pub fn day_pnl(ctx: &crate::orchestrator::strategy::StrategyContext) -> Decimal {
+    let today = chrono::Utc::now().with_timezone(&chrono_tz::US::Eastern).date_naive();
+    let first_day = *FIRST_DAY.get_or_init(|| today);
+    let mut anchors = DAY_ANCHORS.lock().unwrap_or_else(|e| e.into_inner());
+    day_pnl_in(&mut anchors, first_day, &ctx.crypto_filter.to_lowercase(), ctx.session_pnl, today)
+}
+
+/// The day's loss has reached the limit, without the reject log line.
+pub fn drawdown_breached(ctx: &crate::orchestrator::strategy::StrategyContext) -> bool {
+    day_pnl(ctx) <= -config::max_session_drawdown(ctx.starting_collateral)
+}
+
+/// The entry guard every viper checks: the day's loss has reached the limit.
+pub fn drawdown_limit_hit(ctx: &crate::orchestrator::strategy::StrategyContext) -> bool {
+    is_drawdown_limit_hit(day_pnl(ctx), ctx.starting_collateral)
+}
+
+#[cfg(test)]
+mod day_drawdown_tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    fn d(n: u32) -> NaiveDate { NaiveDate::from_ymd_opt(2026, 11, n).unwrap() }
+
+    #[test]
+    fn a_loss_trips_the_day_and_clears_at_midnight_et() {
+        let mut m = Default::default();
+        let loss = -config::max_session_drawdown(dec!(100)) - dec!(0.64);
+        // Process starts on the 4th; the whole session is that day.
+        assert_eq!(day_pnl_in(&mut m, d(4), "btc", loss, d(4)), loss);
+        assert!(is_drawdown_limit_hit(day_pnl_in(&mut m, d(4), "btc", loss, d(4)), dec!(100)));
+        // Midnight: the day restarts from the loss carried over.
+        assert_eq!(day_pnl_in(&mut m, d(4), "btc", loss, d(5)), Decimal::ZERO);
+        assert!(!is_drawdown_limit_hit(day_pnl_in(&mut m, d(4), "btc", loss, d(5)), dec!(100)));
+        // A further loss on the 5th counts from there.
+        assert_eq!(day_pnl_in(&mut m, d(4), "btc", loss - dec!(1.36), d(5)), dec!(-1.36));
+    }
+
+    #[test]
+    fn scopes_keep_their_own_day() {
+        let mut m = Default::default();
+        assert_eq!(day_pnl_in(&mut m, d(4), "btc", dec!(-2), d(4)), dec!(-2));
+        assert_eq!(day_pnl_in(&mut m, d(4), "eth", dec!(1), d(4)), dec!(1));
+        // A scope first seen on a later day anchors at its first reading.
+        assert_eq!(day_pnl_in(&mut m, d(4), "sol", dec!(-7), d(6)), Decimal::ZERO);
+        assert_eq!(day_pnl_in(&mut m, d(4), "sol", dec!(-8), d(6)), dec!(-1));
+    }
 }
 
 /// Shared liquidity/timing entry gate for directional vipers (2026-06-29).

@@ -94,7 +94,6 @@ use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{OrderParams, PositionKey, StrategySignal, StrategyStatus};
 use crate::venues::core::TimeInForce;
 use crate::state::MarketConfig;
-use crate::vipers::is_drawdown_limit_hit;
 
 pub const STRATEGY_NAME: &str = "GboostStrategy";
 
@@ -2023,8 +2022,8 @@ impl Strategy for GboostPlanBStrategy {
             idle("disabled in config");
             return Ok(StrategySignal::NoSignal);
         }
-        if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
-            idle("session drawdown limit hit");
+        if crate::vipers::drawdown_limit_hit(ctx) {
+            idle("daily drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }
         if let Some(why) = shape_gate(&ctx.market) {

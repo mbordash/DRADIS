@@ -31,7 +31,7 @@
 //!   floor (`autoscale_min_multiplier`) at the same return negative.
 //! - Scaling up never takes one order past `autoscale_max_order_usdc`, never past
 //!   the viper's own max exposure (what it already holds counts), and never
-//!   happens while the session drawdown breaker is tripped.
+//!   happens while the daily drawdown breaker is tripped.
 //! - Scaling down never goes below the venue's minimum order size.
 //!
 //! Settings are instance-wide (the CAG level): read from the global config row,
@@ -389,9 +389,9 @@ pub async fn scale_entry_with(
     let min_shares = crate::venues::min_order_shares();
     let smallest_leg = pair_params.as_ref().map_or(params.shares, |p| p.shares.min(params.shares));
     let min_factor = if smallest_leg > Decimal::ZERO { min_shares / smallest_leg } else { Decimal::ONE };
-    // The breaker's own condition, without `is_drawdown_limit_hit`'s "Risk
+    // The breaker's own condition (the day's loss, B90), without the "Risk
     // Reject" log: the scaler only withholds growth, it rejects nothing.
-    let drawdown = ctx.session_pnl <= -crate::config::max_session_drawdown(ctx.starting_collateral);
+    let drawdown = crate::vipers::drawdown_breached(ctx);
     let cap = viper_cap(strategy, &ctx.dynamic_config);
     let factor = applied_factor(mult, notional, held, cap, s.max_order_usdc, drawdown, min_factor);
 

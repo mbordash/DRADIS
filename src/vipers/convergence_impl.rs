@@ -90,7 +90,7 @@ use tracing::debug;
 
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
-use crate::vipers::{is_drawdown_limit_hit, resting_tp_price};
+use crate::vipers::resting_tp_price;
 use crate::config;
 use crate::venues::core::{MarketId, TimeInForce};
 
@@ -201,8 +201,8 @@ impl Strategy for ConvergenceStrategyImpl {
         }
 
         // ── Global risk + scope gates ─────────────────────────────────────────
-        if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
-            idle("session drawdown limit hit");
+        if crate::vipers::drawdown_limit_hit(ctx) {
+            idle("daily drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }
         // BTC-only: institutional_pulse has no ETH/SOL analog.

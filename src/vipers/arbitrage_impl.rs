@@ -44,7 +44,6 @@ use rust_decimal_macros::dec;
 
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams, PositionKey};
-use crate::vipers::is_drawdown_limit_hit;
 use crate::venues::core::TimeInForce;
 
 /// How long the intl pair arbiter waits for the second leg before it repairs a
@@ -80,8 +79,8 @@ impl Strategy for ArbitrageStrategyImpl {
         }
 
         // ── Global Risk Check ────────────────────────────────────────────────
-        if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
-            idle("session drawdown limit hit");
+        if crate::vipers::drawdown_limit_hit(ctx) {
+            idle("daily drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }
 

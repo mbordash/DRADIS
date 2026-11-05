@@ -88,7 +88,6 @@ use tracing::debug;
 
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
-use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
 use crate::venues::core::TimeInForce;
 
@@ -135,8 +134,8 @@ impl Strategy for TrendReversalStrategyImpl {
         }
 
         // ── Global drawdown guard ────────────────────────────────────────────
-        if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
-            idle("session drawdown limit hit");
+        if crate::vipers::drawdown_limit_hit(ctx) {
+            idle("daily drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }
 

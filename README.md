@@ -563,7 +563,7 @@ CRYPTO_FILTER=btc
 - **Signal: return on capital**, realized P&L ÷ dollars risked (entry price × shares) over the viper's last *Lookback Trades* (30) closed trades. Not win rate: on a binary a 70% win rate bought at 0.80 loses money.
 - **Scope: viper × squadron.** Anchor on the BTC squadron scales on Anchor's BTC trades only; a losing viper cannot ride a winning one's record. Simulated and real ledgers never mix.
 - **The multiplier** is 1× until *Min Trades* (20), then runs linearly from 1× at zero return to *Max Multiplier* (2×) at *Full-Scale Return* (+10%), and down to *Min Multiplier* (0.5×) at −10%.
-- **Limits on growth:** never past *Max Scaled Order* ($25 per order, both legs of a pair together; 0 = no growth), never past the viper's own Max Exposure counting what it already holds, never while the session drawdown breaker is tripped. A limit only stops growth; it never shrinks the viper's own order. Shrinking never goes below the venue's minimum order size.
+- **Limits on growth:** never past *Max Scaled Order* ($25 per order, both legs of a pair together; 0 = no growth), never past the viper's own Max Exposure counting what it already holds, never while the daily drawdown breaker is tripped. A limit only stops growth; it never shrinks the viper's own order. Shrinking never goes below the venue's minimum order size.
 - **Never scaled:** exits, and Helm (the operator's own sizing).
 - **Visible:** while the scaler is on, each viper card on a squadron page carries a 📐 badge with the multiplier it earns there (green above 1×, red below, `1× · 12/20` while it builds its record), with the return and the factor last applied in its tooltip. The Risk & Engine card shows every viper's record, return, multiplier and last applied factor; `GET /api/autoscale` returns the same. Each scaled entry logs `📐 Auto-scaler`.
 
@@ -809,6 +809,7 @@ LLM_OUTCOME_HORIZON_SECS=7200    # when applied changes get outcome-scored
 ## ️ Safety Systems
 
 - **Circuit breaker**: Pauses all trading after 3 consecutive execution failures.
+- **Daily drawdown limit**: every viper, Anchor included since 1.6.0, stops opening positions once the day's loss reaches the profile's limit (conservative: the larger of 0.75% of the starting balance and $3). The day is counted from midnight ET and clears at the next midnight; until 1.6.0 it counted from engine start and held until a restart. Exits are never blocked.
 - **TOCTOU-safe entry**: Atomic lock scope prevents duplicate orders.
 - **Orphaned pair detection**: Arbiter waits 5s after first-leg confirm before acting on a missing second leg. TimeDecay GTC bids are given the full theta window (up to 30 min) before a resting order is declared orphaned, on every venue since 1.6.0 (Kalshi and Polymarket US cancelled the partner after 60 s before).
 - **Capital Auto-Scaler limits**: when enabled, a scaled-up entry is bounded by a per-order dollar cap and the viper's own runtime Max Exposure, and never grows while the drawdown breaker is tripped (see [Capital Auto-Scaler](#capital-auto-scaler)).
