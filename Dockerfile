@@ -64,7 +64,28 @@ COPY src ./src
 # customer later selects. Baking the least aggressive one means a customer who
 # never touches Setup, or who picks Conservative, is never running something
 # racier than they asked for.
-RUN cp src/config.conservative.rs.example src/config.rs
+#
+# [B89] DRADIS_PROFILE picks another profile for a non-customer build:
+# `balanced` or `aggressive`, or `local` to build the src/config.rs that is in
+# the build context (the public demo uploads one). DRADIS_FORCE_GHOST=true
+# compiles GHOST_MODE on and fails the build if it cannot. Until 2026-11-05 this
+# line ignored both: the demo's uploaded config and its GHOST_MODE edit never
+# reached the binary, which ran conservative and simulated only because new
+# installs default to ghost mode and the read-only API refuses the switch.
+ARG DRADIS_PROFILE=conservative
+ARG DRADIS_FORCE_GHOST=false
+RUN set -e; \
+    case "$DRADIS_PROFILE" in \
+        conservative|balanced|aggressive) cp "src/config.$DRADIS_PROFILE.rs.example" src/config.rs ;; \
+        local) test -f src/config.rs || { echo "DRADIS_PROFILE=local but the build context has no src/config.rs"; exit 1; } ;; \
+        *) echo "unknown DRADIS_PROFILE '$DRADIS_PROFILE' (want: conservative balanced aggressive local)"; exit 1 ;; \
+    esac; \
+    if [ "$DRADIS_FORCE_GHOST" = "true" ]; then \
+        sed -i 's/^pub const GHOST_MODE: bool = false;/pub const GHOST_MODE: bool = true;/' src/config.rs; \
+        grep -q '^pub const GHOST_MODE: bool = true;' src/config.rs || { echo "DRADIS_FORCE_GHOST: could not compile GHOST_MODE on"; exit 1; }; \
+    fi; \
+    mkdir -p /out/meta; \
+    echo "profile=$DRADIS_PROFILE $(grep '^pub const GHOST_MODE:' src/config.rs)" | tee /out/meta/build-profile
 # Each venue is built once and copied twice: the unstripped binary is kept for
 # symbols, the stripped one ships.
 #
@@ -116,6 +137,9 @@ EXPOSE 9000
 # One binary per baked venue; entrypoint.sh selects at container start.
 COPY --from=builder /out/bin ./bin
 COPY deploy/entrypoint.sh ./entrypoint.sh
+# [B89] Which profile this image compiled and whether GHOST_MODE was forced, so a
+# deploy can check the image itself (BuildKit prints nothing for a cached step).
+COPY --from=builder /out/meta/build-profile ./build-profile
 RUN chmod +x ./entrypoint.sh
 # The engine opens its SQLite shards at logs/<asset>-dradis.db, relative to this
 # WORKDIR. SQLite creates the FILE but never the directory, so without this the
