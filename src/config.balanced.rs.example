@@ -1683,13 +1683,17 @@ pub const FAIRVALUE_STOP_COUNTERFACTUAL_RECORD: bool = true;
 
 pub const ENABLE_TIME_DECAY_TRADING: bool = true;
 
-pub const MIN_TIME_DECAY_NET_PROFIT: Decimal = dec!(0.002);
+/// [E85] 3 cents: a balanced 0.49/0.50 book (1 cent) is refused. At the touch
+/// its first fill is adverse by construction (2026-11-03 trade 250: the NO bid
+/// filled in 6 s, YES ran away, −$2.21). Enter only when a settled book offers
+/// real theta; the book-settled gate still refuses torn books.
+pub const MIN_TIME_DECAY_NET_PROFIT: Decimal = dec!(0.03);
 pub const MAX_TIME_DECAY_COMBINED_ASK: Decimal = dec!(1.008);
 pub const TIME_DECAY_CONVERGENCE_WINDOW_SECS: i64 = 1200;
 pub const TIME_DECAY_CONVERGENCE_EXIT_BID: Decimal = dec!(0.998);
 pub const TIME_DECAY_MIN_SECS_TO_EXPIRY: i64 = 900;
 pub const TIME_DECAY_MAX_SECS_TO_EXPIRY: i64 = 1800;
-pub const TIME_DECAY_POSITION_SIZE_USDC: Decimal = dec!(15);
+pub const TIME_DECAY_POSITION_SIZE_USDC: Decimal = dec!(5);
 pub const TIME_DECAY_TARGET_PROFIT_PERCENT: Decimal = dec!(0.012);
 pub const TIME_DECAY_MAX_TOTAL_EXPOSURE_USDC: Decimal = dec!(50);
 pub const TIME_DECAY_MAX_POSITIONS: usize = 5;
@@ -1705,7 +1709,11 @@ pub const TIME_DECAY_LONE_LEG_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
 /// profile templates and above the aggressive default; see
 /// `MOMENTUM_STOP_LOSS_CEILING` for why a ceiling is not the profile's default.
 pub const TIME_DECAY_STOP_LOSS_CEILING: Decimal = dec!(0.10);
-pub const TIME_DECAY_MIN_HOLD_SECS: i64 = 120;
+/// [E85] 1800 s, the whole entry window: no stop fires during the hold, so a
+/// lone leg rides to settlement (as Anchor does) instead of the stop selling
+/// at-the-money noise near expiry (trade 250 stopped at 0.36, settled in its
+/// favour). The forced expiry exit of a completed pair is not gated by this.
+pub const TIME_DECAY_MIN_HOLD_SECS: i64 = 1800;
 pub const TIME_DECAY_STOP_LOSS_COOLDOWN_SECS: u64 = 600;
 
 /// Oracle volatility gate — balanced: mid-range thresholds, stop halved on vol spikes.
@@ -1718,7 +1726,7 @@ pub const TIME_DECAY_MAX_SLOW_DRIFT_PCT: Decimal = dec!(0.002);
 pub const TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER: Decimal = dec!(0.5);
 
 /// Price bounds: only enter when genuine market uncertainty exists.
-pub const TIME_DECAY_MAX_ENTRY_PRICE: Decimal = dec!(0.46);
+pub const TIME_DECAY_MAX_ENTRY_PRICE: Decimal = dec!(0.50);
 /// Ceiling for `time_decay_max_entry_price` on this build. A TimeDecay leg
 /// bought above $0.50 is no longer the cheap side of a sub-$1.00 pair, so the
 /// premise ends there; the 2026-08-29 approval of 0.50 that the old cap
@@ -2018,7 +2026,7 @@ pub const MAKER_MAX_EXPOSURE_USDC: Decimal = dec!(8);
 pub const MAKER_QUOTE_SIZE_USDC: Decimal = dec!(8);
 pub const ARBITRAGE_MAX_EXPOSURE_USDC: Decimal = dec!(30);
 pub const ARBITRAGE_POSITION_SIZE_USDC: Decimal = dec!(15.0);
-pub const TIME_DECAY_MAX_EXPOSURE_USDC: Decimal = dec!(24);
+pub const TIME_DECAY_MAX_EXPOSURE_USDC: Decimal = dec!(10);
 pub const BASIS_MAX_EXPOSURE_USDC: Decimal = dec!(15.0);
 
 pub fn max_session_drawdown(collateral: Decimal) -> Decimal {

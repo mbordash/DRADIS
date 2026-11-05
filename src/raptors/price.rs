@@ -166,8 +166,16 @@ pub enum GapReport {
 /// `SHORT_WINDOW_GAP_WARN_SECS` with no confirmed velocity while ticks arrive,
 /// which is a degraded feed. A feed that stops ticking altogether is the
 /// zombie guard's case, not this one.
+///
+/// [B85] Nor is an outage: the run is measured from the first tick after a
+/// silence of `SHORT_WINDOW_GAP_WARN_SECS` or more (a reconnect, a stalled
+/// feed), never across it. Before, the first tick after a Binance reconnect
+/// reported the whole outage as "no confirmed 1s velocity for 36s while ticks
+/// arrive" (production 2026-11-04 01:50 and 14:46 ET), when no tick had arrived
+/// and the reconnect had already logged its own WARN.
 pub struct GapTally {
     last_confirmed: Instant,
+    last_tick: Instant,
     warned: bool,
     window_start: Instant,
     ticks: u64,
@@ -177,7 +185,7 @@ pub struct GapTally {
 
 impl GapTally {
     pub fn new(now: Instant) -> Self {
-        Self { last_confirmed: now, warned: false, window_start: now, ticks: 0, gaps: 0, worst_ms: 0 }
+        Self { last_confirmed: now, last_tick: now, warned: false, window_start: now, ticks: 0, gaps: 0, worst_ms: 0 }
     }
 
     /// Record one tick: `confirmed` is whether it had a usable anchor,
@@ -186,6 +194,11 @@ impl GapTally {
     pub fn on_tick(&mut self, now: Instant, confirmed: bool, anchor_age_ms: u128) -> Vec<GapReport> {
         let mut out = Vec::new();
         self.ticks += 1;
+        if now.saturating_duration_since(self.last_tick).as_secs() >= SHORT_WINDOW_GAP_WARN_SECS {
+            // [B85] The feed was silent, not degraded: restart the run here.
+            self.last_confirmed = now;
+        }
+        self.last_tick = now;
         if confirmed {
             if self.warned {
                 out.push(GapReport::Recovered { secs: now.saturating_duration_since(self.last_confirmed).as_secs() });
@@ -808,8 +821,31 @@ mod short_window_tests {
         }
         assert_eq!(warns, 1, "one WARN per run");
         assert_eq!(g.on_tick(at(t0, 12_000), true, 1000), vec![GapReport::Recovered { secs: 11 }]);
-        // A later run warns again.
-        assert!(g.on_tick(at(t0, 18_000), false, 6000).iter().any(|r| matches!(r, GapReport::Degraded { secs: 6, .. })));
+        // A later run, ticks still arriving, warns again.
+        assert!(g.on_tick(at(t0, 14_000), false, 2000).is_empty());
+        assert!(g.on_tick(at(t0, 16_000), false, 2000).is_empty());
+        assert!(g.on_tick(at(t0, 18_000), false, 2000).iter().any(|r| matches!(r, GapReport::Degraded { secs: 6, .. })));
+    }
+
+    /// [B85] A reconnect is an outage, not a degraded run: the first ticks
+    /// after 36s of silence must not report the silence as a velocity gap
+    /// (production 2026-11-04 01:50 ET). A run that persists after the
+    /// reconnect still warns, measured from the first tick back.
+    #[test]
+    fn an_outage_is_not_reported_as_a_velocity_gap() {
+        let t0 = Instant::now();
+        let mut g = GapTally::new(t0);
+        assert!(g.on_tick(at(t0, 1000), true, 1000).is_empty());
+        // Feed silent 36s, reconnect; the first ticks back have no 1s history.
+        assert!(g.on_tick(at(t0, 37_000), false, 0).is_empty(), "the outage is the reconnect's to report");
+        assert!(g.on_tick(at(t0, 38_000), true, 1000).is_empty(), "no Recovered without a Degraded");
+        // A real run after the reconnect still warns, timed from its own start.
+        let mut degraded = Vec::new();
+        for k in 1..=5u64 {
+            degraded.extend(g.on_tick(at(t0, 38_000 + k * 1000), false, 2000).into_iter()
+                .filter(|r| matches!(r, GapReport::Degraded { .. })));
+        }
+        assert_eq!(degraded, vec![GapReport::Degraded { secs: 5, anchor_age_ms: 2000 }]);
     }
 
     const TOL: u128 = SHORT_WINDOW_ANCHOR_TOLERANCE_MS;
