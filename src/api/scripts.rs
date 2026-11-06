@@ -23,7 +23,7 @@
 //! parameter values) are ordinary config, written through the config PATCH as
 //! `custom_vipers.<name>`; this module only handles the script itself.
 
-use axum::extract::{Path, Query};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -138,11 +138,22 @@ async fn validate(Json(b): Json<ScriptBody>) -> Response {
     }
 }
 
-async fn save(Path(name): Path<String>, Json(b): Json<ScriptBody>) -> Response {
+#[derive(Deserialize)]
+struct SaveQuery {
+    /// The page is creating a viper, not editing one: refuse a name that is
+    /// already taken rather than replace that viper's code.
+    #[serde(default)]
+    create: bool,
+}
+
+async fn save(Path(name): Path<String>, Query(q): Query<SaveQuery>, Json(b): Json<ScriptBody>) -> Response {
     if b.manifest.name != name {
         return bad(StatusCode::BAD_REQUEST, vec![format!("the manifest names '{}', the URL '{name}'", b.manifest.name)]);
     }
     let current = store::get(&name);
+    if q.create && (current.is_some() || store::broken().iter().any(|x| x.name == name)) {
+        return bad(StatusCode::CONFLICT, vec![format!("a viper named '{name}' already exists; pick another name or open it to edit")]);
+    }
     let new = current.is_none();
     // A viper is attached to squadrons by its classes and venues. Narrowing
     // them while it holds a real position would detach it at the next rebuild
@@ -198,10 +209,19 @@ async fn delete(Path(name): Path<String>) -> Response {
 struct DryRunBody {
     squadron: String,
     source: Option<String>,
+    /// The draft's manifest, so a test run of unsaved work reads its own
+    /// parameters; the saved manifest otherwise.
+    manifest: Option<Manifest>,
 }
 
-async fn dry_run(Path(name): Path<String>, Json(b): Json<DryRunBody>) -> Response {
-    match adapter::dry_run(&b.squadron, &name, b.source.as_deref()) {
+async fn dry_run(State(s): State<ApiState>, Path(name): Path<String>, Json(b): Json<DryRunBody>) -> Response {
+    let manifest = match b.manifest.or_else(|| store::get(&name).map(|x| x.manifest.clone())) {
+        Some(m) => m,
+        None => return bad(StatusCode::NOT_FOUND, vec![format!("no script '{name}' and no manifest given")]),
+    };
+    let overrides = s.config_rx.borrow().custom_vipers.get(&name).map(|c| c.params.clone()).unwrap_or_default();
+    let params = manifest.resolve_params(&overrides);
+    match adapter::dry_run(&b.squadron, &name, b.source.as_deref(), &params) {
         Ok(v) => Json(v).into_response(),
         Err(e) => bad(StatusCode::UNPROCESSABLE_ENTITY, vec![e]),
     }

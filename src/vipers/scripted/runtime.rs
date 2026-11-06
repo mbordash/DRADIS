@@ -302,6 +302,14 @@ mod tests {
         }
     }
 
+    /// The decimal methods the Control Tower's Reference tab documents.
+    #[test]
+    fn the_documented_decimal_methods_exist() {
+        let ast = compile("fn entry(ctx) { let x = 2.25; #{ hold: `${x.sqrt().round(2)} ${(-x).abs()} ${x.round(1)} ${x.ln().round(3)} ${0.5.exp().round(3)}` } } fn exit(ctx, pos) { () }").unwrap();
+        let Action::Hold(Some(s)) = call_entry(&ast, ctx(), &mut Dynamic::UNIT).unwrap() else { panic!() };
+        assert_eq!(s, "1.50 2.25 2.2 0.811 1.649", "round() takes halves to the even digit: 2.25 → 2.2");
+    }
+
     #[test]
     fn helpers_are_callable() {
         let ast = compile("fn entry(ctx) { #{ hold: `${round_tick(0.4249)} ${clamp(1.5, 0, 1)} ${norm_cdf(0)} ${min(2, 0.5)} ${taker_fee(0.5) * 100}` } } fn exit(ctx, pos) { () }").unwrap();

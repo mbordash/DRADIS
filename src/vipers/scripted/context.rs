@@ -123,6 +123,12 @@ pub fn build(ctx: &StrategyContext, params: &BTreeMap<String, ParamValue>, acct:
     c.insert("min_shares".into(), d(crate::venues::min_order_shares()));
 
     // ── Operator parameters ──
+    c.insert("params".into(), params_value(params));
+    c
+}
+
+/// `ctx.params` for a set of resolved parameter values.
+pub fn params_value(params: &BTreeMap<String, ParamValue>) -> Dynamic {
     let mut p = Map::new();
     for (k, v) in params {
         p.insert(k.as_str().into(), match v {
@@ -131,8 +137,7 @@ pub fn build(ctx: &StrategyContext, params: &BTreeMap<String, ParamValue>, acct:
             ParamValue::Decimal(x) => d(*x),
         });
     }
-    c.insert("params".into(), Dynamic::from_map(p));
-    c
+    Dynamic::from_map(p)
 }
 
 /// One position as `exit(ctx, pos)` sees it.

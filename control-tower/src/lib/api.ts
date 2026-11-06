@@ -697,3 +697,79 @@ export function refusalText(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
   return `not saved: ${msg}`;
 }
+
+// ── [E86] Build a Viper ─────────────────────────────────────────────────────
+
+/** The engine's problems for a failed script call, or the HTTP error. */
+async function scriptError(res: Response, what: string): Promise<Error> {
+  const text = await res.text();
+  try {
+    const j = JSON.parse(text);
+    if (Array.isArray(j?.problems)) {
+      const e = new Error(j.problems.join('\n'));
+      (e as Error & { problems?: string[] }).problems = j.problems;
+      return e;
+    }
+  } catch { /* not JSON */ }
+  return new Error(`${what} → ${res.status}: ${text}`);
+}
+
+export async function listScripts(): Promise<import('./types').ScriptList> {
+  const res = await fetch(`${BASE}/api/vipers/scripts`, { cache: 'no-store' });
+  if (!res.ok) throw await scriptError(res, 'GET /api/vipers/scripts');
+  return res.json();
+}
+
+export async function getScript(name: string): Promise<import('./types').ScriptDetail> {
+  const res = await fetch(`${BASE}/api/vipers/scripts/${encodeURIComponent(name)}?limit=100`, { cache: 'no-store' });
+  if (!res.ok) throw await scriptError(res, `GET /api/vipers/scripts/${name}`);
+  return res.json();
+}
+
+export async function getScriptTemplates(): Promise<import('./types').ScriptTemplate[]> {
+  const res = await fetch(`${BASE}/api/vipers/scripts/templates`, { cache: 'no-store' });
+  if (!res.ok) throw await scriptError(res, 'GET /api/vipers/scripts/templates');
+  return res.json();
+}
+
+/** `problems` is empty when the manifest and script are both good. */
+export async function validateScript(manifest: import('./types').ScriptManifest, source: string): Promise<string[]> {
+  const res = await fetch(`${BASE}/api/vipers/scripts/validate`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ manifest, source }), cache: 'no-store',
+  });
+  if (!res.ok) throw await scriptError(res, 'POST /api/vipers/scripts/validate');
+  const j = await res.json();
+  return j.problems ?? [];
+}
+
+/** `create`: the page is making a new viper, so a taken name is refused rather
+ *  than that viper's code replaced. */
+export async function saveScript(manifest: import('./types').ScriptManifest, source: string, create = false): Promise<{ version: string; note: string }> {
+  const res = await fetch(`${BASE}/api/vipers/scripts/${encodeURIComponent(manifest.name)}${create ? '?create=true' : ''}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ manifest, source }), cache: 'no-store',
+  });
+  if (!res.ok) throw await scriptError(res, `PUT /api/vipers/scripts/${manifest.name}`);
+  return res.json();
+}
+
+export async function deleteScript(name: string): Promise<void> {
+  const res = await fetch(`${BASE}/api/vipers/scripts/${encodeURIComponent(name)}`, { method: 'DELETE', cache: 'no-store' });
+  if (!res.ok) throw await scriptError(res, `DELETE /api/vipers/scripts/${name}`);
+}
+
+/** `manifest`: the draft's, so an unsaved viper's test run reads its own parameters. */
+export async function dryRunScript(name: string, squadron: string, source?: string, manifest?: import('./types').ScriptManifest): Promise<import('./types').ScriptDryRun> {
+  const res = await fetch(`${BASE}/api/vipers/scripts/${encodeURIComponent(name)}/dry-run`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ squadron, source, manifest }), cache: 'no-store',
+  });
+  if (!res.ok) throw await scriptError(res, `POST /api/vipers/scripts/${name}/dry-run`);
+  return res.json();
+}
+
+export async function resetScriptState(name: string): Promise<void> {
+  const res = await fetch(`${BASE}/api/vipers/scripts/${encodeURIComponent(name)}/reset-state`, { method: 'POST', cache: 'no-store' });
+  if (!res.ok) throw await scriptError(res, `POST /api/vipers/scripts/${name}/reset-state`);
+}

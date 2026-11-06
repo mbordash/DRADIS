@@ -304,6 +304,10 @@ export interface DynamicConfig {
   // ── Helm Viper (the operator's own position, posture-enforced exit) ─────────
   helm_enabled?: boolean;
   helm_live_enabled?: boolean;
+  /** [E86] The operator's scripted vipers, by script name. Merged per script
+   *  by the engine, so a patch naming one viper never drops another's
+   *  settings; `null` for a name removes its settings. */
+  custom_vipers?: Record<string, CustomViperConfig | null>;
   helm_max_exposure_usdc?: string;
   helm_max_open_intents?: number;
   helm_entry_window_secs?: number;
@@ -1254,4 +1258,119 @@ export interface AutoscaleStatus {
   records: AutoscaleRecord[];
   /** Empty while the scaler is off. */
   applied: { squadron: string; strategy: string; factor: string; market_class: string; underlying: string | null; ghost: boolean }[];
+}
+
+// ── [E86] Build a Viper ─────────────────────────────────────────────────────
+
+/** One scripted viper's switches and values (`DynamicConfig.custom_vipers`). */
+export interface CustomViperConfig {
+  /** Runs at all; on by default. Off stops entries only: exits keep running. */
+  enabled?: boolean;
+  /** Real orders, while the instance is live too. Off: the paper ledger. */
+  live?: boolean;
+  /** The operator's cap, if lower than the manifest's. Decimal string. */
+  max_exposure_usdc?: string | number | null;
+  /** Parameter overrides, checked against the manifest by the engine. */
+  params?: Record<string, number | string | boolean>;
+}
+
+export type ScriptParamType = 'decimal' | 'int' | 'bool';
+
+export interface ScriptParam {
+  type: ScriptParamType;
+  default: number | string | boolean;
+  min?: number | string | null;
+  max?: number | string | null;
+  description?: string;
+}
+
+export interface ScriptManifest {
+  name: string;
+  display_name: string;
+  description?: string;
+  classes: string[];
+  /** Empty: every venue. */
+  venues: string[];
+  max_exposure_usdc: number | string;
+  params: Record<string, ScriptParam>;
+}
+
+export interface PaperSummary {
+  open: number;
+  closed: number;
+  scored: number;
+  wins: number;
+  pnl: string;
+  fees: string;
+}
+
+export interface PaperRow {
+  id: number;
+  script: string;
+  squadron_id: string;
+  market: string;
+  side: string;
+  opened_at: string;
+  close_time: string | null;
+  entry_price: string;
+  shares: string;
+  entry_fee: string;
+  take_profit: string | null;
+  entry_reason: string;
+  script_hash: string;
+  closed_at: string | null;
+  exit_price: string | null;
+  exit_fee: string | null;
+  exit_reason: string | null;
+  close_hash: string | null;
+  pnl: string | null;
+}
+
+export interface ScriptListItem {
+  name: string;
+  strategy: string;
+  manifest: ScriptManifest;
+  version: string;
+  saved_at: string;
+  paper: PaperSummary;
+}
+
+export interface ScriptList {
+  scripts: ScriptListItem[];
+  broken: { name: string; error: string }[];
+  venue: string;
+  dry_run_squadrons: { squadron: string; context_at: string }[];
+}
+
+export interface ScriptDetail {
+  name: string;
+  strategy?: string;
+  manifest?: ScriptManifest;
+  source?: string | null;
+  version?: string;
+  saved_at?: string;
+  paper?: PaperSummary;
+  paper_rows?: PaperRow[];
+  open_positions?: number;
+  /** Set when the script on disk did not load. */
+  broken?: string;
+  manifest_raw?: string | null;
+}
+
+export interface ScriptTemplate {
+  id: string;
+  title: string;
+  summary: string;
+  manifest: ScriptManifest;
+  source: string;
+}
+
+export interface ScriptDryRun {
+  squadron: string;
+  context_at: string;
+  context: Record<string, unknown>;
+  entry: { ok?: string; error?: string };
+  exits: { paper_row: number; side: string; exit: { ok?: string; error?: string } }[];
+  micros: number;
+  note: string;
 }

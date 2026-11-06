@@ -2122,6 +2122,30 @@ pub fn reconcile_global_semantics(
         cfg.helm_max_open_intents = global.helm_max_open_intents;
         corrected.push("helm_max_open_intents");
     }
+    // [E86] A scripted viper's Live switch and the operator's cap describe the
+    // instance, like Helm's: the Build a Viper page sets them on the global row,
+    // and a squadron row that missed the fan-out must not keep sending real
+    // orders while the page says paper. A script the global row does not name
+    // is not live anywhere. `enabled` stays per squadron ("Off here"), and the
+    // parameter values follow the fan-out like any other squadron setting.
+    let mut viper_drift = false;
+    for (name, c) in cfg.custom_vipers.iter_mut() {
+        let (live, cap) = global.custom_vipers.get(name).map_or((false, None), |g| (g.live, g.max_exposure_usdc));
+        if c.live != live || c.max_exposure_usdc != cap {
+            c.live = live;
+            c.max_exposure_usdc = cap;
+            viper_drift = true;
+        }
+    }
+    for (name, g) in &global.custom_vipers {
+        if (g.live || g.max_exposure_usdc.is_some()) && !cfg.custom_vipers.contains_key(name) {
+            cfg.custom_vipers.insert(name.clone(), CustomViperConfig { live: g.live, max_exposure_usdc: g.max_exposure_usdc, ..Default::default() });
+            viper_drift = true;
+        }
+    }
+    if viper_drift {
+        corrected.push("custom_vipers (live, cap)");
+    }
     corrected
 }
 
@@ -2724,7 +2748,17 @@ impl DynamicConfig {
             Some(tx) => tx.borrow().clone(),
             None => Self::load_or_default().await,
         };
-        let overridden = reconcile_global_semantics(&mut updated, &global);
+        let mut overridden = reconcile_global_semantics(&mut updated, &global);
+        // A per-squadron "Off here" on a scripted viper inserts an entry with
+        // default switches; reconciling its live/cap to the global row is the
+        // intended outcome, not the patch overreaching. Warn only when the
+        // patch itself named a script's live switch or cap.
+        let named_live_or_cap = patch.get("custom_vipers").and_then(|v| v.as_object()).is_some_and(|m| {
+            m.values().any(|e| e.get("live").is_some() || e.get("max_exposure_usdc").is_some())
+        });
+        if !named_live_or_cap {
+            overridden.retain(|k| *k != "custom_vipers (live, cap)");
+        }
         if !overridden.is_empty() {
             warn!(
                 "⚠️  Squadron [{}] patch by {} tried to set instance-level field(s) {:?} — \
@@ -2797,6 +2831,26 @@ mod custom_viper_patch_tests {
         assert!(!beta.enabled && !beta.live, "fields not in the patch keep their value");
         assert_eq!(beta.params["min_edge"], serde_json::json!(0.04));
         assert!(out.custom_vipers["gamma"].enabled, "a new entry takes the defaults it does not name");
+    }
+
+    /// A squadron row that missed the fan-out cannot keep a script live, or
+    /// make it live, or loosen its cap; its own on/off stays its own.
+    #[test]
+    fn live_and_cap_follow_the_global_row_and_enabled_stays_per_squadron() {
+        let mut global = DynamicConfig::default();
+        global.custom_vipers.insert("alpha".into(), CustomViperConfig { live: false, max_exposure_usdc: Some(Decimal::from(3)), ..Default::default() });
+        global.custom_vipers.insert("beta".into(), CustomViperConfig { live: true, ..Default::default() });
+        let mut sq = DynamicConfig::default();
+        sq.custom_vipers.insert("alpha".into(), CustomViperConfig { enabled: false, live: true, max_exposure_usdc: Some(Decimal::from(50)), ..Default::default() });
+        sq.custom_vipers.insert("ghost".into(), CustomViperConfig { live: true, ..Default::default() });
+        let corrected = reconcile_global_semantics(&mut sq, &global);
+        assert!(corrected.contains(&"custom_vipers (live, cap)"), "{corrected:?}");
+        let a = &sq.custom_vipers["alpha"];
+        assert!(!a.live && a.max_exposure_usdc == Some(Decimal::from(3)), "global says paper, cap 3");
+        assert!(!a.enabled, "the squadron's own Off stays");
+        assert!(!sq.custom_vipers["ghost"].live, "a script the global row does not name is not live");
+        assert!(sq.custom_vipers["beta"].live, "global live reaches a squadron with no row for it");
+        assert!(reconcile_global_semantics(&mut sq, &global).is_empty(), "idempotent");
     }
 
     #[test]

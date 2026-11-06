@@ -670,7 +670,13 @@ impl Strategy for ScriptedStrategy {
 /// squadron handed a script, with a copy of the state, and dispatch nothing.
 /// `source` evaluates unsaved code. Order-path positions are not visible from
 /// here (they live in the venue loop); their exits are evaluated on the tick.
-pub fn dry_run(squadron: &str, script: &str, source: Option<&str>) -> Result<serde_json::Value, String> {
+///
+/// The recorded context is whichever script last ran on that squadron, so its
+/// `params` (and `exposure`) are replaced with this script's: the parameter
+/// values `params` resolves (from the draft's manifest when one is being
+/// tested), and this viper's paper exposure.
+pub fn dry_run(squadron: &str, script: &str, source: Option<&str>,
+               params: &std::collections::BTreeMap<String, crate::vipers::scripted::manifest::ParamValue>) -> Result<serde_json::Value, String> {
     if source.is_some_and(|s| s.len() > store::MAX_SOURCE_BYTES) {
         return Err(format!("the script is over {} KB", store::MAX_SOURCE_BYTES / 1024));
     }
@@ -681,6 +687,11 @@ pub fn dry_run(squadron: &str, script: &str, source: Option<&str>) -> Result<ser
         Some(src) => runtime::compile(src)?,
         None => store::get(script).map(|s| (*s.ast).clone()).ok_or_else(|| format!("no script '{script}'"))?,
     };
+    let mut ctx = last.ctx.clone();
+    ctx.insert("params".into(), context::params_value(params));
+    let exposure: Decimal = paper::cached_all(script).iter().map(PaperRow::cost).sum();
+    ctx.insert("exposure".into(), rhai::Dynamic::from_decimal(exposure));
+    let last = store::LastContext { at: last.at, ctx };
     let mut st = store::state_copy(squadron, script);
     let t = std::time::Instant::now();
     let entry = runtime::call_entry(&ast, last.ctx.clone(), &mut st);
@@ -978,6 +989,26 @@ mod tests {
             "$8.10 held elsewhere plus $2.10 here is over $10");
         let status = serde_json::to_string(&viper_status::snapshot(Some(asset))).unwrap();
         assert!(status.contains("exposure cap"), "{status}");
+    }
+
+    /// Every starter runs against a real context without a script error: a
+    /// template that only compiles could still fail on its first tick.
+    #[tokio::test]
+    async fn every_template_runs_against_a_real_context() {
+        for t in crate::vipers::scripted::templates::all() {
+            let asset = format!("scripttpl{}", t.id.replace('_', ""));
+            let _pool = pool(&asset).await;
+            let mut m: crate::vipers::scripted::manifest::Manifest = serde_json::from_value(t.manifest.clone()).unwrap();
+            m.name = asset.clone();
+            store::insert_hidden_for_test(m, t.source);
+            let strat = ScriptedStrategy::new(&asset);
+            let mut c = ctx(&asset, DynamicConfig::default());
+            c.market.market_close_time = Some(Utc::now() + chrono::Duration::minutes(5));
+            strat.evaluate_entry(&c).await.unwrap();
+            strat.evaluate_exit(&c).await.unwrap();
+            let status = serde_json::to_string(&viper_status::snapshot(Some(&asset))).unwrap();
+            assert!(!status.contains("script error"), "{}: {status}", t.id);
+        }
     }
 
     #[test]

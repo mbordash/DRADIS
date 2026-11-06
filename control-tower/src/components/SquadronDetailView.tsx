@@ -36,6 +36,7 @@ import {
 import ViperCard, { fmtAgo, isTroubled, type AutoscaleBadge } from '@/components/ViperCard';
 import { AdvancedRow } from '@/components/AdvancedConfigModal';
 import OpenPositionsCard from '@/components/OpenPositionsCard';
+import ScriptViperCard from '@/components/ScriptViperCard';
 import HelmIntentsPanel from '@/components/HelmIntentsPanel';
 import { useConfirm } from '@/components/ConfirmDialog';
 import { DEMO_MODE } from '@/lib/demo';
@@ -428,7 +429,10 @@ export default function SquadronDetailView({ squadron, onBack, onOpenMarket }: P
   // dropping it — an unlisted viper erroring silently is exactly what this
   // panel exists to catch.
   const rendered = new Set(activeVipers.map((v) => v.strategyName));
-  const unmapped = (viperStatus ?? []).filter((r) => !rendered.has(r.strategy));
+  // [E86] The operator's scripted vipers report under `Script:<name>` and get
+  // their own card.
+  const scriptRows = (viperStatus ?? []).filter((r) => r.strategy.startsWith('Script:'));
+  const unmapped = (viperStatus ?? []).filter((r) => !rendered.has(r.strategy) && !r.strategy.startsWith('Script:'));
 
 
   // ── Handlers ───────────────────────────────────────────────────────────────
@@ -593,6 +597,14 @@ export default function SquadronDetailView({ squadron, onBack, onOpenMarket }: P
         ) : (
           <div className="card p-6 flex items-center justify-center h-32 text-gray-600 text-sm">
             Loading config…
+          </div>
+        )}
+
+        {config && scriptRows.length > 0 && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 mt-3">
+            {scriptRows.map((r) => (
+              <ScriptViperCard key={r.strategy} row={r} config={config} onPatch={handlePatch} />
+            ))}
           </div>
         )}
 

@@ -28,6 +28,7 @@ import SquadronsPanel  from '@/components/SquadronsPanel';
 import SquadronDetailView from '@/components/SquadronDetailView';
 import TradelogPage    from '@/components/TradelogPage';
 import HelmPage        from '@/components/HelmPage';
+import BuildViperPage  from '@/components/BuildViperPage';
 import TakeTheHelmModal from '@/components/TakeTheHelmModal';
 import SetupPage       from '@/components/SetupPage';
 import AiActionsPage   from '@/components/AiActionsPage';
@@ -518,7 +519,7 @@ function PortfolioValueBanner({
 
 // ── Top-level nav ─────────────────────────────────────────────────────────────
 
-type AppView = 'main' | 'telemetry' | 'markets' | 'tradelog' | 'helm' | 'ai' | 'console' | 'setup';
+type AppView = 'main' | 'telemetry' | 'markets' | 'tradelog' | 'helm' | 'vipers' | 'ai' | 'console' | 'setup';
 
 /**
  * The app's location, encoded in the URL hash.
@@ -562,6 +563,8 @@ const VIEW_DEFS: { id: AppView; label: string; icon: string }[] = [
   // carries a thesis, a stated probability, a falsification condition and a
   // critique — none of which fit a trade row, and all of which are the point.
   { id: 'helm',      label: 'Helm',       icon: '🧭' },
+  // [E86] The operator's own strategies, written as scripts.
+  { id: 'vipers',    label: 'Build a Viper', icon: '🛠️' },
   { id: 'ai',        label: 'AI Actions', icon: '🤖' },
   { id: 'console',   label: 'Console',    icon: '🖥️' },
   { id: 'setup',     label: 'Setup',      icon: '⚙️' },
@@ -1061,6 +1064,17 @@ export default function DashboardPage() {
           <DarkFeedBanner feeds={status?.dark_market_feeds} />
           <OddsFeedBanner feed={status?.odds_feed} />
           <TradelogPage availableAssets={availableAssets} />
+          <Footer />
+        </main>
+      )}
+
+      {/* ── Build a Viper view ──────────────────────────────────────────────── */}
+      {activeView === 'vipers' && (
+        <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+          {config?.ghost_mode && <GhostBanner ghost />}
+          <ErrorBoundary label="Build a Viper">
+            <BuildViperPage />
+          </ErrorBoundary>
           <Footer />
         </main>
       )}

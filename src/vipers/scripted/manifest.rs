@@ -92,7 +92,16 @@ const RESERVED: &[&str] = &[
     "is_shared", "object", "func", "macro", "include", "def",
 ];
 
+/// Names the scripts API uses as routes of its own.
+const ROUTE_NAMES: &[&str] = &["templates", "validate"];
+
+/// A script name: a valid identifier that is not one of the API's own routes.
 pub fn valid_name(name: &str) -> bool {
+    !ROUTE_NAMES.contains(&name) && valid_ident(name)
+}
+
+/// 3-32 characters of a-z, 0-9 and _, starting with a letter.
+pub fn valid_ident(name: &str) -> bool {
     (3..=32).contains(&name.len())
         && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
         && name.as_bytes()[0].is_ascii_lowercase()
@@ -102,7 +111,9 @@ impl Manifest {
     /// Every problem with the manifest, so the page can show them all at once.
     pub fn problems(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if !valid_name(&self.name) {
+        if ROUTE_NAMES.contains(&self.name.as_str()) {
+            out.push(format!("name '{}' is reserved by the scripts API", self.name));
+        } else if !valid_name(&self.name) {
             out.push(format!("name '{}' must be 3-32 characters of a-z, 0-9 and _, starting with a letter", self.name));
         }
         if self.display_name.trim().is_empty() || self.display_name.len() > 64 {
@@ -128,7 +139,7 @@ impl Manifest {
             out.push(format!("at most {MAX_PARAMS} params"));
         }
         for (k, p) in &self.params {
-            if !valid_name(k) {
+            if !valid_ident(k) {
                 out.push(format!("param name '{k}' must be 3-32 characters of a-z, 0-9 and _, starting with a letter"));
             } else if RESERVED.contains(&k.as_str()) {
                 out.push(format!("param name '{k}' is a reserved word in the script language"));
