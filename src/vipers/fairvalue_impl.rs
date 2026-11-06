@@ -2559,9 +2559,9 @@ impl Strategy for FairValueStrategyImpl {
 ///   live rule priced on rides along from the stop's own emission
 ///   (`note_emission`, rule 4), so the counterfactual uses the same
 ///   `entry × (1 − 2 × stop)` the live floor would have.
-/// * **The resolution comes from the venue**, by the same Gamma rule the sports
-///   ledger and GBoost's shadow lane use (`settled_prices_for_market`: $0 or
-///   $1 outright, $0.50 only when UMA reports `resolved`). Not from the oracle:
+/// * **The resolution comes from the venue**, through the resolver each venue
+///   installs (`venues::core::resolve_leg`), as GBoost's and Anchor's shadow
+///   lanes do: only a final $0 or $1 scores a row. Not from the oracle:
 ///   the model's strike and Binance print are an approximation of the venue's
 ///   resolution source, and a measurement meant to settle a real-money
 ///   question should not inherit the model's own errors. The probe starts
@@ -2615,8 +2615,8 @@ impl Strategy for FairValueStrategyImpl {
 /// which positions exist to be stopped.
 pub(crate) mod stop_counterfactual {
     use std::collections::HashMap;
-    use std::sync::{Mutex as StdMutex, OnceLock};
-    use std::time::{Duration, Instant};
+    use std::sync::Mutex as StdMutex;
+    use std::time::Instant;
 
     use chrono::{DateTime, Utc};
     use rust_decimal::Decimal;
@@ -2638,7 +2638,6 @@ pub(crate) mod stop_counterfactual {
     /// Past this, an undecided row is closed unscored — the same bound the
     /// live settlement sweep and the GBoost shadow lane use.
     pub(crate) const GIVE_UP_SECS: i64 = 24 * 3600;
-    const HTTP_TIMEOUT_SECS: u64 = 5;
     /// Emissions older than this are forgotten; a stop that has not filled in
     /// two hours belongs to a market that has rotated away.
     const EMISSION_TTL_SECS: i64 = 2 * 3600;
@@ -2745,16 +2744,6 @@ pub(crate) mod stop_counterfactual {
 
     fn state(asset: &str) -> &'static StdMutex<State> {
         &super::globals(asset).stop_shadow
-    }
-
-    fn http() -> &'static reqwest::Client {
-        static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-        CLIENT.get_or_init(|| {
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-                .build()
-                .unwrap_or_default()
-        })
     }
 
     fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
@@ -2864,6 +2853,17 @@ pub(crate) mod stop_counterfactual {
             // Recording is off (rule 4 notes nothing), or the stop was priced
             // by a process that has since restarted. Either way there is no
             // floor to measure against, and a row without one would be a guess.
+            //
+            // Said out loud, because this used to return silently: the three
+            // Kalshi stops of 2026-10-18 opened no row and left nothing in the
+            // log to say why. With recording on, a miss here is worth a line.
+            if lock(state(&fill.asset)).emissions.is_empty() {
+                info!("🔭 FairValue stop counterfactual: stop on {} {} not recorded — no stop emission noted (recorder off, or the engine restarted since)",
+                      fill.market_name, fill.side);
+            } else {
+                warn!("🔭 FairValue stop counterfactual: stop on {} {} not recorded — no emission matches token {} opened {}",
+                      fill.market_name, fill.side, fill.token_id.as_str(), fill.opened_at.to_rfc3339());
+            }
             return;
         };
         let Some(open) = open_for(fill, &e) else { return };
@@ -2980,18 +2980,26 @@ pub(crate) mod stop_counterfactual {
             (probes, scores, abandons)
         };
 
-        // Spawned, never awaited here: a Gamma call is allowed five seconds and
+        // Spawned, never awaited here: a venue call can take seconds and
         // `evaluate_exit` runs inside the orchestrator's per-strategy timeout.
+        //
+        // Through the venue's installed resolver (`venues::core::resolve_leg`),
+        // as the GBoost and Anchor shadow lanes do. This probe used to ask
+        // Polymarket's Gamma directly by condition id, so on Kalshi and US no
+        // row could ever be scored: each would have been written off after a
+        // day. `cid` is the handle Polymarket International's resolver keys
+        // on; the other venues ignore it. Anything but a final price is "not
+        // yet".
         for (cid, token) in probes {
             let asset_c = asset.clone();
             tokio::spawn(async move {
-                let got = crate::raptors::sports_ledger::settled_prices_for_market(
-                    http(), &cid, std::slice::from_ref(&token),
-                ).await;
-                if let Some(px) = got.get(&token).copied() {
-                    let mut st = lock(state(&asset_c));
-                    st.resolved.insert(token, px);
-                    if st.resolved.len() > 512 { st.resolved.clear(); }
+                let got = crate::venues::core::resolve_leg(&cid, &MarketId::new(token.as_str())).await;
+                if let Some(crate::venues::core::TokenResolution::Resolved(px)) = got {
+                    if let Some(px) = px.to_f64() {
+                        let mut st = lock(state(&asset_c));
+                        st.resolved.insert(token, px);
+                        if st.resolved.len() > 512 { st.resolved.clear(); }
+                    }
                 }
             });
         }

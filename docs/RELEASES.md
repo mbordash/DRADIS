@@ -6,7 +6,9 @@ version's release notes field; the detail below it is the full account.
 
 ## 1.6.1 (unreleased)
 
-- Settings that only one venue uses are now shown only on that venue. A Kalshi instance's Setup > Risk & Engine tab used to show an Engine card made entirely of Polymarket settings (the two Polymarket fee rates, the order book price-change feed, the USDC.e collateral sweep); on Kalshi that card no longer appears. The same applies to three Polymarket International settings on strategy cards (Momentum and Convergence Resting Take Profit, FairValue Stop Counterfactual Recorder), and the Kalshi Sports Game Series setting no longer appears on Polymarket instances. Nothing about trading changes, and the engine still accepts every setting, so a config bundle moves between venues as before. The LLM Advisor is no longer offered settings the venue ignores.
+- Settings that only one venue uses are now shown only on that venue. A Kalshi instance's Setup > Risk & Engine tab used to show an Engine card made entirely of Polymarket settings (the two Polymarket fee rates, the order book price-change feed, the USDC.e collateral sweep); on Kalshi that card no longer appears. The same applies to two Polymarket International settings on strategy cards (Momentum and Convergence Resting Take Profit), and the Kalshi Sports Game Series setting no longer appears on Polymarket instances. Nothing about trading changes, and the engine still accepts every setting, so a config bundle moves between venues as before. The LLM Advisor is no longer offered settings the venue ignores.
+
+- FairValue's Stop Counterfactual Recorder now works on Kalshi and Polymarket US. For each position FairValue's stop closes, it records what holding to settlement would have returned instead, so the stop's width can be tuned from evidence. It looked the result up only on Polymarket International, so on the other venues no stop could ever be scored. It now asks each venue for its own settlement, as GBoost's and Anchor's simulated trades already do. A stop that fills without a matching record now says so in the log instead of being skipped silently.
 
 ## 1.6.0 (2026-11-05)
 

@@ -1030,7 +1030,7 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              behind it: every dollar of FairValue's net loss sat in its stop exits while its holds to settlement \
              were all profitable — a split the stop produces by selecting the bad paths, which only scoring those \
              paths at settlement can settle. Read the record at GET /api/fairvalue/stop-counterfactual?asset=btc. \
-             Polymarket International only: the resolution comes from Gamma.").venues(VENUE_INTL));
+             Every venue: the row is scored at the venue's own settlement."));
         v.push(F::new(g, e, "fairvalue_post_exit_cooldown_secs", "Post-Exit Cooldown", "secs", true,
             "Seconds a token is locked out after any FairValue exit. Second entries into a market the viper had \
              just left went 0-for-4 for −$1.88 gross on 2026-08-13/14 while first entries were flat, and the \
