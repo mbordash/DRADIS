@@ -4,6 +4,10 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
+## 1.6.1 (unreleased)
+
+- Settings that only one venue uses are now shown only on that venue. A Kalshi instance's Setup > Risk & Engine tab used to show an Engine card made entirely of Polymarket settings (the two Polymarket fee rates, the order book price-change feed, the USDC.e collateral sweep); on Kalshi that card no longer appears. The same applies to three Polymarket International settings on strategy cards (Momentum and Convergence Resting Take Profit, FairValue Stop Counterfactual Recorder), and the Kalshi Sports Game Series setting no longer appears on Polymarket instances. Nothing about trading changes, and the engine still accepts every setting, so a config bundle moves between venues as before. The LLM Advisor is no longer offered settings the venue ignores.
+
 ## 1.6.0 (2026-11-05)
 
 - Capital Auto-Scaler (new, off by default): sizes each strategy by its own recent results in its own squadron. While on, a strategy's entry orders grow while it makes money on the capital it risks and shrink while it loses, between a floor and a ceiling (defaults 0.5× and 2×). The measure is return on capital, realized profit or loss over the dollars risked across its last 30 closed trades, not win rate, which on a yes/no contract says nothing without the price paid. Nothing moves before 20 closed trades. Growth stops at a per-order dollar limit (default $25, both legs of a pair together; 0 means never grow), at the strategy's own Max Exposure counting what it already holds, and while the daily drawdown breaker is tripped; shrinking stops at the venue's minimum order size. Exits and Helm entries are never scaled, and simulated and real results are never mixed. Set it in Setup → Risk & Engine, where a table shows each strategy's record and the multiplier it earns; each strategy card shows the multiplier in force. The settings are instance-wide and not part of the risk profiles, so applying a profile never changes them.

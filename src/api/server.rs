@@ -3249,7 +3249,8 @@ async fn get_autoscale() -> Response {
 
 async fn get_config_schema() -> Response {
     debug!("Received GET /api/config/schema");
-    Json(crate::api::config_schema::config_schema()).into_response()
+    // Only the fields this build reads; see `ConfigFieldSchema::venues`.
+    Json(crate::api::config_schema::config_schema_for_venue(crate::venues::venue_name())).into_response()
 }
 
 /// GET /api/squadrons/{id}/config

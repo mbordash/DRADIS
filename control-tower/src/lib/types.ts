@@ -349,6 +349,9 @@ export interface ConfigFieldSchema {
   /** Market classes this field applies to; absent or null means every class.
    *  A viper card on a squadron of another class leaves the field out. */
   market_classes?: string[] | null;
+  /** Venue builds this field means anything on; absent or null means every venue.
+   *  The engine already leaves out fields the running venue ignores. */
+  venues?: string[] | null;
   /**
    * Which config row this field lives in. 'global' fields are written by
    * PATCH /api/config and read instance-wide; 'squadron' fields are written by

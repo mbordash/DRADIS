@@ -152,6 +152,33 @@ pub struct ConfigFieldSchema {
     /// it there (production, 2026-10-17) reads as a switch the operator should
     /// understand when it is one they can safely ignore.
     pub market_classes: Option<&'static [&'static str]>,
+    /// The venue builds this field means anything on (`venues::venue_name()`
+    /// values), or `None` for every venue. `GET /api/config/schema` leaves out
+    /// a field the running build ignores: until 1.6.1 a Kalshi instance's
+    /// Setup › Risk & Engine showed an Engine card of nothing but Polymarket
+    /// settings (fee rates, the book feed, the USDC.e sweep), told apart only
+    /// by a line in each tooltip. The engine still accepts every key, so a
+    /// config bundle moves between venues unchanged.
+    pub venues: Option<&'static [&'static str]>,
+}
+
+/// Venue tags for [`ConfigFieldSchema::venues`].
+pub const VENUE_INTL: &[&str] = &["intl_clob"];
+pub const VENUE_US: &[&str] = &["us_retail"];
+pub const VENUE_KALSHI: &[&str] = &["kalshi"];
+
+impl ConfigFieldSchema {
+    /// Does this field mean anything on the `venue` build?
+    pub fn applies_to_venue(&self, venue: &str) -> bool {
+        self.venues.is_none_or(|v| v.contains(&venue))
+    }
+}
+
+/// The schema as the running build shows it: [`config_schema`] without the
+/// fields this venue ignores. What the Control Tower renders and the LLM
+/// Advisor is offered; validation keeps the full schema.
+pub fn config_schema_for_venue(venue: &str) -> Vec<ConfigFieldSchema> {
+    config_schema().into_iter().filter(|f| f.applies_to_venue(venue)).collect()
 }
 
 impl ConfigFieldSchema {
@@ -172,8 +199,10 @@ impl ConfigFieldSchema {
             // it from the group so the two can never disagree.
             scope: ConfigScope::Squadron,
             market_classes: None,
+            venues: None,
         }
     }
+    fn venues(mut self, venues: &'static [&'static str]) -> Self { self.venues = Some(venues); self }
     fn classes(mut self, classes: &'static [&'static str]) -> Self { self.market_classes = Some(classes); self }
     fn range(mut self, min: f64, max: f64) -> Self { self.min = Some(min); self.max = Some(max); self }
     fn min(mut self, min: f64) -> Self { self.min = Some(min); self }
@@ -198,7 +227,8 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
          legs of a round trip; makers pay nothing. Recorded P&L is net of it. 0.07 is the rate measured \
          from actual collateral movement — the venue's fee-rate endpoint advertises 1000 bps, but that is \
          the ceiling an order authorizes, not what is charged. Only change this if Polymarket's schedule \
-         changes; setting it wrong silently skews every recorded trade.").range(0.0, 0.5).step(0.005));
+         changes; setting it wrong silently skews every recorded trade.").range(0.0, 0.5).step(0.005)
+        .venues(VENUE_INTL));
     v.push(F::new("Global", None, "us_taker_fee_rate", "Polymarket US Taker Fee Rate", "pct", true,
         "Polymarket US only. The venue's taker fee coefficient: fee = rate × price × (1 − price) × shares on \
          every fill that crosses the spread, entry and exit alike; a resting post-only order pays nothing and \
@@ -207,7 +237,7 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
          effective July 2026) and the feeCoefficient the gateway sends on every market; DRADIS logs a warning \
          at deploy if a market publishes a different one. DRADIS carried this as zero before 2026-09-09, \
          which silently switched off every fee gate on the venue — setting it to zero does that again.")
-        .range(0.0, 0.5).step(0.005));
+        .range(0.0, 0.5).step(0.005).venues(VENUE_US));
     v.push(F::new("Global", None, "book_apply_price_changes", "Apply Price Changes", "bool", false,
         "Polymarket International only. Keep the order book current between trades by folding the \
          venue's price_change messages (order placements and cancellations) into the book. Off, the \
@@ -216,7 +246,8 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
          $0.67 and sold a winning position at a loss. Leave this on. It is a kill switch: turn it off \
          only if the log shows repeated 'Book feed inconsistent' warnings, which means the venue's \
          message shape has changed and the feed is already protecting itself by falling back to the \
-         last full snapshot. Instance-wide, like Ghost Mode — the feed reads the global setting."));
+         last full snapshot. Instance-wide, like Ghost Mode — the feed reads the global setting.")
+        .venues(VENUE_INTL));
     v.push(F::new("Global", None, "collateral_sweep_enabled", "Collateral Sweep", "bool", false,
         "Polymarket International only. Wrap settlement proceeds that arrive in your Safe as USDC.e \
          back into pUSD, the collateral the exchange trades. Polymarket still mints its crypto hourly \
@@ -227,11 +258,11 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
          from your Safe paid for by your signer's gas, and logs both hashes. Off, the stranded amount \
          is still shown on the main page and in the log so nothing is hidden. Off by default because \
          it moves funds on-chain; turn it on once you have seen the stranded figure and want it back \
-         in play."));
+         in play.").venues(VENUE_INTL));
     v.push(F::new("Global", None, "collateral_sweep_min_usdc", "Sweep Minimum", "usd", true,
-        "Smallest stranded USDC.e balance worth a sweep, in dollars. Each sweep costs one or two Polygon \
+        "Polymarket International only. Smallest stranded USDC.e balance worth a sweep, in dollars. Each sweep costs one or two Polygon \
          transactions of gas, so dust below this is left in the Safe; anything at or above it is wrapped \
-         in full.").range(0.01, 1000.0).step(0.5).unit("USDC"));
+         in full.").range(0.01, 1000.0).step(0.5).unit("USDC").venues(VENUE_INTL));
 
     // ── Arbitrage ───────────────────────────────────────────────────────────────
     {
@@ -465,7 +496,8 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              exits still cross with a FAK, and the patrol pulls the ask before any of them needs the shares. Only \
              the winning leg goes fee-free — a stop still pays both legs — so the edge the signal must supply above \
              a coin flip falls by about a quarter, not by half. Polymarket International only: Kalshi and Polymarket \
-             US ignore the signal and keep the taker take-profit. Off restores the taker take-profit everywhere."));
+             US ignore the signal and keep the taker take-profit. Off restores the taker take-profit everywhere.")
+            .venues(VENUE_INTL));
     }
 
     // ── Maker ─────────────────────────────────────────────────────────────────
@@ -839,7 +871,7 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              with a FAK, and the patrol pulls the ask before any of them needs the shares. Only the winning leg \
              goes fee-free: at $0.65 on a 7% target the break-even hit rate falls from 87% to 77%, which is a \
              cheaper trade, not a tradeable one. Polymarket International only: Kalshi and Polymarket US ignore \
-             the signal and keep the taker take-profit."));
+             the signal and keep the taker take-profit.").venues(VENUE_INTL));
     }
 
     // ── FairValue ─────────────────────────────────────────────────────────────
@@ -998,7 +1030,7 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              behind it: every dollar of FairValue's net loss sat in its stop exits while its holds to settlement \
              were all profitable — a split the stop produces by selecting the bad paths, which only scoring those \
              paths at settlement can settle. Read the record at GET /api/fairvalue/stop-counterfactual?asset=btc. \
-             Polymarket International only: the resolution comes from Gamma."));
+             Polymarket International only: the resolution comes from Gamma.").venues(VENUE_INTL));
         v.push(F::new(g, e, "fairvalue_post_exit_cooldown_secs", "Post-Exit Cooldown", "secs", true,
             "Seconds a token is locked out after any FairValue exit. Second entries into a market the viper had \
              just left went 0-for-4 for −$1.88 gross on 2026-08-13/14 while first entries were flat, and the \
@@ -1097,7 +1129,8 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              the slot stays empty until one does. Only game series are accepted — every Kalshi game \
              series ends in GAME, MATCH or FIGHT — and anything else you enter is ignored with a \
              warning in the log, so the list cannot put a coaching or awards market in the slot. \
-             The full catalog is at kalshi.com under each sport; the series ticker is in the URL."));
+             The full catalog is at kalshi.com under each sport; the series ticker is in the URL.")
+            .venues(VENUE_KALSHI));
         v.push(F::new(g, e, "event_market_retire_grace_secs", "Event Market Retire Delay", "secs", false,
             "How long a politics or sports squadron waits after its market closes before standing \
              itself down, in seconds. Standing down is what frees the class: DRADIS runs one \
@@ -1783,6 +1816,61 @@ mod tests {
             "these groups match no Control Tower card, so their knobs render nowhere: \
              {orphans:?} — the cards are {cards:?}",
         );
+    }
+
+    /// A description that says a field works on one venue must carry the tag,
+    /// so the Control Tower hides it elsewhere; the prose alone is how a Kalshi
+    /// Setup page came to show a card of Polymarket settings.
+    #[test]
+    fn a_field_described_as_one_venue_only_is_tagged_for_it() {
+        let cases: &[(&str, &[&str])] = &[
+            ("Polymarket International only", VENUE_INTL),
+            ("Polymarket US only", VENUE_US),
+            ("Kalshi only", VENUE_KALSHI),
+        ];
+        let mut wrong = Vec::new();
+        for f in config_schema() {
+            for (phrase, venues) in cases {
+                if f.description.contains(phrase) && f.venues != Some(*venues) {
+                    wrong.push(format!("{} says '{phrase}' but is tagged {:?}", f.key, f.venues));
+                }
+            }
+            // "Taker Fee Rate" is International's; its prose names Polymarket, not the build.
+            if f.key == "intl_taker_fee_rate" && f.venues != Some(VENUE_INTL) {
+                wrong.push("intl_taker_fee_rate must be tagged International".into());
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[test]
+    fn venue_tags_name_real_builds() {
+        for f in config_schema() {
+            for v in f.venues.unwrap_or(&[]) {
+                assert!(["intl_clob", "us_retail", "kalshi"].contains(v), "{}: unknown venue {v}", f.key);
+            }
+        }
+    }
+
+    /// On Kalshi the Engine card (the Global group less Ghost Mode, which the
+    /// header owns) has nothing left and so is not drawn; on International all
+    /// of its settings stay.
+    #[test]
+    fn kalshi_shows_no_polymarket_engine_settings() {
+        let engine = |venue: &str| -> Vec<&'static str> {
+            config_schema_for_venue(venue).into_iter()
+                .filter(|f| f.group == "Global" && f.key != "ghost_mode")
+                .map(|f| f.key).collect()
+        };
+        assert!(engine("kalshi").is_empty(), "{:?}", engine("kalshi"));
+        assert_eq!(engine("us_retail"), vec!["us_taker_fee_rate"]);
+        assert!(engine("intl_clob").contains(&"collateral_sweep_enabled"));
+        assert!(!engine("intl_clob").contains(&"us_taker_fee_rate"));
+        // Kalshi's own setting appears there and nowhere else.
+        let has = |venue: &str| config_schema_for_venue(venue).iter().any(|f| f.key == "kalshi_sports_game_series");
+        assert!(has("kalshi") && !has("intl_clob") && !has("us_retail"));
+        // The full schema, which validation reads, keeps every field.
+        assert!(config_schema().iter().any(|f| f.key == "book_apply_price_changes"));
     }
 
     #[test]

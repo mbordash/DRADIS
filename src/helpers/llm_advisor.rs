@@ -1362,7 +1362,8 @@ fn build_user_prompt(
     lines.push("Use ONLY these exact keys in the proposals json block (key = current [min..max]):".to_string());
     lines.push("(A parameter not listed below cannot be changed; do not propose it.)".to_string());
     let cfg_json = serde_json::to_value(dyn_cfg).unwrap_or(serde_json::Value::Null);
-    for f in crate::api::config_schema::config_schema() {
+    // A key this venue's build ignores is not offered (`ConfigFieldSchema::venues`).
+    for f in crate::api::config_schema::config_schema_for_venue(crate::venues::venue_name()) {
         if f.advanced {
             continue;
         }
