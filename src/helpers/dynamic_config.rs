@@ -482,6 +482,58 @@ fn default_trendreversal_mode()                -> bool    { config::TRENDREVERSA
 
 // ─── Struct ──────────────────────────────────────────────────────────────────
 
+/// [E86] One scripted viper's settings (`DynamicConfig::custom_vipers`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CustomViperConfig {
+    /// Runs at all. On by default: a viper that is not live only paper-trades.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Sends real orders. Off by default, and real only while the instance is
+    /// live too; with this off the viper paper-trades in its own ledger.
+    #[serde(default)]
+    pub live: bool,
+    /// The operator's cap, if lower than the manifest's. The adapter enforces
+    /// the smaller of the two.
+    #[serde(default)]
+    pub max_exposure_usdc: Option<Decimal>,
+    /// Parameter overrides, checked against the manifest each time they are read.
+    #[serde(default)]
+    pub params: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+fn default_true() -> bool { true }
+
+/// Layer a config patch over the current config's JSON: each top-level field
+/// in the patch replaces the current one, except `custom_vipers`, which merges
+/// per script so that saving one script's settings cannot drop another's.
+/// Inside one script's entry the patch's fields replace the current ones
+/// (`params` as a whole), and a `null` entry removes the script's settings.
+fn merge_patch_into(obj: &mut serde_json::Map<String, serde_json::Value>, patch: &serde_json::Map<String, serde_json::Value>) {
+    for (k, v) in patch {
+        if k == "custom_vipers" {
+            if let (Some(cur), Some(p)) = (obj.get_mut(k).and_then(|c| c.as_object_mut()), v.as_object()) {
+                for (name, entry) in p {
+                    match (entry, cur.get_mut(name).and_then(|e| e.as_object_mut())) {
+                        (serde_json::Value::Null, _) => { cur.remove(name); }
+                        (serde_json::Value::Object(fields), Some(existing)) => {
+                            for (f, fv) in fields { existing.insert(f.clone(), fv.clone()); }
+                        }
+                        _ => { cur.insert(name.clone(), entry.clone()); }
+                    }
+                }
+                continue;
+            }
+        }
+        obj.insert(k.clone(), v.clone());
+    }
+}
+
+impl Default for CustomViperConfig {
+    fn default() -> Self {
+        Self { enabled: true, live: false, max_exposure_usdc: None, params: Default::default() }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DynamicConfig {
     // ── Global ────────────────────────────────────────────────────────────────
@@ -1409,6 +1461,13 @@ pub struct DynamicConfig {
     /// May Helm place REAL orders? Ships off; simulated squadrons ignore it.
     #[serde(default = "default_helm_live_enabled")]
     pub helm_live_enabled: bool,
+    /// [E86] Settings of the operator's scripted vipers, by script name
+    /// (`vipers::scripted`). One generic entry per script instead of a field
+    /// per viper: a script the operator writes after the build has no field.
+    /// Missing entries mean the defaults (on, paper, the manifest's cap and
+    /// parameter defaults), so the risk profiles need no change.
+    #[serde(default)]
+    pub custom_vipers: std::collections::BTreeMap<String, CustomViperConfig>,
     /// Ceiling on total Helm notional across every Helm squadron (shared session).
     #[serde(default = "default_helm_max_exposure_usdc")]
     pub helm_max_exposure_usdc: Decimal,
@@ -1812,6 +1871,7 @@ impl Default for DynamicConfig {
             anchor_exit_fair_edge: config::ANCHOR_EXIT_FAIR_EDGE,
             helm_enabled: config::HELM_ENABLED,
             helm_live_enabled: config::HELM_LIVE_ENABLED,
+            custom_vipers: Default::default(),
             helm_max_exposure_usdc: config::HELM_MAX_EXPOSURE_USDC,
             helm_fee_verdict_enforce: config::HELM_FEE_VERDICT_ENFORCE,
             helm_fee_max_ratio: config::HELM_FEE_MAX_RATIO,
@@ -2160,7 +2220,10 @@ impl DynamicConfig {
             // is still the operator's declaration. `helm_live_enabled` gates
             // real orders separately.
             "helm"         => self.helm_enabled,
-            _ => true,
+            k => match k.strip_prefix(crate::vipers::scripted::store::KIND_PREFIX) {
+                Some(name) => self.custom_vipers.get(name).is_none_or(|c| c.enabled),
+                None => true,
+            },
         }
     }
 
@@ -2438,9 +2501,7 @@ impl DynamicConfig {
 
         // Merge: patch fields overwrite current fields; unknown keys are ignored.
         if let (Some(obj), Some(patch_obj)) = (value.as_object_mut(), patch.as_object()) {
-            for (k, v) in patch_obj {
-                obj.insert(k.clone(), v.clone());
-            }
+            merge_patch_into(obj, patch_obj);
         }
 
         let updated: DynamicConfig = serde_json::from_value(value)?;
@@ -2471,7 +2532,10 @@ impl DynamicConfig {
             "bookline"     => self.bookline_enabled,
             "anchor"       => self.anchor_enabled,
             "helm"         => self.helm_enabled,
-            _ => return None,
+            k => match k.strip_prefix(crate::vipers::scripted::store::KIND_PREFIX) {
+                Some(name) => self.custom_vipers.get(name).is_none_or(|c| c.enabled),
+                None => return None,
+            },
         })
     }
 
@@ -2635,9 +2699,7 @@ impl DynamicConfig {
         refuse_ceiling_violations(&patch)?;
 
         if let (Some(obj), Some(patch_obj)) = (value.as_object_mut(), patch.as_object()) {
-            for (k, v) in patch_obj {
-                obj.insert(k.clone(), v.clone());
-            }
+            merge_patch_into(obj, patch_obj);
         }
 
         let mut updated: DynamicConfig = serde_json::from_value(value)?;
@@ -2712,6 +2774,39 @@ impl DynamicConfig {
 }
 
 
+
+#[cfg(test)]
+mod custom_viper_patch_tests {
+    use super::*;
+
+    #[test]
+    fn a_patch_to_one_script_keeps_the_others_and_null_removes_one() {
+        let mut cfg = DynamicConfig::default();
+        cfg.custom_vipers.insert("alpha".into(), CustomViperConfig { live: true, ..Default::default() });
+        cfg.custom_vipers.insert("beta".into(), CustomViperConfig::default());
+        let mut v = serde_json::to_value(&cfg).unwrap();
+        let patch = serde_json::json!({ "custom_vipers": {
+            "beta": { "enabled": false, "params": { "min_edge": 0.04 } },
+            "gamma": { "live": false },
+            "alpha": null
+        }});
+        merge_patch_into(v.as_object_mut().unwrap(), patch.as_object().unwrap());
+        let out: DynamicConfig = serde_json::from_value(v).unwrap();
+        assert!(!out.custom_vipers.contains_key("alpha"), "null removes a script's settings");
+        let beta = &out.custom_vipers["beta"];
+        assert!(!beta.enabled && !beta.live, "fields not in the patch keep their value");
+        assert_eq!(beta.params["min_edge"], serde_json::json!(0.04));
+        assert!(out.custom_vipers["gamma"].enabled, "a new entry takes the defaults it does not name");
+    }
+
+    #[test]
+    fn a_config_without_the_field_reads_as_no_custom_vipers() {
+        let mut v = serde_json::to_value(DynamicConfig::default()).unwrap();
+        v.as_object_mut().unwrap().remove("custom_vipers");
+        let out: DynamicConfig = serde_json::from_value(v).unwrap();
+        assert!(out.custom_vipers.is_empty(), "an older saved config still loads");
+    }
+}
 
 #[cfg(test)]
 mod tests {

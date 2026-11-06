@@ -4931,6 +4931,8 @@ pub async fn run_api_server(
     // Helm intents: the operator's conviction record. Mounted here so the
     // API-key and read-only gates below apply to its writes like any other.
     let protected_routes = protected_routes.merge(crate::api::helm::routes());
+    // [E86] Build a Viper: the operator's scripted vipers.
+    let protected_routes = protected_routes.merge(crate::api::scripts::routes());
     // The Markets page: live markets, each with the venue's picture and the engine's own view.
     let protected_routes = protected_routes.merge(crate::api::markets::routes());
 

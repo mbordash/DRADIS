@@ -35,6 +35,7 @@ pub mod anchor_impl;
 pub mod bookline_impl;
 pub mod bookline_board;
 pub mod helm_impl;
+pub mod scripted;
 
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;

@@ -359,9 +359,8 @@ export default function TakeTheHelmModal({ isOpen, onClose, onDone, initialMarke
           {(step === 'market' || step === 'deploying') && (
             <>
               <p className="text-xs font-mono text-gray-400">
-                Pick the market. The squadron you deploy carries one viper, Helm, and no Raptors — whatever the
-                venue files the market under, it resolves to class <span className="text-teal-300">helm</span>.
-                The posture you state next is the whole exit plan.
+                Pick a market for <span className="text-teal-300">Helm</span> to trade. Helm runs it alone, with no
+                other vipers or signal feeds. Next you set the exit plan, and the engine follows exactly that.
               </p>
               {!initialMarket && <div className="flex gap-2">
                 {BROWSABLE.map((b) => (
@@ -390,12 +389,9 @@ export default function TakeTheHelmModal({ isOpen, onClose, onDone, initialMarke
               {selected && (
                 <div className="rounded border border-[#1e1e32] bg-[#0a0a14] px-3 py-2 text-[11px] font-mono text-gray-400 space-y-1">
                   <p>
-                    DRADIS files this market as <span className="text-gray-200">{selected.market_class}</span>; a
-                    {' '}{selected.market_class} squadron would carry that class&apos;s Raptors and vipers.
-                  </p>
-                  <p>
-                    Deployed as Helm it resolves to class <span className="text-teal-300">helm</span> — one viper,
-                    no Raptors.{selected.end_date ? ` Closes ${new Date(selected.end_date).toLocaleString()}.` : ''}
+                    This is a <span className="text-gray-200">{selected.market_class}</span> market. Normally it would
+                    get the {selected.market_class} vipers and signal feeds; under Helm, only Helm trades it.
+                    {selected.end_date ? ` Closes ${new Date(selected.end_date).toLocaleString()}.` : ''}
                   </p>
                 </div>
               )}

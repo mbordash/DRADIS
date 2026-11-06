@@ -1902,8 +1902,10 @@ mod tests {
             // check, which is why `helm_live_enabled` and
             // `helm_fee_verdict_enforce` are here while the two fee ceilings
             // they govern are profile-settable like any other risk dial.
+            // `custom_vipers` [E86]: the operator's own scripted vipers, whose
+            // switches (Live above all) only the operator sets, per viper.
             const NOT_IN_PROFILES: &[&str] = &[
-                "ghost_mode", "collateral_sweep_enabled", "helm_live_enabled",
+                "ghost_mode", "collateral_sweep_enabled", "helm_live_enabled", "custom_vipers",
                 "helm_fee_verdict_enforce",
                 "sports_ledger_enabled", "sports_ledger_leagues", "sports_ledger_snapshot_offsets_mins",
                 "sports_ledger_credit_reserve", "sports_ledger_quota_reset_day",

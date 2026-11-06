@@ -605,7 +605,18 @@ struct MarketRegistries {
     /// after `sports-open` was reaped on 2026-10-23 the status page still listed
     /// its vipers on the finished game.
     markets: Option<(Arc<watch::Sender<HashMap<String, String>>>, String)>,
+    /// This loop flies a Helm squadron. Helm squadrons share one status scope,
+    /// so the last one to finish clears it (see [`LIVE_HELM_LOOPS`]).
+    helm: bool,
 }
+
+/// Helm market loops running right now. All Helm squadrons record under one
+/// shared status scope, so no single loop may forget it on exit, but once the
+/// last one ends nothing else ever would: 2026-11-06 a Helm squadron was stood
+/// down on production and its Helm row aged into "stale", turning the health
+/// ribbon red ("16/17 vipers alive, 1 stale/error") for a squadron no longer
+/// on screen. The loop that takes this count to zero clears the scope.
+static LIVE_HELM_LOOPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl MarketRegistries {
     fn new(
@@ -614,9 +625,13 @@ impl MarketRegistries {
         status_scope: &str,
         markets: Option<(&Arc<watch::Sender<HashMap<String, String>>>, &str)>,
     ) -> Self {
-        let own_scope = mandate == MarketMandate::Pinned
-            && status_scope != crate::vipers::helm_impl::KIND;
+        let helm = status_scope == crate::vipers::helm_impl::KIND;
+        if helm {
+            LIVE_HELM_LOOPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let own_scope = mandate == MarketMandate::Pinned && !helm;
         Self {
+            helm,
             tickers: tickers.to_vec(),
             status_scope: own_scope.then(|| status_scope.to_string()),
             markets: if own_scope { markets.map(|(tx, id)| (Arc::clone(tx), id.to_string())) } else { None },
@@ -631,6 +646,11 @@ impl Drop for MarketRegistries {
         }
         if let Some(scope) = &self.status_scope {
             crate::helpers::viper_status::forget(scope);
+        }
+        if self.helm
+            && LIVE_HELM_LOOPS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1
+        {
+            crate::helpers::viper_status::forget(crate::vipers::helm_impl::KIND);
         }
         if let Some((tx, squadron_id)) = &self.markets {
             tx.send_modify(|map| crate::state::forget_squadron_markets(map, squadron_id));
@@ -4224,8 +4244,13 @@ mod venue_status_tests {
     /// A rotating crypto market forgets its ticker but keeps the asset's viper
     /// rows (the next hourly market reuses them), and a Helm squadron keeps
     /// the shared Helm scope because other Helm squadrons may still be flying.
+    /// Serializes the tests that open Helm loops: `LIVE_HELM_LOOPS` is
+    /// process-wide, and two of them interleaving would hide the zero crossing.
+    static HELM_LOOPS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn rotation_and_helm_keep_their_shared_viper_rows() {
+        let _serial = HELM_LOOPS_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use crate::helpers::viper_status;
         use crate::state::price_state::book_feed;
         let ticker = "KXTEST-REGISTRIES-HOURLY";
@@ -4243,6 +4268,24 @@ mod venue_status_tests {
         let helm = crate::vipers::helm_impl::KIND;
         let guard = MarketRegistries::new(&[], MarketMandate::Pinned, helm, None);
         assert!(guard.markets.is_none(), "the Helm scope keeps its shared status entries too");
-        assert!(guard.status_scope.is_none(), "the Helm scope is shared and never forgotten here");
+        assert!(guard.status_scope.is_none(), "the Helm scope is shared and never forgotten by one loop");
+        drop(guard);
+    }
+
+    /// The shared Helm row outlives every Helm loop but the last: two flying,
+    /// the first to finish leaves the row, the second clears it. Before this,
+    /// the row stayed forever and aged into "stale" on the health ribbon.
+    #[test]
+    fn the_last_helm_loop_to_finish_clears_the_shared_helm_row() {
+        let _serial = HELM_LOOPS_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        use crate::helpers::viper_status;
+        let helm = crate::vipers::helm_impl::KIND;
+        let first = MarketRegistries::new(&[], MarketMandate::Pinned, helm, None);
+        let second = MarketRegistries::new(&[], MarketMandate::Pinned, helm, None);
+        viper_status::record_idle(helm, "HelmStrategy", "waiting");
+        drop(first);
+        assert!(!viper_status::snapshot(Some(helm)).is_empty(), "another Helm squadron is still flying");
+        drop(second);
+        assert!(viper_status::snapshot(Some(helm)).is_empty(), "the last Helm loop clears the shared row");
     }
 }

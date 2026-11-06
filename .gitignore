@@ -101,6 +101,7 @@ tools/dedupe-duplicate-settlements.sh
 # questions. Research spikes in docs/spikes/ that report on work already done
 # are public; a design doc for something not yet built is strategy, not record.
 docs/spikes/helm-design.md
+docs/spikes/scripted-viper-spike.md
 
 # Private keys
 *.pem

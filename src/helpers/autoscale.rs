@@ -341,9 +341,11 @@ pub fn viper_cap(strategy: &str, dc: &DynamicConfig) -> Option<Decimal> {
 }
 
 /// Vipers the scaler may resize: every one but Helm, whose size is the
-/// operator's own decision on each intent.
+/// operator's own decision on each intent, and the operator's scripted vipers
+/// [E86], whose size is exactly what the script asks for (and what the paper
+/// ledger traded while the viper was off live, so paper and live compare).
 pub fn scalable(strategy: &str) -> bool {
-    strategy != "HelmStrategy"
+    strategy != "HelmStrategy" && crate::vipers::scripted::store::script_of(strategy).is_none()
 }
 
 fn scale_leg(p: &mut OrderParams, factor: Decimal) {

@@ -465,6 +465,11 @@ async fn run() -> Result<()> {
     // are all anchored to this ID for the lifetime of the process.
     let _session_id = db::init_session(Some("dradis startup")).await;
 
+    // [E86] Load the operator's scripted vipers from the data volume before any
+    // squadron builds its strategy list. A script that does not load is logged
+    // and listed on the Build a Viper page with its error; it does not run.
+    dradis::vipers::scripted::store::load_all();
+
     // Retire simulated positions left open by an earlier session.
     //
     // Nothing rehydrates ghost rows into the in-memory position map after a

@@ -342,8 +342,17 @@ pub fn allowed_payload_path(p: &str) -> bool {
         ["bundle.json"] => true,
         ["logs", f] => f.ends_with("-dradis.db") || f.ends_with("-gboost_planb_v1.json"),
         ["logs", "gboost_planb", _asset, rest @ ..] => !rest.is_empty() && rest != ["candidate.json"],
+        // [E86] The operator's scripted vipers: a script and its manifest.
+        ["data", "vipers", f] => is_script_file(f),
         _ => false,
     }
+}
+
+/// `<name>.rhai` or `<name>.json` with a valid script name.
+fn is_script_file(f: &str) -> bool {
+    f.rsplit_once('.').is_some_and(|(stem, ext)| {
+        matches!(ext, "rhai" | "json") && crate::vipers::scripted::manifest::valid_name(stem)
+    })
 }
 
 fn version_tuple(v: &str) -> Option<(u64, u64, u64)> {
@@ -537,6 +546,26 @@ fn backup_sources(work: &Path, include_training_data: bool) -> Result<Vec<PathBu
             let p = entry.path();
             if p.is_file() && p.file_name().is_some_and(|n| n.to_string_lossy().ends_with("-gboost_planb_v1.json")) {
                 sources.push(p);
+            }
+        }
+    }
+    // [E86] Scripted vipers live in the data folder, which a backup otherwise
+    // never touches (it holds this instance's secrets). Only the scripts are
+    // carried, at `data/vipers/<file>`, and only where the data folder is the
+    // working directory's `data/` (the AMI layout: /app and /app/data), so the
+    // restore puts them back where the engine loads them from.
+    let vipers = work.join("data").join("vipers");
+    let same_place = match (fs::canonicalize(work.join("data")), fs::canonicalize(data_dir())) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if same_place {
+        if let Ok(dir) = fs::read_dir(&vipers) {
+            for entry in dir.flatten() {
+                let p = entry.path();
+                if p.is_file() && p.file_name().is_some_and(|n| is_script_file(&n.to_string_lossy())) {
+                    sources.push(p);
+                }
             }
         }
     }
@@ -1036,6 +1065,8 @@ mod tests {
             "logs/btc-gboost_planb_v1.json",
             "logs/gboost_planb/btc/archive/incumbent.json",
             "logs/gboost_planb/btc/markets/1789390800.json",
+            "data/vipers/fade_spikes.rhai",
+            "data/vipers/fade_spikes.json",
         ] {
             assert!(allowed_payload_path(ok), "{ok}");
         }
@@ -1052,6 +1083,10 @@ mod tests {
             "logs/gboost_planb/btc/candidate.json",
             "logs/gboost_planb/btc",
             "logs\\btc-dradis.db",
+            "data/vipers/secrets.env",
+            "data/vipers/X.rhai",
+            "data/vipers/sub/a.rhai",
+            "data/vipers/fade_spikes.rhai.tmp",
         ] {
             assert!(!allowed_payload_path(bad), "{bad}");
         }

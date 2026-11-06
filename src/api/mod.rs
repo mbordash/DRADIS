@@ -22,3 +22,4 @@ pub mod helm;
 pub mod markets;
 pub mod funding;
 
+pub mod scripts;

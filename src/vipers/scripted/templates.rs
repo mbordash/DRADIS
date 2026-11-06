@@ -1,0 +1,180 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// DRADIS — autonomous trading engine for crypto prediction markets.
+// Copyright (C) 2026 Michael Bordash
+//
+// This file is part of DRADIS. DRADIS is free software: you can redistribute it
+// and/or modify it under the terms of the GNU Affero General Public License,
+// version 3, as published by the Free Software Foundation.
+//
+// DRADIS is distributed in the hope that it will be useful, but WITHOUT ANY
+// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+// A PARTICULAR PURPOSE. See the GNU Affero General Public License for details.
+//
+// You should have received a copy of the GNU Affero General Public License along
+// with this program. If not, see <https://www.gnu.org/licenses/>.
+
+//! The starters the Build a Viper page offers: a blank script and two small
+//! worked examples. They are deliberately simple: they show the API (context
+//! fields, parameters, state, the three things `exit` may return), not a
+//! strategy anyone should run with money. The shipped Rust vipers cannot be
+//! opened as scripts.
+
+use serde::Serialize;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Template {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub summary: &'static str,
+    pub manifest: serde_json::Value,
+    pub source: &'static str,
+}
+
+pub const BLANK: &str = r#"// entry(ctx) is called every tick while the squadron has a market.
+// Return () or #{ hold: "why" } to sit out, or an order:
+//   #{ buy: "yes" | "no", price: ctx.yes.ask, shares: 5, take_profit: 0.60, reason: "..." }
+fn entry(ctx) {
+    #{ hold: "not written yet" }
+}
+
+// exit(ctx, pos) is called every tick for each position this viper holds.
+// Return () to hold, #{ sell: ctx.yes.bid, reason: "..." } to sell as a taker,
+// or #{ take_profit: 0.70 } to set or move the take-profit.
+fn exit(ctx, pos) {
+    ()
+}
+"#;
+
+pub const MOMENTUM: &str = r#"// Plain momentum: buy the side the oracle is moving toward when the
+// five-second velocity passes a threshold, with a take-profit and a stop.
+fn entry(ctx) {
+    if ctx.velocity == () { return #{ hold: "no price feed on this squadron" }; }
+    if ctx.secs_to_close == () || ctx.secs_to_close < ctx.params.min_secs_to_close {
+        return #{ hold: "too close to the close" };
+    }
+    let v = ctx.velocity;
+    let side = if v > ctx.params.velocity { "yes" } else if v < -ctx.params.velocity { "no" } else { () };
+    if side == () { return #{ hold: `velocity ${v} inside ±${ctx.params.velocity}` }; }
+
+    let book = if side == "yes" { ctx.yes } else { ctx.no };
+    if book.ask < ctx.params.min_price || book.ask > ctx.params.max_price {
+        return #{ hold: `ask ${book.ask} outside ${ctx.params.min_price}-${ctx.params.max_price}` };
+    }
+    // One entry per market: remember the last market entered.
+    if this.entered == ctx.market_name { return #{ hold: "already entered this market" }; }
+    this.entered = ctx.market_name;
+
+    #{ buy: side, price: book.ask, shares: ctx.params.contracts,
+       take_profit: min(book.ask + ctx.params.take_profit, 0.99),
+       reason: `velocity ${v}` }
+}
+
+fn exit(ctx, pos) {
+    let book = if pos.side == "yes" { ctx.yes } else { ctx.no };
+    if book.bid > 0 && book.bid <= pos.avg_entry - ctx.params.stop_loss {
+        return #{ sell: book.bid, reason: `stop: bid ${book.bid}, entry ${pos.avg_entry}` };
+    }
+    ()
+}
+"#;
+
+pub const LATE_FAVOURITE: &str = r#"// Late favourite: in the last minutes of an hourly market, when the oracle
+// sits well clear of the strike, buy the side it favours and hold it to the
+// settlement. A worked example of a fair value from norm_cdf.
+fn entry(ctx) {
+    if ctx.oracle == () || ctx.strike == () || ctx.secs_to_close == () {
+        return #{ hold: "needs an oracle, a strike and a close time" };
+    }
+    let t = ctx.secs_to_close;
+    if t > ctx.params.window_secs || t < 30 { return #{ hold: `outside the last ${ctx.params.window_secs}s` }; }
+    if ctx.hist_vol == () || ctx.hist_vol <= 0 { return #{ hold: "no volatility reading" }; }
+
+    // Distance to the strike in standard deviations over the time left. hist_vol
+    // is the 60-minute realized move as a fraction; scale it to the time left.
+    let move_left = ctx.hist_vol * ctx.oracle * (to_decimal(t) / 3600.0).sqrt();
+    let z = (ctx.oracle - ctx.strike) / move_left;
+    let p_yes = norm_cdf(z);
+    let side = if p_yes > 0.5 { "yes" } else { "no" };
+    let fair = if side == "yes" { p_yes } else { 1 - p_yes };
+    let book = if side == "yes" { ctx.yes } else { ctx.no };
+    let edge = fair - book.ask - taker_fee(book.ask);
+    if edge < ctx.params.min_edge { return #{ hold: `edge ${edge} below ${ctx.params.min_edge}` }; }
+    if book.ask > ctx.params.max_price { return #{ hold: `ask ${book.ask} above ${ctx.params.max_price}` }; }
+
+    #{ buy: side, price: book.ask, shares: ctx.params.contracts, reason: `fair ${fair}, edge ${edge}` }
+}
+
+// Held to the settlement: nothing to decide.
+fn exit(ctx, pos) {
+    ()
+}
+"#;
+
+pub fn all() -> Vec<Template> {
+    vec![
+        Template {
+            id: "blank",
+            title: "Blank",
+            summary: "Both functions, holding. Start here.",
+            manifest: serde_json::json!({
+                "name": "my_viper", "display_name": "My Viper", "description": "",
+                "classes": ["crypto"], "venues": [], "max_exposure_usdc": 5, "params": {}
+            }),
+            source: BLANK,
+        },
+        Template {
+            id: "momentum",
+            title: "Plain Momentum",
+            summary: "Buys the side the oracle is moving toward on a velocity threshold; take-profit and stop.",
+            manifest: serde_json::json!({
+                "name": "my_momentum", "display_name": "My Momentum",
+                "description": "Velocity threshold, taker in and out.",
+                "classes": ["crypto"], "venues": [], "max_exposure_usdc": 5,
+                "params": {
+                    "velocity": { "type": "decimal", "default": 0.001, "min": 0, "max": 0.05,
+                                  "description": "Five-second oracle move, as a fraction, that triggers an entry." },
+                    "min_price": { "type": "decimal", "default": 0.20, "min": 0.01, "max": 0.99, "description": "Lowest ask to buy." },
+                    "max_price": { "type": "decimal", "default": 0.70, "min": 0.01, "max": 0.99, "description": "Highest ask to buy." },
+                    "take_profit": { "type": "decimal", "default": 0.10, "min": 0.01, "max": 0.5, "description": "Take-profit above the entry, in dollars." },
+                    "stop_loss": { "type": "decimal", "default": 0.10, "min": 0.01, "max": 0.5, "description": "Stop below the entry, in dollars." },
+                    "contracts": { "type": "int", "default": 5, "min": 1, "max": 100, "description": "Contracts per entry." },
+                    "min_secs_to_close": { "type": "int", "default": 300, "min": 0, "max": 3600, "description": "No entry closer to the close than this." }
+                }
+            }),
+            source: MOMENTUM,
+        },
+        Template {
+            id: "late_favourite",
+            title: "Late Favourite",
+            summary: "Last-minutes fair value from norm_cdf; buys the favoured side with an edge and holds to settlement.",
+            manifest: serde_json::json!({
+                "name": "my_late_favourite", "display_name": "My Late Favourite",
+                "description": "Fair value from distance to strike; hold to settlement.",
+                "classes": ["crypto"], "venues": [], "max_exposure_usdc": 5,
+                "params": {
+                    "window_secs": { "type": "int", "default": 600, "min": 60, "max": 3600, "description": "Enter only in this many final seconds." },
+                    "min_edge": { "type": "decimal", "default": 0.04, "min": 0, "max": 0.5, "description": "Fair minus ask minus fee required." },
+                    "max_price": { "type": "decimal", "default": 0.90, "min": 0.01, "max": 0.99, "description": "Highest ask to buy." },
+                    "contracts": { "type": "int", "default": 5, "min": 1, "max": 100, "description": "Contracts per entry." }
+                }
+            }),
+            source: LATE_FAVOURITE,
+        },
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vipers::scripted::manifest::Manifest;
+
+    #[test]
+    fn every_template_compiles_and_its_manifest_is_valid() {
+        for t in all() {
+            let m: Manifest = serde_json::from_value(t.manifest.clone()).unwrap_or_else(|e| panic!("{}: {e}", t.id));
+            assert!(m.problems().is_empty(), "{}: {:?}", t.id, m.problems());
+            crate::vipers::scripted::store::check(&m, t.source).unwrap_or_else(|e| panic!("{}: {e:?}", t.id));
+        }
+    }
+}

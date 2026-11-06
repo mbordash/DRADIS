@@ -114,7 +114,7 @@ impl StrategyRegistry {
         // the gate decisions an operator is actually reading for.
         static BANNER: std::sync::Once = std::sync::Once::new();
         BANNER.call_once(Self::log_active_thresholds);
-        vec![
+        let mut all: Vec<Box<dyn Strategy>> = vec![
             Box::new(MomentumStrategyImpl::new())          as Box<dyn Strategy>,
             Box::new(ArbitrageStrategyImpl::default())                as Box<dyn Strategy>,
             Box::new(TimeDecayStrategyImpl)                as Box<dyn Strategy>,
@@ -132,7 +132,12 @@ impl StrategyRegistry {
             // carries nothing else; on every other class the kind filter below
             // leaves it out. Inert until the intent model lands.
             Box::new(HelmStrategy::new())                  as Box<dyn Strategy>,
-        ]
+        ];
+        // [E86] One adapter per loaded operator script, after the built-ins.
+        // Each looks its script up by name every tick, so a save applies
+        // without rebuilding the squadron, and a deleted script holds.
+        all.extend(crate::vipers::scripted::adapters());
+        all
     }
 
     /// Instantiate exactly the strategies meaningful for a market class.
@@ -227,7 +232,11 @@ pub fn strategy_name_to_kind(name: &str) -> &'static str {
         "TrendReversalStrategy" => "trendcapture",
         "TrendCaptureStrategy"  => "trendcapture", // legacy alias (pre-rename positions)
         crate::vipers::helm_impl::STRATEGY_NAME => crate::vipers::helm_impl::KIND,
-        _ => "",
+        other => match crate::vipers::scripted::store::script_of(other) {
+            // [E86] An operator script: `script:<name>`, interned once.
+            Some(script) => crate::vipers::scripted::store::kind_of(script),
+            None => "",
+        },
     }
 }
 

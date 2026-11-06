@@ -2075,6 +2075,59 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) {
              ON bookline_shadow(lane, asset, closed_at)"
     ).execute(pool).await;
 
+    // [E86] The paper ledger of operator-scripted vipers (`vipers::scripted`).
+    // A scripted viper whose own Live switch is off never reaches the order
+    // path: its entries fill here at the ask (taker fee charged), its exits at
+    // the bid, a resting take-profit when the bid reaches it, and what is still
+    // open at the close is scored through the venue's resolver. REAL columns:
+    // nothing here is money. `script_hash` names the version of the script that
+    // opened (and `close_hash` closed) each row, so an edit is visible in the
+    // record.
+    let _ = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS script_paper (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            script        TEXT    NOT NULL,
+            asset         TEXT    NOT NULL,
+            squadron_id   TEXT    NOT NULL,
+            condition_id  TEXT    NOT NULL,
+            token_id      TEXT    NOT NULL,
+            market        TEXT    NOT NULL,
+            side          TEXT    NOT NULL,
+            opened_at     TEXT    NOT NULL,
+            close_time    TEXT,
+            entry_price   REAL    NOT NULL,
+            shares        REAL    NOT NULL,
+            entry_fee     REAL    NOT NULL,
+            take_profit   REAL,
+            entry_reason  TEXT    NOT NULL,
+            script_hash   TEXT    NOT NULL,
+            closed_at     TEXT,
+            exit_price    REAL,
+            exit_fee      REAL,
+            exit_reason   TEXT,
+            close_hash    TEXT,
+            pnl           REAL
+        )"
+    ).execute(pool).await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_script_paper_open ON script_paper(asset, closed_at)"
+    ).execute(pool).await;
+    // [E86] The take-profit a scripted viper set on a position it holds through
+    // the order path. Kalshi and Polymarket US have no resting exit, so the
+    // adapter watches the bid itself; the target is kept here so a restart does
+    // not silently drop it. A row outlives its position only until the adapter
+    // next sees that the viper no longer holds the token.
+    let _ = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS script_take_profit (
+            squadron_id TEXT NOT NULL,
+            script      TEXT NOT NULL,
+            token_id    TEXT NOT NULL,
+            take_profit REAL NOT NULL,
+            set_at      TEXT NOT NULL,
+            PRIMARY KEY (squadron_id, script, token_id)
+        )"
+    ).execute(pool).await;
+
     // Anchor's simulated ledger (`vipers::anchor_impl`). One row per would-be
     // entry, with the model's reading at the time, settled through the venue's
     // resolver once the market closes. REAL columns throughout, like the GBoost
@@ -3320,13 +3373,21 @@ pub async fn raptors_for_class(pool: &SqlitePool, class: &str) -> Vec<String> {
 
 /// Resolve the viper kinds linked to a market class.
 pub async fn vipers_for_class(pool: &SqlitePool, class: &str) -> Vec<String> {
-    sqlx::query(
+    let mut kinds: Vec<String> = sqlx::query(
         "SELECT viper_kind FROM market_class_viper WHERE market_class = ? ORDER BY viper_kind"
     )
     .bind(class)
     .fetch_all(pool).await.ok()
     .map(|rows| rows.into_iter().filter_map(|r| r.try_get::<String, _>(0).ok()).collect())
-    .unwrap_or_default()
+    .unwrap_or_default();
+    // [E86] Operator scripts that declare this class, from the loaded set
+    // rather than taxonomy rows: a script is a file on the data volume, and a
+    // row would outlive its deletion. Never on a Helm squadron.
+    kinds.extend(
+        crate::vipers::scripted::store::names_for_class(class)
+            .iter().map(|n| crate::vipers::scripted::store::kind_of(n).to_string()),
+    );
+    kinds
 }
 
 /// Resolve the raptor kinds linked to a market class with full info.
