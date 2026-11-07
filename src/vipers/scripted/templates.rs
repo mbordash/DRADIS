@@ -47,15 +47,19 @@ fn exit(ctx, pos) {
 "#;
 
 pub const MOMENTUM: &str = r#"// Plain momentum: buy the side the oracle is moving toward when the
-// five-second velocity passes a threshold, with a take-profit and a stop.
+// five-second move passes a threshold, with a take-profit and a stop.
 fn entry(ctx) {
     if ctx.velocity == () { return #{ hold: "no price feed on this squadron" }; }
     if ctx.secs_to_close == () || ctx.secs_to_close < ctx.params.min_secs_to_close {
         return #{ hold: "too close to the close" };
     }
+    // ctx.velocity is the oracle's move over five seconds in dollars; the
+    // threshold is a fraction of the price, so it means the same at any level
+    // (0.001 is $100 at $100,000), as in the built-in Momentum.
     let v = ctx.velocity;
-    let side = if v > ctx.params.velocity { "yes" } else if v < -ctx.params.velocity { "no" } else { () };
-    if side == () { return #{ hold: `velocity ${v} inside ±${ctx.params.velocity}` }; }
+    let thr = ctx.params.velocity * ctx.oracle;
+    let side = if v > thr { "yes" } else if v < -thr { "no" } else { () };
+    if side == () { return #{ hold: `5s move $${v} inside ±$${thr.round(2)}` }; }
 
     let book = if side == "yes" { ctx.yes } else { ctx.no };
     if book.ask < ctx.params.min_price || book.ask > ctx.params.max_price {
@@ -67,7 +71,7 @@ fn entry(ctx) {
 
     #{ buy: side, price: book.ask, shares: ctx.params.contracts,
        take_profit: min(book.ask + ctx.params.take_profit, 0.99),
-       reason: `velocity ${v}` }
+       reason: `5s move $${v}` }
 }
 
 fn exit(ctx, pos) {
@@ -88,11 +92,12 @@ fn entry(ctx) {
     }
     let t = ctx.secs_to_close;
     if t > ctx.params.window_secs || t < 30 { return #{ hold: `outside the last ${ctx.params.window_secs}s` }; }
-    if ctx.hist_vol == () || ctx.hist_vol <= 0 { return #{ hold: "no volatility reading" }; }
 
-    // Distance to the strike in standard deviations over the time left. hist_vol
-    // is the 60-minute realized move as a fraction; scale it to the time left.
-    let move_left = ctx.hist_vol * ctx.oracle * (to_decimal(t) / 3600.0).sqrt();
+    // Distance to the strike in standard deviations over the time left. The
+    // typical one-hour move is your parameter (a fraction of the price), scaled
+    // by the square root of the time left. ctx.hist_vol is a 0-1 flatness
+    // index, not a move, so it is not used here.
+    let move_left = ctx.params.hourly_vol * ctx.oracle * (to_decimal(t) / 3600).sqrt();
     let z = (ctx.oracle - ctx.strike) / move_left;
     let p_yes = norm_cdf(z);
     let side = if p_yes > 0.5 { "yes" } else { "no" };
@@ -132,8 +137,8 @@ pub fn all() -> Vec<Template> {
                 "description": "Velocity threshold, taker in and out.",
                 "classes": ["crypto"], "venues": [], "max_exposure_usdc": 5,
                 "params": {
-                    "velocity": { "type": "decimal", "default": 0.001, "min": 0, "max": 0.05,
-                                  "description": "Five-second oracle move, as a fraction, that triggers an entry." },
+                    "velocity": { "type": "decimal", "default": 0.001, "min": 0.0001, "max": 0.05,
+                                  "description": "Five-second oracle move that triggers an entry, as a fraction of the price (0.001 = $100 at $100,000)." },
                     "min_price": { "type": "decimal", "default": 0.20, "min": 0.01, "max": 0.99, "description": "Lowest ask to buy." },
                     "max_price": { "type": "decimal", "default": 0.70, "min": 0.01, "max": 0.99, "description": "Highest ask to buy." },
                     "take_profit": { "type": "decimal", "default": 0.10, "min": 0.01, "max": 0.5, "description": "Take-profit above the entry, in dollars." },
@@ -154,6 +159,7 @@ pub fn all() -> Vec<Template> {
                 "classes": ["crypto"], "venues": [], "max_exposure_usdc": 5,
                 "params": {
                     "window_secs": { "type": "int", "default": 600, "min": 60, "max": 3600, "description": "Enter only in this many final seconds." },
+                    "hourly_vol": { "type": "decimal", "default": 0.005, "min": 0.0005, "max": 0.05, "description": "Typical one-hour move of the underlying, as a fraction of the price (0.005 = 0.5%). Set it from the market you trade." },
                     "min_edge": { "type": "decimal", "default": 0.04, "min": 0, "max": 0.5, "description": "Fair minus ask minus fee required." },
                     "max_price": { "type": "decimal", "default": 0.90, "min": 0.01, "max": 0.99, "description": "Highest ask to buy." },
                     "contracts": { "type": "int", "default": 5, "min": 1, "max": 100, "description": "Contracts per entry." }

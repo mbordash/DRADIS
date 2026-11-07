@@ -1,5 +1,7 @@
 # Writing a Custom Viper Strategy
 
+> **On a Marketplace instance, or without a Rust toolchain?** Use **Build a Viper** instead: write the strategy as a script in Control Tower, save it, and it runs from the next tick, with no rebuild. See [SCRIPTED_VIPERS.md](SCRIPTED_VIPERS.md). This guide is for compiling a Viper into the engine from source.
+
 This guide walks through implementing and integrating a new trading strategy into dradis using the new "Strategy is Sovereign" architecture.
 
 ---

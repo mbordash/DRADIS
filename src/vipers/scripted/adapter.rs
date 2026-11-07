@@ -434,7 +434,9 @@ impl ScriptedStrategy {
         let checked = check_buy(
             side, price, shares, tp, ask, ask_depth, paper, exposure, live.max_exposure, held,
             (!paper).then_some(ctx.available_collateral),
-            crate::venues::venue_name() == "kalshi", crate::venues::min_order_shares(),
+            // Kalshi and Polymarket US trade whole contracts; only the intl CLOB
+            // takes fractional sizes.
+            crate::venues::venue_name() != "intl_clob", crate::venues::min_order_shares(),
         );
         let b = match checked {
             Ok(b) => b,
@@ -769,8 +771,10 @@ mod tests {
                 no_bid: dec!(0.57), no_bid_depth: dec!(180), no_ask: dec!(0.59), no_ask_depth: dec!(160),
                 yes_bid_depth_total: dec!(1200), yes_ask_depth_total: dec!(900),
                 no_bid_depth_total: dec!(1100), no_ask_depth_total: dec!(950),
-                oracle_price: dec!(100100), velocity: dec!(0.0012), velocity_1s: dec!(0), acceleration: dec!(0),
-                funding_rate: dec!(0), oracle_drift_60m: dec!(0), oracle_drift_10m: dec!(0), hist_vol: dec!(0.004),
+                // Real units: velocity and drifts are dollar moves, hist_vol the
+                // 0-1 flatness index (about 0.003 for ordinary BTC).
+                oracle_price: dec!(100100), velocity: dec!(120), velocity_1s: dec!(30), acceleration: dec!(0),
+                funding_rate: dec!(0), oracle_drift_60m: dec!(-250), oracle_drift_10m: dec!(80), hist_vol: dec!(0.003),
                 institutional_pulse: dec!(0), tide_coherence: dec!(0), tradfi_velocity: dec!(0),
                 macro_coherence: dec!(0), vix_proxy: dec!(0), vix_velocity: dec!(0),
                 oi_delta_pct: dec!(0), cvd_ratio: dec!(1), secs_to_expiry: 1800, timestamp: Utc::now(),
@@ -807,7 +811,7 @@ mod tests {
         let r = &rows[0];
         assert_eq!((r.side.as_str(), r.entry_price, r.shares, r.take_profit), ("YES", dec!(0.42), dec!(5), Some(dec!(0.47))));
         assert_eq!(r.entry_fee, (crate::venues::taker_fee_per_share(dec!(0.42)) * dec!(5)).round_dp(6));
-        assert!(r.entry_reason.starts_with("test entry v0.0012"), "{}", r.entry_reason);
+        assert!(r.entry_reason.starts_with("test entry v120"), "{}", r.entry_reason);
 
         strat.evaluate_entry(&c).await.unwrap();
         assert_eq!(paper::open_rows(&pool, &c.squadron_id, asset).await.len(), 1, "one position per side");
@@ -1009,6 +1013,33 @@ mod tests {
             let status = serde_json::to_string(&viper_status::snapshot(Some(&asset))).unwrap();
             assert!(!status.contains("script error"), "{}: {status}", t.id);
         }
+    }
+
+    /// The momentum starter in real units: `ctx.velocity` is a dollar move, the
+    /// threshold a fraction of the price, so at $100,100 and 0.001 the line is
+    /// about $100. A $30 move holds; a $120 move buys the side it points to.
+    #[tokio::test]
+    async fn the_momentum_starter_reads_velocity_in_dollars() {
+        let t = crate::vipers::scripted::templates::all().into_iter().find(|t| t.id == "momentum").unwrap();
+        let asset = "scriptmomunits";
+        let pool = pool(asset).await;
+        let mut m: crate::vipers::scripted::manifest::Manifest = serde_json::from_value(t.manifest.clone()).unwrap();
+        m.name = asset.into();
+        store::insert_hidden_for_test(m, t.source);
+        let strat = ScriptedStrategy::new(asset);
+
+        let mut c = ctx(asset, DynamicConfig::default());
+        c.snapshot.velocity = dec!(30);
+        strat.evaluate_entry(&c).await.unwrap();
+        assert!(paper::open_rows(&pool, &c.squadron_id, asset).await.is_empty(), "$30 in five seconds is noise at $100,100");
+        let status = serde_json::to_string(&viper_status::snapshot(Some(asset))).unwrap();
+        assert!(status.contains("inside ±$100.10"), "{status}");
+
+        c.snapshot.velocity = dec!(-120);
+        strat.evaluate_entry(&c).await.unwrap();
+        let rows = paper::open_rows(&pool, &c.squadron_id, asset).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].side, "NO", "a fall buys NO");
     }
 
     #[test]

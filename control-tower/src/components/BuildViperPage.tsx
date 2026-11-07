@@ -636,11 +636,14 @@ function ReferencePanel() {
           {row('secs_to_close, market_age_secs, window_secs', 'integers (secs_to_close and window_secs may be ())')}
           {row('now_secs, book_age_secs', 'integers: the tick’s clock (the only one a script has) and the book’s age')}
           {row('yes, no', 'each #{ bid, ask, bid_depth, ask_depth, bid_depth_total, ask_depth_total, obi }')}
-          {row('oracle, velocity, velocity_1s, acceleration', 'price feed; () without one')}
-          {row('drift_10m, drift_60m, hist_vol', 'oracle drift and 60-minute realized volatility (fractions)')}
+          {row('oracle', 'the price feed’s level in dollars; () without a feed')}
+          {row('velocity, velocity_1s', 'the oracle’s move over 5 s and 1 s, in dollars (divide by ctx.oracle for a fraction)')}
+          {row('acceleration', 'change in velocity since the previous tick, in dollars')}
+          {row('drift_10m, drift_60m', 'the oracle’s move over 10 and 60 minutes, in dollars')}
+          {row('hist_vol', 'a 0-1 flatness index (log-return spread over the hour ÷ 2%, ~0.003 for ordinary BTC), not a move')}
           {row('funding_rate, institutional_pulse, cvd_ratio, oi_delta_pct', 'derivatives and ETF-flow signals')}
           {row('tide_coherence, tradfi_velocity, vix_proxy', 'macro signals (BTC, US hours)')}
-          {row('sports', '#{ yes, no } each #{ consensus, num_books, dispersion, odds_age_secs, secs_to_start, league }, or ()')}
+          {row('sports', '#{ yes, no } each #{ consensus, num_books, dispersion, odds_age_secs, secs_to_start, league }; () until the sports ledger matches the market')}
           {row('collateral, day_pnl', 'the account')}
           {row('ghost', 'true when this viper’s orders are not real right now')}
           {row('exposure, max_exposure', 'this viper’s open cost basis across every squadron, and its cap')}
@@ -666,7 +669,7 @@ function ReferencePanel() {
           {row('norm_cdf(z)', 'standard normal CDF, for option-style fair values')}
           {row('clamp(x, lo, hi), min(a, b), max(a, b)', 'on any numbers')}
           {row('to_decimal(n)', 'an integer as a decimal')}
-          {row('x.sqrt(), x.exp(), x.ln(), x.abs(), x.round(dp)', 'decimal maths; sqrt and the others carry 28 places, and round(dp) takes halves to the even digit (2.25 → 2.2)')}
+          {row('x.sqrt(), x.exp(), x.ln(), x.abs(), x.round(dp)', 'decimal maths; sqrt, exp and ln can return up to 28 places, and round(dp) takes halves to the even digit (2.25 → 2.2)')}
         </tbody></table>
       </section>
       <section>
@@ -675,7 +678,7 @@ function ReferencePanel() {
           <li>Paper unless the viper is on live; real money only while the instance is live too.</li>
           <li>The cap, across every squadron, fees included. An order that does not fit is refused, not resized.</li>
           <li>The daily drawdown limit, for every entry made while the viper is on live (simulated or real); paper entries are exempt.</li>
-          <li>Prices inside (0, 1) on the tick; at least the venue’s minimum size (whole contracts on Kalshi); one position per market.</li>
+          <li>Prices inside (0, 1) on the tick; at least the venue’s minimum size (whole contracts on Kalshi and Polymarket US); one position per market.</li>
           <li>No file, network or clock access; each call is stopped after about half a millisecond of work.</li>
         </ul>
       </section>

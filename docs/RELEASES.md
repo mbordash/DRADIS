@@ -4,7 +4,13 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
-## 1.6.1 (unreleased)
+## 1.7.0 (unreleased)
+
+- Build a Viper (new): write your own strategy as a script in Control Tower, save it, and it runs from the next tick, with no rebuild. A script defines entry(ctx) and exit(ctx, pos), reads the squadron's market, its signals and its own parameters, and returns a hold, a buy, a sale or a take-profit. Start from a blank script or one of two worked examples (Plain Momentum, Late Favourite). Check finds every problem with the manifest and the script at once. Test run evaluates the script against a squadron's latest market data without sending anything.
+- A new viper trades on paper, in its own ledger: taker fills at the ask and bid with the venue's fee, and settlement at the venue's result. Nothing reaches the venue or the trade log. Its Live switch sends real orders only while the instance is live as well, behind a confirmation that shows its cap and its paper record.
+- The engine owns every check that protects money, whatever the script returns: a required exposure cap counted across every squadron, the daily drawdown limit, taker limits no more than 2 cents past the touch, the venue's minimum size, one position per market, and a sandbox with no file, network or clock access and a hard bound on each call's work.
+- Switching a viper off, or taking it off Live, stops new entries only: what it holds keeps its stop and take-profit until it closes. A take-profit is watched by the engine and sold as a taker on every venue, and it survives a restart.
+- Scripts live in the data folder and travel in the instance backup. Each squadron page shows a card for every scripted viper, with its mode, its paper record and a per-squadron on/off switch. Guide: docs/SCRIPTED_VIPERS.md.
 
 - Settings that only one venue uses are now shown only on that venue. A Kalshi instance's Setup > Risk & Engine tab used to show an Engine card made entirely of Polymarket settings (the two Polymarket fee rates, the order book price-change feed, the USDC.e collateral sweep); on Kalshi that card no longer appears. The same applies to two Polymarket International settings on strategy cards (Momentum and Convergence Resting Take Profit), and the Kalshi Sports Game Series setting no longer appears on Polymarket instances. Nothing about trading changes, and the engine still accepts every setting, so a config bundle moves between venues as before. The LLM Advisor is no longer offered settings the venue ignores.
 
