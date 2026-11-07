@@ -116,7 +116,10 @@ page writes both, and they travel in the instance backup.
   a word the language reserves, such as `default`, `fn` or `go`; the page
   tells you if one is. You change their values on the Settings tab, without
   editing the script. A value that does not fit its type or range is ignored
-  and the default applies.
+  and the default applies. Check and Save refuse a script that reads
+  `ctx.params.<name>` for a name not in this list, so add a parameter before
+  (or with) the code that reads it. A comment or a string that mentions one
+  does not count, and neither do map methods such as `ctx.params.len()`.
 
 ### The script
 

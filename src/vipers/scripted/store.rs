@@ -177,6 +177,135 @@ pub fn check(manifest: &Manifest, source: &str) -> Result<AST, Vec<String>> {
     }
 }
 
+/// [`check`] plus the rules a script must pass to be saved but that a script
+/// already on disk is never refused for: refusing one at startup would stop it
+/// managing positions it holds.
+///
+/// [B92] A read of a parameter the viper does not define is `()` at run time,
+/// and the first arithmetic on it fails every tick with a message that names an
+/// operator, not the parameter. Check and Save refuse it by name instead.
+pub fn check_for_save(manifest: &Manifest, source: &str) -> Result<AST, Vec<String>> {
+    let undefined: Vec<String> = params_read(source).into_iter()
+        .filter(|name| !manifest.params.contains_key(name))
+        .map(|name| format!(
+            "the script reads ctx.params.{name}, which is not one of this viper's parameters; add it or fix the name"
+        ))
+        .collect();
+    match check(manifest, source) {
+        Ok(ast) if undefined.is_empty() => Ok(ast),
+        Ok(_) => Err(undefined),
+        Err(mut p) => { p.extend(undefined); Err(p) }
+    }
+}
+
+/// Every `ctx.params.<name>` the source reads, once each, in order of first
+/// use. Only code counts: comments (nested block comments included), string
+/// and character literals are skipped, while the code inside a template's
+/// `${...}` is a real read and counts. A map method (`ctx.params.len()`,
+/// `.contains("x")`, `.keys()`) is not a parameter read.
+fn params_read(source: &str) -> Vec<String> {
+    static READ: OnceLock<regex::Regex> = OnceLock::new();
+    let read = READ.get_or_init(|| {
+        regex::Regex::new(r"\bctx\s*\.\s*params\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)(\s*\()?").expect("static regex")
+    });
+    let code = code_only(source);
+    let mut out: Vec<String> = Vec::new();
+    for c in read.captures_iter(&code) {
+        if c.get(2).is_some() { continue; }
+        let name = c[1].to_string();
+        if !out.contains(&name) { out.push(name); }
+    }
+    out
+}
+
+/// The source with everything that is not code blanked to spaces: `//` and
+/// nested `/* */` comments, `"..."` strings, `'c'` characters, `#"..."#` raw
+/// strings, and the text of `` `...` `` templates, whose `${...}` stays.
+fn code_only(source: &str) -> String {
+    let c: Vec<char> = source.chars().collect();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0;
+    // Brace depth of each open `${`, innermost last: a `}` at that depth
+    // returns to the template's text.
+    let mut interp: Vec<usize> = Vec::new();
+    let mut depth = 0usize;
+    let mut in_template = false;
+    let blank = |out: &mut String, ch: char| out.push(if ch == '\n' { '\n' } else { ' ' });
+    while i < c.len() {
+        let ch = c[i];
+        let next = c.get(i + 1).copied();
+        if in_template {
+            if ch == '`' { in_template = false; blank(&mut out, ch); i += 1; continue; }
+            if ch == '$' && next == Some('{') {
+                in_template = false;
+                depth += 1;
+                interp.push(depth);
+                out.push_str("  ");
+                i += 2;
+                continue;
+            }
+            blank(&mut out, ch);
+            i += 1;
+            continue;
+        }
+        match (ch, next) {
+            ('/', Some('/')) => {
+                while i < c.len() && c[i] != '\n' { blank(&mut out, c[i]); i += 1; }
+            }
+            ('/', Some('*')) => {
+                let mut level = 0usize;
+                while i < c.len() {
+                    if c[i] == '/' && c.get(i + 1) == Some(&'*') { level += 1; out.push_str("  "); i += 2; continue; }
+                    if c[i] == '*' && c.get(i + 1) == Some(&'/') {
+                        level -= 1; out.push_str("  "); i += 2;
+                        if level == 0 { break; }
+                        continue;
+                    }
+                    blank(&mut out, c[i]);
+                    i += 1;
+                }
+            }
+            ('"', _) | ('\'', _) => {
+                let q = ch;
+                blank(&mut out, ch);
+                i += 1;
+                while i < c.len() && c[i] != q {
+                    if c[i] == '\\' && i + 1 < c.len() { blank(&mut out, c[i]); i += 1; }
+                    blank(&mut out, c[i]);
+                    i += 1;
+                }
+                if i < c.len() { blank(&mut out, c[i]); i += 1; }
+            }
+            ('#', Some('"')) | ('#', Some('#')) => {
+                // A raw string: n hashes, a quote, and the text up to a quote
+                // followed by the same n hashes. Anything else is not one.
+                let mut n = 0;
+                while c.get(i + n) == Some(&'#') { n += 1; }
+                if c.get(i + n) != Some(&'"') { out.push(ch); i += 1; continue; }
+                let start = i;
+                i += n + 1;
+                let mut closed = false;
+                while i < c.len() {
+                    if c[i] == '"' && (0..n).all(|k| c.get(i + 1 + k) == Some(&'#')) { i += n + 1; closed = true; break; }
+                    i += 1;
+                }
+                if !closed { i = c.len(); }
+                for &x in &c[start..i] { blank(&mut out, x); }
+            }
+            ('`', _) => { in_template = true; blank(&mut out, ch); i += 1; }
+            ('{', _) => { depth += 1; out.push(ch); i += 1; }
+            ('}', _) => {
+                if interp.last() == Some(&depth) { interp.pop(); in_template = true; blank(&mut out, ch); }
+                else { out.push(ch); }
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ => { out.push(ch); i += 1; }
+        }
+    }
+    out
+}
+
 fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes)?;
@@ -190,7 +319,14 @@ pub fn save(manifest: Manifest, source: String) -> Result<Arc<Script>, Vec<Strin
 }
 
 pub fn save_in(dir: &Path, manifest: Manifest, source: String) -> Result<Arc<Script>, Vec<String>> {
-    let ast = check(&manifest, &source)?;
+    // The name becomes two file names in `dir`. `check` refuses a bad one
+    // too; this guard sits beside the path it protects, as in `delete_in`, so
+    // no later change to `check` can turn a request body into a path outside
+    // the folder.
+    if !super::manifest::valid_name(&manifest.name) {
+        return Err(vec![format!("name '{}' must be 3-32 characters of a-z, 0-9 and _, starting with a letter", manifest.name)]);
+    }
+    let ast = check_for_save(&manifest, &source)?;
     let name = manifest.name.clone();
     std::fs::create_dir_all(dir).map_err(|e| vec![format!("cannot create {}: {e}", dir.display())])?;
     let json = serde_json::to_vec_pretty(&manifest).map_err(|e| vec![e.to_string()])?;
@@ -419,6 +555,52 @@ pub(crate) mod tests {
         let d = std::env::temp_dir().join(format!("dradis-scripts-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_plain_identifier_never_reaches_the_filesystem() {
+        let d = tmp("pathname");
+        for bad in ["../escape", "a/b", "..", "x\\y", "/etc/passwd"] {
+            let mut m = manifest("store_path_ok");
+            m.name = bad.to_string();
+            assert!(save_in(&d, m, OK.into()).is_err(), "{bad} must be refused");
+        }
+        assert!(!d.exists() || std::fs::read_dir(&d).unwrap().next().is_none(), "nothing written");
+        assert!(!std::env::temp_dir().join("escape.rhai").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_read_of_an_undefined_parameter_is_refused_by_name() {
+        let mut m = manifest("store_params");
+        m.params = serde_json::from_value(serde_json::json!({
+            "hourly_vol": { "type": "decimal", "default": 0.003, "description": "" }
+        })).unwrap();
+        // The B92 case: code saved before its parameter was added.
+        let src = "fn entry(ctx) { let x = ctx.oracle - ctx.params.basis; let v = ctx.params.hourly_vol; () }\n\
+                   fn exit(ctx, pos) { () }";
+        let err = check_for_save(&m, src).unwrap_err();
+        assert_eq!(err.len(), 1, "{err:?}");
+        assert!(err[0].contains("ctx.params.basis"), "{err:?}");
+        // Comments do not count; a string template does.
+        let ok = "// ctx.params.basis was here\n/* and ctx.params.gone */\n\
+                  fn entry(ctx) { #{ hold: `vol ${ctx.params.hourly_vol}` } } fn exit(ctx, pos) { () }";
+        assert!(check_for_save(&m, ok).is_ok());
+        let templ = "fn entry(ctx) { #{ hold: `x ${ctx.params.missing}` } } fn exit(ctx, pos) { () }";
+        assert!(check_for_save(&m, templ).unwrap_err()[0].contains("ctx.params.missing"));
+        // A script already on disk is never refused for it: it may hold positions.
+        assert!(check(&m, src).is_ok());
+        assert_eq!(params_read("ctx . params . a + ctx.params.b + ctx.params.a"), vec!["a", "b"]);
+        // [review] Map methods are not reads; strings, nested comments and raw
+        // strings hide nothing and trip nothing; a `//` inside a string does not
+        // hide a read after it on the same line.
+        assert!(params_read("let n = ctx.params.len(); let k = ctx.params.contains (\"x\");").is_empty());
+        assert!(params_read(r#"#{ hold: "set ctx.params.basis first" }"#).is_empty());
+        assert!(params_read("/* a /* b */ ctx.params.old */ let x = 1;").is_empty());
+        assert!(params_read(r##"let r = #"ctx.params.raw"#;"##).is_empty());
+        assert_eq!(params_read(r#"let u = "http://x"; let v = ctx.params.zzz;"#), vec!["zzz"]);
+        assert_eq!(params_read("let s = `a ${ctx.params.p + #{x: 1}.x} b ${ctx.params.q}`; ctx.params.r"), vec!["p", "q", "r"]);
+        assert_eq!(params_read("let c = '\"'; let v = ctx.params.after_char;"), vec!["after_char"]);
     }
 
     #[test]

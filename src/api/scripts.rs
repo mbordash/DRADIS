@@ -168,9 +168,11 @@ struct PaperQuery { limit: Option<i64>, asset: Option<String> }
 async fn read(Path(name): Path<String>, Query(q): Query<LimitQuery>) -> Response {
     let Some(s) = store::get(&name) else {
         if let Some(b) = store::broken().into_iter().find(|b| b.name == name) {
-            let src = std::fs::read_to_string(store::dir().join(format!("{name}.rhai"))).ok();
-            let man = std::fs::read_to_string(store::dir().join(format!("{name}.json"))).ok();
-            return Json(serde_json::json!({ "name": name, "broken": b.error, "source": src, "manifest_raw": man })).into_response();
+            // The file names come from the loader's own record of what is in
+            // the folder, never from the URL.
+            let src = std::fs::read_to_string(store::dir().join(format!("{}.rhai", b.name))).ok();
+            let man = std::fs::read_to_string(store::dir().join(format!("{}.json", b.name))).ok();
+            return Json(serde_json::json!({ "name": b.name, "broken": b.error, "source": src, "manifest_raw": man })).into_response();
         }
         return bad(StatusCode::NOT_FOUND, vec![format!("no script '{name}'")]);
     };
@@ -199,7 +201,7 @@ struct ScriptBody {
 }
 
 async fn validate(Json(b): Json<ScriptBody>) -> Response {
-    match store::check(&b.manifest, &b.source) {
+    match store::check_for_save(&b.manifest, &b.source) {
         Ok(_) => Json(serde_json::json!({ "ok": true, "problems": [] })).into_response(),
         Err(p) => bad(StatusCode::OK, p),
     }

@@ -736,6 +736,10 @@ pub async fn run_kalshi_trader(
     // The squadron the rotation loop currently owns, so the next rotation can
     // retire it when it lands on a different underlying.
     let mut last_rotation_squadron: Option<String> = None;
+    // [B94] The cadence rank of the market that just closed, so the next
+    // selection waits for its successor to be listed instead of flying a worse
+    // cadence for one rescan.
+    let mut closed_rank: Option<u8> = None;
 
     loop {
         if cancel.is_cancelled() {
@@ -752,10 +756,11 @@ pub async fn run_kalshi_trader(
             continue;
         }
 
-        let selection = match select_market(&venue, &series, &filter, &cancel, &process_heartbeat_secs).await {
+        let selection = match select_market(&venue, &series, &filter, &cancel, &process_heartbeat_secs, closed_rank.take()).await {
             Some(s) => s,
             None => return,
         };
+        let wanted_after_close = successor_rank(&selection.primary);
 
         let market_cancel = cancel.child_token();
         let outcome = trade_one_market(
@@ -784,6 +789,7 @@ pub async fn run_kalshi_trader(
                 info!("🔀 Kalshi rotation — hotter market found, switching");
             }
             MarketOutcome::Closed => {
+                closed_rank = Some(wanted_after_close);
                 info!("🔁 Kalshi market closed — rotating to next market");
                 if wait_or_cancel(&cancel, 10).await {
                     return;
@@ -1121,13 +1127,66 @@ struct MarketSelection {
     maker: Option<KalshiPair>,
 }
 
+/// [B94] How long the selection after a close waits for a market of the
+/// closed market's cadence to be listed, rescanning every
+/// `CLOSE_RELIST_POLL_SECS`. Kalshi lists the next window a few seconds to a
+/// minute after the old one closes; without the wait the loop flew whatever
+/// worse cadence was listed (the 17:00 daily between 15-minute windows, a
+/// 15-minute market at the top of the hour) and rotated back on the next
+/// rescan, two minutes later, every quarter hour. Kalshi's `status=open`
+/// listing showed the next 15-minute window 14-16 s after a close (measured
+/// 2026-11-07), so the wait normally ends on the second or third poll; when no
+/// such market comes, the best listed market is taken once it runs out. What
+/// is waited for is `successor_rank` narrowed by `wanted_rank`.
+const CLOSE_RELIST_WAIT_SECS: u64 = 90;
+const CLOSE_RELIST_POLL_SECS: u64 = 5;
+
+/// The cadence rank to wait for once `flown` closes. A close on the hour
+/// starts a new hour, whose market the hour-shaped Vipers want, whatever was
+/// flown before it (the 16:00-17:00 ET hour flies 15-minute windows, and at
+/// 17:00 the next hourly and the next 15-minute window are listed within
+/// seconds of each other). Any other close wants its own cadence back.
+fn successor_rank(flown: &KalshiPair) -> u8 {
+    use chrono::Timelike;
+    match flown.close_time {
+        Some(t) if t.minute() == 0 && t.second() == 0 => Cadence::primary_rank(Some(Cadence::Hourly)),
+        _ => Cadence::primary_rank(flown.cadence),
+    }
+}
+
+/// The rank actually worth waiting for, given the board. An hour whose ladder
+/// is the daily (Kalshi's 17:00 ET market) has no hourly market to wait for:
+/// with a daily closing within the hour on the board, the 15-minute window is
+/// the best that will come.
+fn wanted_rank(wanted: Option<u8>, pairs: &[KalshiPair], now: chrono::DateTime<Utc>) -> Option<u8> {
+    let hourly = Cadence::primary_rank(Some(Cadence::Hourly));
+    match wanted {
+        Some(r) if r == hourly && pairs.iter().any(|p| p.cadence == Some(Cadence::Daily)
+            && p.close_time.is_some_and(|c| (c - now).num_seconds() <= 3600 + 120)) =>
+            Some(Cadence::primary_rank(Some(Cadence::FifteenMin))),
+        w => w,
+    }
+}
+
+/// Keep waiting for the successor? Only while the best listed market ranks
+/// below the wanted cadence and the wait has time left.
+fn wait_for_successor(wanted: Option<u8>, chosen: &KalshiPair, waited_secs: u64) -> bool {
+    match wanted {
+        Some(r) => Cadence::primary_rank(chosen.cadence) > r && waited_secs < CLOSE_RELIST_WAIT_SECS,
+        None => false,
+    }
+}
+
 async fn select_market(
     venue: &Arc<KalshiVenue>,
     series: &[String],
     filter: &Option<String>,
     cancel: &CancellationToken,
     process_heartbeat_secs: &AtomicU64,
+    closed_rank: Option<u8>,
 ) -> Option<MarketSelection> {
+    let started = std::time::Instant::now();
+    let mut wait_logged = false;
     loop {
         if cancel.is_cancelled() {
             return None;
@@ -1137,6 +1196,25 @@ async fn select_market(
         if pairs.is_empty() {
             warn!("Kalshi trader: no tradeable markets across {series:?} — retrying in {DISCOVERY_RETRY_SECS}s");
         } else {
+            let primary = choose_primary(&pairs, filter.as_deref());
+            let wanted = wanted_rank(closed_rank, &pairs, Utc::now());
+
+            if let Some(p) = primary.as_ref().filter(|p| wait_for_successor(wanted, p, started.elapsed().as_secs())) {
+                if !wait_logged {
+                    wait_logged = true;
+                    info!(
+                        "⏳ Kalshi: the closed market's next window is not listed yet; waiting up to {CLOSE_RELIST_WAIT_SECS}s before settling for \"{}\" ({:?})",
+                        p.question, p.cadence
+                    );
+                }
+                if wait_or_cancel(cancel, CLOSE_RELIST_POLL_SECS).await {
+                    return None;
+                }
+                continue;
+            }
+
+            // Once per selection, on the scan that decides it, not on every
+            // poll of a wait.
             info!(
                 "📊 Kalshi discovered {} tradeable market(s). Top 3: {}",
                 pairs.len(),
@@ -1144,8 +1222,6 @@ async fn select_market(
                     .map(|p| format!("\"{}\" ({:?}, vol {:.0})", p.question, p.cadence, p.volume))
                     .collect::<Vec<_>>().join(", ")
             );
-
-            let primary = choose_primary(&pairs, filter.as_deref());
 
             if let Some(p) = primary {
                 let maker = choose_maker(&pairs, &p);
@@ -4077,6 +4153,60 @@ mod hourly_market_tests {
         assert_eq!(choose_primary(&no_hourly, None).unwrap().ticker, "KXBTC15M-A");
         // The operator's filter still narrows the field.
         assert_eq!(choose_primary(&board, Some("daily")).unwrap().ticker, "KXBTCD-DAILY");
+    }
+
+    /// [B94] After a close the selection waits for the closed cadence's
+    /// successor rather than flying a worse cadence for one rescan, and gives
+    /// up once the wait runs out (the daily-close hour has no hourly market).
+    #[test]
+    fn after_a_close_the_selection_waits_for_the_same_cadence() {
+        let daily = pair("KXBTCD-DAILY", Some(Cadence::Daily), 20_000.0);
+        let quarter = pair("KXBTC15M-A", Some(Cadence::FifteenMin), 50_000.0);
+        let hourly = pair("KXBTCD-HOUR", Some(Cadence::Hourly), 900.0);
+        let r = |c| Some(Cadence::primary_rank(Some(c)));
+        // 16:30: a 15-minute market closed, only the daily is listed yet.
+        assert!(wait_for_successor(r(Cadence::FifteenMin), &daily, 9));
+        // ... and once the next 15-minute market is listed, it is taken.
+        assert!(!wait_for_successor(r(Cadence::FifteenMin), &quarter, 14));
+        // 14:00: an hourly closed, a 15-minute market is listed first.
+        assert!(wait_for_successor(r(Cadence::Hourly), &quarter, 9));
+        assert!(!wait_for_successor(r(Cadence::Hourly), &hourly, 20));
+        // 16:00: no hourly will come; the wait runs out and the best is taken.
+        assert!(!wait_for_successor(r(Cadence::Hourly), &quarter, CLOSE_RELIST_WAIT_SECS));
+        // A better cadence than the closed one never waits, and neither does a
+        // selection that is not after a close (startup, a hotter-market switch).
+        assert!(!wait_for_successor(r(Cadence::Daily), &quarter, 0));
+        assert!(!wait_for_successor(None, &daily, 0));
+    }
+
+    /// [B94 review] A close on the hour wants the new hour's market, whatever
+    /// was flown; other closes want their own cadence; an hour whose ladder is
+    /// the daily wants the 15-minute window instead of waiting for an hourly
+    /// that will not come.
+    #[test]
+    fn the_wanted_successor_follows_the_clock_and_the_board() {
+        use chrono::TimeZone;
+        let at = |p: &str, c, close: &str| {
+            let mut x = pair(p, c, 1.0);
+            x.close_time = Some(chrono::DateTime::parse_from_rfc3339(close).unwrap().with_timezone(&Utc));
+            x
+        };
+        let hourly = Cadence::primary_rank(Some(Cadence::Hourly));
+        let quarter = Cadence::primary_rank(Some(Cadence::FifteenMin));
+        // 17:00 ET: a 15-minute window closing on the hour wants the 18:00 hourly.
+        assert_eq!(successor_rank(&at("KXBTC15M-1700", Some(Cadence::FifteenMin), "2026-11-07T22:00:00Z")), hourly);
+        // 16:30 ET: a 15-minute close wants the next 15-minute window.
+        assert_eq!(successor_rank(&at("KXBTC15M-1630", Some(Cadence::FifteenMin), "2026-11-07T21:30:00Z")), quarter);
+        // 16:00 ET: the 16:00 hourly closed and the board's ladder for the hour is
+        // the 17:00 daily, so no hourly is coming; the 15-minute window is wanted.
+        let now = Utc.with_ymd_and_hms(2026, 11, 7, 21, 0, 10).unwrap();
+        let board = vec![at("KXBTCD-DAILY", Some(Cadence::Daily), "2026-11-07T22:00:00Z")];
+        assert_eq!(wanted_rank(Some(hourly), &board, now), Some(quarter));
+        // Any other hour: the daily is a day away, so the hourly is still wanted.
+        let now = Utc.with_ymd_and_hms(2026, 11, 7, 19, 0, 10).unwrap();
+        assert_eq!(wanted_rank(Some(hourly), &board, now), Some(hourly));
+        assert_eq!(wanted_rank(Some(quarter), &board, now), Some(quarter));
+        assert_eq!(wanted_rank(None, &board, now), None);
     }
 
     /// A better cadence rotates at once; the same cadence rotates only for a
