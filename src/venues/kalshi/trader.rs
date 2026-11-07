@@ -1388,11 +1388,15 @@ async fn trade_one_market(
         pair.is_crypto().then(|| pair.underlying.to_string()),
     );
 
+    // [E86] Created before the viper list is read, so a script saved between
+    // the two is attached on the first tick rather than missed.
+    let mut script_attacher = crate::vipers::scripted::Attacher::new(&squadron_id, status_scope, &market_class);
     let viper_kinds = match db::pool() {
         Some(p) => db::vipers_for_class(p, &market_class).await,
         None => Vec::new(),
     };
-    let strategies = StrategyRegistry::create_strategies_for_kinds(&viper_kinds);
+    let mut strategies = StrategyRegistry::create_strategies_for_kinds(&viper_kinds);
+    script_attacher.sync(&mut strategies);
     info!(
         "🎯 Kalshi loop will run {} viper(s) for class '{}': {:?}",
         strategies.len(),
@@ -1937,6 +1941,15 @@ async fn trade_one_market(
                 // suppressed at dispatch by `opens_exposure`.
             }
             MarketPhase::Open => {}
+        }
+
+        // [E86] A script saved since this loop started joins it now, not at
+        // the next market. One atomic load on a tick with nothing new.
+        for sn in script_attacher.sync(&mut strategies) {
+            let key = sn.to_lowercase();
+            markets_tx.send_modify(|map| {
+                map.insert(crate::state::strategy_market_key(&squadron_id, &key), pair.question.clone());
+            });
         }
 
         if strategies.is_empty() || Instant::now() < cooldown_until {

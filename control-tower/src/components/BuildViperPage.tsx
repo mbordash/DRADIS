@@ -34,7 +34,7 @@ import {
   patchConfig, resetScriptState, saveScript, validateScript,
 } from '@/lib/api';
 import type {
-  CustomViperConfig, ScriptDryRun, ScriptManifest, ScriptParam, ScriptParamType, ScriptTemplate,
+  CustomViperConfig, ScriptDryRun, ScriptList, ScriptListItem, ScriptManifest, ScriptParam, ScriptParamType, ScriptTemplate,
 } from '@/lib/types';
 import { useConfirm } from './ConfirmDialog';
 
@@ -460,6 +460,109 @@ function SettingsPanel({ name, manifest, cfg, instanceGhost, paperCount, paperPn
   );
 }
 
+// ── Where it runs ─────────────────────────────────────────────────────────────
+
+const ago = (s: number | null | undefined) =>
+  s == null ? '' : s < 60 ? `${s}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : `${Math.floor(s / 3600)}h ago`;
+
+/** A status row this old means the squadron stopped ticking the viper. */
+const STALE_SECS = 120;
+
+/** Each running squadron of the viper's classes, and what the viper is doing
+ *  there: joining, waiting for a market, ticking (with its last decision), or
+ *  failing. The engine attaches a saved script on the squadron's next tick. */
+function WhereItRuns({ item, squadrons, enabled, venue }: {
+  item: ScriptListItem; squadrons: ScriptList['squadrons']; enabled: boolean; venue: string;
+}) {
+  const classes = item.manifest.classes ?? [];
+  // An empty venue list means every venue.
+  const venueOk = !item.manifest.venues?.length || item.manifest.venues.includes(venue);
+  const venueLabel = VENUES.find((v) => v.id === venue)?.label ?? venue;
+  const matching = venueOk ? squadrons.filter((s) => classes.includes(s.class)) : [];
+  // Attached where its classes or venues no longer reach (the manifest was
+  // narrowed): it stays on that squadron until the squadron moves on, and the
+  // engine refuses it new entries there.
+  const leftover = item.running_on.filter((a) => !matching.some((m) => m.squadron === a.squadron))
+    .filter((a, i, all) => all.findIndex((x) => x.squadron === a.squadron) === i);
+
+  const row = (squadron: string, cls: string, note?: string) => {
+    // The newest, should a re-deployed squadron briefly have two loops.
+    const a = item.running_on.filter((x) => x.squadron === squadron)
+      .sort((x, y) => y.attached_at.localeCompare(x.attached_at))[0];
+    const st = a?.status ?? null;
+    let badge: { label: string; cls: string };
+    let line: string | null = null;
+    if (!a) {
+      badge = { label: 'joining', cls: 'text-amber-300 border-amber-500/40' };
+      line = 'Attaches on this squadron’s next tick.';
+    } else if (!st) {
+      badge = { label: 'attached', cls: 'text-teal-300 border-teal-500/40' };
+      line = 'Waiting for its first tick here.';
+    } else if (st.last_eval_secs_ago > STALE_SECS) {
+      badge = { label: 'stalled', cls: 'text-red-300 border-red-500/40' };
+      line = `No tick for ${ago(st.last_eval_secs_ago).replace(' ago', '')}. The squadron detail shows why.`;
+    } else if (st.last_outcome === 'error' || st.last_outcome === 'timeout') {
+      badge = { label: st.last_outcome, cls: 'text-red-300 border-red-500/40' };
+      line = st.last_reason;
+    } else if (st.last_reason === 'disabled in config') {
+      badge = { label: 'off', cls: 'text-gray-500 border-gray-600/40' };
+      line = 'Switched off on this squadron: no new entries; what it holds keeps its exits.';
+    } else if (st.last_outcome === 'idle') {
+      badge = { label: 'waiting', cls: 'text-gray-400 border-gray-600/40' };
+      line = st.last_reason ?? 'waiting for a tradeable market';
+    } else {
+      badge = { label: st.last_outcome === 'signal' ? 'signal' : 'running', cls: 'text-teal-300 border-teal-500/40' };
+      line = st.last_reason ? `${st.last_outcome === 'signal' ? 'entry' : 'hold'}: ${st.last_reason}` : null;
+    }
+    return (
+      <div key={squadron} className="rounded border border-[#1e1e32] px-2 py-1.5 space-y-0.5">
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-xs font-mono text-gray-200">
+            {squadron} <span className="text-gray-600">· {cls}</span>
+          </span>
+          <span className="flex items-center gap-2">
+            {st && <span className="text-[10px] font-mono text-gray-500">ticked {ago(st.last_eval_secs_ago)}</span>}
+            <span className={`text-[9px] font-mono uppercase border rounded px-1 ${badge.cls}`}>{badge.label}</span>
+          </span>
+        </div>
+        {line && <div className="text-[10px] font-mono text-gray-400 break-words">{line}</div>}
+        {st && st.refusals.length > 0 && (
+          <div className="text-[10px] font-mono text-gray-500">
+            Refused: {st.refusals.slice(0, 3).map((r) => `${r.reason} ×${r.count}`).join(' · ')}
+          </div>
+        )}
+        {note && <div className="text-[10px] font-mono text-amber-300/80">{note}</div>}
+      </div>
+    );
+  };
+
+  return (
+    <div className="card p-3 border border-[#1e1e32] space-y-2">
+      <p className={labelCls}>Where it runs</p>
+      {!enabled && (
+        <p className="text-[10px] font-mono text-amber-300">
+          Switched off in Settings: it stays attached and manages what it holds, but takes no new entries.
+        </p>
+      )}
+      {!venueOk && (
+        <p className="text-[11px] font-mono text-amber-300">
+          Its venues leave out {venueLabel}, which this instance trades, so it joins no squadron here. Add {venueLabel} under
+          Venues, or leave Venues empty for all of them.
+        </p>
+      )}
+      {venueOk && matching.length === 0 && leftover.length === 0 && (
+        <p className="text-[11px] font-mono text-gray-500">
+          No {classes.join(' or ')} squadron is running on this instance. It joins one on that squadron&apos;s first tick
+          once you deploy it.
+        </p>
+      )}
+      {matching.map((s) => row(s.squadron, s.class))}
+      {leftover.map((a) => row(a.squadron, a.class,
+        `Its ${venueOk ? `classes no longer include ${a.class}` : `venues no longer include ${venueLabel}`}. It stays on this squadron, with no new entries, until the squadron moves to a new market.`))}
+    </div>
+  );
+}
+
 // ── Test run ──────────────────────────────────────────────────────────────────
 
 function TestRunPanel({ name, squadrons, unsavedSource, isNew, manifest, manifestProblems }: {
@@ -490,9 +593,10 @@ function TestRunPanel({ name, squadrons, unsavedSource, isNew, manifest, manifes
   if (squadrons.length === 0) {
     return (
       <p className="text-xs font-mono text-gray-500">
-        No squadron has handed a script its market yet. A squadron records its market each tick any saved viper runs there;
-        {isNew ? ' save this viper (it paper-trades until you put it on live) and' : ''} come back after the squadron&apos;s
-        next rebuild (about two minutes on Kalshi).
+        No squadron has run a script yet, so there is no market to test against.
+        {isNew
+          ? ' Save this viper (it paper-trades until you put it on live): it joins every running squadron of its classes on that squadron’s next tick, and the test run works from then.'
+          : ' It joins a running squadron of its classes on that squadron’s next tick; Where it runs, on the Script tab, shows when.'}
       </p>
     );
   }
@@ -689,7 +793,9 @@ function ReferencePanel() {
 // ── The page ──────────────────────────────────────────────────────────────────
 
 export default function BuildViperPage() {
-  const { data: list, mutate: refreshList, error: listError } = useSWR('scripts', listScripts, { refreshInterval: 15_000 });
+  // Every 5 s: the Where it runs panel is the operator's view of a save taking
+  // effect, and a 15 s lag read as "nothing happened".
+  const { data: list, mutate: refreshList, error: listError } = useSWR('scripts', listScripts, { refreshInterval: 5_000 });
   const { data: config, mutate: refreshConfig, error: configError } = useSWR('config', getConfig);
   const { data: templates } = useSWR('script-templates', getScriptTemplates);
   const [confirm, confirmDialog] = useConfirm();
@@ -785,7 +891,9 @@ export default function BuildViperPage() {
     try {
       const r = await saveScript(m, draft.source, draft.isNew);
       setProblems(null);
-      setNotice(`Saved as version ${r.version}. ${r.note}.`);
+      setNotice(draft.isNew
+        ? `Saved as version ${r.version}, on paper. It joins its squadrons on their next tick: see Where it runs below.`
+        : `Saved as version ${r.version}. It runs from each squadron’s next tick.`);
       ++openSeq.current;
       setSelected(m.name);
       setDraft({ ...draft, manifest: m, isNew: false });
@@ -898,7 +1006,8 @@ export default function BuildViperPage() {
             ))}
           </div>
           <div className="card p-3 border border-[#1e1e32] space-y-2">
-            <p className={labelCls}>New viper from</p>
+            <p className={labelCls}>Templates</p>
+            <p className="text-[10px] font-mono text-gray-500">Pick one to start a new viper.</p>
             {templates?.map((t) => (
               <button key={t.id} onClick={() => startFrom(t)} className="w-full text-left rounded border border-[#1e1e32] px-2 py-1.5 hover:bg-white/[0.02]">
                 <div className="text-xs font-mono text-gray-200">{t.title}</div>
@@ -971,6 +1080,9 @@ export default function BuildViperPage() {
                     Saving checks the manifest and compiles the script first; if anything is wrong nothing is written and the running
                     version keeps running. A saved change applies from the next tick, including to positions the viper already holds.
                   </p>
+                  {!draft.isNew && current && list && (
+                    <WhereItRuns item={current} squadrons={list.squadrons ?? []} enabled={cfg.enabled ?? true} venue={list.venue} />
+                  )}
                 </div>
               )}
 

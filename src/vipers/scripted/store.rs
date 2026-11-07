@@ -26,13 +26,14 @@
 //! compiled before anything touches disk, so a bad edit is reported to the
 //! page and the running version keeps running.
 //!
-//! Also kept here, because the adapters are rebuilt with their squadrons (every
-//! two minutes on Kalshi) and must not lose it: each viper's `this` state per
+//! Also kept here, because the adapters are rebuilt with their squadrons (when
+//! a squadron moves to a new market) and must not lose it: each viper's `this` state per
 //! squadron, and the last context each squadron handed a script, which is what
 //! the dry run evaluates against.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use chrono::{DateTime, Utc};
@@ -96,6 +97,17 @@ pub fn dir() -> PathBuf {
 }
 
 pub fn strategy_name(name: &str) -> String { format!("{NAME_PREFIX}{name}") }
+
+/// Bumped after every change to the running set (save, delete, load), so a
+/// running squadron can tell cheaply, once a tick, that it should look for a
+/// script to attach. Bumped while the write lock is still held and after the
+/// change, so a reader that sees the new number and then takes the read lock
+/// sees the change too.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub fn generation() -> u64 { GENERATION.load(Ordering::Acquire) }
+
+fn bump() { GENERATION.fetch_add(1, Ordering::AcqRel); }
 
 /// The script name inside a strategy name, if it is one.
 pub fn script_of(strategy_name: &str) -> Option<&str> { strategy_name.strip_prefix(NAME_PREFIX) }
@@ -195,6 +207,7 @@ pub fn save_in(dir: &Path, manifest: Manifest, source: String) -> Result<Arc<Scr
     let mut s = write();
     s.broken.remove(&name);
     let replaced = s.scripts.insert(name.clone(), Arc::clone(&script)).is_some();
+    bump();
     info!("📜 Script viper '{}' {} (version {})", name, if replaced { "updated" } else { "added" }, script.hash);
     Ok(script)
 }
@@ -210,6 +223,7 @@ pub fn delete_in(dir: &Path, name: &str) -> std::io::Result<bool> {
     }
     let mut s = write();
     let had = s.scripts.remove(name).is_some() | s.broken.remove(name).is_some();
+    bump();
     if had { info!("📜 Script viper '{name}' deleted"); }
     Ok(had)
 }
@@ -255,6 +269,7 @@ pub fn load_all_in(dir: &Path) -> usize {
     for k in loaded.keys() { s.broken.remove(k); }
     s.scripts.extend(loaded);
     s.broken.extend(broken);
+    bump();
     n
 }
 
@@ -311,8 +326,78 @@ pub fn context_squadrons() -> Vec<(String, DateTime<Utc>)> {
     contexts().lock().unwrap_or_else(|p| p.into_inner()).iter().map(|(k, v)| (k.clone(), v.at)).collect()
 }
 
+// ── Where each script runs ────────────────────────────────────────────────────
+
+/// One squadron loop running a script, as the Build a Viper page shows it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Attachment {
+    pub script: String,
+    pub squadron: String,
+    /// The key the viper status registry files this squadron's rows under.
+    pub status_asset: String,
+    pub class: String,
+    pub attached_at: DateTime<Utc>,
+    /// Attached by a running loop after a save, not when the loop started.
+    pub hot: bool,
+    #[serde(skip)]
+    loop_id: u64,
+}
+
+/// One running squadron loop, whether or not it runs any script, so the page
+/// can tell "waiting for a squadron" from "no squadron of that class".
+#[derive(Debug, Clone, Serialize)]
+pub struct RunningLoop {
+    pub squadron: String,
+    pub class: String,
+    #[serde(skip)]
+    loop_id: u64,
+}
+
+fn loops() -> &'static Mutex<Vec<RunningLoop>> {
+    static L: OnceLock<Mutex<Vec<RunningLoop>>> = OnceLock::new();
+    L.get_or_init(Default::default)
+}
+
+pub(crate) fn note_loop(loop_id: u64, squadron: &str, class: &str) {
+    loops().lock().unwrap_or_else(|p| p.into_inner())
+        .push(RunningLoop { squadron: squadron.to_string(), class: class.to_string(), loop_id });
+}
+
+/// The squadron loops running now, oldest first.
+pub fn running_loops() -> Vec<RunningLoop> {
+    loops().lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+fn attachments() -> &'static Mutex<Vec<Attachment>> {
+    static A: OnceLock<Mutex<Vec<Attachment>>> = OnceLock::new();
+    A.get_or_init(Default::default)
+}
+
+pub(crate) fn note_attached(loop_id: u64, script: &str, squadron: &str, status_asset: &str, class: &str, hot: bool) {
+    let mut a = attachments().lock().unwrap_or_else(|p| p.into_inner());
+    if a.iter().any(|x| x.loop_id == loop_id && x.script == script) { return; }
+    a.push(Attachment {
+        script: script.to_string(), squadron: squadron.to_string(), status_asset: status_asset.to_string(),
+        class: class.to_string(), attached_at: Utc::now(), hot, loop_id,
+    });
+}
+
+/// A squadron loop ended (rotation, stand-down): its attachments go with it.
+/// Keyed by loop, so a loop that ends after its successor started cannot
+/// remove the successor's rows.
+pub(crate) fn forget_loop(loop_id: u64) {
+    loops().lock().unwrap_or_else(|p| p.into_inner()).retain(|x| x.loop_id != loop_id);
+    attachments().lock().unwrap_or_else(|p| p.into_inner()).retain(|x| x.loop_id != loop_id);
+}
+
+/// Every running attachment of a script.
+pub fn attachments_of(script: &str) -> Vec<Attachment> {
+    attachments().lock().unwrap_or_else(|p| p.into_inner())
+        .iter().filter(|x| x.script == script).cloned().collect()
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Test scripts are declared for a venue other than the one being built,

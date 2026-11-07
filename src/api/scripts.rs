@@ -74,6 +74,23 @@ async fn open_positions(name: &str) -> i64 {
     n
 }
 
+/// Where a script runs: each squadron loop it is attached to, with that
+/// squadron's latest status row for it (last tick, last reason, refusals).
+fn running_on(name: &str) -> Vec<serde_json::Value> {
+    let strategy = store::strategy_name(name);
+    store::attachments_of(name).into_iter().map(|a| {
+        let status = crate::helpers::viper_status::snapshot(Some(&a.status_asset))
+            .into_iter().find(|r| r.strategy == strategy);
+        serde_json::json!({
+            "squadron": a.squadron,
+            "class": a.class,
+            "attached_at": a.attached_at,
+            "hot": a.hot,
+            "status": status,
+        })
+    }).collect()
+}
+
 async fn list() -> Response {
     let mut scripts = Vec::new();
     for s in store::all() {
@@ -84,10 +101,12 @@ async fn list() -> Response {
             "version": s.hash,
             "saved_at": s.saved_at,
             "paper": paper_summary(&s.manifest.name).await,
+            "running_on": running_on(&s.manifest.name),
         }));
     }
     Json(serde_json::json!({
         "scripts": scripts,
+        "squadrons": store::running_loops(),
         "broken": store::broken(),
         "venue": crate::venues::venue_name(),
         "dry_run_squadrons": store::context_squadrons()
@@ -176,7 +195,7 @@ async fn save(Path(name): Path<String>, Query(q): Query<SaveQuery>, Json(b): Jso
             "ok": true,
             "version": s.hash,
             "note": if new {
-                "saved; the viper attaches to matching squadrons at their next rebuild and paper-trades until its Live switch is on"
+                "saved; it joins every running squadron of its classes on that squadron's next tick and paper-trades until its Live switch is on"
             } else {
                 "saved; the new version runs from the next tick"
             },

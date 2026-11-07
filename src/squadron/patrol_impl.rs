@@ -569,11 +569,15 @@ impl Squadron {
         // idled on missing oracle data rather than by design — TimeDecay, which
         // needs no oracle, was one theta window away from resting bids on
         // "Trump out as President by August 31?".
+        // [E86] Created before the viper list is read, so a script saved
+        // between the two is attached on the first tick rather than missed.
+        let mut script_attacher = crate::vipers::scripted::Attacher::new(&self.id, &asset_lc, &market_class);
         let viper_kinds = match db::pool_for(&asset_lc) {
             Some(p) => crate::helpers::db::vipers_for_class(&p, &market_class).await,
             None => Vec::new(),
         };
-        let strategies = StrategyRegistry::create_strategies_for_kinds(&viper_kinds);
+        let mut strategies = StrategyRegistry::create_strategies_for_kinds(&viper_kinds);
+        script_attacher.sync(&mut strategies);
         info!(
             "🎯 Squadron [{}] will run {} viper(s) for class '{}': {:?}",
             self.id,
@@ -767,6 +771,9 @@ impl Squadron {
                 "Sports" => hourly_market_name.clone(),
                 // Helm: one market, no split, and that market is the squadron's.
                 "Single market" => hourly_market_name.clone(),
+                // [E86] A script viper runs on the hourly snapshot, as the
+                // tick's routing does for it.
+                "Script" => hourly_market_name.clone(),
                 _ => String::from("Unknown"),
             };
             let status_key = sn
@@ -1678,6 +1685,13 @@ impl Squadron {
                         sports: crate::raptors::sports_ledger::line_for(hourly_market_config_for_ctx.yes_token.as_str(), hourly_market_config_for_ctx.no_token.as_str()),
                     };
 
+                    // [E86] A script saved since this squadron started joins it
+                    // now, not at the next rotation. One atomic load on a tick
+                    // with nothing new.
+                    for sn in script_attacher.sync(&mut strategies) {
+                        let (key, market) = (sn.to_lowercase(), hourly_market_name.clone());
+                        markets_tx.send_modify(|m| { m.insert(key, market); });
+                    }
                     let eval_result = match execute_strategies_concurrent(&strategies, &ctx, 500, &mut last_executor_summary).await {
                         Ok(r) => r,
                         Err(e) => { warn!("⚠️ Strategy evaluation error: {}", e); continue; }

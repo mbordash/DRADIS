@@ -570,7 +570,7 @@ export default function SquadronDetailView({ squadron, onBack, onOpenMarket }: P
         </div>
 
         {config ? (
-          activeVipers.length > 0 ? (
+          activeVipers.length + scriptRows.length > 0 ? (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
               {activeVipers.map((v) => (
                 <ViperCard
@@ -588,6 +588,11 @@ export default function SquadronDetailView({ squadron, onBack, onOpenMarket }: P
                   autoscale={v.strategyName === 'HelmStrategy' ? undefined : scaleFor(v.strategyName)}
                 />
               ))}
+              {/* [E86] The operator's scripts, in the same grid: a separate row
+                  below read as "not on the list". */}
+              {scriptRows.map((r) => (
+                <ScriptViperCard key={r.strategy} row={r} config={config} onPatch={handlePatch} />
+              ))}
             </div>
           ) : (
             <div className="card p-6 flex items-center justify-center h-32 text-gray-600 text-sm">
@@ -600,13 +605,6 @@ export default function SquadronDetailView({ squadron, onBack, onOpenMarket }: P
           </div>
         )}
 
-        {config && scriptRows.length > 0 && (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 mt-3">
-            {scriptRows.map((r) => (
-              <ScriptViperCard key={r.strategy} row={r} config={config} onPatch={handlePatch} />
-            ))}
-          </div>
-        )}
 
         {/* Settings that apply across the squadron rather than to one viper.
             Rendered here because these read the SQUADRON's config — the same

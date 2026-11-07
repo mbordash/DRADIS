@@ -133,14 +133,22 @@ function ViperCoverage({ squadronId, marketClass, vipers }: {
       })
     : undefined;
 
-  const total = applicable.length;
-  const on = active?.length;
+  // [E86] The operator's script vipers this squadron runs. The class list above
+  // is the built-in taxonomy, so without these a squadron running a script
+  // read "10/10" beside an engine reporting eleven.
+  const scripts = (vipers ?? []).filter(id => id.startsWith('script:')).map(id => id.slice('script:'.length));
+  const scriptsOn = cfg ? scripts.filter(n => cfg.custom_vipers?.[n]?.enabled !== false) : undefined;
+
+  const total = applicable.length + scripts.length;
+  const on = active && scriptsOn ? active.length + scriptsOn.length : undefined;
   // Amber only when something is off. A squadron running everything it can is
   // healthy even if its class supports fewer strategies than crypto does.
   const partial = on !== undefined && on < total;
-  const offNames = active && applicable
-    .filter(v => !active.some(a => a.id === v.id))
-    .map(v => v.display);
+  const offNames = active && scriptsOn && [
+    ...applicable.filter(v => !active.some(a => a.id === v.id)).map(v => v.display),
+    ...scripts.filter(n => !scriptsOn.includes(n)).map(n => `${n} (script)`),
+  ];
+  const onNames = active && scriptsOn && [...active.map(v => v.display), ...scriptsOn.map(n => `${n} (script)`)];
 
   return (
     <span
@@ -152,10 +160,10 @@ function ViperCoverage({ squadronId, marketClass, vipers }: {
       title={[
         on === undefined
           ? `${total} strategies apply to ${marketClass} markets.`
-          : `${on} of ${total} strategies active: ${active!.map(v => v.display).join(', ') || 'none'}.`,
+          : `${on} of ${total} strategies active: ${onNames!.join(', ') || 'none'}.`,
         offNames && offNames.length > 0 ? `Switched off: ${offNames.join(', ')}.` : '',
-        total < full.length
-          ? `${total} of ${full.length} strategies apply to ${marketClass} markets — the rest need a ` +
+        applicable.length < full.length
+          ? `${applicable.length} of ${full.length} built-in strategies apply to ${marketClass} markets — the rest need a ` +
             `per-market price signal that only crypto markets provide.`
           : '',
       ].filter(Boolean).join(' ')}

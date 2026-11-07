@@ -17,6 +17,8 @@
 // ── API response shapes ───────────────────────────────────────────────────────
 
 /** Rust Decimal values are serialized as strings over the wire. */
+import type { ViperStatusRow } from './api';
+
 export interface DynamicConfig {
   // Global
   ghost_mode: boolean;
@@ -1326,6 +1328,17 @@ export interface PaperRow {
   pnl: string | null;
 }
 
+/** One squadron a script runs on, with that squadron's latest status row for
+ *  it (null until its first tick there). */
+export interface ScriptAttachment {
+  squadron: string;
+  class: string;
+  attached_at: string;
+  /** Joined a running squadron after a save, rather than at the squadron's start. */
+  hot: boolean;
+  status: ViperStatusRow | null;
+}
+
 export interface ScriptListItem {
   name: string;
   strategy: string;
@@ -1333,12 +1346,15 @@ export interface ScriptListItem {
   version: string;
   saved_at: string;
   paper: PaperSummary;
+  running_on: ScriptAttachment[];
 }
 
 export interface ScriptList {
   scripts: ScriptListItem[];
   broken: { name: string; error: string }[];
   venue: string;
+  /** Every squadron running now and its market class, script or not. */
+  squadrons: { squadron: string; class: string }[];
   dry_run_squadrons: { squadron: string; context_at: string }[];
 }
 

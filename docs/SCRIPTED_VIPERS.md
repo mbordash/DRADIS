@@ -55,15 +55,17 @@ A script can only ask. The engine decides what actually happens.
 ## Quick start
 
 1. Open **Build a Viper** from the main menu.
-2. Under **New viper from**, pick **Plain Momentum**, then change its name
+2. Under **Templates**, pick **Plain Momentum**, then change its name
    (e.g. `my_momentum`).
 3. Press **Check**, then **Save (starts on paper)**.
-4. Matching squadrons pick it up at their next rebuild: about every two
-   minutes on Kalshi and five on Polymarket US. On Polymarket International a
-   squadron picks it up when it next rotates to a new market (hourly markets
-   rotate on the hour) or is deployed. After that, the **Test run** tab can run your script against a
+4. Every running squadron of the viper's classes picks it up on its next
+   tick, on every venue, without a restart. **Where it runs**, under the editor,
+   lists those squadrons and what the viper is doing on each: joining, waiting
+   for a market, running with its last hold reason, or failing. Once it has
+   ticked on a squadron, the **Test run** tab can run your script against that
    squadron's latest market data without sending anything.
-5. Watch the **Paper ledger** tab and the viper's card on the squadron page.
+5. Watch **Where it runs**, the **Paper ledger** tab and the viper's card on
+   the squadron page.
 6. When the paper record says so, and not before, use **Settings → Live**.
 
 ---
@@ -277,8 +279,8 @@ on that market, against the last market data a squadron handed any script.
 It uses this viper's parameters and a copy of its memory. Nothing is sent and
 nothing is recorded. It can run the editor's unsaved code. A squadron records
 its market data each tick that any saved viper runs there, so on a fresh
-instance save a viper first (it starts on paper) and wait for the squadron's
-next rebuild.
+instance save a viper first (it starts on paper); it joins its squadrons on
+their next tick.
 
 ## Backups
 
@@ -311,9 +313,14 @@ a patch that names one viper leaves the others alone. Within one viper,
 
 ## Troubleshooting
 
-- **The viper never appears on a squadron.** Check that its classes include
-  the squadron's class and its venues include this venue (or are empty), then
-  wait for the squadron's next rebuild (see the quick start).
+- **The viper never appears on a squadron.** **Where it runs** says why: no
+  squadron of its classes is running, or its venues leave out this venue. A
+  squadron that shows **joining** for more than a few seconds is not ticking
+  (no market yet, or a fault); its squadron detail says which.
+- **I narrowed its classes and it still runs on a squadron.** A squadron it was
+  already running on keeps it until that squadron moves to a new market;
+  **Where it runs** marks it. (While the viper holds a real position, a save
+  that narrows its classes or venues is refused.)
 - **"script error: …" on the card.** The script raised an error or returned
   something malformed. The message names the function and the line.
 - **"Too many operations".** The script did too much work in one call. Look

@@ -1231,11 +1231,15 @@ async fn trade_one_market(
 
     // Resolve the vipers meaningful for this market class and instantiate exactly
     // those strategy impls from the shared registry.
+    // [E86] Created before the viper list is read, so a script saved between
+    // the two is attached on the first tick rather than missed.
+    let mut script_attacher = crate::vipers::scripted::Attacher::new(&squadron_id, asset, &market_class);
     let viper_kinds = match db::pool() {
         Some(p) => db::vipers_for_class(p, &market_class).await,
         None => Vec::new(),
     };
-    let strategies = StrategyRegistry::create_strategies_for_kinds(&viper_kinds);
+    let mut strategies = StrategyRegistry::create_strategies_for_kinds(&viper_kinds);
+    script_attacher.sync(&mut strategies);
     info!(
         "🎯 US loop will run {} viper(s) for class '{}': {:?}",
         strategies.len(),
@@ -1575,6 +1579,13 @@ async fn trade_one_market(
                 // at dispatch by `opens_exposure`.
             }
             MarketPhase::Open => {}
+        }
+
+        // [E86] A script saved since this loop started joins it now, not at
+        // the next market. One atomic load on a tick with nothing new.
+        let attached: Vec<String> = script_attacher.sync(&mut strategies).iter().map(|sn| sn.to_lowercase()).collect();
+        if !attached.is_empty() {
+            publish_us_strategy_market(markets_tx, &squadron_id, &attached, &pair.question);
         }
 
         if strategies.is_empty() || Instant::now() < cooldown_until {
