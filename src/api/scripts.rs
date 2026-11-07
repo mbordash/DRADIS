@@ -138,7 +138,28 @@ async fn paper_trades(Query(q): Query<PaperQuery>) -> Response {
     }
     rows.sort_by(|a, b| b.opened_at.cmp(&a.opened_at));
     rows.truncate(limit as usize);
-    Json(rows).into_response()
+    // The Trade Log files every row by venue, class and underlying. The paper
+    // ledger stores none of them, and none needs storing: the ledger lives in
+    // this engine's database, so the venue is this build's; the class is the
+    // running squadron's, or crypto when the market names an underlying; the
+    // underlying reads from the market's name as the squadrons' own does.
+    let loops = store::running_loops();
+    let out: Vec<_> = rows.into_iter().map(|r| {
+        let underlying = crate::squadron::underlying_from_market_name(&r.market);
+        let class = loops.iter().find(|l| l.squadron == r.squadron_id).map(|l| l.class.clone())
+            .or_else(|| underlying.map(|_| "crypto".to_string()));
+        PaperTradeOut { venue: crate::venues::ledger_venue(), market_class: class, underlying, row: r }
+    }).collect();
+    Json(out).into_response()
+}
+
+#[derive(serde::Serialize)]
+struct PaperTradeOut {
+    venue: &'static str,
+    market_class: Option<String>,
+    underlying: Option<&'static str>,
+    #[serde(flatten)]
+    row: paper::PaperRow,
 }
 
 #[derive(Deserialize)]

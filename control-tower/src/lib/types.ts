@@ -1348,6 +1348,11 @@ export interface PaperTradeRow {
   exit_reason: string | null;
   /** Null while open, and on a row closed unscored. */
   pnl: string | null;
+  /** This engine's venue, as `/api/trades` files it (`kalshi`, …). */
+  venue?: string | null;
+  market_class?: string | null;
+  /** Null for a market with no underlying (sports, politics). */
+  underlying?: string | null;
 }
 
 /** One squadron a script runs on, with that squadron's latest status row for

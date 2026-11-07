@@ -189,6 +189,10 @@ notes = open(notes_path, encoding="utf-8").read().strip("\n")
 FOLD = {"→": "->", "←": "<-", "…": "...", "×": "x", "¢": "c", "—": "-", "–": "-",
         "‘": "'", "’": "'", "“": '"', "”": '"', "≥": ">=", "≤": "<=", "≈": "~",
         "σ": "sigma", "Δ": "delta", "·": "-", "\u00a0": " "}
+# Badge emoji name what the Control Tower shows; the word beside them carries the
+# meaning, so the Marketplace copy drops the emoji ("a 📝 paper badge" -> "a paper badge").
+for badge in ("📝", "👻"):
+    notes = notes.replace(badge + " ", "").replace(badge, "")
 notes = "".join(FOLD.get(c, c) for c in notes)
 left = sorted({c for c in notes if ord(c) > 127})
 if left:

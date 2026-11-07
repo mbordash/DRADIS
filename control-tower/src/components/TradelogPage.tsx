@@ -270,9 +270,9 @@ function paperToEntries(shard: string, rows: PaperTradeRow[]): LogEntry[] {
       key:         `${shard}-paper-${r.id}`,
       ts:          new Date(closed ? r.closed_at! : r.opened_at),
       shard,
-      venue:       null,
-      marketClass: null,
-      underlying:  null,
+      venue:       r.venue ?? null,
+      marketClass: r.market_class ?? null,
+      underlying:  r.underlying ?? null,
       // Only on a scored row: under an unscored row's dash, a fee line would
       // print a "gross" figure that never existed.
       fees:        closed && r.pnl != null ? fees : null,
