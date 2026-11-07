@@ -4,7 +4,7 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
-## 1.7.0 (unreleased)
+## 1.7.0 (2026-11-07)
 
 - Build a Viper (new): write your own strategy as a script in Control Tower, save it, and it runs from the next tick, with no rebuild. A script defines entry(ctx) and exit(ctx, pos), reads the squadron's market, its signals and its own parameters, and returns a hold, a buy, a sale or a take-profit. Start from a blank script or one of two worked examples (Plain Momentum, Late Favourite). Check finds every problem with the manifest and the script at once. Test run evaluates the script against a squadron's latest market data without sending anything.
 - The Trade Log shows script vipers' paper trades beside the real ones, with a 📝 paper badge and a Show/Hide filter. They stay out of every total (Realized, Unrealized, Net, the summary cards, the chart, the auto-scaler and the advisor), and the footer gives them a line of their own. The CSV export stays real trades only. Ghost mode keeps its 👻 ghost badge; Build a Viper now says ghost, not simulated, for the instance setting.
