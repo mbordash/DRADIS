@@ -148,6 +148,14 @@ pub async fn recent(pool: &SqlitePool, script: &str, limit: i64) -> Vec<PaperRow
         .fetch_all(pool).await.unwrap_or_default().iter().map(row).collect()
 }
 
+/// The most recent rows of every script, deleted ones included, newest first,
+/// for the Trade Log. Open rows come first in time order like the rest.
+pub async fn recent_all(pool: &SqlitePool, limit: i64) -> Vec<PaperRow> {
+    sqlx::query("SELECT * FROM script_paper ORDER BY id DESC LIMIT ?")
+        .bind(limit.clamp(1, 1000))
+        .fetch_all(pool).await.unwrap_or_default().iter().map(row).collect()
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Summary {
     pub open: i64,

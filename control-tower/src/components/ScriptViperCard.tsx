@@ -34,9 +34,9 @@ export default function ScriptViperCard({ row, config, onPatch }: {
   const name = row.strategy.replace(/^Script:/, '');
   const cfg = config.custom_vipers?.[name] ?? {};
   const enabled = cfg.enabled ?? true;
-  const mode = !enabled ? 'off' : cfg.live ? (config.ghost_mode ? 'live · sim' : 'live') : 'paper';
+  const mode = !enabled ? 'off' : cfg.live ? (config.ghost_mode ? 'live · ghost' : 'live') : 'paper';
   const modeCls = mode === 'live' ? 'text-red-300 border-red-500/40'
-    : mode === 'live · sim' ? 'text-amber-300 border-amber-500/40'
+    : mode === 'live · ghost' ? 'text-amber-300 border-amber-500/40'
     : mode === 'paper' ? 'text-teal-300 border-teal-500/40' : 'text-gray-500 border-gray-600/40';
   const bad = isTroubled(row);
 

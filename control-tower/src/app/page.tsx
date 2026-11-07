@@ -458,7 +458,7 @@ function PortfolioValueBanner({
             `${unpriced} awaiting first mark`,
             'New positions are valued at cost (or from the last snapshot) until the first mark-to-market sweep, about a minute.',
           )}
-          {ghostMode && badge('bg-amber-500/10 text-amber-400 border-amber-500/20', 'virtual', 'Ghost mode: simulated fills, no real orders.')}
+          {ghostMode && badge('bg-amber-500/10 text-amber-400 border-amber-500/20', '👻 ghost', 'Ghost mode: simulated fills, no real orders.')}
         </div>
         <span className={`text-3xl font-mono font-bold tracking-tight ${isLoading || totalValue === null ? 'text-gray-600' : 'text-white'}`}>
           {isLoading ? '——' : totalValue === null ? '—' : fmt$(totalValue)}

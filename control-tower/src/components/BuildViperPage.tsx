@@ -336,7 +336,7 @@ function SettingsPanel({ name, manifest, cfg, instanceGhost, paperCount, paperPn
           <div className="space-y-2 text-xs font-mono text-gray-300">
             <p>
               {instanceGhost
-                ? 'The instance is simulated, so its orders stay simulated until the instance itself goes live. Then they are real.'
+                ? 'The instance is in ghost mode, so its orders are ghost orders (simulated fills) until the instance itself goes live. Then they are real.'
                 : 'The instance is live: this viper will place real orders with real money.'}
             </p>
             <p>
@@ -402,7 +402,7 @@ function SettingsPanel({ name, manifest, cfg, instanceGhost, paperCount, paperPn
           <p className="text-[10px] font-mono text-gray-500">
             {live
               ? instanceGhost
-                ? 'Live, on a simulated instance: orders are simulated until the instance goes live.'
+                ? 'Live, on an instance in ghost mode: ghost orders (simulated fills) until the instance goes live.'
                 : 'Live: real orders with real money.'
               : 'Paper: trades in its own ledger. Nothing reaches the venue.'}
           </p>
@@ -781,7 +781,7 @@ function ReferencePanel() {
         <ul className="list-disc pl-5 text-gray-400 space-y-1">
           <li>Paper unless the viper is on live; real money only while the instance is live too.</li>
           <li>The cap, across every squadron, fees included. An order that does not fit is refused, not resized.</li>
-          <li>The daily drawdown limit, for every entry made while the viper is on live (simulated or real); paper entries are exempt.</li>
+          <li>The daily drawdown limit, for every entry made while the viper is on live (ghost or real); paper entries are exempt.</li>
           <li>Prices inside (0, 1) on the tick; at least the venue’s minimum size (whole contracts on Kalshi and Polymarket US); one position per market.</li>
           <li>No file, network or clock access; each call is stopped after about half a millisecond of work.</li>
         </ul>
@@ -932,7 +932,7 @@ export default function BuildViperPage() {
     [selected, config],
   );
   // Until the config has loaded the page does not know whether the instance is
-  // live, so it assumes it is: the Live confirm must never say "simulated" by
+  // live, so it assumes it is: the Live confirm must never say "ghost" by
   // default on a box that trades real money. Settings waits for the config.
   const configLoaded = config !== undefined;
   const instanceGhost = config?.ghost_mode ?? false;
@@ -942,7 +942,7 @@ export default function BuildViperPage() {
     const c = config?.custom_vipers?.[name] ?? {};
     if (c.enabled === false) return { label: 'off', cls: 'text-gray-500 border-gray-600/40' };
     if (c.live) return instanceGhost
-      ? { label: 'live · sim', cls: 'text-amber-300 border-amber-500/40' }
+      ? { label: 'live · ghost', cls: 'text-amber-300 border-amber-500/40' }
       : { label: 'live', cls: 'text-red-300 border-red-500/40' };
     return { label: 'paper', cls: 'text-teal-300 border-teal-500/40' };
   };

@@ -18,8 +18,8 @@
 
 import { useState, useMemo } from 'react';
 import useSWR from 'swr';
-import type { TradeRow, OpenPositionRow, TradeStats, PositionQuote } from '@/lib/types';
-import { getTrades, getTradeStats, getOpenPositions, getPositionQuotes, downloadTradelogCsv } from '@/lib/api';
+import type { TradeRow, OpenPositionRow, TradeStats, PositionQuote, PaperTradeRow } from '@/lib/types';
+import { getTrades, getTradeStats, getOpenPositions, getPositionQuotes, getPaperTrades, downloadTradelogCsv } from '@/lib/api';
 import { DEMO_MODE } from '@/lib/demo';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -58,6 +58,9 @@ interface LogEntry {
   pnl:       number | null; // realized for completed; unrealized for open
   reason:    string;
   ghost:     boolean;
+  /** A script viper's paper trade: its own ledger, never an order. Not money,
+   *  so kept out of every total, like ghost rows but on a line of its own. */
+  paper:     boolean;
   /** Set only on Helm trades; links the row to the conviction behind it. */
   intentId?: number | null;
   chainAdopted: boolean;
@@ -102,7 +105,8 @@ const STATUS_META: Record<LogStatus, { icon: string; label: string; color: strin
   completed: { icon: '🎯', label: 'Completed', color: 'text-green-400' },
 };
 
-function shortStrategy(s: string) { return s.replace('Strategy', ''); }
+// A script keeps its own name: `Script:my_strategy` must not lose "Strategy".
+function shortStrategy(s: string) { return s.startsWith('Script:') ? s : s.replace('Strategy', ''); }
 
 function fmtTime(d: Date) {
   const date = d.toLocaleDateString('en-US', { month: '2-digit', day: '2-digit' });
@@ -195,6 +199,7 @@ function assetToEntries(
       // that looked entirely real. Rows written before the column existed report
       // false, which is what they already displayed.
       ghost:      t.ghost ?? false,
+      paper:      false,
       intentId:   t.intent_id ?? null,
       chainAdopted: false,
     });
@@ -244,6 +249,7 @@ function assetToEntries(
       pnl:         unrealized,
       reason:      '',
       ghost:       p.ghost_mode,
+      paper:       false,
       chainAdopted: p.chain_adopted,
       tokenId:     p.token_id,
       rawPosition: p,
@@ -251,6 +257,43 @@ function assetToEntries(
   }
 
   return entries;
+}
+
+/** A shard's paper trades as log rows. An open one has no mark (the ledger
+ *  keeps none), so its P&L reads as a dash rather than an invented figure. */
+function paperToEntries(shard: string, rows: PaperTradeRow[]): LogEntry[] {
+  const num = (x: string | null) => (x == null ? null : parseFloat(x));
+  return rows.map((r) => {
+    const closed = r.closed_at != null;
+    const fees = (num(r.entry_fee) ?? 0) + (num(r.exit_fee) ?? 0);
+    return {
+      key:         `${shard}-paper-${r.id}`,
+      ts:          new Date(closed ? r.closed_at! : r.opened_at),
+      shard,
+      venue:       null,
+      marketClass: null,
+      underlying:  null,
+      // Only on a scored row: under an unscored row's dash, a fee line would
+      // print a "gross" figure that never existed.
+      fees:        closed && r.pnl != null ? fees : null,
+      status:      closed ? 'completed' : 'inflight',
+      strategy:    `Script:${r.script}`,
+      market:      r.market,
+      side:        r.side,
+      entry:       parseFloat(r.entry_price),
+      curOrExit:   closed ? num(r.exit_price) : null,
+      priceAgeSecs: null,
+      priceIsLiveBid: false,
+      quoteSeen:   false,
+      liveAsk:     null,
+      shares:      parseFloat(r.shares),
+      pnl:         closed ? num(r.pnl) : null,
+      reason:      closed ? (r.exit_reason ?? '') : '',
+      ghost:       false,
+      paper:       true,
+      chainAdopted: false,
+    } satisfies LogEntry;
+  });
 }
 
 // ── Sub-components ────────────────────────────────────────────────────────────
@@ -291,14 +334,15 @@ function FilterPill({
 function SummaryBar({ entries, stats, unknown }: {
   entries: LogEntry[]; stats: (TradeStats & { asset: string })[]; unknown: string | null;
 }) {
-  const launches   = entries.filter(e => e.status === 'launch').length;
-  const inflight   = entries.filter(e => e.status === 'inflight').length;
+  // Paper rows are a script's own ledger, not missions the account flew.
+  const launches   = entries.filter(e => e.status === 'launch' && !e.paper).length;
+  const inflight   = entries.filter(e => e.status === 'inflight' && !e.paper).length;
   const completedCount = stats.reduce((s, t) => s + t.count, 0);
   const realizedPnl    = stats.reduce((s, t) => s + t.realized_pnl, 0);
   // `stats` is already scoped to real rows server-side; keep the open side on
   // the same footing, so a simulated open position never pads the headline.
   const unrealized = entries
-    .filter(e => e.status !== 'completed' && e.pnl !== null && !e.ghost)
+    .filter(e => e.status !== 'completed' && e.pnl !== null && !e.ghost && !e.paper)
     .reduce((s, e) => s + (e.pnl ?? 0), 0);
 
   const pnlTotal = realizedPnl + unrealized;
@@ -450,6 +494,10 @@ export default function TradelogPage({ availableAssets }: Props) {
   const [statusFilter,   setStatusFilter]   = useState<string>('all');
   const [strategyFilter, setStrategyFilter] = useState<string>('all');
   const [sideFilter,     setSideFilter]     = useState<string>('all');
+  // Script paper trades: shown by default, so a viper's first trade appears
+  // where the operator looks for trades; hidden in one press when a busy paper
+  // viper crowds the real ones.
+  const [showPaper,      setShowPaper]      = useState<boolean>(true);
 
   // ── RTB state ───────────────────────────────────────────────────────────────
   const [rtbEntry,   setRtbEntry]   = useState<LogEntry | null>(null);
@@ -480,6 +528,16 @@ export default function TradelogPage({ availableAssets }: Props) {
     async () => {
       const results = await Promise.all(assets.map(a => getOpenPositions(a).then(rows => rows.map(r => ({ asset: a, ...r })))));
       return results.flat();
+    },
+    { refreshInterval: 15_000 },
+  );
+
+  const { data: paperData } = useSWR(
+    ['tradelog-paper', assets.join(',')],
+    async () => {
+      // A failed read leaves paper rows out; it must not blank the real log.
+      const results = await Promise.allSettled(assets.map(a => getPaperTrades(200, a).then(rows => ({ asset: a, rows }))));
+      return results.flatMap(r => (r.status === 'fulfilled' ? [r.value] : []));
     },
     { refreshInterval: 15_000 },
   );
@@ -568,9 +626,17 @@ export default function TradelogPage({ availableAssets }: Props) {
     for (const a of assets) {
       entries.push(...assetToEntries(a, byAsset[a].trades, byAsset[a].positions, quoteByToken));
     }
+    // Defensive: the asset list names one entry per database today, so no
+    // row arrives twice; should two ever share one, keep one of each row.
+    const seenPaper = new Set<string>();
+    for (const { asset, rows } of paperData ?? []) {
+      const fresh = rows.filter(r => !seenPaper.has(`${r.script}:${r.id}:${r.opened_at}`));
+      fresh.forEach(r => seenPaper.add(`${r.script}:${r.id}:${r.opened_at}`));
+      entries.push(...paperToEntries(asset, fresh));
+    }
     entries.sort((a, b) => b.ts.getTime() - a.ts.getTime());
     return entries;
-  }, [allTrades, allPositions, assets, quoteByToken]);
+  }, [allTrades, allPositions, assets, quoteByToken, paperData]);
 
   // ── Derived filter options ──────────────────────────────────────────────────
   const strategies = useMemo(() => {
@@ -585,9 +651,11 @@ export default function TradelogPage({ availableAssets }: Props) {
       if (statusFilter   !== 'all' && e.status                       !== statusFilter)   return false;
       if (strategyFilter !== 'all' && shortStrategy(e.strategy)      !== strategyFilter) return false;
       if (sideFilter     !== 'all' && e.side.toUpperCase()           !== sideFilter)     return false;
+      if (!showPaper && e.paper) return false;
       return true;
     });
-  }, [allEntries, assetFilter, statusFilter, strategyFilter, sideFilter]);
+  }, [allEntries, assetFilter, statusFilter, strategyFilter, sideFilter, showPaper]);
+  const paperCount = useMemo(() => allEntries.filter(e => e.paper).length, [allEntries]);
 
   // ── RTB handler ──────────────────────────────────────────────────────────────
   const handleRtbConfirm = async () => {
@@ -680,6 +748,15 @@ export default function TradelogPage({ availableAssets }: Props) {
           {['all', 'YES', 'NO'].map(s => (
             <FilterPill key={s} label={s === 'all' ? 'All' : s} active={sideFilter === s} onClick={() => setSideFilter(s)} />
           ))}
+
+          {/* Paper: only when there is any */}
+          {paperCount > 0 && (
+            <>
+              <span className="text-xs text-gray-500 font-mono ml-4 mr-1">Paper:</span>
+              <FilterPill label={`📝 Show (${paperCount})`} active={showPaper} onClick={() => setShowPaper(true)} />
+              <FilterPill label="Hide" active={!showPaper} onClick={() => setShowPaper(false)} />
+            </>
+          )}
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {/* Strategy */}
@@ -918,9 +995,17 @@ export default function TradelogPage({ availableAssets }: Props) {
 
                       {/* Reason / Mode */}
                       <td className="px-3 py-2 text-gray-500 max-w-[180px]">
+                        {e.paper && (
+                          <span
+                            className="block text-sky-300/80 text-[10px]"
+                            title="A script viper's paper trade: its own ledger, at the venue's touch and fee. No order was sent. Not money: kept out of every total."
+                          >
+                            📝 paper
+                          </span>
+                        )}
                         {e.status === 'completed' && e.reason ? (
                           <TipCell full={e.reason} maxChars={28} />
-                        ) : e.ghost ? (
+                        ) : e.paper ? null : e.ghost ? (
                           <span className="text-amber-400 opacity-70">👻 ghost</span>
                         ) : (
                           <span className="text-green-400 opacity-70">⚡ live</span>
@@ -967,8 +1052,10 @@ export default function TradelogPage({ availableAssets }: Props) {
           // in ghost mode still gets their simulated running total on its own
           // line, labeled as such.
           const sum  = (xs: LogEntry[]) => xs.reduce((s, e) => s + (e.pnl ?? 0), 0);
-          const real = filtered.filter(e => !e.ghost);
+          const real = filtered.filter(e => !e.ghost && !e.paper);
           const sim  = filtered.filter(e => e.ghost);
+          const paper = filtered.filter(e => e.paper && e.status === 'completed' && e.pnl !== null);
+          const paperPnl = sum(paper);
           const realized   = sum(real.filter(e => e.status === 'completed'));
           const unrealized = sum(real.filter(e => e.status !== 'completed' && e.pnl !== null));
           const net = realized + unrealized;
@@ -991,11 +1078,19 @@ export default function TradelogPage({ availableAssets }: Props) {
                 </span>
               </span>
               {sim.length > 0 && (
-                <span className="text-gray-500" title="Simulated rows: instance ghost mode and the GBoost / Anchor shadow lanes. Not money; kept out of Realized, Unrealized and Net.">
-                  👻 Simulated: <span className="text-amber-400 opacity-80">
+                <span className="text-gray-500" title="Ghost rows: instance ghost mode and the GBoost / Anchor shadow lanes. Simulated fills, not money; kept out of Realized, Unrealized and Net.">
+                  👻 Ghost: <span className="text-amber-400 opacity-80">
                     {simulated >= 0 ? '+' : ''}${simulated.toFixed(4)}
                   </span>
                   <span className="text-gray-600"> ({sim.length} {sim.length === 1 ? 'row' : 'rows'}, not money)</span>
+                </span>
+              )}
+              {paper.length > 0 && (
+                <span className="text-gray-500" title="Script vipers' paper trades: each script's own ledger; no order was sent. Not money; kept out of Realized, Unrealized and Net.">
+                  📝 Paper: <span className="text-sky-300 opacity-80">
+                    {paperPnl >= 0 ? '+' : ''}${paperPnl.toFixed(4)}
+                  </span>
+                  <span className="text-gray-600"> ({paper.length} closed, not money)</span>
                 </span>
               )}
             </div>

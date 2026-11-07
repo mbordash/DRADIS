@@ -21,13 +21,21 @@ you have run a script yourself on paper, treat it as untested on your venue.
 
 A script can only ask. The engine decides what actually happens.
 
+Two words, two things. **Ghost** is the instance setting: every viper's orders
+go through the order path with simulated fills, and the Trade Log badges them
+👻 ghost. **Paper** is one script viper you have not yet trusted with orders:
+its own ledger, on a live or a ghost instance alike, badged 📝 paper. On a
+ghost instance, turning a script's Live switch on moves it from paper to ghost.
+
 - **Paper until you say otherwise.** A new viper trades in its own *paper
-  ledger*. Its fills are recorded there and never reach the venue, the
-  position book or the trade log, whether your instance is live or simulated.
-  It reaches the order path only when you turn on its **Live** switch.
+  ledger*. Its fills are recorded there and never reach the venue or the
+  position book, whether your instance is live or in ghost mode. The Trade Log
+  shows them with a 📝 paper badge, kept out of every total. It reaches the
+  order path only when you turn on its **Live** switch.
 - **Real money needs two switches.** With Live on, its orders are real only
-  while the instance itself is live. On a simulated instance they are the
-  instance's ordinary simulated orders.
+  while the instance itself is live. On an instance in ghost mode they are the
+  instance's ordinary ghost orders.
+
 - **The cap is the engine's.** Every viper declares a maximum exposure. The
   engine counts what the viper holds across every squadron, fees included,
   and refuses any order that would go over. It refuses; it never resizes.

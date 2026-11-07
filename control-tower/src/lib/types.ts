@@ -1328,6 +1328,28 @@ export interface PaperRow {
   pnl: string | null;
 }
 
+/** One paper trade of a script viper (`script_paper`), for the Trade Log.
+ *  Decimals arrive as strings. Not money: kept out of every total. */
+export interface PaperTradeRow {
+  id: number;
+  script: string;
+  squadron_id: string;
+  market: string;
+  side: string;
+  opened_at: string;
+  closed_at: string | null;
+  entry_price: string;
+  shares: string;
+  entry_fee: string;
+  exit_price: string | null;
+  exit_fee: string | null;
+  take_profit: string | null;
+  entry_reason: string;
+  exit_reason: string | null;
+  /** Null while open, and on a row closed unscored. */
+  pnl: string | null;
+}
+
 /** One squadron a script runs on, with that squadron's latest status row for
  *  it (null until its first tick there). */
 export interface ScriptAttachment {

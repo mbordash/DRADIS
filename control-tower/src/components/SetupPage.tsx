@@ -1752,7 +1752,7 @@ function AutoscaleTable({ enabled }: { enabled: boolean }) {
       <p className="text-[11px] text-gray-500">
         {enabled ? 'Live: entries are being sized by these multipliers.' : 'Off: shown for review, nothing is scaled.'}
         {' '}Each row is one viper in one squadron scope, over its last {data.lookback ?? '—'} closed trades
-        {data.ghost ? ' (simulated ledger: the instance is in Simulation Mode)' : ''}.
+        {data.ghost ? ' (ghost ledger: the instance is in ghost mode)' : ''}.
       </p>
       {rows.length === 0 ? (
         <p className="text-[11px] text-gray-600 font-mono">No classified trades yet.</p>

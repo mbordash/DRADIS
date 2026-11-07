@@ -1000,7 +1000,7 @@ openclaw skills install dradis-tactical-command
 | You say                            | Effect                              |
 |------------------------------------|-------------------------------------|
 | *"Pause GBoost"*                   | Stops GBoost entries on next tick   |
-| *"Enable ghost mode"*              | Switches to paper trading instantly |
+| *"Enable ghost mode"*              | Switches to ghost mode (simulated fills) instantly |
 | *"What's my P&L today?"*           | Returns session profit/loss         |
 | *"Show open positions"*            | Lists all in-flight positions       |
 | *"Tighten GBoost stop loss to 8%"* | Updates risk parameter live         |

@@ -37,6 +37,7 @@ use crate::vipers::scripted::{adapter, manifest::Manifest, paper, store};
 pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/api/vipers/scripts", get(list))
+        .route("/api/vipers/paper-trades", get(paper_trades))
         .route("/api/vipers/scripts/validate", post(validate))
         .route("/api/vipers/scripts/templates", get(templates))
         .route("/api/vipers/scripts/{name}", get(read).put(save).delete(delete))
@@ -116,6 +117,32 @@ async fn list() -> Response {
 
 #[derive(Deserialize)]
 struct LimitQuery { limit: Option<i64> }
+
+/// GET /api/vipers/paper-trades?limit=200
+///
+/// Every script's paper trades, newest first, for the Trade Log. A route of its
+/// own, never folded into `/api/trades`: that endpoint feeds the dashboard's
+/// totals, and paper trades are not money.
+///
+/// Scoped by `asset` exactly as `/api/trades` is, so the Trade Log files each
+/// paper row under the same shard as the real trades it reads beside it.
+async fn paper_trades(Query(q): Query<PaperQuery>) -> Response {
+    let limit = q.limit.unwrap_or(200).clamp(1, 1000);
+    let pools = match q.asset.as_deref() {
+        Some(a) => db::pool_for_opt_retry(Some(a)).await.into_iter().collect::<Vec<_>>(),
+        None => db::all_pools(),
+    };
+    let mut rows = Vec::new();
+    for pool in pools {
+        rows.extend(paper::recent_all(&pool, limit).await);
+    }
+    rows.sort_by(|a, b| b.opened_at.cmp(&a.opened_at));
+    rows.truncate(limit as usize);
+    Json(rows).into_response()
+}
+
+#[derive(Deserialize)]
+struct PaperQuery { limit: Option<i64>, asset: Option<String> }
 
 async fn read(Path(name): Path<String>, Query(q): Query<LimitQuery>) -> Response {
     let Some(s) = store::get(&name) else {
