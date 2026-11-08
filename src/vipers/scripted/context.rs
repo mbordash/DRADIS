@@ -81,8 +81,14 @@ pub fn build(ctx: &StrategyContext, params: &BTreeMap<String, ParamValue>, acct:
     c.insert("no".into(), side(s.no_bid, s.no_ask, s.no_bid_depth, s.no_ask_depth,
         s.no_bid_depth_total, s.no_ask_depth_total, s.no_obi(whole_book)));
 
-    // ── Signals: `()` without a price feed behind them ──
-    let feed = ctx.has_price_feed;
+    // ── Signals: `()` without a live price feed behind them ──
+    // [B95] A squadron with a feed attached still reads an oracle of 0 until
+    // the first print after a start, and again while the feed is down (the
+    // price raptor publishes 0 for "not connected"). Every rate is 0 with it.
+    // A script must see "no price" there, never a price of zero: on production
+    // 2026-11-07 a script bought YES one second after a restart because a $0
+    // level sat $75,800 below the strike and its model read that as certain.
+    let feed = ctx.has_price_feed && s.oracle_price > Decimal::ZERO;
     let sig = |x: Decimal| if feed { d(x) } else { Dynamic::UNIT };
     c.insert("has_price_feed".into(), feed.into());
     for (k, v) in [

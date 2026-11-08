@@ -49,7 +49,7 @@ fn exit(ctx, pos) {
 pub const MOMENTUM: &str = r#"// Plain momentum: buy the side the oracle is moving toward when the
 // five-second move passes a threshold, with a take-profit and a stop.
 fn entry(ctx) {
-    if ctx.velocity == () { return #{ hold: "no price feed on this squadron" }; }
+    if ctx.velocity == () { return #{ hold: "no price from the feed (none on this squadron, or not printed yet)" }; }
     if ctx.secs_to_close == () || ctx.secs_to_close < ctx.params.min_secs_to_close {
         return #{ hold: "too close to the close" };
     }

@@ -204,8 +204,8 @@ running on this squadron, is `()`, not 0.
 | `market_age_secs`, `book_age_secs` | integers |
 | `now_secs` | integer: the tick's clock (Unix seconds) |
 | `yes`, `no` | each `#{ bid, ask, bid_depth, ask_depth, bid_depth_total, ask_depth_total, obi }` |
-| `has_price_feed` | bool |
-| `oracle` | the price feed's level, in dollars |
+| `has_price_feed` | bool: true while the squadron's price feed is attached **and** has a price. False on a squadron with no feed, and for the first moments after a start, before the feed's first print; every signal below is then `()`, and on a squadron with a feed the engine refuses new entries until it prints (exits keep running). A comparison with `()` is false, not an error, so test `ctx.oracle == ()` before relying on an `else` branch. During a mid-session outage the feed keeps its last price |
+| `oracle` | the price feed's level, in dollars, or `()` (see `has_price_feed`) |
 | `velocity`, `velocity_1s` | the oracle's move over the last five seconds and the last second, **in dollars** (not a fraction: divide by `ctx.oracle` for one) |
 | `acceleration` | the change in `velocity` since the previous tick, in dollars |
 | `drift_10m`, `drift_60m` | the oracle's move over the last 10 and 60 minutes, in dollars; 0 until that much history exists |

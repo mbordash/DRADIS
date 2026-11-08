@@ -78,6 +78,9 @@ pub enum Mode {
     Orders { ghost: bool },
 }
 
+/// The refusal while the squadron's price feed has no price yet [B95].
+pub const ORACLE_UNKNOWN: &str = "oracle price unknown (the price feed has not printed yet)";
+
 pub fn mode(cfg: &CustomViperConfig, instance_ghost: bool) -> Mode {
     if cfg.live { Mode::Orders { ghost: instance_ghost } } else { Mode::Paper }
 }
@@ -310,6 +313,14 @@ impl ScriptedStrategy {
             if !live.script.manifest.classes.iter().any(|c| c == class) {
                 return Some(format!("not declared for class {class}"));
             }
+        }
+        // [B95] A squadron whose price feed has not printed yet reads an oracle
+        // of 0. The context gives the script `()` there, but a comparison with
+        // `()` is false rather than an error, so `if ctx.oracle > ctx.strike
+        // { .. } else { buy }` would still open on it. The engine refuses the
+        // entry itself, as Maker and Time Decay do; exits keep running.
+        if ctx.has_price_feed && ctx.snapshot.oracle_price <= Decimal::ZERO {
+            return Some(ORACLE_UNKNOWN.into());
         }
         None
     }
@@ -1013,6 +1024,50 @@ mod tests {
             let status = serde_json::to_string(&viper_status::snapshot(Some(&asset))).unwrap();
             assert!(!status.contains("script error"), "{}: {status}", t.id);
         }
+    }
+
+    /// [B95] A feed that has not printed yet (oracle 0 after a start, or while
+    /// it is down) is no price at all: every template holds, and the context
+    /// says so, instead of reading a level of $0.
+    #[tokio::test]
+    async fn an_oracle_of_zero_is_no_price_and_every_template_holds() {
+        for t in crate::vipers::scripted::templates::all() {
+            let asset = format!("scriptzero{}", t.id.replace('_', ""));
+            let pool = pool(&asset).await;
+            let mut m: crate::vipers::scripted::manifest::Manifest = serde_json::from_value(t.manifest.clone()).unwrap();
+            m.name = asset.clone();
+            store::insert_hidden_for_test(m.clone(), t.source);
+            let strat = ScriptedStrategy::new(&asset);
+            let mut c = ctx(&asset, DynamicConfig::default());
+            c.market.market_close_time = Some(Utc::now() + chrono::Duration::minutes(5));
+            c.snapshot.oracle_price = Decimal::ZERO;
+            c.snapshot.velocity = Decimal::ZERO;
+            let map = crate::vipers::scripted::context::build(&c, &m.resolve_params(&Default::default()), &crate::vipers::scripted::context::Account { ghost: false, exposure: Decimal::ZERO, max_exposure: dec!(5), day_pnl: Decimal::ZERO });
+            assert!(map["oracle"].is_unit(), "{}: oracle must be ()", t.id);
+            assert!(map["velocity"].is_unit(), "{}: velocity must be ()", t.id);
+            assert_eq!(map["has_price_feed"].as_bool().ok(), Some(false), "{}", t.id);
+            strat.evaluate_entry(&c).await.unwrap();
+            let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM script_paper").fetch_one(&pool).await.unwrap();
+            assert_eq!(n, 0, "{}: no paper entry on a $0 oracle", t.id);
+        }
+        // A script that compares without checking for `()`: the comparison is
+        // false, its else branch buys, and only the engine's refusal stops it.
+        let asset = "scriptzerocmp";
+        let pool = pool(asset).await;
+        let m: crate::vipers::scripted::manifest::Manifest = serde_json::from_value(serde_json::json!({
+            "name": asset, "display_name": "Cmp", "classes": ["crypto"], "max_exposure_usdc": 5
+        })).unwrap();
+        store::insert_hidden_for_test(m, "fn entry(ctx) { if ctx.oracle > ctx.strike { #{ hold: \"above\" } } \
+            else { #{ buy: \"no\", price: ctx.no.ask, shares: 5 } } } fn exit(ctx, pos) { () }");
+        let strat = ScriptedStrategy::new(asset);
+        let mut c = ctx(asset, DynamicConfig::default());
+        c.market.market_close_time = Some(Utc::now() + chrono::Duration::minutes(5));
+        c.snapshot.oracle_price = Decimal::ZERO;
+        strat.evaluate_entry(&c).await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM script_paper").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0, "the engine refuses the entry while the feed has no price");
+        let status = serde_json::to_string(&viper_status::snapshot(Some(asset))).unwrap();
+        assert!(status.contains("oracle price unknown"), "{status}");
     }
 
     /// The momentum starter in real units: `ctx.velocity` is a dollar move, the
