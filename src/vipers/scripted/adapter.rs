@@ -332,6 +332,14 @@ impl ScriptedStrategy {
         if ctx.has_price_feed && ctx.snapshot.oracle_price <= Decimal::ZERO {
             return Some(ORACLE_UNKNOWN.into());
         }
+        // [E95] A market listed ahead of its window (a venue publishes the
+        // next 15-minute market before the current one closes): its reference
+        // price does not exist yet, so nothing is entered before it opens.
+        if live.script.manifest.market == crate::orchestrator::strategy::MarketRole::UltraShort
+            && ctx.market_started_at > Utc::now()
+        {
+            return Some("the market's window has not opened yet".into());
+        }
         None
     }
 
@@ -943,6 +951,30 @@ mod tests {
         up.ultra_snapshot.as_mut().unwrap().yes_bid = dec!(0.40);
         strat.evaluate_exit(&up).await.unwrap();
         assert!(paper::open_rows(&pool, &c.squadron_id, asset).await.is_empty(), "the take-profit read the ultra book");
+    }
+
+    /// [E95] A market listed ahead of its window is not entered before it opens.
+    #[tokio::test]
+    async fn a_market_whose_window_has_not_opened_is_not_entered() {
+        use crate::orchestrator::strategy::MarketRole;
+        let asset = "scriptultraearly";
+        let pool = pool(asset).await;
+        let mut m = manifest(asset, dec!(10));
+        m.market = MarketRole::UltraShort;
+        store::insert_hidden_for_test(m, E2E);
+        let strat = ScriptedStrategy::new(asset);
+        let mut u = ctx(asset, DynamicConfig::default());
+        u.ultra_market = Some(MarketConfig {
+            yes_token: MarketId::new("e-yes"), no_token: MarketId::new("e-no"),
+            market_name: "next window".into(), market_close_time: Some(Utc::now() + chrono::Duration::minutes(16)),
+            strike_price: None, window_secs: Some(900), is_neg_risk: false,
+            condition_id: "e-cid".into(), yes_fee_bps: 0, no_fee_bps: 0,
+        });
+        u.ultra_snapshot = Some(u.snapshot.clone());
+        strat.evaluate_entry(&u).await.unwrap();
+        assert!(paper::open_rows(&pool, &u.squadron_id, asset).await.is_empty());
+        let status = serde_json::to_string(&viper_status::snapshot(Some(asset))).unwrap();
+        assert!(status.contains("has not opened yet"), "{status}");
     }
 
     /// The cap is the manifest's (or the operator's, if lower), and the Live

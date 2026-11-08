@@ -1312,6 +1312,15 @@ async fn trade_one_market(
     // populate (both feed `/api/status`).
     publish_us_raptor_health(raptor_health_tx, asset, true);
     publish_us_strategy_market(markets_tx, &squadron_id, &viper_kinds, &pair.question);
+    // [E95] Each viper on the market its role trades: window vipers on the
+    // window market when this wing has one (the crypto wing), ultra-short
+    // vipers on none (no 15-minute listings on this venue). The squadron page
+    // shows the window market too, as on the other venues.
+    let maker_q = maker_pair.as_ref().map(|mk| mk.question.clone());
+    publish_us_roles(markets_tx, &squadron_id, &strategies, maker_q.as_deref());
+    if let Some(q) = &maker_q {
+        cag.update_maker_market(&squadron_id, q.clone());
+    }
 
     // ── Stream both legs' order books (tied to the per-market cancel token) ───
     let ws_url = venue.markets_ws_url();
@@ -1586,6 +1595,7 @@ async fn trade_one_market(
         let attached: Vec<String> = script_attacher.sync(&mut strategies).iter().map(|sn| sn.to_lowercase()).collect();
         if !attached.is_empty() {
             publish_us_strategy_market(markets_tx, &squadron_id, &attached, &pair.question);
+            publish_us_roles(markets_tx, &squadron_id, &strategies, maker_q.as_deref());
         }
 
         if strategies.is_empty() || Instant::now() < cooldown_until {
@@ -3412,6 +3422,32 @@ fn publish_us_strategy_market(
     });
 }
 
+
+/// [E95] Re-point the `strategy_markets` entries of vipers whose role is not
+/// the primary: Window to the window market (when there is one), UltraShort to
+/// none, since Polymarket US lists no 15-minute markets.
+fn publish_us_roles(
+    tx: &watch::Sender<HashMap<String, String>>,
+    squadron_id: &str,
+    strategies: &[Box<dyn crate::orchestrator::strategy::Strategy>],
+    maker_question: Option<&str>,
+) {
+    use crate::orchestrator::strategy::MarketRole;
+    tx.send_modify(|map| {
+        for s in strategies {
+            let market = match s.market_role() {
+                MarketRole::Hourly => continue,
+                MarketRole::Window => match maker_question { Some(q) => q, None => continue },
+                MarketRole::UltraShort => "",
+            };
+            let key = s.name()
+                .strip_suffix("Strategy").unwrap_or(&s.name()).to_lowercase()
+                .replace("timedecay", "time_decay")
+                .replace("trendreversal", "trendcapture");
+            map.insert(crate::state::strategy_market_key(squadron_id, &key), market.to_string());
+        }
+    });
+}
 
 /// Drop map entries the operator closed by hand (the Trade Log's Close Now)
 /// since the last tick. Keyed by strategy and token, so another strategy's live

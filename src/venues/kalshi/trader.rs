@@ -1686,6 +1686,9 @@ async fn trade_one_market(
     // Discovery runs off the tick: a REST call with no timeout must never
     // hold up exits and stops (review of E95 phase 2).
     let mut ultra_job: Option<tokio::task::JoinHandle<Vec<KalshiPair>>> = None;
+    // Whether the slot is wanted this tick; a slot kept only for a held
+    // position (setting switched off) takes no new exposure.
+    let mut ultra_wanted = false;
 
     // ── Tick loop ────────────────────────────────────────────────────────────
     let mut price_tick = tokio::time::interval(Duration::from_millis(TICK_MS));
@@ -2130,6 +2133,7 @@ async fn trade_one_market(
             let want = pair.is_crypto() && mandate == MarketMandate::Rotating
                 && crate::helpers::dynamic_config::ultra_short_market_enabled()
                 && strategies.iter().any(|s| s.market_role() == MarketRole::UltraShort);
+            ultra_wanted = want;
             let now = Utc::now();
             let closed = ultra.as_ref().is_some_and(|u| u.cfg.market_close_time.is_some_and(|c| c <= now));
             let held_on_ultra = match &ultra {
@@ -2351,11 +2355,12 @@ async fn trade_one_market(
             if winding_down && signal.opens_exposure() {
                 continue;
             }
-            // [E95] The ultra-short market's own last minute: no new exposure
-            // on its legs, exits still flow.
+            // [E95] The ultra-short market's own last minute, or a slot kept
+            // only for what it holds: no new exposure on its legs, exits
+            // still flow.
             if signal.opens_exposure() {
                 if let Some(u) = &ultra {
-                    let ending = u.cfg.phase(Utc::now(), MARKET_RTB_WINDOW_SECS) != MarketPhase::Open;
+                    let ending = !ultra_wanted || u.cfg.phase(Utc::now(), MARKET_RTB_WINDOW_SECS) != MarketPhase::Open;
                     if ending && signal.tokens_opened().iter().any(|t| t == &u.pair.long || t == &u.pair.short) {
                         continue;
                     }

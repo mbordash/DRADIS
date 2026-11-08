@@ -255,6 +255,56 @@ pub async fn fetch_specific_window_daily_market(
     None
 }
 
+/// [E95] Polymarket International's current 15-minute "Up or Down" market for
+/// `asset` (`btc`, `eth`, `sol`, `xrp`), by its deterministic slug
+/// `<asset>-updown-15m-<window start, unix>`; the next window once the current
+/// one has under `min_secs_left`. `None` for an asset with no 15-minute series
+/// or a window not listed yet. These markets resolve on a Chainlink 60-second
+/// TWAP stream, not the Binance candle the hourly ones use.
+pub async fn fetch_ultra_short_candidate(
+    http: &reqwest::Client,
+    asset: &str,
+    now: DateTime<Utc>,
+    min_secs_left: i64,
+) -> Option<MarketCandidate> {
+    let asset = asset.to_ascii_lowercase();
+    if !matches!(asset.as_str(), "btc" | "eth" | "sol" | "xrp") { return None; }
+    let t = now.timestamp();
+    let start = t - t.rem_euclid(900);
+    for window in [start, start + 900] {
+        let slug = format!("{asset}-updown-15m-{window}");
+        let url = format!("https://gamma-api.polymarket.com/markets?slug={slug}");
+        let data: serde_json::Value = match http.get(&url).send().await {
+            Ok(r) => match r.json().await { Ok(d) => d, Err(e) => { debug!("ultra-short slug '{slug}' unreadable: {e}"); continue; } },
+            Err(e) => { debug!("ultra-short slug '{slug}' fetch failed: {e}"); continue; }
+        };
+        for m in gamma_market_array(&data) {
+            let active = m.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+            let closed = m.get("closed").and_then(|v| v.as_bool()).unwrap_or(true);
+            if !active || closed || !get_enable_orderbook(&m) { continue; }
+            let tokens = extract_token_ids_u256(&m);
+            if tokens.len() < 2 || tokens[0] == U256::ZERO || tokens[1] == U256::ZERO { continue; }
+            let close = m.get("endDate").and_then(|v| v.as_str())
+                .and_then(|d| DateTime::parse_from_rfc3339(d).ok()).map(|d| d.with_timezone(&Utc));
+            let Some(close) = close else { continue };
+            if (close - now).num_seconds() < min_secs_left { continue; }
+            return Some(MarketCandidate {
+                yes_token: market_id_from_u256(tokens[0]),
+                no_token: market_id_from_u256(tokens[1]),
+                name: m.get("question").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                link: slug.clone(),
+                description: String::new(),
+                is_hot: false,
+                close_time: Some(close),
+                volume: 0.0,
+                condition_id: m.get("conditionId").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                strike_price: None,
+            });
+        }
+    }
+    None
+}
+
 /// One validated Gamma market in the shape the selection chain consumes:
 /// `(token_ids, question, slug, vol24h, is_high_priority, close_time, description, condition_id)`.
 pub type GammaCandidate = (Vec<U256>, String, String, f64, bool, Option<DateTime<Utc>>, String, String);

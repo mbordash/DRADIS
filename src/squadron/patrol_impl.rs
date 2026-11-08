@@ -63,6 +63,84 @@ use super::patrol_tasks::{
 };
 use crate::venues::lifecycle::{LifecycleConfig, OrderLifecycle};
 
+/// [E95] The squadron's ultra-short (15-minute) market on Polymarket
+/// International: its config and its own two book feeds, cancelled when the
+/// slot is replaced or the patrol ends.
+struct IntlUltra {
+    cfg: MarketConfig,
+    yes_rx: tokio::sync::watch::Receiver<crate::state::PriceState>,
+    no_rx: tokio::sync::watch::Receiver<crate::state::PriceState>,
+    cancel: CancellationToken,
+}
+
+impl Drop for IntlUltra {
+    fn drop(&mut self) { self.cancel.cancel(); }
+}
+
+/// [E95] The in-flight ultra-short discovery, aborted if the patrol ends first.
+struct JobHandle(Option<tokio::task::JoinHandle<Option<MarketConfig>>>);
+impl JobHandle {
+    fn new(h: tokio::task::JoinHandle<Option<MarketConfig>>) -> Self { Self(Some(h)) }
+    fn is_finished(&self) -> bool { self.0.as_ref().is_none_or(|h| h.is_finished()) }
+    fn take_handle(&mut self) -> Option<tokio::task::JoinHandle<Option<MarketConfig>>> { self.0.take() }
+}
+impl Drop for JobHandle {
+    fn drop(&mut self) { if let Some(h) = self.0.take() { h.abort(); } }
+}
+struct UltraJob(JobHandle);
+
+/// [E95] Point every ultra-short viper's `strategy_markets` entry (bare viper
+/// keys on this venue) at the slot's current market ("" when empty).
+fn publish_intl_ultra_markets(
+    markets_tx: &tokio::sync::watch::Sender<std::collections::HashMap<String, String>>,
+    strategies: &[Box<dyn crate::orchestrator::strategy::Strategy>],
+    question: &str,
+) {
+    markets_tx.send_modify(|map| {
+        for s in strategies.iter().filter(|s| s.market_role() == crate::orchestrator::strategy::MarketRole::UltraShort) {
+            let sn = s.name();
+            let key = sn.strip_suffix("Strategy").unwrap_or(&sn).to_lowercase()
+                .replace("timedecay", "time_decay").replace("trendreversal", "trendcapture");
+            map.insert(key, question.to_string());
+        }
+    });
+}
+
+/// [E95] Find the current 15-minute market for `asset` and price its fees,
+/// off the tick. `None` when the venue lists none or a lookup fails; the slot
+/// asks again at its next poll.
+async fn find_intl_ultra(
+    http: Arc<reqwest::Client>,
+    client: Arc<polymarket_client_sdk_v2::clob::Client<polymarket_client_sdk_v2::auth::state::Authenticated<polymarket_client_sdk_v2::auth::Normal>>>,
+    asset: String,
+) -> Option<MarketConfig> {
+    let c = crate::helpers::market::fetch_ultra_short_candidate(&http, &asset, Utc::now(), 60).await?;
+    let fee = |t: &MarketId| {
+        let id = u256_from_market_id(t).unwrap_or_default();
+        let client = Arc::clone(&client);
+        async move {
+            match tokio::time::timeout(Duration::from_secs(10), client.fee_rate_bps(id)).await {
+                Ok(Ok(r)) => Some(r.base_fee),
+                _ => None,
+            }
+        }
+    };
+    let yes_fee = fee(&c.yes_token).await?;
+    let no_fee = fee(&c.no_token).await?;
+    Some(MarketConfig {
+        yes_token: c.yes_token,
+        no_token: c.no_token,
+        window_secs: Some(900),
+        market_name: c.name,
+        market_close_time: c.close_time,
+        strike_price: None,
+        is_neg_risk: false,
+        condition_id: c.condition_id,
+        yes_fee_bps: yes_fee,
+        no_fee_bps: no_fee,
+    })
+}
+
 // V2 CTF Exchange contracts — same as main.rs constants
 const EXCHANGE_NORMAL:   Address = address!("0xE111180000d2663C0091e4f400237545B87B996B");
 const EXCHANGE_NEG_RISK: Address = address!("0xe2222d279d744050d28e00520010520000310F59");
@@ -817,6 +895,16 @@ impl Squadron {
         // strategy signal arms where `ctx` is shadowed by a local StrategyContext.
         let patrol_venue = std::sync::Arc::clone(&ctx.session.venue);
 
+        // [E95] The ultra-short (15-minute) slot: found off the tick, fed by its
+        // own two book subscriptions, replaced at each close. Only a crypto
+        // squadron on an asset with a 15-minute series, with the setting on and
+        // a viper that trades it.
+        let mut ultra: Option<IntlUltra> = None;
+        let mut ultra_job: Option<UltraJob> = None;
+        let mut ultra_checked_at: Option<Instant> = None;
+        let mut ultra_closed_at: Option<Instant> = Some(Instant::now());
+        let ultra_asset_ok = !single_market && matches!(asset_lc.as_str(), "btc" | "eth" | "sol" | "xrp");
+
         // ── Core tick loop: 3 arms ────────────────────────────────────────────
         let mut ticker = interval(config::main_ticker_interval());
         loop {
@@ -1311,6 +1399,72 @@ impl Squadron {
                     let (maker_nb, maker_nbd, maker_na, maker_nad, maker_no_ws_ts, maker_nbd_all, maker_nad_all) = maker_no_price_rx.as_ref().map_or((dec!(0), dec!(0), dec!(1), dec!(0), Utc::now(), dec!(0), dec!(0)), |rx| *rx.borrow());
                     let maker_snap_ts = maker_yes_ws_ts.min(maker_no_ws_ts);
 
+                    // [E95] Keep the ultra-short slot filled (see `ultra` above).
+                    // A slot kept only for a held position takes no new entries
+                    // (`ultra_wanted`, checked at the entry gate).
+                    let ultra_wanted = ultra_asset_ok
+                        && crate::helpers::dynamic_config::ultra_short_market_enabled()
+                        && strategies.iter().any(|s| s.market_role() == crate::orchestrator::strategy::MarketRole::UltraShort);
+                    {
+                        let now = Utc::now();
+                        let closed = ultra.as_ref().is_some_and(|u| u.cfg.market_close_time.is_some_and(|c| c <= now));
+                        let held_on_ultra = match &ultra {
+                            Some(u) if !ultra_wanted => positions.lock().await.iter().any(|(k, p)| {
+                                k.squadron == squadron_id && p.shares > Decimal::ZERO
+                                    && (k.market == u.cfg.yes_token || k.market == u.cfg.no_token)
+                            }),
+                            _ => false,
+                        };
+                        if closed || (!ultra_wanted && ultra.is_some() && !held_on_ultra) {
+                            if let Some(old) = ultra.take() {
+                                // A closed 15-minute market's positions leave the map
+                                // as an expired hourly's do (their rows settle from the
+                                // chain or the venue's result), and its tokens stop
+                                // being polled.
+                                if closed {
+                                    crate::tasks::cleanup::cleanup_expired_positions(
+                                        Arc::clone(&positions), old.cfg.market_name.clone(),
+                                        old.cfg.yes_token.clone(), old.cfg.no_token.clone(), old.cfg.market_close_time,
+                                    ).await;
+                                }
+                                patrol_venue.unregister_tokens(&[old.cfg.yes_token.clone(), old.cfg.no_token.clone()]).await;
+                            }
+                            if closed { ultra_closed_at = Some(Instant::now()); }
+                            cag.update_ultra_market(&squadron_id, None);
+                            publish_intl_ultra_markets(&markets_tx, &strategies, "");
+                        }
+                        if !ultra_wanted {
+                            ultra_job = None;
+                        } else if ultra.is_none() {
+                            if ultra_job.as_ref().is_some_and(|j| j.0.is_finished()) {
+                                let found = match ultra_job.take() { Some(mut j) => match j.0.take_handle() { Some(h) => h.await.ok().flatten(), None => None }, None => None };
+                                if let Some(cfg) = found.filter(|c| c.market_close_time.is_some_and(|t| t > now)) {
+                                    let default_feed: crate::state::PriceState = (dec!(0), dec!(0), dec!(1), dec!(0), Utc::now(), dec!(0), dec!(0));
+                                    let (ytx, yrx) = tokio::sync::watch::channel(default_feed);
+                                    let (ntx, nrx) = tokio::sync::watch::channel(default_feed);
+                                    let feed_cancel = CancellationToken::new();
+                                    let drained = super::previous_generation_drained(Vec::new());
+                                    if let (Ok(y), Ok(n)) = (u256_from_market_id(&cfg.yes_token), u256_from_market_id(&cfg.no_token)) {
+                                        super::spawn_ws_task(y, ytx, feed_cancel.clone(), "ultra", drained.clone());
+                                        super::spawn_ws_task(n, ntx, feed_cancel.clone(), "ultra", drained);
+                                        patrol_venue.register_tokens(&[cfg.yes_token.clone(), cfg.no_token.clone()]).await;
+                                        info!("⚡ Ultra-short market for [{}]: \"{}\" close={:?} | YES {} bps | NO {} bps",
+                                              squadron_id, cfg.market_name, cfg.market_close_time, cfg.yes_fee_bps, cfg.no_fee_bps);
+                                        cag.update_ultra_market(&squadron_id, Some(cfg.market_name.clone()));
+                                        publish_intl_ultra_markets(&markets_tx, &strategies, &cfg.market_name);
+                                        ultra = Some(IntlUltra { cfg, yes_rx: yrx, no_rx: nrx, cancel: feed_cancel });
+                                        ultra_closed_at = None;
+                                    }
+                                }
+                            }
+                            let every = if ultra_closed_at.is_some_and(|t| t.elapsed().as_secs() < 90) { 5 } else { 60 };
+                            if ultra.is_none() && ultra_job.is_none() && ultra_checked_at.is_none_or(|t| t.elapsed().as_secs() >= every) {
+                                ultra_checked_at = Some(Instant::now());
+                                ultra_job = Some(UltraJob(JobHandle::new(tokio::spawn(find_intl_ultra(Arc::clone(&shared_http), Arc::clone(&trading_client), asset_lc.clone())))));
+                            }
+                        }
+                    }
+
                     // Only proceed if at least one market has valid prices
                     if (hourly_ya == dec!(1) && hourly_na == dec!(1)) && (maker_ya == dec!(1) && maker_na == dec!(1)) {
                         // A squadron with NO market at all is idle on purpose:
@@ -1622,6 +1776,27 @@ impl Squadron {
                                 .unwrap_or(0),
                             timestamp: hourly_snap_ts,
                     };
+                    // [E95] The ultra-short market's book on the same signals,
+                    // when its feed has delivered one.
+                    let (ultra_market_now, ultra_snapshot_now) = match &ultra {
+                        Some(u) => {
+                            let (yb, ybd, ya, yad, yts, ybd_all, yad_all) = *u.yes_rx.borrow();
+                            let (nb, nbd, na, nad, nts, nbd_all, nad_all) = *u.no_rx.borrow();
+                            if ya == dec!(1) && na == dec!(1) {
+                                (None, None)
+                            } else {
+                                let mut us = hourly_snapshot.clone();
+                                us.yes_bid = yb; us.yes_bid_depth = ybd; us.yes_ask = ya; us.yes_ask_depth = yad;
+                                us.no_bid = nb; us.no_bid_depth = nbd; us.no_ask = na; us.no_ask_depth = nad;
+                                us.yes_bid_depth_total = ybd_all; us.yes_ask_depth_total = yad_all;
+                                us.no_bid_depth_total = nbd_all; us.no_ask_depth_total = nad_all;
+                                us.secs_to_expiry = u.cfg.market_close_time.map(|t| (t - Utc::now()).num_seconds()).unwrap_or(0);
+                                us.timestamp = yts.min(nts);
+                                (Some(u.cfg.clone()), Some(us))
+                            }
+                        }
+                        None => (None, None),
+                    };
 
                     // ── Single-market arbitrage ─────────────────────────────
                     // Arbitrage reads the maker (window/daily) venue, and refuses
@@ -1664,7 +1839,7 @@ impl Squadron {
                         crypto_filter: crypto_filter.clone(),
                         market_started_at,
                         maker_market: maker_market_config_for_ctx,
-                        ultra_market: None, ultra_snapshot: None,
+                        ultra_market: ultra_market_now, ultra_snapshot: ultra_snapshot_now,
                         maker_snapshot: if single_market_arb {
                             Some(hourly_snapshot)
                         } else { maker_market_config.as_ref().map(|mk| MarketSnapshot {
@@ -1717,9 +1892,13 @@ impl Squadron {
                         let sq_key = squadron_id.clone();
                         let (target_yes_token, target_no_token, target_market_close_time, target_is_neg_risk, target_yes_fee_bps, target_no_fee_bps) = {
                             let strategy_role = strategies.iter().find(|s| s.name() == sn).map(|s| s.market_role()).unwrap_or_default();
+                            let ultra_cfg = ultra.as_ref().map(|u| &u.cfg);
                             if strategy_role == crate::orchestrator::strategy::MarketRole::Window && maker_market_config.is_some() {
                                 let mk = maker_market_config.as_ref().unwrap();
                                 (mk.yes_token.clone(), mk.no_token.clone(), mk.market_close_time, mk.is_neg_risk, mk.yes_fee_bps, mk.no_fee_bps)
+                            } else if let (crate::orchestrator::strategy::MarketRole::UltraShort, Some(uc)) = (strategy_role, ultra_cfg) {
+                                // [E95] The 15-minute market's own tokens, close and fees.
+                                (uc.yes_token.clone(), uc.no_token.clone(), uc.market_close_time, uc.is_neg_risk, uc.yes_fee_bps, uc.no_fee_bps)
                             } else {
                                 (hourly_yes_token.clone(), hourly_no_token.clone(), hourly_market_close_time, hourly_is_neg_risk, hourly_yes_fee_rate, hourly_no_fee_rate)
                             }
@@ -1743,9 +1922,11 @@ impl Squadron {
                         // Checking both books makes the label independent of
                         // which venue a strategy declared.
                         let maker_yes_token = maker_market_config.as_ref().map(|mk| mk.yes_token.clone());
+                        let ultra_yes_token = ultra.as_ref().map(|u| u.cfg.yes_token.clone());
                         let side_of = |token: &MarketId| -> &'static str {
                             if *token == hourly_yes_token { return "YES"; }
                             if maker_yes_token.as_ref().is_some_and(|y| y == token) { return "YES"; }
+                            if ultra_yes_token.as_ref().is_some_and(|y| y == token) { return "YES"; }
                             "NO"
                         };
 
@@ -2252,6 +2433,8 @@ impl Squadron {
                                                     // note above for the same trap).
                                                     let fill_close_time = if tid_m == hourly_yes_token || tid_m == hourly_no_token {
                                                         hourly_market_close_time
+                                                    } else if let Some(u) = ultra.as_ref().filter(|u| tid_m == u.cfg.yes_token || tid_m == u.cfg.no_token) {
+                                                        u.cfg.market_close_time
                                                     } else {
                                                         maker_market_config.as_ref().and_then(|mk| mk.market_close_time)
                                                     };
@@ -2453,11 +2636,20 @@ impl Squadron {
                                     let strat_role = strategies.iter().find(|s| s.name() == sn).map(|s| s.market_role()).unwrap_or_default();
                                     if strat_role == crate::orchestrator::strategy::MarketRole::Window {
                                         ctx.maker_snapshot.clone().unwrap_or_else(|| ctx.snapshot.clone())
+                                    } else if strat_role == crate::orchestrator::strategy::MarketRole::UltraShort {
+                                        ctx.ultra_snapshot.clone().unwrap_or_else(|| ctx.snapshot.clone())
                                     } else {
                                         ctx.snapshot.clone()
                                     }
                                 };
-                                if let Some(close_time) = target_market_close_time { if (close_time - Utc::now()).num_seconds() < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY { continue; } }
+                                // [E95] A 15-minute market's floor is its last minute, not
+                                // the hourly floor (5-10 minutes), which would cover most of
+                                // its life; a slot kept only for a held position takes none.
+                                let ultra_entry = strategies.iter().find(|s| s.name() == sn).map(|s| s.market_role()).unwrap_or_default()
+                                    == crate::orchestrator::strategy::MarketRole::UltraShort;
+                                if ultra_entry && !ultra_wanted { continue; }
+                                let entry_floor = if ultra_entry { 60 } else { config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY };
+                                if let Some(close_time) = target_market_close_time { if (close_time - Utc::now()).num_seconds() < entry_floor { continue; } }
                                 if let Some(lt) = last_trade_time.get(&sn) { if lt.elapsed() < Duration::from_secs(config::TRADE_COOLDOWN_SECS as u64) { continue; } }
                                 if let Some(lt) = last_stop_loss_time.get(&sn) {
                                     // Escalate with the loss streak: 180s → 360s → 720s → 1440s, capped 1h.
