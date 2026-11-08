@@ -1712,7 +1712,7 @@ pub const TIME_DECAY_STOP_LOSS_CEILING: Decimal = dec!(0.10);
 /// [E85] 1800 s, the whole entry window: no stop fires during the hold, so a
 /// lone leg rides to settlement (as Anchor does) instead of the stop selling
 /// at-the-money noise near expiry (trade 250 stopped at 0.36, settled in its
-/// favour). The forced expiry exit of a completed pair is not gated by this.
+/// favor). The forced expiry exit of a completed pair is not gated by this.
 pub const TIME_DECAY_MIN_HOLD_SECS: i64 = 1800;
 pub const TIME_DECAY_STOP_LOSS_COOLDOWN_SECS: u64 = 600;
 

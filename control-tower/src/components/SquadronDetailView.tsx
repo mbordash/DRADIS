@@ -331,7 +331,7 @@ export default function SquadronDetailView({ squadron, onBack, onOpenMarket }: P
         <div className="space-y-2">
           <p>
             This squadron stops trading {squadron.market_name || 'its market'}. Resting
-            orders are cancelled and any open position is flattened or left to settle.
+            orders are canceled and any open position is flattened or left to settle.
           </p>
           {autoDeployed && (
             <p className="text-amber-300">

@@ -40,7 +40,7 @@ The system is organized around four BSG-inspired tactical layers:
 
 | Layer        | Folder          | Role                                                                           |
 |--------------|-----------------|--------------------------------------------------------------------------------|
-| **Raptors**  | `src/raptors/`  | Signal scouts — fetch, normalise, broadcast external data                      |
+| **Raptors**  | `src/raptors/`  | Signal scouts — fetch, normalize, broadcast external data                      |
 | **Vipers**   | `src/vipers/`   | Trading strategies — evaluate signals and place orders                         |
 | **Squadron** | `src/squadron/` | Deployment unit — bundles Raptors + Vipers onto a battle location              |
 | **CAG**      | `src/cag/`      | Commander Air Group — async dispatch, session state, multi-asset orchestration |
@@ -781,7 +781,7 @@ per cycle), recorded in the `llm_actions` audit table, and TTL-bound (30 min —
 stale advice never applies). What happens next depends on the autonomy tier,
 set live from **Setup → AI Autonomy** (no restart):
 
-| Tier | Name | Behaviour |
+| Tier | Name | Behavior |
 |------|------|-----------|
 | 1 | **Recommend** | Nothing auto-applies. Proposals queue in the dashboard; a human presses **apply** (revalidated against the *current* config first) or **reject**. |
 | 2 | **Limited** | Safe changes apply immediately: schema-clamped, per-field delta capped (±20% default), rate-limited (1 batch/hour default), **never money fields** (`*_usdc`, budgets, collateral). Everything else queues for approval. |
@@ -802,7 +802,7 @@ Guardrails at every tier:
   from its own track record.
 
 All tiers run identically in LIVE and GHOST mode (each action is stamped with
-the mode), so you can audition tier 2/3 behaviour risk-free in ghost first.
+the mode), so you can audition tier 2/3 behavior risk-free in ghost first.
 
 ```bash
 # Autonomy knobs (.env — all optional, shown with defaults)
@@ -822,7 +822,7 @@ LLM_OUTCOME_HORIZON_SECS=7200    # when applied changes get outcome-scored
 - **Circuit breaker**: Pauses all trading after 3 consecutive execution failures.
 - **Daily drawdown limit**: every viper, Anchor included since 1.6.0, stops opening positions once the day's loss reaches the profile's limit (conservative: the larger of 0.75% of the starting balance and $3). The day is counted from midnight ET and clears at the next midnight; until 1.6.0 it counted from engine start and held until a restart. Exits are never blocked.
 - **TOCTOU-safe entry**: Atomic lock scope prevents duplicate orders.
-- **Orphaned pair detection**: Arbiter waits 5s after first-leg confirm before acting on a missing second leg. TimeDecay GTC bids are given the full theta window (up to 30 min) before a resting order is declared orphaned, on every venue since 1.6.0 (Kalshi and Polymarket US cancelled the partner after 60 s before).
+- **Orphaned pair detection**: Arbiter waits 5s after first-leg confirm before acting on a missing second leg. TimeDecay GTC bids are given the full theta window (up to 30 min) before a resting order is declared orphaned, on every venue since 1.6.0 (Kalshi and Polymarket US canceled the partner after 60 s before).
 - **Capital Auto-Scaler limits**: when enabled, a scaled-up entry is bounded by a per-order dollar cap and the viper's own runtime Max Exposure, and never grows while the drawdown breaker is tripped (see [Capital Auto-Scaler](#capital-auto-scaler)).
 - **Rescue-profit gate**: Arbitrage entries are blocked when a single-leg failure cannot be rescued into profit (`yes_rescue_cost` or `no_rescue_cost ≥ $1.00` including fees and rehedge buffer).
 - **Fee Gates**: Blocks Taker Vipers from entering high-fee (10%+) markets.

@@ -132,7 +132,7 @@ function IntentRow({ intent, showSquadron, onChanged, engineReason }: {
         {!terminal && !inFlight && (
           <button
             disabled={busy}
-            onClick={() => run(() => cancelHelmIntent(intent.id, 'cancelled from the Control Tower'))}
+            onClick={() => run(() => cancelHelmIntent(intent.id, 'canceled from the Control Tower'))}
             className="text-[11px] font-mono border border-red-500/30 bg-red-500/10 text-red-200 rounded px-2 py-1 hover:bg-red-500/20 disabled:opacity-40"
           >
             Cancel

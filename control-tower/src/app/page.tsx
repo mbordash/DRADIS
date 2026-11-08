@@ -264,7 +264,7 @@ function DarkFeedBanner({ feeds }: { feeds?: { market: string; market_name?: str
  * The bookmaker feed has been failing. Shown only after a second consecutive
  * failure so one timed-out poll does not flash a banner; the engine keeps the
  * sports slot idle for as long as this lasts, and until 1.5.3 it said so only at
- * debug level, so a cancelled key went five days unnoticed.
+ * debug level, so a canceled key went five days unnoticed.
  */
 function OddsFeedBanner({ feed }: { feed?: OddsFeedHealth }) {
   if (!feed?.failing_since || feed.consecutive_failures < 2) return null;
@@ -281,7 +281,7 @@ function OddsFeedBanner({ feed }: { feed?: OddsFeedHealth }) {
           </p>
           <p className="text-[11px] text-gray-400 mt-1 leading-relaxed">
             The Odds API is not answering, so no sports market can be seeded or priced until it
-            recovers; crypto and politics squadrons are unaffected. A key that was cancelled or
+            recovers; crypto and politics squadrons are unaffected. A key that was canceled or
             ran out of credits answers HTTP 401 or 429: check the Odds API key on the Setup page.
           </p>
           {feed.last_error && (

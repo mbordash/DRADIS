@@ -39,7 +39,7 @@ safe here because the package is never actually invoked — see below.
 ### postcss 8.4.31, vendored inside Next
 
 `node_modules/next/node_modules/postcss` remains at 8.4.31. Next depends on that
-**exact** version and vendors its own copy, and npm honours the pin over an
+**exact** version and vendors its own copy, and npm honors the pin over an
 `overrides` entry — verified, not assumed. Forcing it would mean fighting the
 framework's own resolution on every install.
 

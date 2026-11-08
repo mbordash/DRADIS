@@ -280,7 +280,7 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(g, e, "arb_max_rescue_cost", "Max Rescue Cost", "price", false,
             "Block entry if a single-leg orphan can't be rescued below this cost.").range(1.0, 1.2).step(0.01));
         v.push(F::new(g, e, "arb_settle_grace_secs", "Orphan Settle Grace", "secs", true,
-            "Seconds the orphan arbiter waits after cancelling the missing leg's GTC before re-reading its \
+            "Seconds the orphan arbiter waits after canceling the missing leg's GTC before re-reading its \
              on-chain balance and committing to a repair. Guards against flattening a leg whose fill was still \
              settling; every second is also a second of naked directional exposure. The post-flatten late-fill \
              watcher catches a leg that fills after we commit, so cutting this short costs at most two spreads. \
@@ -576,10 +576,10 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Consecutive OBI breaches required before ToxicFill fires. A healthy tick resets the count.").range(1.0, 20.0).step(1.0));
         // Oracle-drift thresholds. The oracle (Binance) leads the Polymarket book by
         // minutes, so these fire before OBI can confirm. Two separate knobs because the
-        // two actions have different costs: cancelling an unfilled quote is free, while
+        // two actions have different costs: canceling an unfilled quote is free, while
         // exiting a filled position pays the spread to realize a loss.
         v.push(F::new(g, e, "maker_oracle_drift_pull_frac", "Oracle Drift Quote Pull", "pct", true,
-            "Cancel an UNFILLED resting quote once the oracle moves this far against it (0.0003 = 0.03%). Cancelling costs nothing, so keep this tight.").range(0.0, 0.05).step(0.0001));
+            "Cancel an UNFILLED resting quote once the oracle moves this far against it (0.0003 = 0.03%). Canceling costs nothing, so keep this tight.").range(0.0, 0.05).step(0.0001));
         v.push(F::new(g, e, "maker_oracle_drift_exit_frac", "Oracle Drift Exit", "pct", true,
             "Exit a FILLED position once the oracle moves this far against it since the quote was placed (0.0015 = 0.15%). Fires ahead of the OBI path, which lags by minutes. Set 0 to disable and rely on OBI alone.").range(0.0, 0.05).step(0.0005));
         // Resting maker exit — the spread-capture exit path.
@@ -590,7 +590,7 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(g, e, "maker_resting_exit_ask_improvement_ticks", "Resting Exit Ask Improvement", "decimal", true,
             "Ticks to undercut the best ask by. 1 = take queue priority; 0 = join the ask and earn the extra tick.").range(0.0, 5.0).step(1.0));
         v.push(F::new(g, e, "maker_resting_exit_reprice_threshold", "Resting Exit Reprice Deadband", "price", true,
-            "Minimum price move before the resting ask is cancelled and re-posted. Repricing surrenders queue priority, so keep this wider than normal book flicker.").range(0.0, 0.2).step(0.005));
+            "Minimum price move before the resting ask is canceled and re-posted. Repricing surrenders queue priority, so keep this wider than normal book flicker.").range(0.0, 0.2).step(0.005));
     }
 
     // ── Basis ─────────────────────────────────────────────────────────────────

@@ -89,8 +89,8 @@ fn exit(ctx, pos) {
 }
 "#;
 
-pub const LATE_FAVOURITE: &str = r#"// Late favourite: in the last minutes of a crypto market, when the oracle
-// sits well clear of the strike, buy the side it favours and hold it to the
+pub const LATE_FAVORITE: &str = r#"// Late favorite: in the last minutes of a crypto market, when the oracle
+// sits well clear of the strike, buy the side it favors and hold it to the
 // settlement. A worked example of a fair value from norm_cdf.
 //
 // The venue settles on its own index, which can sit tens of dollars from the
@@ -168,16 +168,16 @@ pub fn all() -> Vec<Template> {
             source: MOMENTUM,
         },
         Template {
-            id: "late_favourite",
-            title: "Late Favourite",
-            summary: "Last-minutes fair value from norm_cdf; buys a clear favourite with an edge and holds to settlement.",
+            id: "late_favorite",
+            title: "Late Favorite",
+            summary: "Last-minutes fair value from norm_cdf; buys a clear favorite with an edge and holds to settlement.",
             manifest: serde_json::json!({
-                "name": "my_late_favourite", "display_name": "My Late Favourite",
-                "description": "Fair value from distance to strike; clear favourites only; hold to settlement.",
+                "name": "my_late_favorite", "display_name": "My Late Favorite",
+                "description": "Fair value from distance to strike; clear favorites only; hold to settlement.",
                 "classes": ["crypto"], "venues": [], "max_exposure_usdc": 5,
                 "params": {
                     "window_secs": { "type": "int", "default": 600, "min": 60, "max": 3600, "description": "Enter only in this many final seconds." },
-                    "hourly_vol": { "type": "decimal", "default": 0.003, "min": 0.0005, "max": 0.05, "description": "Typical one-hour move of the underlying, as a fraction of the price (0.003 = 0.3%). It changes with the regime: BTC ran 0.13% to 0.41% an hour in November 2026. Too low makes every favourite look certain." },
+                    "hourly_vol": { "type": "decimal", "default": 0.003, "min": 0.0005, "max": 0.05, "description": "Typical one-hour move of the underlying, as a fraction of the price (0.003 = 0.3%). It changes with the regime: BTC ran 0.13% to 0.41% an hour in November 2026. Too low makes every favorite look certain." },
                     "min_fair": { "type": "decimal", "default": 0.75, "min": 0.5, "max": 0.99, "description": "Only buy a side the model rates at least this likely; near the strike the feed-to-index gap decides the trade." },
                     "fair_cap": { "type": "decimal", "default": 0.95, "min": 0.6, "max": 0.999, "description": "Highest probability the model may claim. Big moves come several times as often as the normal curve says." },
                     "min_edge": { "type": "decimal", "default": 0.04, "min": 0, "max": 0.5, "description": "Fair minus ask minus fee required." },
@@ -185,7 +185,7 @@ pub fn all() -> Vec<Template> {
                     "contracts": { "type": "int", "default": 5, "min": 1, "max": 100, "description": "Contracts per entry." }
                 }
             }),
-            source: LATE_FAVOURITE,
+            source: LATE_FAVORITE,
         },
     ]
 }

@@ -113,5 +113,5 @@ docker run -d --restart unless-stopped \
 | **AWS** | `c6i` / `c7i` (compute-optimized) | `t3.*` burstable — CPU credits cause latency spikes |
 | **OCI** | `VM.Standard.E4.Flex` (dedicated OCPU) or `BM.Standard.E4.128` bare-metal | Shared-core shapes |
 
-**Region placement:** put your instance in the same region as your primary Polymarket CLOB endpoint to minimise RTT. You need to research this yourself.
+**Region placement:** put your instance in the same region as your primary Polymarket CLOB endpoint to minimize RTT. You need to research this yourself.
 

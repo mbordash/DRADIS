@@ -1940,7 +1940,7 @@ function AutonomyPanel({ onAuthError }: { onAuthError: () => void }) {
 
 const MIGRATION_PHASES: Record<string, string> = {
   retiring: 'Retiring this instance…',
-  cancelling_orders: 'Cancelling resting orders…',
+  cancelling_orders: 'Canceling resting orders…',
   snapshotting: 'Snapshotting the databases…',
   copying: 'Copying models and training data…',
   archiving: 'Writing the backup archive…',

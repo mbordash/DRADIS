@@ -57,7 +57,7 @@ export function useConfirm(): [(opts: ConfirmOptions) => Promise<boolean>, React
 
   const confirm = useCallback((o: ConfirmOptions) => {
     // A second call while one is pending would strand the first promise forever
-    // and leak the caller's `await`. Resolve it as cancelled first.
+    // and leak the caller's `await`. Resolve it as canceled first.
     resolver.current?.(false);
     setOpts(o);
     return new Promise<boolean>(resolve => { resolver.current = resolve; });

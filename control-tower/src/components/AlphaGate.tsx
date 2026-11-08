@@ -37,7 +37,7 @@ import type { VenueId, Edition } from '@/lib/setupApi';
 // Venues are named in full: "Polymarket US", "Polymarket International",
 // "Kalshi". Abbreviating to "US" / "International" made the acknowledgement
 // modal read "DRADIS US — read before proceeding", which names no venue a
-// customer would recognise — and this modal is the first thing they see, where
+// customer would recognize — and this modal is the first thing they see, where
 // they are being asked to confirm eligibility to trade on that exact venue.
 const VENUE_NAME: Record<VenueId, string> = {
   intl:   'Polymarket International',
@@ -122,7 +122,7 @@ export default function AlphaGate({
             <ul className="text-xs text-red-200/90 space-y-1 list-disc pl-4">
               <li>DRADIS is <strong>trading automation software provided AS IS</strong>. It places live orders with real funds and can <strong>lose some or all of the capital</strong> you give it access to.</li>
               <li>Automated trading involves substantial risk of loss: software bugs, security issues, network latency, API rate limits, venue outages, slippage, or misconfiguration can produce unintended trades and <strong>total loss of deployed capital</strong>. Start in GHOST mode and with money you can afford to lose entirely.</li>
-              {/* The licence an operator holds depends on how they obtained
+              {/* The license an operator holds depends on how they obtained
                   DRADIS. A Marketplace subscription carries commercial terms —
                   telling those customers they hold an AGPL grant is simply
                   wrong, and it was naming GPLv3 rather than AGPLv3 besides. */}

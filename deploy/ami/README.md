@@ -41,7 +41,7 @@ make the switch appear to succeed and silently do nothing.
 
 `dradis-firstboot.sh` seeds the file once, reading an optional
 `dradis_venue=<intl|us|kalshi>` line from EC2 user data so a customer can pick
-at launch without opening a browser. Anything unrecognised falls back to the
+at launch without opening a browser. Anything unrecognized falls back to the
 default and logs why.
 
 **Venue is not a live config knob.** It selects which binary runs, so it takes
