@@ -444,22 +444,31 @@ pub struct LastContext {
     pub ctx: Map,
 }
 
-fn contexts() -> &'static Mutex<HashMap<String, LastContext>> {
-    static C: OnceLock<Mutex<HashMap<String, LastContext>>> = OnceLock::new();
+/// [E95] Keyed by squadron AND market role: one squadron's scripts may trade
+/// its hourly, window and 15-minute markets, and a Test run must replay the
+/// context of the market the script under test declares.
+fn contexts() -> &'static Mutex<HashMap<(String, crate::orchestrator::strategy::MarketRole), LastContext>> {
+    static C: OnceLock<Mutex<HashMap<(String, crate::orchestrator::strategy::MarketRole), LastContext>>> = OnceLock::new();
     C.get_or_init(Default::default)
 }
 
-pub fn note_context(squadron: &str, ctx: &Map) {
+pub fn note_context(squadron: &str, role: crate::orchestrator::strategy::MarketRole, ctx: &Map) {
     contexts().lock().unwrap_or_else(|p| p.into_inner())
-        .insert(squadron.to_string(), LastContext { at: Utc::now(), ctx: ctx.clone() });
+        .insert((squadron.to_string(), role), LastContext { at: Utc::now(), ctx: ctx.clone() });
 }
 
-pub fn last_context(squadron: &str) -> Option<LastContext> {
-    contexts().lock().unwrap_or_else(|p| p.into_inner()).get(squadron).cloned()
+pub fn last_context(squadron: &str, role: crate::orchestrator::strategy::MarketRole) -> Option<LastContext> {
+    contexts().lock().unwrap_or_else(|p| p.into_inner()).get(&(squadron.to_string(), role)).cloned()
 }
 
+/// Squadrons with a recorded context, each with its most recent one's time.
 pub fn context_squadrons() -> Vec<(String, DateTime<Utc>)> {
-    contexts().lock().unwrap_or_else(|p| p.into_inner()).iter().map(|(k, v)| (k.clone(), v.at)).collect()
+    let mut out: HashMap<String, DateTime<Utc>> = HashMap::new();
+    for ((sq, _), v) in contexts().lock().unwrap_or_else(|p| p.into_inner()).iter() {
+        let e = out.entry(sq.clone()).or_insert(v.at);
+        if v.at > *e { *e = v.at; }
+    }
+    out.into_iter().collect()
 }
 
 // ── Where each script runs ────────────────────────────────────────────────────

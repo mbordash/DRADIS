@@ -1909,6 +1909,10 @@ mod tests {
                 "helm_fee_verdict_enforce",
                 "sports_ledger_enabled", "sports_ledger_leagues", "sports_ledger_snapshot_offsets_mins",
                 "sports_ledger_credit_reserve", "sports_ledger_quota_reset_day",
+                // [E95] Which markets a squadron flies is the instance's shape,
+                // not a risk posture: applying a profile never adds or drops the
+                // ultra-short market.
+                "ultra_short_market_enabled",
             ];
             // `autoscale_` [E91]: the capital auto-scaler is the operator's sizing
             // policy across every profile, so applying a profile never arms,

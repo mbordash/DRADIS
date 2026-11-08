@@ -78,6 +78,16 @@ pub enum Mode {
     Orders { ghost: bool },
 }
 
+/// [E95] Why a script holds when its squadron does not fly its market.
+pub fn no_market_reason(role: crate::orchestrator::strategy::MarketRole) -> String {
+    use crate::orchestrator::strategy::MarketRole;
+    match role {
+        MarketRole::UltraShort => "no ultra-short market on this squadron (this venue lists none for it, or the ultra-short market is off)".into(),
+        MarketRole::Window => "no window market on this squadron".into(),
+        MarketRole::Hourly => "no market".into(),
+    }
+}
+
 /// The refusal while the squadron's price feed has no price yet [B95].
 pub const ORACLE_UNKNOWN: &str = "oracle price unknown (the price feed has not printed yet)";
 
@@ -358,6 +368,22 @@ impl ScriptedStrategy {
         }
     }
 
+    /// [E95] The market and book a held token trades on, from the squadron's
+    /// full context (hourly, window or ultra-short), with its side: exits
+    /// follow the position's token, not the market the script enters on.
+    fn resolve<'a>(full: &'a StrategyContext, token: &str) -> Option<(Side, &'a crate::state::MarketConfig, &'a crate::state::MarketSnapshot)> {
+        let (m, s) = crate::vipers::venue_for_token(full, &MarketId::new(token))?;
+        let side = if token == m.yes_token.as_str() { Side::Yes } else { Side::No };
+        Some((side, m, s))
+    }
+
+    fn bid_fee(m: &crate::state::MarketConfig, s: &crate::state::MarketSnapshot, side: Side) -> (Decimal, u32) {
+        match side {
+            Side::Yes => (s.yes_bid, m.yes_fee_bps),
+            Side::No => (s.no_bid, m.no_fee_bps),
+        }
+    }
+
     fn side_of(ctx: &StrategyContext, token: &str) -> Option<Side> {
         if token == ctx.market.yes_token.as_str() { Some(Side::Yes) }
         else if token == ctx.market.no_token.as_str() { Some(Side::No) }
@@ -374,14 +400,18 @@ impl ScriptedStrategy {
     }
 
     fn order(ctx: &StrategyContext, token: MarketId, price: Decimal, shares: Decimal, fee_bps: u32, ghost: bool) -> OrderParams {
+        Self::order_on(&ctx.market, token, price, shares, fee_bps, ghost)
+    }
+
+    fn order_on(m: &crate::state::MarketConfig, token: MarketId, price: Decimal, shares: Decimal, fee_bps: u32, ghost: bool) -> OrderParams {
         OrderParams {
             token_id: token,
             price,
             shares,
             fee_bps: fee_bps as u16,
-            is_neg_risk: ctx.market.is_neg_risk,
-            market_name: ctx.market.market_name.clone(),
-            condition_id: ctx.market.condition_id.clone(),
+            is_neg_risk: m.is_neg_risk,
+            market_name: m.market_name.clone(),
+            condition_id: m.condition_id.clone(),
             order_type: TimeInForce::Fak,
             post_only: false,
             ghost_mode: ghost,
@@ -419,7 +449,7 @@ impl ScriptedStrategy {
         };
 
         let cmap = self.context(ctx, &live, exposure);
-        store::note_context(&ctx.squadron_id, &cmap);
+        store::note_context(&ctx.squadron_id, self.market_role(), &cmap);
         let ast = std::sync::Arc::clone(&live.script.ast);
         let out = store::with_state(&ctx.squadron_id, &self.script, |st| runtime::call_entry(&ast, cmap, st));
         let action = match out {
@@ -515,13 +545,15 @@ impl ScriptedStrategy {
     /// A position it opened keeps its stop and its take-profit until it is
     /// closed or settles. Paper rows keep being managed after the viper goes
     /// live, so the paper record stays honest.
-    async fn exit(&self, ctx: &StrategyContext) -> StrategySignal {
+    /// `ctx` is what the script's exit() sees (its market's view); `full` is the
+    /// squadron's whole context, which each held token is resolved against.
+    async fn exit(&self, ctx: &StrategyContext, full: &StrategyContext) -> StrategySignal {
         let Some(live) = self.settings(ctx) else { return StrategySignal::NoSignal };
         let paper_mode = live.mode == Mode::Paper;
         let exposure = self.holdings(ctx, paper_mode).await.map_or(Decimal::ZERO, |(e, _)| e);
-        self.paper_exits(ctx, &live, &self.context_as(ctx, &live, exposure, true)).await;
+        self.paper_exits(ctx, full, &live, &self.context_as(ctx, &live, exposure, true)).await;
         let ghost = config::GHOST_MODE || ctx.dynamic_config.ghost_mode;
-        self.order_exits(ctx, &live, &self.context_as(ctx, &live, exposure, ghost), ghost).await
+        self.order_exits(ctx, full, &live, &self.context_as(ctx, &live, exposure, ghost), ghost).await
     }
 
     fn call_exit(&self, ctx: &StrategyContext, live: &Live, cmap: &rhai::Map, pos: &PosView) -> Result<Action, String> {
@@ -553,13 +585,13 @@ impl ScriptedStrategy {
         }
     }
 
-    async fn paper_exits(&self, ctx: &StrategyContext, live: &Live, cmap: &rhai::Map) {
+    async fn paper_exits(&self, ctx: &StrategyContext, full: &StrategyContext, live: &Live, cmap: &rhai::Map) {
         self.paper_settle(ctx, &live.script.hash).await;
         let Some(pool) = crate::helpers::db::pool_for(&Self::asset(ctx)) else { return };
         let now = Utc::now();
         for r in paper::cached_open(&pool, &ctx.squadron_id, &self.script).await {
-            let Some(side) = Self::side_of(ctx, &r.token_id) else { continue };
-            let (_, bid, _, _, _) = Self::book(ctx, side);
+            let Some((side, m, snap)) = Self::resolve(full, &r.token_id) else { continue };
+            let (bid, _) = Self::bid_fee(m, snap, side);
             let decided = if r.take_profit.is_some_and(|tp| bid > Decimal::ZERO && bid >= tp) {
                 Some(format!("take-profit ${:.2} reached", r.take_profit.unwrap_or_default()))
             } else {
@@ -598,7 +630,7 @@ impl ScriptedStrategy {
         }
     }
 
-    async fn order_exits(&self, ctx: &StrategyContext, live: &Live, cmap: &rhai::Map, ghost: bool) -> StrategySignal {
+    async fn order_exits(&self, ctx: &StrategyContext, full: &StrategyContext, live: &Live, cmap: &rhai::Map, ghost: bool) -> StrategySignal {
         let pool = crate::helpers::db::pool_for(&Self::asset(ctx));
         let held = self.order_positions(ctx, false).await;
         if let Some(p) = pool.as_ref() { tp_load(p, &ctx.squadron_id, &self.script).await; }
@@ -606,11 +638,11 @@ impl ScriptedStrategy {
         tp_prune(pool.as_ref(), &ctx.squadron_id, &self.script, &tokens).await;
         let now = Utc::now();
         for (token, p) in held {
-            let Some(side) = Self::side_of(ctx, token.as_str()) else { continue };
-            let (_, bid, _, _, fee_bps) = Self::book(ctx, side);
+            let Some((side, m, snap)) = Self::resolve(full, token.as_str()) else { continue };
+            let (bid, fee_bps) = Self::bid_fee(m, snap, side);
             let tp = tp_get(&ctx.squadron_id, &self.script, token.as_str());
             let sell = |price: Decimal, why: String| StrategySignal::Exit {
-                params: Self::order(ctx, token.clone(), price, p.shares, fee_bps, ghost),
+                params: Self::order_on(m, token.clone(), price, p.shares, fee_bps, ghost),
                 reason: format!("{}: {why} [v{}]", self.name, live.script.hash),
                 exit_pair: false,
             };
@@ -661,12 +693,37 @@ pub fn check_sell(price: Decimal, bid: Decimal) -> Result<Decimal, String> {
 
 #[async_trait::async_trait]
 impl Strategy for ScriptedStrategy {
+    // [E95] A script runs against the market it declared: the squadron's
+    // context viewed with that market as the primary. Without that market here
+    // its entries hold with the reason; its exits still run on the squadron's
+    // context, so paper rows on markets already left are settled.
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> anyhow::Result<StrategySignal> {
-        Ok(self.entry(ctx).await)
+        let role = self.market_role();
+        if role == crate::orchestrator::strategy::MarketRole::Hourly {
+            return Ok(self.entry(ctx).await);
+        }
+        match ctx.view(role) {
+            Some(v) => Ok(self.entry(&v).await),
+            None => {
+                self.reason(ctx, &no_market_reason(role));
+                Ok(StrategySignal::NoSignal)
+            }
+        }
     }
 
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> anyhow::Result<StrategySignal> {
-        Ok(self.exit(ctx).await)
+        let role = self.market_role();
+        if role == crate::orchestrator::strategy::MarketRole::Hourly {
+            return Ok(self.exit(ctx, ctx).await);
+        }
+        match ctx.view(role) {
+            Some(v) => Ok(self.exit(&v, ctx).await),
+            None => Ok(self.exit(ctx, ctx).await),
+        }
+    }
+
+    fn market_role(&self) -> crate::orchestrator::strategy::MarketRole {
+        store::get(&self.script).map(|s| s.manifest.market).unwrap_or_default()
     }
 
     fn status(&self) -> StrategyStatus { StrategyStatus::Active }
@@ -689,12 +746,14 @@ impl Strategy for ScriptedStrategy {
 /// values `params` resolves (from the draft's manifest when one is being
 /// tested), and this viper's paper exposure.
 pub fn dry_run(squadron: &str, script: &str, source: Option<&str>,
-               params: &std::collections::BTreeMap<String, crate::vipers::scripted::manifest::ParamValue>) -> Result<serde_json::Value, String> {
+               params: &std::collections::BTreeMap<String, crate::vipers::scripted::manifest::ParamValue>,
+               role: crate::orchestrator::strategy::MarketRole) -> Result<serde_json::Value, String> {
     if source.is_some_and(|s| s.len() > store::MAX_SOURCE_BYTES) {
         return Err(format!("the script is over {} KB", store::MAX_SOURCE_BYTES / 1024));
     }
-    let last = store::last_context(squadron).ok_or_else(|| format!(
-        "no context recorded for squadron '{squadron}' yet: a context is recorded each tick any script runs there"
+    let last = store::last_context(squadron, role).ok_or_else(|| format!(
+        "no {} context recorded for squadron '{squadron}' yet: a context is recorded each tick a script trading that market runs there",
+        role.label(),
     ))?;
     let ast = match source {
         Some(src) => runtime::compile(src)?,
@@ -794,6 +853,7 @@ mod tests {
             session_pnl: dec!(0), starting_collateral: dec!(100), available_collateral: dec!(100),
             crypto_filter: asset.into(), market_started_at: Utc::now(),
             maker_market: None, maker_snapshot: None,
+            ultra_market: None, ultra_snapshot: None,
             dynamic_config: Arc::new(dc), arb_market_lockouts: None, sports: None,
         }
     }
@@ -837,6 +897,52 @@ mod tests {
         let fee_out = crate::venues::taker_fee_per_share(dec!(0.48)) * dec!(5);
         assert_eq!(done.exit_price, Some(dec!(0.48)));
         assert_eq!(done.pnl, Some(((dec!(0.48) - dec!(0.42)) * dec!(5) - r.entry_fee - fee_out).round_dp(6)));
+    }
+
+    /// [E95] A script that declares the ultra-short market trades that market's
+    /// own tokens, at its book, with its clock; on a squadron without one it
+    /// holds and says why. Its take-profit is watched on that market's book.
+    #[tokio::test]
+    async fn an_ultra_short_script_trades_the_ultra_market_or_holds_without_one() {
+        use crate::orchestrator::strategy::MarketRole;
+        let asset = "scriptultra";
+        let pool = pool(asset).await;
+        let mut m = manifest(asset, dec!(10));
+        m.market = MarketRole::UltraShort;
+        store::insert_hidden_for_test(m, E2E);
+        let strat = ScriptedStrategy::new(asset);
+        assert_eq!(strat.market_role(), MarketRole::UltraShort);
+
+        let c = ctx(asset, DynamicConfig::default());
+        strat.evaluate_entry(&c).await.unwrap();
+        assert!(paper::open_rows(&pool, &c.squadron_id, asset).await.is_empty(), "no ultra market, no entry");
+        let status = serde_json::to_string(&viper_status::snapshot(Some(asset))).unwrap();
+        assert!(status.contains("no ultra-short market on this squadron"), "{status}");
+
+        let mut u = c.clone();
+        let close = Utc::now() + chrono::Duration::minutes(5);
+        u.ultra_market = Some(MarketConfig {
+            yes_token: MarketId::new("u-yes"), no_token: MarketId::new("u-no"),
+            market_name: "BTC price up in next 15 mins?".into(), market_close_time: Some(close),
+            strike_price: Some(dec!(100050)), window_secs: Some(900), is_neg_risk: false,
+            condition_id: "u-cid".into(), yes_fee_bps: 0, no_fee_bps: 0,
+        });
+        let mut us = c.snapshot.clone();
+        us.yes_ask = dec!(0.30); us.yes_bid = dec!(0.28);
+        u.ultra_snapshot = Some(us);
+        let v = u.view(MarketRole::UltraShort).unwrap();
+        assert_eq!(v.market_started_at, close - chrono::Duration::seconds(900), "the clock is the ultra market's");
+
+        strat.evaluate_entry(&u).await.unwrap();
+        let rows = paper::open_rows(&pool, &c.squadron_id, asset).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].token_id.as_str(), rows[0].condition_id.as_str(), rows[0].entry_price), ("u-yes", "u-cid", dec!(0.30)));
+        assert_eq!(rows[0].market, "BTC price up in next 15 mins?");
+
+        let mut up = u.clone();
+        up.ultra_snapshot.as_mut().unwrap().yes_bid = dec!(0.40);
+        strat.evaluate_exit(&up).await.unwrap();
+        assert!(paper::open_rows(&pool, &c.squadron_id, asset).await.is_empty(), "the take-profit read the ultra book");
     }
 
     /// The cap is the manifest's (or the operator's, if lower), and the Live

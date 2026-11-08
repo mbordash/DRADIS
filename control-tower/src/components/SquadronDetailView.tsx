@@ -224,6 +224,12 @@ function SquadronInfoCard({ squadron, onOpenMarket }: { squadron: SquadronSummar
             <span className="text-gray-300 text-[11px] break-words">{squadron.maker_market_name}</span>
           </div>
         )}
+        {squadron.ultra_market_name && (
+          <div className="flex flex-col gap-1 pt-2 border-t border-[#1e1e32]">
+            <span className="text-gray-500">Ultra-short Market (15-minute)</span>
+            <span className="text-gray-300 text-[11px] break-words">{squadron.ultra_market_name}</span>
+          </div>
+        )}
         <div className="pt-2 border-t border-[#1e1e32]">
           <span className="text-gray-700 text-[10px]">ID: {squadron.id}</span>
         </div>

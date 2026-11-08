@@ -1103,6 +1103,12 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              enough that a day of hourly retirements never piles up. A squadron you stand down yourself is \
              removed at once and does not wait on this.")
             .range(0.0, 86_400.0).step(60.0).unit("s"));
+        v.push(F::new(g, e, "ultra_short_market_enabled", "Ultra-short Market", "bool", false,
+            "Each crypto squadron also flies the venue's 15-minute market on its underlying, beside its hourly and \
+             window markets, replacing it at every 15-minute close. Only vipers that declare the ultra-short market \
+             trade it (today: script vipers set to Ultra-short); every built-in viper keeps its own market. Off: no \
+             15-minute market is selected and no extra book is streamed. A venue that lists no 15-minute market for \
+             the underlying leaves it empty, and those vipers say so on their cards."));
         v.push(F::new(g, e, "auto_deploy_politics", "Auto-Deploy Politics", "bool", false,
             "Keep a politics squadron running without waiting for you to deploy one. DRADIS picks \
              the highest-volume politics market inside the resolution horizon above, and replaces \

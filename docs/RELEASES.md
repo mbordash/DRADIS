@@ -4,6 +4,12 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
+## 1.7.2 (unreleased)
+
+- Ultra-short market (new, off by default): each crypto squadron can also fly the venue's 15-minute market on its underlying, beside its hourly and window markets, replacing it at every 15-minute close. Switch it on in Setup (Deployment, Ultra-short Market). Only vipers that declare it trade it: today, script vipers whose market is set to Ultra-short on the Build a Viper page. Every built-in viper keeps its own market. The squadron page shows the 15-minute market beside the others. Kalshi first; on a venue or underlying with no 15-minute market the squadron leaves it empty, and those vipers say so on their cards.
+- Build a Viper: a script chooses which of its squadron's markets it trades (hourly, window/daily or ultra-short). Its ctx describes that market, and its exits follow each position's own market.
+- Up or Down markets whose title gives a time range ("10:15PM-10:30PM ET") are read as that length: a 15-minute or four-hour window is no longer taken for an hour. The Markets page's model strike for a four-hour window now starts at the window's open.
+
 ## 1.7.1 (2026-11-07)
 
 - Kalshi: the crypto squadron no longer trades the wrong market for two minutes after each close. Kalshi lists the next window about 15 seconds after the last one closes, and the squadron chose its next market before that, so it took whatever was listed (the 17:00 daily between 15-minute windows, or a 15-minute market at the top of the hour) and switched back on its next two-minute rescan. Each switch stood the squadron down and canceled its resting orders, and the strategies that trade only hourly markets sat out. After a close the squadron now waits up to 90 seconds for the right next market: the new hour's market at the top of the hour, the next 15-minute window in the hour before Kalshi's 17:00 daily close (which has no hourly market), and otherwise a market like the one that closed.

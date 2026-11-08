@@ -755,7 +755,14 @@ impl Squadron {
         for strategy in &strategies {
             let sn = strategy.name();
             let venue = strategy.venue();
+            let role = strategy.market_role();
             let market_name_attached = match venue {
+                // [E95] A viper's role decides first; a script declares one.
+                _ if role == crate::orchestrator::strategy::MarketRole::UltraShort => String::new(),
+                _ if venue != "Window/Daily" && role == crate::orchestrator::strategy::MarketRole::Window => maker_market_config
+                    .as_ref()
+                    .map(|m| m.market_name.clone())
+                    .unwrap_or_else(|| if single_market { hourly_market_name.clone() } else { String::new() }),
                 "Hourly" => hourly_market_name.clone(),
                 // On a single-market squadron the window/daily vipers run on the
                 // one market too (see `single_market_arb` in the tick), so name
@@ -1657,6 +1664,7 @@ impl Squadron {
                         crypto_filter: crypto_filter.clone(),
                         market_started_at,
                         maker_market: maker_market_config_for_ctx,
+                        ultra_market: None, ultra_snapshot: None,
                         maker_snapshot: if single_market_arb {
                             Some(hourly_snapshot)
                         } else { maker_market_config.as_ref().map(|mk| MarketSnapshot {
@@ -1708,8 +1716,8 @@ impl Squadron {
                         let sn = strategy_name.clone();
                         let sq_key = squadron_id.clone();
                         let (target_yes_token, target_no_token, target_market_close_time, target_is_neg_risk, target_yes_fee_bps, target_no_fee_bps) = {
-                            let strategy_venue = strategies.iter().find(|s| s.name() == sn).map(|s| s.venue()).unwrap_or("Hourly");
-                            if strategy_venue == "Window/Daily" && maker_market_config.is_some() {
+                            let strategy_role = strategies.iter().find(|s| s.name() == sn).map(|s| s.market_role()).unwrap_or_default();
+                            if strategy_role == crate::orchestrator::strategy::MarketRole::Window && maker_market_config.is_some() {
                                 let mk = maker_market_config.as_ref().unwrap();
                                 (mk.yes_token.clone(), mk.no_token.clone(), mk.market_close_time, mk.is_neg_risk, mk.yes_fee_bps, mk.no_fee_bps)
                             } else {
@@ -2442,8 +2450,8 @@ impl Squadron {
                                 // strategies the primary snapshot. Captured here so both the ghost and
                                 // live entry paths can persist the feature-vector behind the fill.
                                 let entry_snap: crate::state::MarketSnapshot = {
-                                    let strat_venue = strategies.iter().find(|s| s.name() == sn).map(|s| s.venue()).unwrap_or("Hourly");
-                                    if strat_venue == "Window/Daily" {
+                                    let strat_role = strategies.iter().find(|s| s.name() == sn).map(|s| s.market_role()).unwrap_or_default();
+                                    if strat_role == crate::orchestrator::strategy::MarketRole::Window {
                                         ctx.maker_snapshot.clone().unwrap_or_else(|| ctx.snapshot.clone())
                                     } else {
                                         ctx.snapshot.clone()

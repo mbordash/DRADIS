@@ -55,6 +55,11 @@ pub struct Manifest {
     /// Operator parameters, by name, readable from the script as `ctx.params`.
     #[serde(default)]
     pub params: BTreeMap<String, Param>,
+    /// [E95] Which of the squadron's markets the script trades: `hourly` (the
+    /// default, and every manifest saved before this field), `window` or
+    /// `ultra_short`.
+    #[serde(default)]
+    pub market: crate::orchestrator::strategy::MarketRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

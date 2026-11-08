@@ -290,7 +290,7 @@ async fn dry_run(State(s): State<ApiState>, Path(name): Path<String>, Json(b): J
     };
     let overrides = s.config_rx.borrow().custom_vipers.get(&name).map(|c| c.params.clone()).unwrap_or_default();
     let params = manifest.resolve_params(&overrides);
-    match adapter::dry_run(&b.squadron, &name, b.source.as_deref(), &params) {
+    match adapter::dry_run(&b.squadron, &name, b.source.as_deref(), &params, manifest.market) {
         Ok(v) => Json(v).into_response(),
         Err(e) => bad(StatusCode::UNPROCESSABLE_ENTITY, vec![e]),
     }

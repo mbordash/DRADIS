@@ -3890,6 +3890,7 @@ mod entry_book_tests {
             market_started_at: Utc::now(),
             maker_snapshot: Some(maker),
             maker_market: Some(market("m-yes", "m-no", "Bitcoin Up or Down - September 2, 12:00PM-4:00PM ET", "cid-maker")),
+            ultra_market: None, ultra_snapshot: None,
             dynamic_config: Arc::new(DynamicConfig::default()),
             arb_market_lockouts: None,
             sports: None,

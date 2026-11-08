@@ -203,6 +203,11 @@ function SquadronRow({
               🗓 {sq.maker_market_name}
             </p>
           )}
+          {sq.ultra_market_name && (
+            <p className="text-[10px] font-mono text-gray-600 truncate mt-0.5" title={sq.ultra_market_name}>
+              ⚡ {sq.ultra_market_name}
+            </p>
+          )}
           {sq.stood_down_reason && (
             <p className="text-[10px] font-mono text-gray-500 truncate mt-0.5" title={sq.stood_down_reason}>
               🏁 retired: {sq.stood_down_reason} — this entry is removed shortly

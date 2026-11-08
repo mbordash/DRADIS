@@ -658,6 +658,83 @@ impl Drop for MarketRegistries {
     }
 }
 
+/// [E95] The squadron's ultra-short (15-minute) market inside one session:
+/// its pair and config, and the cancel token of its own book feed (`None`
+/// when the primary IS the 15-minute market and the two share a book). The
+/// feed stops and its book is forgotten when the slot is replaced or dropped.
+struct UltraSlot {
+    pair: KalshiPair,
+    cfg: MarketConfig,
+    feed: Option<CancellationToken>,
+}
+
+impl Drop for UltraSlot {
+    fn drop(&mut self) {
+        if let Some(f) = self.feed.take() {
+            f.cancel();
+            crate::state::price_state::book_feed::forget(&self.pair.ticker);
+        }
+    }
+}
+
+/// [E95] Point every ultra-short viper's `strategy_markets` entry at the
+/// slot's current market ("" when empty).
+fn publish_ultra_markets(
+    markets_tx: &watch::Sender<HashMap<String, String>>,
+    squadron_id: &str,
+    strategies: &[Box<dyn crate::orchestrator::strategy::Strategy>],
+    question: &str,
+) {
+    markets_tx.send_modify(|map| {
+        for s in strategies.iter().filter(|s| s.market_role() == crate::orchestrator::strategy::MarketRole::UltraShort) {
+            let key = s.name()
+                .strip_suffix("Strategy").unwrap_or(&s.name()).to_lowercase()
+                .replace("timedecay", "time_decay")
+                .replace("trendreversal", "trendcapture");
+            map.insert(crate::state::strategy_market_key(squadron_id, &key), question.to_string());
+        }
+    });
+}
+
+/// [E95] The market config a pair trades under (ticker as the market id).
+fn pair_market_cfg(p: &KalshiPair) -> MarketConfig {
+    MarketConfig {
+        yes_token: p.long.clone(),
+        no_token: p.short.clone(),
+        market_name: p.question.clone(),
+        market_close_time: p.close_time,
+        strike_price: p.strike,
+        // The published window, else the cadence's nominal one, so a script's
+        // market age reads right on a listing that omits its open.
+        window_secs: p.window_secs.or(p.cadence.map(Cadence::window_secs)),
+        is_neg_risk: false,
+        condition_id: p.ticker.clone(),
+        yes_fee_bps: KALSHI_FEE_BPS as u32,
+        no_fee_bps: KALSHI_FEE_BPS as u32,
+    }
+}
+
+/// [E95] The ultra-short market for a squadron flying `primary`: the hottest
+/// listed 15-minute market on the same underlying (`pairs` arrive
+/// hottest-first). The primary itself when it is the 15-minute market.
+fn choose_ultra(pairs: &[KalshiPair], primary: &KalshiPair) -> Option<KalshiPair> {
+    if primary.cadence == Some(Cadence::FifteenMin) {
+        return Some(primary.clone());
+    }
+    pairs.iter()
+        .find(|p| p.cadence == Some(Cadence::FifteenMin) && p.underlying == primary.underlying)
+        .cloned()
+}
+
+/// [E95] How often an empty or closed ultra slot looks for a market: every
+/// 5 s for 90 s after a close (Kalshi lists the next window 14-16 s after the
+/// last one closes, measured 2026-11-07), then once a minute.
+const ULTRA_RELIST_POLL_SECS: u64 = 5;
+const ULTRA_IDLE_POLL_SECS: u64 = 60;
+/// Bound on one off-tick discovery for the ultra slot; a slow board is
+/// retried at the next poll rather than awaited.
+const ULTRA_DISCOVERY_TIMEOUT_SECS: u64 = 20;
+
 #[derive(Debug)]
 enum MarketOutcome {
     Closed,
@@ -1541,7 +1618,13 @@ async fn trade_one_market(
                 .strip_suffix("Strategy").unwrap_or(&s.name()).to_lowercase()
                 .replace("timedecay", "time_decay")
                 .replace("trendreversal", "trendcapture");
-            let market = if s.venue() == "Window/Daily" { maker_name } else { &pair.question };
+            // [E95] By the viper's market role; the ultra-short slot has no
+            // market here yet, so its vipers show none.
+            let market = match s.market_role() {
+                crate::orchestrator::strategy::MarketRole::Window => maker_name,
+                crate::orchestrator::strategy::MarketRole::UltraShort => "",
+                crate::orchestrator::strategy::MarketRole::Hourly => &pair.question,
+            };
             map.insert(crate::state::strategy_market_key(&squadron_id, &key), market.to_string());
         }
     });
@@ -1592,6 +1675,17 @@ async fn trade_one_market(
             session_pnl = if dyn_cfg.ghost_mode { crate::helpers::metrics::realised_session_pnl() } else { total - starting };
         }
     }
+
+    // [E95] The ultra-short slot: filled and replaced inside the session, only
+    // for a rotating crypto squadron with the setting on.
+    let mut ultra: Option<UltraSlot> = None;
+    let mut ultra_checked_at: Option<Instant> = None;
+    // Seeded as just closed: a session starts at a close (or at startup), when
+    // the next 15-minute window may be 14-16 s from listed, so it polls fast.
+    let mut ultra_closed_at: Option<Instant> = Some(Instant::now());
+    // Discovery runs off the tick: a REST call with no timeout must never
+    // hold up exits and stops (review of E95 phase 2).
+    let mut ultra_job: Option<tokio::task::JoinHandle<Vec<KalshiPair>>> = None;
 
     // ── Tick loop ────────────────────────────────────────────────────────────
     let mut price_tick = tokio::time::interval(Duration::from_millis(TICK_MS));
@@ -1665,6 +1759,12 @@ async fn trade_one_market(
                     if let Some(mp) = &maker_pair {
                         live.push(mp.long.clone());
                         live.push(mp.short.clone());
+                    }
+                    // [E95] The current ultra-short legs; one already replaced
+                    // has closed and is booked like any other closed hold.
+                    if let Some(u) = &ultra {
+                        live.push(u.pair.long.clone());
+                        live.push(u.pair.short.clone());
                     }
                     crate::helpers::ghost_settlement::settle_closed_ghost_holds(
                         venue.as_ref(), &positions, p, &scope, asset, &squadron_id, &live,
@@ -2019,13 +2119,90 @@ async fn trade_one_market(
             MarketPhase::Open => {}
         }
 
+        // [E95] Keep the ultra-short slot filled. Wanted only for a rotating
+        // crypto squadron with the setting on and a viper that trades it; not
+        // wanted, it is dropped once nothing is held on it (a held position
+        // keeps its book until it is flat or its market closes). Closed or
+        // empty, it is looked for again off the tick: fast just after a close,
+        // once a minute while the venue lists none.
+        {
+            use crate::orchestrator::strategy::MarketRole;
+            let want = pair.is_crypto() && mandate == MarketMandate::Rotating
+                && crate::helpers::dynamic_config::ultra_short_market_enabled()
+                && strategies.iter().any(|s| s.market_role() == MarketRole::UltraShort);
+            let now = Utc::now();
+            let closed = ultra.as_ref().is_some_and(|u| u.cfg.market_close_time.is_some_and(|c| c <= now));
+            let held_on_ultra = match &ultra {
+                Some(u) if !want => positions.lock().await.iter().any(|(k, p)| {
+                    k.squadron == squadron_id && p.shares > Decimal::ZERO
+                        && (k.market == u.pair.long || k.market == u.pair.short)
+                }),
+                _ => false,
+            };
+            if closed || (!want && ultra.is_some() && !held_on_ultra) {
+                ultra = None;
+                if closed { ultra_closed_at = Some(Instant::now()); }
+                cag.update_ultra_market(&squadron_id, None);
+                publish_ultra_markets(&markets_tx, &squadron_id, &strategies, "");
+            }
+            if !want {
+                if let Some(j) = ultra_job.take() { j.abort(); }
+            } else if ultra.is_none() {
+                // A finished search fills the slot.
+                if ultra_job.as_ref().is_some_and(|j| j.is_finished()) {
+                    let board = match ultra_job.take() { Some(j) => j.await.unwrap_or_default(), None => Vec::new() };
+                    if let Some(up) = choose_ultra(&board, &pair).filter(|u| u.close_time.is_some_and(|c| c > now)) {
+                        let shared = up.ticker == pair.ticker;
+                        let feed = (!shared).then(|| {
+                            let t = cancel.child_token();
+                            ws::spawn_orderbook_feed(super::ws_url(), venue.auth.clone(), vec![up.ticker.clone()], hub.clone(), t.clone());
+                            t
+                        });
+                        info!("⚡ Kalshi ultra-short market for [{}]: \"{}\" [{}] close={:?}{}",
+                              squadron_id, up.question, up.ticker, up.close_time, if shared { " (the primary)" } else { "" });
+                        cag.update_ultra_market(&squadron_id, Some(up.question.clone()));
+                        publish_ultra_markets(&markets_tx, &squadron_id, &strategies, &up.question);
+                        ultra = Some(UltraSlot { cfg: pair_market_cfg(&up), pair: up, feed });
+                        ultra_closed_at = None;
+                    }
+                }
+                let every = if ultra_closed_at.is_some_and(|t| t.elapsed().as_secs() < 90) { ULTRA_RELIST_POLL_SECS } else { ULTRA_IDLE_POLL_SECS };
+                if ultra.is_none() && ultra_job.is_none() && ultra_checked_at.is_none_or(|t| t.elapsed().as_secs() >= every) {
+                    ultra_checked_at = Some(Instant::now());
+                    if pair.cadence == Some(Cadence::FifteenMin) {
+                        // The primary is the 15-minute market: nothing to look up.
+                        let me = vec![pair.clone()];
+                        ultra_job = Some(tokio::spawn(async move { me }));
+                    } else {
+                        let (v, ser) = (Arc::clone(venue), series.to_vec());
+                        ultra_job = Some(tokio::spawn(async move {
+                            tokio::time::timeout(Duration::from_secs(ULTRA_DISCOVERY_TIMEOUT_SECS), discover_pairs(&v, &ser))
+                                .await.unwrap_or_default()
+                        }));
+                    }
+                }
+            }
+        }
+
         // [E86] A script saved since this loop started joins it now, not at
         // the next market. One atomic load on a tick with nothing new.
-        for sn in script_attacher.sync(&mut strategies) {
-            let key = sn.to_lowercase();
-            markets_tx.send_modify(|map| {
-                map.insert(crate::state::strategy_market_key(&squadron_id, &key), pair.question.clone());
-            });
+        let new_scripts = script_attacher.sync(&mut strategies);
+        if !new_scripts.is_empty() {
+            let maker_q = maker_pair.as_ref().map(|mp| mp.question.clone()).unwrap_or_else(|| pair.question.clone());
+            let ultra_q = ultra.as_ref().map(|u| u.pair.question.clone()).unwrap_or_default();
+            for sn in new_scripts {
+                let key = sn.to_lowercase();
+                // [E95] Shown on the market the script declared.
+                let role = strategies.iter().find(|s| s.name() == sn).map(|s| s.market_role()).unwrap_or_default();
+                let market = match role {
+                    crate::orchestrator::strategy::MarketRole::Hourly => pair.question.clone(),
+                    crate::orchestrator::strategy::MarketRole::Window => maker_q.clone(),
+                    crate::orchestrator::strategy::MarketRole::UltraShort => ultra_q.clone(),
+                };
+                markets_tx.send_modify(|map| {
+                    map.insert(crate::state::strategy_market_key(&squadron_id, &key), market);
+                });
+            }
         }
 
         if strategies.is_empty() || Instant::now() < cooldown_until {
@@ -2053,6 +2230,17 @@ async fn trade_one_market(
             _ => (Some(market_cfg.clone()), Some(snapshot.clone())),
         };
 
+        // [E95] The ultra-short market's config and book, as a pair or not at
+        // all; sharing the primary's when the primary is that market.
+        let (ul_market, ul_snapshot) = match &ultra {
+            Some(u) if u.feed.is_none() => (Some(market_cfg.clone()), Some(snapshot.clone())),
+            Some(u) => match build_snapshot(&hub, &u.pair.ticker, &raptors, &u.cfg).await {
+                Some(us) => (Some(u.cfg.clone()), Some(us)),
+                None => (None, None),
+            },
+            None => (None, None),
+        };
+
         // ── Ghost maker fills: rest until the book crosses the quote ──────
         //
         // Simulated maker quotes are held in the venue-neutral registry and
@@ -2076,6 +2264,10 @@ async fn trade_one_market(
                 if let (Some(mcfg), Some(ms)) = (mk_market.as_ref(), mk_snapshot.as_ref()) {
                     if m == &mcfg.yes_token { return Some(ms.yes_ask); }
                     if m == &mcfg.no_token  { return Some(ms.no_ask); }
+                }
+                if let (Some(ucfg), Some(us)) = (ul_market.as_ref(), ul_snapshot.as_ref()) {
+                    if m == &ucfg.yes_token { return Some(us.yes_ask); }
+                    if m == &ucfg.no_token  { return Some(us.no_ask); }
                 }
                 None
             };
@@ -2131,6 +2323,7 @@ async fn trade_one_market(
             crypto_filter: status_scope.to_uppercase(),
             market_started_at,
             maker_market: mk_market,
+            ultra_market: ul_market, ultra_snapshot: ul_snapshot,
             maker_snapshot: mk_snapshot,
             available_collateral,
             dynamic_config: dyn_cfg.clone(),
@@ -2157,6 +2350,16 @@ async fn trade_one_market(
             // new: cancels and exits still flow, entries and quotes do not.
             if winding_down && signal.opens_exposure() {
                 continue;
+            }
+            // [E95] The ultra-short market's own last minute: no new exposure
+            // on its legs, exits still flow.
+            if signal.opens_exposure() {
+                if let Some(u) = &ultra {
+                    let ending = u.cfg.phase(Utc::now(), MARKET_RTB_WINDOW_SECS) != MarketPhase::Open;
+                    if ending && signal.tokens_opened().iter().any(|t| t == &u.pair.long || t == &u.pair.short) {
+                        continue;
+                    }
+                }
             }
             if dispatch_signal(&squadron_id, venue.as_ref(), &pool, &scope, &positions, &lifecycle, &strategy_name, status_scope, &signal, starting).await {
                 acted = true;
@@ -2245,9 +2448,11 @@ async fn flatten_before_stand_down(
         } else if token == mcfg.no_token {
             snap.no_bid
         } else {
+            let on_primary = token == primary_cfg.yes_token || token == primary_cfg.no_token;
             info!(
-                "🏁 [{strategy}] {} shares on \"{}\" are on the closed primary — leaving to settle",
-                shares, primary_cfg.market_name,
+                "🏁 [{strategy}] {} shares on {} are on a market that is closing with it — leaving to settle",
+                shares,
+                if on_primary { format!("\"{}\"", primary_cfg.market_name) } else { format!("its ultra-short market ({token})") },
             );
             continue;
         };
@@ -4107,6 +4312,29 @@ mod hourly_market_tests {
             close_time: None, volume, underlying: "btc", strike: None, cadence,
             window_secs: cadence.map(Cadence::window_secs),
         }
+    }
+
+    /// [E95] The ultra-short market is the hottest 15-minute market on the
+    /// primary's underlying, or the primary itself when it is one; never a
+    /// 15-minute market on another underlying, never an hourly or daily.
+    #[test]
+    fn the_ultra_short_market_is_the_hottest_fifteen_minute_on_the_underlying() {
+        let hourly = pair("KXBTCD-HOUR", Some(Cadence::Hourly), 900.0);
+        let mut eth_q = pair("KXETH15M-A", Some(Cadence::FifteenMin), 90_000.0);
+        eth_q.underlying = "eth";
+        let board = vec![
+            eth_q,
+            pair("KXBTC15M-A", Some(Cadence::FifteenMin), 50_000.0),
+            pair("KXBTCD-DAILY", Some(Cadence::Daily), 20_000.0),
+            hourly.clone(),
+        ];
+        assert_eq!(choose_ultra(&board, &hourly).unwrap().ticker, "KXBTC15M-A");
+        let only_hourly = vec![hourly.clone(), pair("KXBTCD-DAILY", Some(Cadence::Daily), 1.0)];
+        assert!(choose_ultra(&only_hourly, &hourly).is_none(), "no 15-minute market, no ultra slot");
+        let quarter = pair("KXBTC15M-B", Some(Cadence::FifteenMin), 10.0);
+        assert_eq!(choose_ultra(&[], &quarter).unwrap().ticker, "KXBTC15M-B", "the primary itself");
+        let cfg = pair_market_cfg(&quarter);
+        assert_eq!((cfg.condition_id.as_str(), cfg.window_secs), ("KXBTC15M-B", Some(900)));
     }
 
     /// Kalshi's `KXBTCD` series carries both a one-hour and a 25-hour listing.

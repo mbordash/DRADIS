@@ -106,6 +106,12 @@ page writes both, and they travel in the instance backup.
 - `name`: 3 to 32 characters of `a-z`, `0-9` and `_`, starting with a letter.
   It is fixed once saved, and the viper reports as `Script:<name>`.
   `templates` and `validate` are reserved.
+- `market`: which of the squadron's markets the script trades: `hourly` (the
+  default, the squadron's primary), `window` (its window/daily market) or
+  `ultra_short` (its 15-minute market, where the venue lists one and the
+  squadron flies it). `ctx` describes that market: its book, strike, close
+  time, `window_secs` and age. On a squadron without it the script holds with
+  the reason.
 - `classes`: the market classes whose squadrons attach this viper: `crypto`,
   `sports`, `politics`, `unknown`. A Helm squadron never attaches one.
 - `venues`: `kalshi`, `intl_clob`, `us_retail`. Empty means every venue.

@@ -184,7 +184,7 @@ export async function buildSupportBundle(now = new Date()): Promise<SupportBundl
     }),
     section('Squadrons', getSquadrons, rows => rows.length === 0
       ? 'none deployed'
-      : rows.map(s => `${s.id.padEnd(16)} ${(s.asset ?? '-').padEnd(8)} ${s.state.padEnd(11)} ${s.market_class ?? '-'} | ${s.market_name ?? '-'}${s.maker_market_name ? ` | maker: ${s.maker_market_name}` : ''}`).join('\n')),
+      : rows.map(s => `${s.id.padEnd(16)} ${(s.asset ?? '-').padEnd(8)} ${s.state.padEnd(11)} ${s.market_class ?? '-'} | ${s.market_name ?? '-'}${s.maker_market_name ? ` | maker: ${s.maker_market_name}` : ''}${s.ultra_market_name ? ` | ultra: ${s.ultra_market_name}` : ''}`).join('\n')),
     section('Viper status (holding reasons and refusal ledger)', allViperRows, renderVipers),
     section('Dynamic config, instance-wide row (risk knobs, no credentials)', getConfig, c => JSON.stringify(c, null, 2)),
     section('Squadron config (each squadron\'s own row: every switch, then its other differences)', squadronConfigs, renderSquadronConfigs),

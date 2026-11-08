@@ -161,6 +161,12 @@ pub fn window_secs_from_question(question: &str) -> Option<i64> {
 }
 
 pub fn up_down_window_secs(question: &str) -> i64 {
+    // [E95] A clock range ("10:15PM-10:30PM ET", "12:00PM-4:00PM ET") is its own
+    // length: a 15-minute market is 900 s and a four-hour window 14,400 s, not
+    // the hour a single clock time means.
+    if let Some(mins) = crate::helpers::config_helpers::parse_window_duration_minutes(question) {
+        if mins > 0 { return i64::from(mins) * 60; }
+    }
     static CLOCK: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let clock = CLOCK.get_or_init(|| Regex::new(r"(?i)\b\d{1,2}(:\d{2})?\s?(AM|PM)\b").expect("clock-time regex"));
     if clock.is_match(question) { 3600 } else { 86_400 }
@@ -644,6 +650,14 @@ mod up_down_window_tests {
         assert_eq!(up_down_window_secs("Bitcoin Up or Down - October 8, 12PM ET"), 3600);
         assert_eq!(up_down_window_secs("Ethereum Up or Down - October 8, 3am ET"), 3600);
         assert_eq!(up_down_window_secs("Bitcoin Up or Down - October 8, 12:30PM ET"), 3600);
+    }
+
+    /// [E95] A clock range is its own length.
+    #[test]
+    fn a_clock_range_up_or_down_question_has_that_window() {
+        assert_eq!(up_down_window_secs("Bitcoin Up or Down - November 7, 10:15PM-10:30PM ET"), 900);
+        assert_eq!(up_down_window_secs("XRP Up or Down - November 7, 11:45PM-12:00AM ET"), 900);
+        assert_eq!(up_down_window_secs("Bitcoin Up or Down - September 2, 12:00PM-4:00PM ET"), 14_400);
     }
 
     #[test]

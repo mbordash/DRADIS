@@ -27,6 +27,31 @@ use crate::helpers::dynamic_config::DynamicConfig;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// [E95] Which of its squadron's markets a viper trades. A squadron flies up to
+/// three: the hourly primary, the window/daily market resting orders favor, and
+/// the ultra-short (15-minute) market. Venue agnostic: each venue's loop fills
+/// the markets it has, and a viper whose market a venue does not list idles
+/// with that reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketRole {
+    #[default]
+    Hourly,
+    Window,
+    UltraShort,
+}
+
+impl MarketRole {
+    /// The label the Control Tower and the attachment log show.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hourly => "Hourly",
+            Self::Window => "Window/Daily",
+            Self::UltraShort => "Ultra-short",
+        }
+    }
+}
+
 /// Context passed to strategies containing all market data and shared state they need.
 #[derive(Clone)]
 pub struct StrategyContext {
@@ -79,6 +104,11 @@ pub struct StrategyContext {
     /// Live orderbook snapshot for the maker venue.
     /// Paired with maker_market — always Some when maker_market is Some, None otherwise.
     pub maker_snapshot: Option<MarketSnapshot>,
+    /// [E95] The squadron's ultra-short (15-minute) market and its book, when
+    /// the venue lists one and the squadron flies it. Paired like the maker
+    /// fields: both Some or both None.
+    pub ultra_market: Option<MarketConfig>,
+    pub ultra_snapshot: Option<MarketSnapshot>,
     /// Live pUSD collateral balance, updated every 60s.
     /// Strategies should gate on this to avoid generating signals when the wallet cannot
     /// afford even the minimum trade + fee, preventing 400 rejections from the CLOB.
@@ -113,6 +143,27 @@ pub struct StrategyContext {
     pub sports: Option<crate::raptors::sports_ledger::SportsMarketLine>,
 }
 
+impl StrategyContext {
+    /// [E95] This context with `role`'s market as the primary: what a viper with
+    /// affinity for that market evaluates. `None` when the squadron does not fly
+    /// that market. The market clock (`market_started_at`) follows the market:
+    /// a 15-minute market's age is counted from its own open.
+    pub fn view(&self, role: MarketRole) -> Option<StrategyContext> {
+        let (m, s) = match role {
+            MarketRole::Hourly => return Some(self.clone()),
+            MarketRole::Window => (self.maker_market.as_ref()?, self.maker_snapshot.as_ref()?),
+            MarketRole::UltraShort => (self.ultra_market.as_ref()?, self.ultra_snapshot.as_ref()?),
+        };
+        let mut v = self.clone();
+        if let (Some(close), Some(w)) = (m.market_close_time, m.window_secs) {
+            v.market_started_at = close - chrono::Duration::seconds(w);
+        }
+        v.market = m.clone();
+        v.snapshot = s.clone();
+        Some(v)
+    }
+}
+
 /// Trait that all strategies must implement.
 /// Enables uniform handling and future per-strategy threading.
 #[async_trait::async_trait]
@@ -132,6 +183,13 @@ pub trait Strategy: Send + Sync {
     /// Venue label shown in the startup attachment log (e.g. "Hourly", "Window/Daily").
     /// Default: "Hourly"
     fn venue(&self) -> &'static str { "Hourly" }
+
+    /// [E95] Which of the squadron's markets this viper trades; routing,
+    /// attachment labels and order targets follow it. Derived from `venue()` so
+    /// every built-in keeps its market; script vipers declare theirs.
+    fn market_role(&self) -> MarketRole {
+        if self.venue() == "Window/Daily" { MarketRole::Window } else { MarketRole::Hourly }
+    }
 
     /// Maximum USDC exposure budget for this strategy.
     /// Default: 0 (override in each strategy impl)

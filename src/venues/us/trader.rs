@@ -1691,6 +1691,7 @@ async fn trade_one_market(
             // it the same market/snapshot rather than None, which left it
             // permanently idle ("no daily/window venue available", 2026-08-08).
             maker_market: mk_market,
+            ultra_market: None, ultra_snapshot: None,
             maker_snapshot: mk_snapshot,
             available_collateral,
             dynamic_config: dyn_cfg.clone(),

@@ -1205,6 +1205,7 @@ mod shadow_sweep_tests {
             crypto_filter: ASSET.to_string(),
             market_started_at: Utc::now(),
             maker_market: None, maker_snapshot: None,
+            ultra_market: None, ultra_snapshot: None,
             dynamic_config: Arc::new(dc),
             arb_market_lockouts: None,
             sports: None,

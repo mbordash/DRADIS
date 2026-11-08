@@ -300,6 +300,8 @@ export interface DynamicConfig {
   anchor_obi_adverse_block?: string;
   anchor_max_vol_annualized?: string;
   anchor_exit_enabled?: boolean;
+  /** [E95] Fly a 15-minute market in each crypto squadron. */
+  ultra_short_market_enabled?: boolean;
   anchor_take_profit_pct?: string;
   anchor_exit_fair_edge?: string;
 
@@ -787,6 +789,7 @@ export interface SquadronSummary {
   state:             SquadronState;
   market_name:       string;        // primary (hourly) Polymarket market name
   maker_market_name?: string;       // window/daily maker venue name (present once fee-rate fetch completes)
+  ultra_market_name?: string;       // [E95] ultra-short (15-minute) market, while the squadron flies one
   deployed_at:       string;        // ISO 8601
 
   // ── Market taxonomy (data-driven; resolved from the DB join tables) ─────────
@@ -1295,6 +1298,8 @@ export interface ScriptManifest {
   venues: string[];
   max_exposure_usdc: number | string;
   params: Record<string, ScriptParam>;
+  /** [E95] Which of the squadron's markets the script trades; absent = hourly. */
+  market?: 'hourly' | 'window' | 'ultra_short';
 }
 
 export interface PaperSummary {

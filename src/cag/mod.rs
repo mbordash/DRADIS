@@ -110,6 +110,10 @@ pub struct SquadronSummary {
     /// Window/daily maker venue — `None` until the fee-rate fetch resolves it,
     /// a few seconds after the squadron is first registered.
     pub maker_market_name: Option<String>,
+    /// [E95] The ultra-short (15-minute) market, while the squadron flies one;
+    /// replaced at every 15-minute close.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ultra_market_name: Option<String>,
     pub deployed_at:       DateTime<Utc>,
 
     /// Market taxonomy, resolved from the DB at request time by the API layer.
@@ -161,6 +165,7 @@ impl SquadronSummary {
             state:             s.state.to_string(),
             market_name:       s.market.market_name.clone(),
             maker_market_name: None,
+            ultra_market_name: None,
             deployed_at:       s.deployed_at,
             market_class:      String::new(),
             underlying:        s.asset.slug(),
@@ -388,6 +393,7 @@ impl Cag {
             state:             "PATROLLING".to_string(),
             market_name:       market_question.to_string(),
             maker_market_name: None,
+            ultra_market_name: None,
             deployed_at:       Utc::now(),
             market_class:      market_type.to_string(),
             // The raptor-health lookup key for the Control Tower, and only that.
@@ -533,6 +539,14 @@ impl Cag {
     pub fn update_maker_market(&self, id: &SquadronId, maker_market_name: String) {
         if let Some(mut entry) = self.inner.registry.get_mut(id) {
             entry.summary.maker_market_name = Some(maker_market_name);
+        }
+    }
+
+    /// [E95] Record (or clear, with `None`) the squadron's ultra-short market,
+    /// at every 15-minute swap.
+    pub fn update_ultra_market(&self, id: &SquadronId, ultra_market_name: Option<String>) {
+        if let Some(mut entry) = self.inner.registry.get_mut(id) {
+            entry.summary.ultra_market_name = ultra_market_name;
         }
     }
 

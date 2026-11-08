@@ -110,6 +110,13 @@ pub fn ghosting_now() -> bool {
     global_config_tx().map(|tx| tx.borrow().ghost_mode).unwrap_or(false)
 }
 
+/// [E95] Does each crypto squadron fly an ultra-short (15-minute) market beside
+/// its hourly and window markets? Instance-wide and read by the venue loops
+/// outside any tick, so it comes off the global watch; off until it is up.
+pub fn ultra_short_market_enabled() -> bool {
+    global_config_tx().map(|tx| tx.borrow().ultra_short_market_enabled).unwrap_or(false)
+}
+
 /// How long an engine-retired squadron stays listed before the CAG reaps it.
 /// Read outside any tick (the registry reaps when listed), so it comes off the
 /// global watch; the compile-time default applies until the channel is up.
@@ -828,6 +835,10 @@ pub struct DynamicConfig {
     /// reaped. Operator stand-downs are removed at once and never wait on this.
     #[serde(default = "default_squadron_retire_linger_secs")]
     pub squadron_retire_linger_secs:   u64,
+    /// [E95] Fly an ultra-short (15-minute) market in every crypto squadron, for
+    /// the vipers that declare it. Off by default: no selection, no book feed.
+    #[serde(default)]
+    pub ultra_short_market_enabled:    bool,
     /// Keep a sports squadron running without waiting for an operator deploy.
     #[serde(default = "default_auto_deploy_sports")]
     pub auto_deploy_sports:            bool,
@@ -1679,6 +1690,7 @@ impl Default for DynamicConfig {
             deploy_max_days_to_close:      config::DEPLOY_MAX_DAYS_TO_CLOSE,
             auto_deploy_politics:          config::AUTO_DEPLOY_POLITICS,
             squadron_retire_linger_secs:   config::SQUADRON_RETIRE_LINGER_SECS,
+            ultra_short_market_enabled:    false,
             auto_deploy_sports:            config::AUTO_DEPLOY_SPORTS,
             kalshi_sports_game_series:     config::KALSHI_SPORTS_GAME_SERIES.to_string(),
             event_market_retire_grace_secs: config::EVENT_MARKET_RETIRE_GRACE_SECS,
@@ -2990,6 +3002,7 @@ mod tests {
             "helm_fee_verdict_enforce", "helm_fee_max_ratio", "helm_fee_max_notional_pct",
             "helm_critique_timeout_secs", "helm_calibration_min_resolved",
             "squadron_retire_linger_secs",
+            "ultra_short_market_enabled",
             "bookline_max_open_markets",
             "bookline_resting_tp_edge",
             "bookline_board_lane_enabled",

@@ -1062,6 +1062,7 @@ mod tests {
             market_started_at: Utc::now() - chrono::Duration::minutes(10),
             maker_snapshot: None,
             maker_market: None,
+            ultra_market: None, ultra_snapshot: None,
             dynamic_config: Arc::new(dc),
             arb_market_lockouts: None,
             sports: None,

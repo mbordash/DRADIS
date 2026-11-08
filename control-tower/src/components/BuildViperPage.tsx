@@ -202,7 +202,7 @@ function ManifestForm({ draft, setDraft, disabled }: { draft: Draft; setDraft: (
         <input id="viper-desc" className={inputCls} value={m.description ?? ''} disabled={disabled}
                onChange={(e) => set({ description: e.target.value })} />
       </div>
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         <div>
           <label className={labelCls}>Market classes it flies</label>
           <div className="flex flex-wrap gap-3">
@@ -214,6 +214,16 @@ function ManifestForm({ draft, setDraft, disabled }: { draft: Draft; setDraft: (
               </label>
             ))}
           </div>
+        </div>
+        <div>
+          <label className={labelCls} htmlFor="viper-market">Market it trades</label>
+          <select id="viper-market" className={inputCls} value={m.market ?? 'hourly'} disabled={disabled}
+                  onChange={(e) => set({ market: e.target.value as ScriptManifest['market'] })}
+                  title="Each squadron flies an hourly market, a window/daily market and, where the venue lists one and it is switched on, an ultra-short (15-minute) market. The script runs against the one chosen here; without it on a squadron, it holds and says why.">
+            <option value="hourly">Hourly (the squadron&apos;s primary)</option>
+            <option value="window">Window / daily</option>
+            <option value="ultra_short">Ultra-short (15-minute)</option>
+          </select>
         </div>
         <div>
           <label className={labelCls}>Venues (none ticked: every venue)</label>

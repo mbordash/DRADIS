@@ -465,8 +465,11 @@ fn sports_side(line: &crate::raptors::sports_ledger::SportsLine, now: DateTime<U
 /// changes after that). `Err` carries the sentence for `model_unavailable`.
 async fn up_down_strike(asset: &str, market_id: &str, question: &str, criteria: &str, close: DateTime<Utc>, now: DateTime<Utc>) -> Result<Decimal, String> {
     let window = crate::helpers::time::up_down_window_secs(question);
-    let reference = if window == 3600 {
-        close - chrono::Duration::hours(1)
+    // A window shorter than a day opens its own length before the close (an
+    // hourly, a 15-minute or a four-hour window); a daily window opens at the
+    // previous day's reference time.
+    let reference = if window < 86_400 {
+        close - chrono::Duration::seconds(window)
     } else {
         crate::helpers::time::daily_window_reference_time(close).ok_or_else(|| "the close time has no Eastern equivalent".to_string())?
     };

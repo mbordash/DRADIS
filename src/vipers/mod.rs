@@ -337,6 +337,14 @@ pub fn venue_for_token<'a>(
             return Some((mk, ms));
         }
     }
+    // [E95] The ultra-short market, checked before the primary: when the
+    // primary IS the 15-minute market both carry the same book, so either
+    // answer is right.
+    if let (Some(um), Some(us)) = (&ctx.ultra_market, &ctx.ultra_snapshot) {
+        if token_id == &um.yes_token || token_id == &um.no_token {
+            return Some((um, us));
+        }
+    }
     if token_id == &ctx.market.yes_token || token_id == &ctx.market.no_token {
         return Some((&ctx.market, &ctx.snapshot));
     }
@@ -466,6 +474,7 @@ mod venue_resolution_tests {
             market_started_at: Utc::now(),
             maker_snapshot: maker.as_ref().map(|_| snap(dec!(0.70))),
             maker_market: maker,
+            ultra_market: None, ultra_snapshot: None,
             dynamic_config: Arc::new(DynamicConfig::default()),
             arb_market_lockouts: None,
             sports: None,
@@ -523,6 +532,18 @@ mod venue_resolution_tests {
                 "{t} resolved to a venue that does not quote it",
             );
         }
+    }
+
+    /// [E95] The ultra-short market's tokens resolve to its own book.
+    #[test]
+    fn an_ultra_short_token_resolves_to_the_ultra_book() {
+        let mut c = ctx(Some(market("m-yes", "m-no", "Window/Daily")));
+        c.ultra_market = Some(market("u-yes", "u-no", "Ultra-short"));
+        c.ultra_snapshot = Some(snap(dec!(0.91)));
+        let (m, s) = venue_for_token(&c, &MarketId::new("u-no")).expect("ultra token resolves");
+        assert_eq!(m.market_name, "Ultra-short");
+        assert_eq!(s.yes_bid, dec!(0.91));
+        assert_eq!(venue_for_token(&c, &MarketId::new("h-yes")).unwrap().0.market_name, "Hourly");
     }
 }
 
