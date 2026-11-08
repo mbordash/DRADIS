@@ -123,7 +123,17 @@ pub fn check_buy(
     if let Some(h) = held {
         return Err(format!("already holds {} on this market", h.as_str().to_uppercase()));
     }
-    let price_r = crate::helpers::price::round_to_tick_size(price);
+    let mut price_r = crate::helpers::price::round_to_tick_size(price);
+    // A venue that quotes finer than a cent (Kalshi: $0.9720) puts the ask
+    // between ticks. A script buying AT that ask must not be rounded below it
+    // and refused as unfillable (production 2026-11-08 00:41 ET: "buy price
+    // 0.97 is below the NO ask 0.9720"): its limit is the ask rounded up to
+    // the next tick, still inside `MAX_SLIPPAGE`, and the venue fills at the
+    // price offered.
+    if price_r < ask && price >= ask {
+        let tick = rust_decimal_macros::dec!(0.01);
+        price_r = (ask / tick).ceil() * tick;
+    }
     if price_r <= Decimal::ZERO || price_r >= Decimal::ONE {
         return Err(format!("buy price {price} is not inside (0, 1)"));
     }
@@ -686,7 +696,12 @@ impl ScriptedStrategy {
 /// A taker sale's limit: inside (0, 1), at or under the bid, and never more
 /// than `MAX_SLIPPAGE` under it.
 pub fn check_sell(price: Decimal, bid: Decimal) -> Result<Decimal, String> {
-    let p = crate::helpers::price::round_to_tick_size(price);
+    let mut p = crate::helpers::price::round_to_tick_size(price);
+    // The mirror of `check_buy`: a sale AT a bid between ticks ($0.975) must
+    // not round above it and be refused; its limit is the bid rounded down.
+    if p > bid && price <= bid {
+        p = crate::helpers::price::floor_to_tick_size(bid);
+    }
     if p <= Decimal::ZERO || p >= Decimal::ONE {
         return Err(format!("sell price {price} is not inside (0, 1)"));
     }
@@ -1041,6 +1056,25 @@ mod tests {
         let e = check_buy(Side::Yes, dec!(0.42), dec!(5), None, dec!(0.42), dec!(100), false,
             dec!(0), dec!(10), None, Some(dec!(1)), true, dec!(1)).unwrap_err();
         assert!(e.starts_with("collateral"), "{e}");
+    }
+
+    /// [production 2026-11-08 00:41 ET] Kalshi quotes to a tenth of a cent. A
+    /// buy at an ask of 0.972 was rounded to 0.97 and refused as below the
+    /// ask; its limit is now 0.98, and paper fills at the ask itself. A sale at
+    /// a bid of 0.975 sells with a 0.97 limit instead of being refused.
+    #[test]
+    fn a_price_between_ticks_is_rounded_toward_a_fill() {
+        let live = check_buy(Side::No, dec!(0.972), dec!(5), None, dec!(0.972), dec!(100), false,
+            dec!(0), dec!(10), None, Some(dec!(100)), true, dec!(1)).unwrap();
+        assert_eq!(live.price, dec!(0.98), "the limit is the ask rounded up");
+        let paper = check_buy(Side::No, dec!(0.972), dec!(5), None, dec!(0.972), dec!(100), true,
+            dec!(0), dec!(10), None, Some(dec!(100)), true, dec!(1)).unwrap();
+        assert_eq!(paper.price, dec!(0.972), "paper fills at the ask itself");
+        assert!(check_buy(Side::No, dec!(0.96), dec!(5), None, dec!(0.972), dec!(100), false,
+            dec!(0), dec!(10), None, Some(dec!(100)), true, dec!(1)).unwrap_err().contains("below the NO ask"),
+            "a price under the ask is still refused");
+        assert_eq!(check_sell(dec!(0.975), dec!(0.975)), Ok(dec!(0.97)));
+        assert_eq!(check_sell(dec!(0.42), dec!(0.42)), Ok(dec!(0.42)));
     }
 
     #[test]
