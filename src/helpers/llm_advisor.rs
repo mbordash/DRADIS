@@ -690,12 +690,13 @@ These can be adjusted live without restarting the bot:
                 (bookline_enabled is operator-only: recommend it in prose, never in the json block)
 
 == Scope of the trade list ==
-The trades and open positions in the user message are the WHOLE instance's,
-across every squadron, because risk is shared at the account. The config you
-may change is this one squadron's. Each trade row names its market class; a row
-from another class belongs to another squadron and says nothing about this
-squadron's vipers or flags. Do not infer that a viper is disabled because it is
-absent from this squadron's config: it may simply not fly this market class.
+The trades in the user message are this squadron's market class only; other
+squadrons appear as one summary line for shared account risk. Do not comment
+on other squadrons' trades or count them in "Trades analyzed". Session P&L is
+the whole account's. Open positions are the whole instance's, because risk is
+shared at the account. The config you may change is this one squadron's. Do
+not infer that a viper is disabled because it is absent from this squadron's
+config: it may simply not fly this market class.
 
 IMPORTANT: The CURRENT VALUES of every parameter are provided in the user message
 under "== Current Live Configuration ==". Always use those exact values as the
@@ -732,7 +733,7 @@ Analyze the trades, the open positions and the refusal ledger, and:
 Reply ONLY in this exact structure (no preamble, no markdown headers outside this):
 
 📊 DRADIS LLM ADVISOR
-Session P&L: [value]  |  Trades analyzed: [n]
+Session P&L: [value]  |  Trades analyzed: [n, this squadron's only]
 
 🔍 OBSERVATIONS
 • [bullet 1]
@@ -822,6 +823,23 @@ fn viper_key_prefix(strategy: &str) -> &'static str {
 /// class. The honest answer is "not recorded", never a guess from the name.
 fn trade_class(t: &db::TradeRow) -> &str {
     t.market_class.as_deref().unwrap_or("-")
+}
+
+/// The coin a crypto squadron trades, when its asset key names one; two
+/// crypto squadrons (BTC and ETH) share a class and are told apart by it.
+/// Non-crypto squadrons and operator-deployed crypto markets have none.
+fn squadron_underlying<'a>(class: &str, asset_key: &'a str) -> Option<&'a str> {
+    (class == "crypto" && !asset_key.is_empty() && asset_key != "crypto").then_some(asset_key)
+}
+
+/// Whether a trade row belongs in this squadron's briefing [B100]: its class,
+/// and for a crypto squadron its coin. A row with no recorded coin stays in.
+fn is_own_trade(t: &db::TradeRow, class: &str, underlying: Option<&str>) -> bool {
+    trade_class(t) == class
+        && match (underlying, t.underlying.as_deref()) {
+            (Some(u), Some(r)) => r.eq_ignore_ascii_case(u),
+            _ => true,
+        }
 }
 
 /// A viper switch as the enabled-flags line shows it: `n/a` when this
@@ -1078,9 +1096,33 @@ fn in_flight_lines(actions: &[db::LlmActionRow]) -> Vec<String> {
 
 // ── Prompt builder ────────────────────────────────────────────────────────────
 
+/// [`build_user_prompt_for`] for a squadron with no coin of its own.
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+fn build_user_prompt(
+    session_trades: &[db::TradeRow],
+    prior_trades: Option<&[db::TradeRow]>,
+    open_positions: &[db::OpenPositionRow],
+    session_pnl: rust_decimal::Decimal,
+    starting_collateral: rust_decimal::Decimal,
+    session_id: &str,
+    dyn_cfg: &DynamicConfig,
+    fewshot: &[db::LlmActionRow],
+    squadron_class: &str,
+    allowed_vipers: &[String],
+    refusals: &[crate::helpers::viper_status::ViperRefusalReport],
+    in_flight: &[db::LlmActionRow],
+) -> String {
+    build_user_prompt_for(
+        session_trades, prior_trades, open_positions, session_pnl, starting_collateral, session_id,
+        dyn_cfg, fewshot, squadron_class, None, allowed_vipers, refusals, in_flight,
+    )
+}
+
 /// Format recent trades + session stats into a concise user prompt.
 /// Accepts both current-session trades and optional prior-session context.
-fn build_user_prompt(
+#[allow(clippy::too_many_arguments)]
+fn build_user_prompt_for(
     session_trades: &[db::TradeRow],
     prior_trades: Option<&[db::TradeRow]>,
     open_positions: &[db::OpenPositionRow],
@@ -1093,6 +1135,8 @@ fn build_user_prompt(
     // trade list below is instance-wide, so the prompt names the class the
     // config belongs to and tags every row with its own.
     squadron_class: &str,
+    // The coin of a crypto squadron, which tells two crypto squadrons apart.
+    squadron_underlying: Option<&str>,
     // Viper kinds linked to this squadron's market class — the only ones worth
     // offering the model, since a proposal into a viper the squadron does not
     // fly can never take effect.
@@ -1106,26 +1150,51 @@ fn build_user_prompt(
 ) -> String {
     let mut lines = Vec::new();
 
+    // [B100] Only this squadron's market class is analyzed. The whole
+    // instance's list used to go in with a note to ignore other classes, and
+    // the model spent its bullets explaining that a crypto script's trades
+    // were "another squadron's" on every sports and politics briefing
+    // (2026-11-08). Other squadrons appear as one shared-risk line.
+    let (session_trades, other_trades): (Vec<&db::TradeRow>, Vec<&db::TradeRow>) =
+        session_trades.iter().partition(|t| is_own_trade(t, squadron_class, squadron_underlying));
+
     lines.push(format!(
-        "Session: {}  |  P&L: ${:.2}  |  Starting collateral: ${:.2}  |  Session trades: {}  |  This squadron flies: {} markets",
+        "Session: {}  |  Account P&L (all squadrons): ${:.2}  |  Starting collateral: ${:.2}  |  This squadron's trades: {}  |  This squadron flies: {} markets",
         truncate_on_char_boundary(session_id, 16), // trim to readable date+time prefix
         session_pnl, starting_collateral, session_trades.len(), squadron_class
     ));
+    // Rows with no recorded class belong to no squadron: said so, not
+    // counted as another squadron's.
+    let (unclassed, other_trades): (Vec<&db::TradeRow>, Vec<&db::TradeRow>) =
+        other_trades.into_iter().partition(|t| t.market_class.is_none());
+    let live_sum = |rows: &[&db::TradeRow]| -> (usize, f64, usize) {
+        let live: Vec<&&db::TradeRow> = rows.iter().filter(|t| !t.ghost).collect();
+        (live.len(), live.iter().map(|t| t.pnl.parse::<f64>().unwrap_or(0.0)).sum(), rows.len() - live.len())
+    };
+    if !other_trades.is_empty() {
+        let (n, pnl, sim) = live_sum(&other_trades);
+        lines.push(format!(
+            "Other squadrons this session (shared account risk only, not this squadron's to tune or comment on): \
+             {n} live trade(s), ${pnl:.2}; {sim} simulated row(s)"
+        ));
+    }
+    if !unclassed.is_empty() {
+        let (n, pnl, sim) = live_sum(&unclassed);
+        lines.push(format!(
+            "Rows with no recorded market class (squadron unknown, shared account risk only): \
+             {n} live trade(s), ${pnl:.2}; {sim} simulated row(s)"
+        ));
+    }
     lines.push(String::new());
-
     // ── Current session trades ────────────────────────────────────────────────
     if !session_trades.is_empty() {
-        lines.push("=== CURRENT SESSION TRADES (newest first, whole instance) ===".to_string());
-        lines.push(format!(
-            "Rows whose class is not `{squadron_class}` were made by another squadron's vipers \
-             and are context for shared risk only; `-` means the row has no recorded class; \
-             `sim` rows are simulated and not money."
-        ));
+        lines.push(format!("=== CURRENT SESSION TRADES (newest first, this squadron's `{squadron_class}` markets) ==="));
+        lines.push("`sim` rows are simulated and not money.".to_string());
         lines.push(
             "ts | class | mode | strategy | market | side | entry | exit | shares | pnl | reason".to_string(),
         );
         lines.push("-".repeat(90));
-        for t in session_trades {
+        for t in &session_trades {
             lines.push(format!(
                 "{} | {} | {} | {} | {} | {} | {} | {} | {} | ${} | {}",
                 &t.ts[5..16],
@@ -1155,19 +1224,19 @@ fn build_user_prompt(
                 else { (w, l, p) }
             })
         };
-        let (wins, losses, total_pnl_f) = tally(&mut session_trades.iter().filter(|t| !t.ghost));
+        let (wins, losses, total_pnl_f) = tally(&mut session_trades.iter().copied().filter(|t| !t.ghost));
         let win_rate = if wins + losses > 0 {
             (wins as f64 / (wins + losses) as f64) * 100.0
         } else { 0.0 };
 
         lines.push(String::new());
         lines.push(format!(
-            "Current session, live rows only, whole instance: {} wins / {} losses | Win rate: {:.0}% | P&L: ${:.2}",
+            "Current session, live rows only, this squadron: {} wins / {} losses | Win rate: {:.0}% | P&L: ${:.2}",
             wins, losses, win_rate, total_pnl_f
         ));
         let sim_rows = session_trades.iter().filter(|t| t.ghost).count();
         if sim_rows > 0 {
-            let (sw, sl, sp) = tally(&mut session_trades.iter().filter(|t| t.ghost));
+            let (sw, sl, sp) = tally(&mut session_trades.iter().copied().filter(|t| t.ghost));
             lines.push(format!(
                 "Simulated rows, not money, excluded above: {} ({} wins / {} losses / ${:.2})",
                 sim_rows, sw, sl, sp
@@ -1178,7 +1247,7 @@ fn build_user_prompt(
         // strategy whose rows are all simulated is listed as such.
         let mut by_strategy: std::collections::HashMap<&str, (usize, usize, f64, usize)> =
             std::collections::HashMap::new();
-        for t in session_trades {
+        for t in &session_trades {
             let strat = t.strategy.as_str();
             let entry = by_strategy.entry(strat).or_insert((0, 0, 0.0, 0));
             if t.ghost {
@@ -1225,6 +1294,8 @@ fn build_user_prompt(
 
     // ── Prior session context (supplemental) ─────────────────────────────────
     if let Some(prior) = prior_trades {
+        // Same scope as the current session [B100].
+        let prior: Vec<&db::TradeRow> = prior.iter().filter(|t| is_own_trade(t, squadron_class, squadron_underlying)).collect();
         if !prior.is_empty() {
             lines.push(String::new());
             lines.push(format!(
@@ -1235,7 +1306,7 @@ fn build_user_prompt(
                 "ts | class | mode | strategy | market | side | entry | exit | shares | pnl | reason".to_string(),
             );
             lines.push("-".repeat(90));
-            for t in prior {
+            for t in &prior {
                 lines.push(format!(
                     "{} | {} | {} | {} | {} | {} | {} | {} | {} | ${} | {}",
                     truncate_on_char_boundary(&t.ts, 16),
@@ -1681,9 +1752,14 @@ fn advisor_input_fingerprint(
     // situation worth a call, and one that keeps refusing for the same reason
     // is not.
     refusals: &[crate::helpers::viper_status::ViperRefusalReport],
+    // [B100] Only this squadron's class is in its prompt, so only its trades
+    // are new input; another squadron's fill is not a reason to call.
+    squadron_class: &str,
+    squadron_underlying: Option<&str>,
 ) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
+    let trades: Vec<&db::TradeRow> = trades.iter().filter(|t| is_own_trade(t, squadron_class, squadron_underlying)).collect();
     trades.len().hash(&mut h);
     positions.len().hash(&mut h);
     for r in refusals {
@@ -2237,40 +2313,6 @@ pub async fn run_llm_advisor_loop(
 
         let session_id = db::current_session_id().to_string();
 
-        // Determine supplemental context: if current session is thin, pull prior session.
-        // NOTE: We always proceed to the LLM call — 0 trades is itself a meaningful signal
-        // (settings may be too stringent for the current market).  Prior session data is
-        // appended as supplemental context when available; absence of it is not a blocker.
-        let prior_trades: Option<Vec<db::TradeRow>> =
-            if all_session_trades.len() < LLM_ADVISOR_MIN_SESSION_TRADES {
-                // For multi-asset mode, pull prior trades from primary pool only
-                // (could extend to all pools but that risks context explosion)
-                let prior = db::get_previous_session_trades(&primary_pool, LLM_ADVISOR_PRIOR_SESSION_SUPPLEMENT).await;
-                if prior.is_empty() {
-                    if all_session_trades.is_empty() {
-                        info!(
-                            "🤖 LLM Advisor: 0 session trades across all squadrons, no prior history — \
-                             firing with market-conditions / settings-stringency prompt"
-                        );
-                    } else {
-                        info!(
-                            "🤖 LLM Advisor: only {} session trade(s) (min {}), no prior session data — \
-                             proceeding with thin-data analysis",
-                            all_session_trades.len(), LLM_ADVISOR_MIN_SESSION_TRADES
-                        );
-                    }
-                    None // proceed without supplemental context
-                } else {
-                    info!(
-                        "🤖 LLM Advisor: {} session trade(s) (below min {}), supplementing with {} prior-session trades",
-                        all_session_trades.len(), LLM_ADVISOR_MIN_SESSION_TRADES, prior.len()
-                    );
-                    Some(prior)
-                }
-            } else {
-                None
-            };
-
         // Session P&L and collateral, from the live handles where they exist and
         // from the newest `pnl_history` row otherwise. Both venues without a
         // SessionState already record that snapshot every dashboard sync, so
@@ -2356,10 +2398,6 @@ pub async fn run_llm_advisor_loop(
         // applies — the model learns what worked and what got shot down.
         let fewshot = db::fetch_llm_fewshot_examples(&primary_pool, LLM_FEWSHOT_EXAMPLES).await;
 
-        let session_trade_count = all_session_trades.len();
-        let total_trade_count = session_trade_count
-            + prior_trades.as_ref().map(|p| p.len()).unwrap_or(0);
-
         // ── Pre-flight: verify the provider is reachable before a long inference ──
         // Ollama gets a real endpoint probe (GET /api/tags, fast probe_client);
         // hosted APIs skip it. On failure we skip this cycle rather than block.
@@ -2435,6 +2473,36 @@ pub async fn run_llm_advisor_loop(
         let dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;
         let allowed_vipers = db::vipers_for_class(&primary_pool, &market_class).await;
 
+        // [B100] This squadron's own trades decide whether the session is thin
+        // and what counts as analyzed; another squadron's fills do not.
+        let underlying = squadron_underlying(&market_class, &asset_key);
+        let session_trade_count = all_session_trades.iter()
+            .filter(|t| is_own_trade(t, &market_class, underlying)).count();
+        // Supplemental context when this squadron's session is thin. We always
+        // proceed to the call: 0 trades is itself a signal (settings may be too
+        // stringent for the current market).
+        let prior_trades: Option<Vec<db::TradeRow>> = if session_trade_count < LLM_ADVISOR_MIN_SESSION_TRADES {
+            let prior: Vec<db::TradeRow> = db::get_previous_session_trades(
+                &primary_pool, &market_class, LLM_ADVISOR_PRIOR_SESSION_SUPPLEMENT,
+            ).await.into_iter().filter(|t| is_own_trade(t, &market_class, underlying)).collect();
+            if prior.is_empty() {
+                info!(
+                    "🤖 LLM Advisor [{}]: {} session trade(s) (min {}), no prior history — thin-data analysis",
+                    squadron_id, session_trade_count, LLM_ADVISOR_MIN_SESSION_TRADES,
+                );
+                None
+            } else {
+                info!(
+                    "🤖 LLM Advisor [{}]: {} session trade(s) (below min {}), supplementing with {} prior-session trades",
+                    squadron_id, session_trade_count, LLM_ADVISOR_MIN_SESSION_TRADES, prior.len(),
+                );
+                Some(prior)
+            }
+        } else {
+            None
+        };
+        let total_trade_count = session_trade_count + prior_trades.as_ref().map(|p| p.len()).unwrap_or(0);
+
         // Peek at the refusal ledger first; it is only TAKEN (window reset)
         // once a provider call is actually spent on it, so a skipped cycle
         // lets the window keep accumulating rather than dropping its counts.
@@ -2445,7 +2513,7 @@ pub async fn run_llm_advisor_loop(
         // deliberate "0 trades is itself a signal" behavior.
         let fingerprint = advisor_input_fingerprint(
             &all_session_trades, &all_open_positions, current_pnl, collateral, &dyn_cfg,
-            &refusals_peek,
+            &refusals_peek, &market_class, underlying,
         );
         if !advisor_should_call(&squadron_id, fingerprint) {
             continue;
@@ -2460,7 +2528,7 @@ pub async fn run_llm_advisor_loop(
 
         // ── Build prompt & call LLM (with retries) ───────────────────────────
         // all_open_positions already collected above from all asset pools
-        let user_prompt = build_user_prompt(
+        let user_prompt = build_user_prompt_for(
             &all_session_trades,
             prior_trades.as_deref(),
             &all_open_positions,
@@ -2470,6 +2538,7 @@ pub async fn run_llm_advisor_loop(
             &dyn_cfg,
             &fewshot,
             &market_class,
+            underlying,
             &allowed_vipers,
             &refusals,
             &in_flight,
@@ -3024,29 +3093,57 @@ mod refusal_ledger_tests {
         }
     }
 
-    /// The trade list is the whole instance's; the politics pass on
-    /// 2026-10-22 read Anchor's crypto settlements as its own history and
-    /// concluded the viper had been disabled mid-session. Every row now names
-    /// its class and whether it was money, and the header names the class this
-    /// squadron flies.
+    /// The politics pass on 2026-10-22 read Anchor's crypto settlements as its
+    /// own history, and on 2026-11-08 the sports and politics passes spent
+    /// their bullets on a crypto script's trades [B100]. A squadron's prompt
+    /// lists only its own class; other squadrons are one shared-risk line.
     #[test]
-    fn trade_rows_carry_their_class_and_mode() {
+    fn a_squadron_sees_only_its_own_class_and_a_summary_of_the_rest() {
         let dc = DynamicConfig::default();
         let trades = vec![
-            trade("AnchorStrategy", Some("crypto"), false, "2.7"),
+            trade("Script:my_closing_sniper", Some("crypto"), false, "0.14"),
             trade("GboostStrategy", Some("crypto"), true, "-4.0"),
-            trade("MakerStrategy", None, false, "0.1"),
+            trade("MakerStrategy", Some("politics"), false, "0.1"),
+            trade("MakerStrategy", None, false, "0.2"),
         ];
         let prompt = build_user_prompt(
             &trades, None, &[], rust_decimal::Decimal::ZERO, rust_decimal_macros::dec!(100),
             "2026-10-22T01:41:00Z", &dc, &[], "politics", &["maker".to_string()], &[], &[],
         );
         assert!(prompt.contains("This squadron flies: politics markets"), "{prompt}");
-        assert!(prompt.contains("whole instance"), "{prompt}");
-        assert!(prompt.contains("Rows whose class is not `politics`"), "{prompt}");
-        assert!(prompt.contains("| crypto | live | Anchor |"), "{prompt}");
-        assert!(prompt.contains("| crypto | sim | Gboost |"), "{prompt}");
-        assert!(prompt.contains("| - | live | Maker |"), "legacy rows say so, not a guess: {prompt}");
+        assert!(prompt.contains("This squadron's trades: 1"), "{prompt}");
+        assert!(prompt.contains("Rows with no recorded market class"), "{prompt}");
+        assert!(prompt.contains("| politics | live | Maker |"), "{prompt}");
+        assert!(!prompt.contains("my_closing_sniper"), "another class's rows stay out: {prompt}");
+        assert!(!prompt.contains("| crypto |"), "{prompt}");
+        assert!(prompt.contains("Other squadrons this session (shared account risk only"), "{prompt}");
+        assert!(prompt.contains("1 live trade(s), $0.14; 1 simulated row(s)"), "{prompt}");
+    }
+
+    /// Two crypto squadrons share a class; each sees its own coin [B100]. A
+    /// row with no class is labeled as such, not counted as a squadron's.
+    #[test]
+    fn crypto_squadrons_split_by_coin_and_unclassed_rows_say_so() {
+        let dc = DynamicConfig::default();
+        let mut eth = trade("AnchorStrategy", Some("crypto"), false, "1.0");
+        eth.underlying = Some("eth".into());
+        let trades = vec![
+            trade("Script:my_closing_sniper", Some("crypto"), false, "0.14"),
+            eth,
+            trade("ChainReconcile", None, false, "-0.5"),
+        ];
+        let prompt = build_user_prompt_for(
+            &trades, None, &[], rust_decimal::Decimal::ZERO, rust_decimal_macros::dec!(100),
+            "2026-11-08T01:41:00Z", &dc, &[], "crypto", squadron_underlying("crypto", "btc"),
+            &["anchor".to_string()], &[], &[],
+        );
+        assert!(prompt.contains("This squadron's trades: 1"), "{prompt}");
+        assert!(prompt.contains("my_closing_sniper"), "{prompt}");
+        assert!(!prompt.contains("| crypto | live | Anchor |"), "the ETH row is another squadron's: {prompt}");
+        assert!(prompt.contains("Other squadrons this session (shared account risk only, not this squadron's to tune or comment on): 1 live trade(s), $1.00"), "{prompt}");
+        assert!(prompt.contains("Rows with no recorded market class (squadron unknown, shared account risk only): 1 live trade(s), $-0.50"), "{prompt}");
+        assert_eq!(squadron_underlying("crypto", "crypto"), None, "an operator-deployed crypto market has no coin");
+        assert_eq!(squadron_underlying("sports", "sports"), None);
     }
 
     /// Anchor's switch is `anchor_enabled`, not `enable_anchor`; on a squadron
@@ -3118,7 +3215,7 @@ mod refusal_ledger_tests {
             &trades, None, &[], rust_decimal::Decimal::ZERO, rust_decimal_macros::dec!(100),
             "2026-10-22T01:41:00Z", &dc, &[], "crypto", &["anchor".to_string(), "gboost".to_string()], &[], &[],
         );
-        assert!(prompt.contains("live rows only, whole instance: 1 wins / 1 losses | Win rate: 50% | P&L: $1.60"), "{prompt}");
+        assert!(prompt.contains("live rows only, this squadron: 1 wins / 1 losses | Win rate: 50% | P&L: $1.60"), "{prompt}");
         assert!(prompt.contains("Simulated rows, not money, excluded above: 2 (1 wins / 1 losses / $-0.56)"), "{prompt}");
         assert!(prompt.contains("Anchor: 1 wins / 1 losses / $1.60"), "{prompt}");
         assert!(prompt.contains("Gboost: 0 wins / 0 losses / $0.00 | 2 simulated row(s), not money"), "{prompt}");

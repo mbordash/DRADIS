@@ -4285,15 +4285,10 @@ async fn release_operator_closed_positions(positions: &Arc<Mutex<PositionMap>>) 
 /// DB-only; the map is this loop's to keep honest, or a settle-held leg keeps
 /// counting against every exposure cap until the process restarts.
 async fn release_swept_positions(positions: &Arc<Mutex<PositionMap>>) {
-    for tok in db::take_released_positions() {
-        let m = crate::venues::core::MarketId::new(tok.as_str());
-        let mut map = positions.lock().await;
-        let before = map.len();
-        map.retain(|k, _| k.market != m);
-        let dropped = before - map.len();
-        if dropped > 0 {
-            info!("🧾 Released {} in-memory position(s) on {} — the settlement sweep booked and closed the row", dropped, tok);
-        }
+    // Read, not drained: every squadron loop sees every release [B99].
+    let dead = db::release_swept_from_map(&mut *positions.lock().await);
+    for k in dead {
+        info!("🧾 Released {}'s in-memory position on {} — the settlement sweep booked and closed the row", k.strategy, k.market);
     }
 }
 

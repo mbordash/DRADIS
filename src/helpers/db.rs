@@ -765,6 +765,12 @@ pub(crate) async fn init_schema(pool: &SqlitePool) -> Result<()> {
     // tick; the market index above cannot serve that.
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sports_line_ledger_token ON sports_line_ledger(token_id, ts)")
         .execute(pool).await;
+    // The sports board's refresh reads the newest row per token for games
+    // starting in a window (`sports_ledger_board_rows`); without this it scans
+    // the whole ledger (66 ms at 49,600 rows on production, over 1 s while the
+    // box compiles a deploy, and growing about 2,300 rows a day).
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sports_line_ledger_commence ON sports_line_ledger(commence, token_id, ts)")
+        .execute(pool).await;
 
     // [E63] A snapshot pass is not instantaneous: one paid odds call is followed
     // by a CLOB book read per outcome, so a single `ts` timestamped the book
@@ -5903,24 +5909,57 @@ pub async fn market_has_pending_redemption_settlement(pool: &SqlitePool, market:
 /// $12 exposure cap for the rest of the session. Process-global for the same
 /// reason as the venue registries above; a restart empties both the set and
 /// the map it feeds, so nothing can go stale across one.
-fn released_positions() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    static REG: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+///
+/// Read, not drained [B99]: every squadron loop on the instance polls it, and a
+/// drain handed each token to whichever loop ticked first. On Kalshi that was
+/// usually a sports or politics squadron holding nothing, so the btc-open loop
+/// that held a settled 15-minute leg never heard of it and kept counting it
+/// until its hourly session ended (2026-11-08, `my_closing_sniper`). Each loop
+/// now drops its own entries opened at or before the release, and an entry
+/// ages out after [`RELEASED_POSITION_TTL_SECS`].
+fn released_positions() -> &'static std::sync::Mutex<std::collections::HashMap<String, DateTime<Utc>>> {
+    static REG: OnceLock<std::sync::Mutex<std::collections::HashMap<String, DateTime<Utc>>>> = OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
+
+/// Long enough for every loop's dashboard tick to see a release many times
+/// over; short enough that the registry stays small.
+pub const RELEASED_POSITION_TTL_SECS: i64 = 3600;
 
 fn note_position_released(token_id: &str) {
     if let Ok(mut reg) = released_positions().lock() {
-        reg.insert(token_id.to_string());
+        let now = Utc::now();
+        reg.retain(|_, t| (now - *t).num_seconds() < RELEASED_POSITION_TTL_SECS);
+        reg.insert(token_id.to_string(), now);
     }
 }
 
-/// Drain the tokens the sweep has closed since the last call. Each venue loop
-/// calls this on its own cadence and drops the matching map entries.
-pub fn take_released_positions() -> Vec<String> {
+/// Tokens the sweep has closed in the last hour, with when. Every venue loop
+/// reads this on its own cadence and drops the matching entries it holds that
+/// were opened at or before the release (see [`release_swept_from_map`]).
+pub fn released_positions_snapshot() -> std::collections::HashMap<String, DateTime<Utc>> {
     match released_positions().lock() {
-        Ok(mut reg) => reg.drain().collect(),
-        Err(_) => Vec::new(),
+        Ok(mut reg) => {
+            let now = Utc::now();
+            reg.retain(|_, t| (now - *t).num_seconds() < RELEASED_POSITION_TTL_SECS);
+            reg.clone()
+        }
+        Err(_) => std::collections::HashMap::new(),
     }
+}
+
+/// Drop from one loop's position map every entry on a token the sweep has
+/// closed, unless it was opened after the release (a fresh position on the
+/// same token is not the row that was booked). Returns the keys dropped.
+pub fn release_swept_from_map(map: &mut crate::state::PositionMap) -> Vec<crate::state::PositionKey> {
+    let released = released_positions_snapshot();
+    if released.is_empty() { return Vec::new(); }
+    let dead: Vec<crate::state::PositionKey> = map.iter()
+        .filter(|(k, p)| released.get(k.market.as_str()).is_some_and(|t| p.opened_at <= *t))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in &dead { map.remove(k); }
+    dead
 }
 
 /// Tokens with an exit in flight right now, by whoever is selling: a trading
@@ -5973,9 +6012,9 @@ impl Drop for ExitClaim {
 /// by strategy and token, waiting for the trading loop that holds the guard to
 /// drop it.
 ///
-/// Distinct from [`take_released_positions`] on purpose: that set is drained
-/// whole by whichever loop ticks first and clears every strategy's entry for the
-/// token, which is right for a settlement (every holder is done) and wrong for
+/// Distinct from [`released_positions_snapshot`] on purpose: that set is read
+/// by every loop and clears every strategy's entry for the token, which is
+/// right for a settlement (every holder is done) and wrong for
 /// an operator closing ONE strategy's position while another still holds the
 /// same token. A loop consumes only the entries whose key it holds, so a sibling
 /// squadron's tick cannot take them. Entries nobody consumes (the loop ended)
@@ -6173,6 +6212,8 @@ pub async fn purge_stale_open_positions(
     // neither the live nor the redeemable on-chain sets, and the old pending-skip
     // made it immune to every purge path forever — inflating the portfolio value
     // by its phantom mark-to-market (observed: +$14.85 of redeemed ETH arb legs).
+    // Tokens whose row this pass deleted; published below [B99].
+    let mut released_here: Vec<String> = Vec::new();
     const STALE_PENDING_GRACE_SECS: i64 = 3600; // 60 min ≫ indexer lag, ≪ orphan lifetime
 
     // Ghost rows are excluded at the query.
@@ -6420,7 +6461,7 @@ pub async fn purge_stale_open_positions(
                 error!("❌ DB purge_stale_open_positions delete failed for id {}: {}", id, e);
             } else {
                 purged += 1;
-            note_position_released(&token_id);
+            released_here.push(token_id.clone());
             }
             continue;
         }
@@ -6535,7 +6576,27 @@ pub async fn purge_stale_open_positions(
             error!("❌ DB purge_stale_open_positions delete failed for id {}: {}", id, e);
         } else {
             purged += 1;
-            note_position_released(&token_id);
+            released_here.push(token_id.clone());
+        }
+    }
+    // [B99] Publish a release only when no live row for the token survives.
+    // The release is token-wide and every loop now reads it, so a stale row
+    // deleted beside a fresh one on the same token (a re-entry the indexer
+    // has not reported yet) must not take the fresh position out of a map.
+    released_here.sort();
+    released_here.dedup();
+    for tok in released_here {
+        let left: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM open_positions WHERE token_id = ? AND ghost_mode = 0",
+        )
+        .bind(&tok)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+        if left == 0 {
+            note_position_released(&tok);
+        } else {
+            info!("🧾 {} still has {} live row(s) after this sweep — not releasing it from memory", tok, left);
         }
     }
     purged
@@ -7270,16 +7331,19 @@ pub async fn get_session_trades(pool: &SqlitePool) -> Vec<TradeRow> {
 /// Includes trades with `session_id IS NULL` — these are rows written before the
 /// session-tracking migration was applied.  They are definitionally not the current
 /// session so it is safe to treat them as prior-session context.
-pub async fn get_previous_session_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
+/// The newest trades from earlier sessions in one market class (the LLM
+/// advisor's thin-data supplement for one squadron [B100]).
+pub async fn get_previous_session_trades(pool: &SqlitePool, market_class: &str, limit: i64) -> Vec<TradeRow> {
     let sid = current_session_id();
     match sqlx::query(
         "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason,
                 venue, market_class, underlying, fees, ghost, intent_id
          FROM trades
-         WHERE (session_id IS NULL OR session_id != ?)
+         WHERE (session_id IS NULL OR session_id != ?) AND market_class = ?
          ORDER BY ts DESC LIMIT ?"
     )
     .bind(sid)
+    .bind(market_class)
     .bind(limit)
     .fetch_all(pool)
     .await {
@@ -11195,9 +11259,36 @@ mod released_position_tests {
         resolved.insert(tok.to_string(), (dec!(1.0), Decimal::ZERO));
         let purged = purge_stale_open_positions(&pool, &live, &resolved, &std::collections::HashSet::new()).await;
         assert_eq!(purged, 1, "the settled row must be booked and deleted");
-        let released = take_released_positions();
-        assert!(released.iter().any(|t| t == tok), "the deleted row's token must be published");
-        assert!(!take_released_positions().iter().any(|t| t == tok), "a drain empties the set");
+        assert!(released_positions_snapshot().contains_key(tok), "the deleted row's token must be published");
+        assert!(released_positions_snapshot().contains_key(tok), "reading does not consume it [B99]");
+    }
+
+    /// [B99] 2026-11-08: the sniper's settled 15-minute leg stayed in the
+    /// btc-open map for 45 minutes because a sibling squadron's tick drained
+    /// the release first. Every loop must see it, and a position opened after
+    /// the release on the same token is not the one that was booked.
+    #[test]
+    fn every_loop_releases_its_own_settled_entry_and_keeps_a_fresh_one() {
+        use crate::state::{PositionKey, PositionMap};
+        use crate::venues::core::MarketId;
+        let tok = "KXBTC15M-B99TEST-15#no";
+        let pos = |opened_at| crate::state::Position {
+            shares: dec!(5), avg_entry: dec!(0.978), opened_at, close_time: None,
+            market_name: String::new(), pair_token_id: MarketId::new(tok),
+            fill_confirmed_at: None, paired_leg_token_id: None, entry_fee: Decimal::ZERO,
+        };
+        let held = pos(Utc::now() - chrono::Duration::seconds(120));
+        let mut sibling: PositionMap = PositionMap::new();
+        let mut owner: PositionMap = PositionMap::new();
+        owner.insert(PositionKey::new("btc-open", "Script:my_closing_sniper", MarketId::new(tok)), held.clone());
+        note_position_released(tok);
+        assert!(release_swept_from_map(&mut sibling).is_empty(), "a loop holding nothing drops nothing");
+        let dead = release_swept_from_map(&mut owner);
+        assert_eq!(dead.len(), 1, "the owner still sees the release after a sibling read it");
+        assert!(owner.is_empty());
+        let fresh = pos(Utc::now() + chrono::Duration::seconds(5));
+        owner.insert(PositionKey::new("btc-open", "Script:my_closing_sniper", MarketId::new(tok)), fresh);
+        assert!(release_swept_from_map(&mut owner).is_empty(), "a position opened after the release stays");
     }
 
     /// Only the live pending row goes: a confirmed live row is a real holding

@@ -1530,19 +1530,17 @@ impl Squadron {
                     // The sweep books and deletes the ROW; the map entry is this
                     // loop's to drop. Wallet-wide: a token the wallet no longer
                     // holds is gone for every squadron on this asset.
-                    for tok in db::take_released_positions() {
-                        let m = MarketId::new(tok.as_str());
-                        let dead: Vec<PositionKey> = {
-                            let map = positions.lock().await;
-                            map.keys().filter(|k| k.market == m).cloned().collect()
-                        };
-                        if dead.is_empty() { continue; }
-                        {
-                            let mut map = positions.lock().await;
-                            for k in &dead { map.remove(k); maker_resting_exits.remove(k); }
+                    // Read, not drained: every squadron loop sees every release [B99].
+                    let dead = db::release_swept_from_map(&mut *positions.lock().await);
+                    if !dead.is_empty() {
+                        let still_held: std::collections::HashSet<MarketId> =
+                            positions.lock().await.keys().map(|k| k.market.clone()).collect();
+                        let mut owners = token_ownership.lock().await;
+                        for k in &dead {
+                            maker_resting_exits.remove(k);
+                            if !still_held.contains(&k.market) { owners.remove(&k.market); }
+                            info!("🧾 Released {}'s in-memory position on {} — the chain sweep booked and closed the row", k.strategy, k.market);
                         }
-                        token_ownership.lock().await.remove(&m);
-                        info!("🧾 Released {} in-memory position(s) on {} — the chain sweep booked and closed the row", dead.len(), tok);
                     }
                     // A Global-scope knob, read from the global row like every other fee
                     // reader (entry gates, the orphan path, balance). The squadron row
