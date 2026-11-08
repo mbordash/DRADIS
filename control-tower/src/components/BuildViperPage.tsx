@@ -37,6 +37,7 @@ import type {
   CustomViperConfig, ScriptDryRun, ScriptList, ScriptListItem, ScriptManifest, ScriptParam, ScriptParamType, ScriptTemplate,
 } from '@/lib/types';
 import { useConfirm } from './ConfirmDialog';
+import { toast } from './Toast';
 
 const inputCls = 'w-full bg-[#0a0a14] border border-[#1e1e32] rounded px-2 py-1.5 text-xs font-mono text-gray-200 focus:outline-none focus:border-teal-500/50 disabled:opacity-50';
 const labelCls = 'block text-[10px] font-mono uppercase tracking-wide text-gray-500 mb-1';
@@ -251,6 +252,18 @@ function ManifestForm({ draft, setDraft, disabled }: { draft: Draft; setDraft: (
           </button>
         </div>
         {draft.params.length === 0 && <p className="text-[10px] font-mono text-gray-600">No parameters.</p>}
+        {draft.params.length > 0 && (
+          // Column headers: the inputs' placeholders vanish once a value is in,
+          // leaving a row of bare numbers. Spans mirror ParamRow's grid.
+          <div className="grid grid-cols-12 gap-2 text-[10px] font-mono uppercase tracking-wider text-gray-500" aria-hidden>
+            <span className="col-span-2">Name</span>
+            <span className="col-span-2">Type</span>
+            <span className="col-span-2">Default</span>
+            <span className="col-span-1">Min</span>
+            <span className="col-span-1">Max</span>
+            <span className="col-span-3">Description</span>
+          </div>
+        )}
         {draft.params.map((e) => (
           <ParamRow key={e.id} name={e.name} p={e.p} disabled={disabled}
                     onName={(n) => update(e.id, { name: n.toLowerCase() })}
@@ -324,13 +337,16 @@ function SettingsPanel({ name, manifest, cfg, instanceGhost, paperCount, paperPn
   const effectiveCap = cfg.max_exposure_usdc != null && cfg.max_exposure_usdc !== ''
     ? Math.min(Number(cfg.max_exposure_usdc), manifestCap) : manifestCap;
 
-  const patch = async (entry: CustomViperConfig) => {
+  const patch = async (entry: CustomViperConfig, done: string) => {
     setBusy(true); setError(null);
     try {
       await patchConfig({ custom_vipers: { [name]: entry } });
       onSaved();
+      toast.success(done);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      toast.error(`Not saved: ${msg}`);
     } finally {
       setBusy(false);
     }
@@ -363,7 +379,11 @@ function SettingsPanel({ name, manifest, cfg, instanceGhost, paperCount, paperPn
       });
       if (!ok) return;
     }
-    await patch({ live: on });
+    await patch({ live: on }, !on
+      ? `${manifest.display_name} is back on paper. What it holds keeps its exits until it closes.`
+      : instanceGhost
+        ? `${manifest.display_name} is set to live. The instance is in simulation, so it still paper-trades.`
+        : `${manifest.display_name} is live: it sends real orders from the next tick.`);
   };
 
   const saveValues = async () => {
@@ -383,8 +403,12 @@ function SettingsPanel({ name, manifest, cfg, instanceGhost, paperCount, paperPn
       params[k] = n;
     }
     if (cap !== '' && (!Number.isFinite(Number(cap)) || Number(cap) <= 0)) bad.push(`your cap '${cap}' must be a number above 0, or blank`);
-    if (bad.length) { setError(bad.join('\n')); return; }
-    await patch({ params, max_exposure_usdc: cap === '' ? null : cap });
+    if (bad.length) {
+      setError(bad.join('\n'));
+      toast.error(`Not saved: ${bad.length} value${bad.length === 1 ? '' : 's'} out of range. See the list at the top of Settings.`);
+      return;
+    }
+    await patch({ params, max_exposure_usdc: cap === '' ? null : cap }, `Saved ${manifest.display_name}'s values. They apply from the next tick.`);
   };
 
   return (
@@ -396,7 +420,7 @@ function SettingsPanel({ name, manifest, cfg, instanceGhost, paperCount, paperPn
           <div className="flex items-center justify-between">
             <span className="text-xs font-mono text-gray-200">Enabled</span>
             <button className={enabled ? btnPrimary : btnPlain} disabled={busy} aria-pressed={enabled}
-                    onClick={() => patch({ enabled: !enabled })}>{enabled ? 'On' : 'Off'}</button>
+                    onClick={() => patch({ enabled: !enabled }, `${manifest.display_name} switched ${enabled ? 'off' : 'on'}.`)}>{enabled ? 'On' : 'Off'}</button>
           </div>
           <p className="text-[10px] font-mono text-gray-500">
             Off stops new entries. Positions it holds keep their exits until they close or settle. This sets every
@@ -455,8 +479,11 @@ function SettingsPanel({ name, manifest, cfg, instanceGhost, paperCount, paperPn
                     try {
                       await resetScriptState(name);
                       setError(null);
+                      toast.success(`Cleared ${manifest.display_name}'s memory on every squadron.`);
                     } catch (e) {
-                      setError(e instanceof Error ? e.message : String(e));
+                      const msg = e instanceof Error ? e.message : String(e);
+                      setError(msg);
+                      toast.error(`Memory not reset: ${msg}`);
                     }
                   }}>
             Reset memory
@@ -815,8 +842,23 @@ export default function BuildViperPage() {
   const [saved, setSaved] = useState<{ manifest: string; source: string } | null>(null);
   const [tab, setTab] = useState<Tab>('script');
   const [problems, setProblems] = useState<string[] | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Which button is working, so it can say so ("Saving…").
+  const [pending, setPending] = useState<'check' | 'save' | 'delete' | null>(null);
+  const problemsRef = useRef<HTMLDivElement>(null);
+  // Problems stay inline, where the operator reads them while fixing the
+  // script; a toast says they are there and the list scrolls into view.
+  const showProblems = (list: string[], what: 'Check' | 'Save' | 'Delete') => {
+    setProblems(list);
+    const scroll = () => problemsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    window.requestAnimationFrame(scroll);
+    toast.error(
+      what === 'Check'
+        ? `Check found ${list.length} problem${list.length === 1 ? '' : 's'}.`
+        : `${what} failed: ${list.length} problem${list.length === 1 ? '' : 's'}. Nothing was changed.`,
+      { action: { label: 'Show', run: scroll } },
+    );
+  };
 
   // Compared as the engine would receive it, so reordering nothing or typing
   // and deleting a character does not leave the draft marked unsaved.
@@ -837,7 +879,6 @@ export default function BuildViperPage() {
   const open = async (name: string) => {
     if (dirty && !(await confirm({ title: 'Discard unsaved changes?', tone: 'danger', confirmLabel: 'Discard' }))) return;
     const seq = ++openSeq.current;
-    setNotice(null);
     let d;
     try {
       d = await getScript(name);
@@ -866,7 +907,7 @@ export default function BuildViperPage() {
   const startFrom = async (t: ScriptTemplate) => {
     if (dirty && !(await confirm({ title: 'Discard unsaved changes?', tone: 'danger', confirmLabel: 'Discard' }))) return;
     ++openSeq.current;
-    setSelected(null); setProblems(null); setNotice(null); setTab('script');
+    setSelected(null); setProblems(null); setTab('script');
     setDraft(draftOf(structuredClone(t.manifest), t.source, true));
     setSaved(null);
   };
@@ -874,35 +915,35 @@ export default function BuildViperPage() {
   const check = async () => {
     if (!draft) return;
     const { manifest, problems: local } = normalized(draft);
-    if (local.length) { setProblems(local); setNotice(null); return; }
-    setBusy(true); setNotice(null);
+    if (local.length) { showProblems(local, 'Check'); return; }
+    setBusy(true); setPending('check');
     try {
       const p = await validateScript(manifest, draft.source);
-      setProblems(p.length ? p : []);
-      if (!p.length) setNotice('No problems found.');
+      if (p.length) showProblems(p, 'Check');
+      else { setProblems([]); toast.success('Check passed: no problems found.'); }
     } catch (e) {
-      setProblems(problemsOf(e));
+      showProblems(problemsOf(e), 'Check');
     } finally {
-      setBusy(false);
+      setBusy(false); setPending(null);
     }
   };
 
   const save = async () => {
     if (!draft) return;
     const { manifest: m, problems: local } = normalized(draft);
-    if (local.length) { setProblems(local); setNotice(null); return; }
+    if (local.length) { showProblems(local, 'Save'); return; }
     // A new viper may not take an existing viper's name: that would replace
     // its code, and it might be live. The engine refuses it too.
     if (draft.isNew && (list?.scripts.some((x) => x.name === m.name) || list?.broken.some((x) => x.name === m.name))) {
-      setProblems([`A viper named '${m.name}' already exists. Pick another name, or open it to edit it.`]);
+      showProblems([`A viper named '${m.name}' already exists. Pick another name, or open it to edit it.`], 'Save');
       return;
     }
-    setBusy(true); setNotice(null);
+    setBusy(true); setPending('save');
     try {
       const r = await saveScript(m, draft.source, draft.isNew);
       setProblems(null);
-      setNotice(draft.isNew
-        ? `Saved as version ${r.version}, on paper. It joins its squadrons on their next tick: see Where it runs below.`
+      toast.success(draft.isNew
+        ? `Saved as version ${r.version}, on paper. It joins its squadrons on their next tick: see Where it runs.`
         : `Saved as version ${r.version}. It runs from each squadron’s next tick.`);
       ++openSeq.current;
       setSelected(m.name);
@@ -910,9 +951,9 @@ export default function BuildViperPage() {
       setSaved({ manifest: JSON.stringify(m), source: draft.source });
       await refreshList();
     } catch (e) {
-      setProblems(problemsOf(e));
+      showProblems(problemsOf(e), 'Save');
     } finally {
-      setBusy(false);
+      setBusy(false); setPending(null);
     }
   };
 
@@ -923,16 +964,16 @@ export default function BuildViperPage() {
       body: 'The script and its manifest are removed. Its open paper positions are closed unscored. A viper that holds a real position cannot be deleted: switch it off and wait until those positions close.',
     });
     if (!ok) return;
-    setBusy(true);
+    setBusy(true); setPending('delete');
     try {
       await deleteScript(selected);
       setSelected(null); setDraft(null); setSaved(null); setProblems(null);
-      setNotice(`Deleted ${selected}.`);
+      toast.success(`Deleted ${selected}.`);
       await refreshList();
     } catch (e) {
-      setProblems(problemsOf(e));
+      showProblems(problemsOf(e), 'Delete');
     } finally {
-      setBusy(false);
+      setBusy(false); setPending(null);
     }
   };
 
@@ -1034,9 +1075,8 @@ export default function BuildViperPage() {
         <section className="lg:col-span-3 space-y-3">
           {!draft ? (
             <div className="card p-6 border border-[#1e1e32] text-xs font-mono text-gray-500 space-y-3">
-              {notice && <div className="rounded border border-teal-500/30 bg-teal-500/5 px-3 py-2 text-teal-200">{notice}</div>}
               {problems && problems.length > 0 && (
-                <div className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-red-300 whitespace-pre-wrap">{problems.join('\n')}</div>
+                <div ref={problemsRef} className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-red-300 whitespace-pre-wrap">{problems.join('\n')}</div>
               )}
               <div>Pick a viper, or start one from a template.</div>
             </div>
@@ -1064,9 +1104,8 @@ export default function BuildViperPage() {
                 </div>
               </div>
 
-              {notice && <div className="rounded border border-teal-500/30 bg-teal-500/5 px-3 py-2 text-xs font-mono text-teal-200">{notice}</div>}
               {problems && problems.length > 0 && (
-                <div className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs font-mono text-red-300 space-y-1">
+                <div ref={problemsRef} className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs font-mono text-red-300 space-y-1">
                   {problems.map((p, i) => <div key={i} className="whitespace-pre-wrap">{p}</div>)}
                 </div>
               )}
@@ -1076,15 +1115,15 @@ export default function BuildViperPage() {
                   <ManifestForm draft={draft} setDraft={setDraft} disabled={busy} />
                   <CodeEditor value={draft.source} onChange={(source) => setDraft({ ...draft, source })} disabled={busy} />
                   <div className="flex flex-wrap gap-2">
-                    <button className={btnPlain} disabled={busy} onClick={check}>Check</button>
-                    <button className={btnPrimary} disabled={busy || !dirty} onClick={save}>{draft.isNew ? 'Save (starts on paper)' : 'Save'}</button>
+                    <button className={btnPlain} disabled={busy} onClick={check}>{pending === 'check' ? 'Checking…' : 'Check'}</button>
+                    <button className={btnPrimary} disabled={busy || !dirty} onClick={save}>{pending === 'save' ? 'Saving…' : draft.isNew ? 'Save (starts on paper)' : 'Save'}</button>
                     {saved && (
                       <button className={btnPlain} disabled={busy || !dirty}
                               onClick={() => setDraft(draftOf(JSON.parse(saved.manifest), saved.source, false))}>
                         Revert
                       </button>
                     )}
-                    {!draft.isNew && <button className={btnDanger} disabled={busy} onClick={remove}>Delete</button>}
+                    {!draft.isNew && <button className={btnDanger} disabled={busy} onClick={remove}>{pending === 'delete' ? 'Deleting…' : 'Delete'}</button>}
                   </div>
                   <p className="text-[10px] font-mono text-gray-600">
                     Saving checks the manifest and compiles the script first; if anything is wrong nothing is written and the running

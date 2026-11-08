@@ -17,6 +17,7 @@
 import type { Metadata } from 'next';
 import './globals.css';
 import DemoBanner from '@/components/DemoBanner';
+import Toaster from '@/components/Toast';
 import { DEMO_MODE } from '@/lib/demo';
 
 export const metadata: Metadata = {
@@ -30,6 +31,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body className={DEMO_MODE ? 'pb-12' : undefined}>
         {children}
         <DemoBanner />
+        <Toaster />
       </body>
     </html>
   );
