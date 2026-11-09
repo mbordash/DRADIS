@@ -89,50 +89,6 @@ fn exit(ctx, pos) {
 }
 "#;
 
-pub const LATE_FAVORITE: &str = r#"// Late favorite: in the last minutes of a crypto market, when the oracle
-// sits well clear of the strike, buy the side it favors and hold it to the
-// settlement. A worked example of a fair value from norm_cdf.
-//
-// The venue settles on its own index, which can sit tens of dollars from the
-// feed in ctx.oracle (Kalshi settles on CF Benchmarks). Near the strike that
-// gap decides the trade, which is why min_fair keeps this to sides well clear
-// of it.
-fn entry(ctx) {
-    if ctx.oracle == () || ctx.strike == () || ctx.secs_to_close == () {
-        return #{ hold: "needs an oracle, a strike and a close time" };
-    }
-    let t = ctx.secs_to_close;
-    if t > ctx.params.window_secs || t < 30 { return #{ hold: `outside the last ${ctx.params.window_secs}s` }; }
-
-    // Distance to the strike in standard deviations over the time left. The
-    // typical one-hour move is your parameter (a fraction of the price), scaled
-    // by the square root of the time left. ctx.hist_vol is a 0-1 flatness
-    // index, not a move, so it is not used here.
-    let move_left = ctx.params.hourly_vol * ctx.oracle * (to_decimal(t) / 3600).sqrt();
-    let z = (ctx.oracle - ctx.strike) / move_left;
-    let p_yes = norm_cdf(z);
-    let side = if p_yes > 0.5 { "yes" } else { "no" };
-    let fair = if side == "yes" { p_yes } else { 1 - p_yes };
-    // Big moves come several times as often as the normal curve says, so the
-    // model may not claim more than fair_cap.
-    if fair > ctx.params.fair_cap { fair = ctx.params.fair_cap; }
-    if fair < ctx.params.min_fair { return #{ hold: `fair ${fair.round(3)} below ${ctx.params.min_fair} (z ${z.round(2)})` }; }
-
-    let book = if side == "yes" { ctx.yes } else { ctx.no };
-    if book.ask > ctx.params.max_price { return #{ hold: `ask ${book.ask} above ${ctx.params.max_price}` }; }
-    let edge = fair - book.ask - taker_fee(book.ask);
-    if edge < ctx.params.min_edge { return #{ hold: `edge ${edge.round(3)} below ${ctx.params.min_edge}` }; }
-
-    #{ buy: side, price: book.ask, shares: ctx.params.contracts,
-       reason: `fair ${fair.round(3)}, edge ${edge.round(3)}, oracle ${ctx.oracle} vs strike ${ctx.strike}, z ${z.round(2)}` }
-}
-
-// Held to the settlement: nothing to decide.
-fn exit(ctx, pos) {
-    ()
-}
-"#;
-
 pub fn all() -> Vec<Template> {
     vec![
         Template {
@@ -166,26 +122,6 @@ pub fn all() -> Vec<Template> {
                 }
             }),
             source: MOMENTUM,
-        },
-        Template {
-            id: "late_favorite",
-            title: "Late Favorite",
-            summary: "Last-minutes fair value from norm_cdf; buys a clear favorite with an edge and holds to settlement.",
-            manifest: serde_json::json!({
-                "name": "my_late_favorite", "display_name": "My Late Favorite",
-                "description": "Fair value from distance to strike; clear favorites only; hold to settlement.",
-                "classes": ["crypto"], "venues": [], "max_exposure_usdc": 5,
-                "params": {
-                    "window_secs": { "type": "int", "default": 600, "min": 60, "max": 3600, "description": "Enter only in this many final seconds." },
-                    "hourly_vol": { "type": "decimal", "default": 0.003, "min": 0.0005, "max": 0.05, "description": "Typical one-hour move of the underlying, as a fraction of the price (0.003 = 0.3%). It changes with the regime: BTC ran 0.13% to 0.41% an hour in November 2026. Too low makes every favorite look certain." },
-                    "min_fair": { "type": "decimal", "default": 0.75, "min": 0.5, "max": 0.99, "description": "Only buy a side the model rates at least this likely; near the strike the feed-to-index gap decides the trade." },
-                    "fair_cap": { "type": "decimal", "default": 0.95, "min": 0.6, "max": 0.999, "description": "Highest probability the model may claim. Big moves come several times as often as the normal curve says." },
-                    "min_edge": { "type": "decimal", "default": 0.04, "min": 0, "max": 0.5, "description": "Fair minus ask minus fee required." },
-                    "max_price": { "type": "decimal", "default": 0.90, "min": 0.01, "max": 0.99, "description": "Highest ask to buy." },
-                    "contracts": { "type": "int", "default": 5, "min": 1, "max": 100, "description": "Contracts per entry." }
-                }
-            }),
-            source: LATE_FAVORITE,
         },
     ]
 }

@@ -25,9 +25,14 @@
 //! cargo run --features registry-tool --bin viper-registry -- publish <key file> <key id> <out dir> <publisher> <version> <source dir>
 //! cargo run --features registry-tool --bin viper-registry -- yank    <key file> <key id> <out dir> <publisher> <name> <version> <reason>
 //! cargo run --features registry-tool --bin viper-registry -- verify  <out dir>
+//! cargo run --features registry-tool --bin viper-registry -- check   <source dir>...
 //! ```
 //!
-//! A source dir holds `manifest.json`, `script.rhai` and `README.md`. Published
+//! A source dir holds `manifest.json`, `script.rhai` and `README.md`, at
+//! `vipers/<publisher>/<name>/` in the dradis-contrib repository
+//! (github.com/mbordash/dradis-contrib), where contributions arrive by pull
+//! request. `check` needs no key: it is what that repository's CI runs on
+//! every pull request, and what `publish` runs first. Published
 //! versions are immutable: `publish` refuses to overwrite one, and a bad one is
 //! yanked, never rewritten.
 
@@ -49,6 +54,7 @@ fn main() {
         ["publish", key, key_id, out, publisher, version, src] => publish(Path::new(key), key_id, Path::new(out), publisher, version, Path::new(src)),
         ["yank", key, key_id, out, publisher, name, version, reason] => yank(Path::new(key), key_id, Path::new(out), publisher, name, version, reason),
         ["verify", out] => verify(Path::new(out)),
+        ["check", dirs @ ..] if !dirs.is_empty() => check_all(dirs),
         _ => Err("usage: see the header of src/bin/viper_registry.rs".into()),
     };
     if let Err(e) = out {
@@ -114,19 +120,51 @@ fn write_json<T: serde::Serialize>(path: &Path, v: &T, overwrite: bool) -> R<()>
     std::fs::write(path, body).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// A viper source dir, read and checked: everything `publish` needs except
+/// the registry's own rules (version order, name ownership).
+struct Source { manifest: Manifest, source: String, readme: String }
+
+fn load_source(src: &Path) -> R<Source> {
+    let read = |f: &str| std::fs::read_to_string(src.join(f)).map_err(|e| format!("{}: {e}", src.join(f).display()));
+    let manifest: Manifest = serde_json::from_str(&read("manifest.json")?).map_err(|e| format!("manifest.json: {e}"))?;
+    let source = bundle::normalize_source(&read("script.rhai")?);
+    let readme = read("README.md")?;
+    let mut problems = Vec::new();
+    let name = manifest.name.clone();
+    if !valid_name(&name) { problems.push(format!("'{name}' is not a valid viper name (3-32 of a-z, 0-9, _; starting with a letter)")); }
+    if manifest.origin.is_some() { problems.push("manifest.json carries an `origin`; remove it (it records where a local copy came from)".into()); }
+    if readme.trim().is_empty() { problems.push("README.md is empty; say what the viper does, why, and what to watch".into()); }
+    if readme.len() > bundle::MAX_README_BYTES { problems.push("README.md is over 32 KB".into()); }
+    if manifest.api_version.unwrap_or(1) > bundle::API_VERSION {
+        problems.push(format!("needs script API level {}; this tool provides {}", manifest.api_version.unwrap_or(1), bundle::API_VERSION));
+    }
+    if let Err(p) = store::check_for_save(&manifest, &source) { problems.extend(p); }
+    // The folder layout is `.../<publisher>/<name>/`.
+    let folder = src.file_name().and_then(|f| f.to_str()).unwrap_or("");
+    let publisher = src.parent().and_then(|p| p.file_name()).and_then(|f| f.to_str()).unwrap_or("");
+    if folder != name { problems.push(format!("the folder is '{folder}' but the manifest names '{name}'; they must match")); }
+    if !registry::valid_publisher(publisher) { problems.push(format!("the parent folder '{publisher}' is not a valid publisher id (your GitHub login, lowercase)")); }
+    if !problems.is_empty() { return Err(format!("{}:\n  {}", src.display(), problems.join("\n  "))); }
+    Ok(Source { manifest, source, readme })
+}
+
+fn check_all(dirs: &[&str]) -> R<()> {
+    let mut failed = Vec::new();
+    for d in dirs {
+        match load_source(Path::new(d)) {
+            Ok(s) => println!("OK {d} (digest {}…)", &bundle::content_digest(&s.manifest, &s.source)[..12]),
+            Err(e) => { eprintln!("FAIL {e}"); failed.push(*d); }
+        }
+    }
+    if failed.is_empty() { Ok(()) } else { Err(format!("{} viper(s) failed the checks", failed.len())) }
+}
+
 fn publish(key_path: &Path, key_id: &str, out: &Path, publisher: &str, version: &str, src: &Path) -> R<()> {
     let key = load_key(key_path)?;
     if !registry::valid_publisher(publisher) { return Err(format!("'{publisher}' is not a valid publisher id")); }
     let parsed = registry::parse_version(version).ok_or("version must be MAJOR.MINOR.PATCH")?;
-    let read = |f: &str| std::fs::read_to_string(src.join(f)).map_err(|e| format!("{}: {e}", src.join(f).display()));
-    let mut manifest: Manifest = serde_json::from_str(&read("manifest.json")?).map_err(|e| format!("manifest.json: {e}"))?;
-    manifest.origin = None;
-    let source = bundle::normalize_source(&read("script.rhai")?);
-    let readme = read("README.md")?;
+    let Source { manifest, source, readme } = load_source(src)?;
     let name = manifest.name.clone();
-    if !valid_name(&name) { return Err(format!("'{name}' is not a valid viper name")); }
-    if readme.len() > bundle::MAX_README_BYTES { return Err("README.md is over 32 KB".into()); }
-    store::check_for_save(&manifest, &source).map_err(|p| format!("the script does not pass the save checks:\n  {}", p.join("\n  ")))?;
 
     let mut index = load_index(out, &key)?;
     if let Some(e) = index.vipers.iter().find(|e| e.name == name && e.publisher != publisher) {
