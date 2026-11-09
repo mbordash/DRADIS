@@ -1300,6 +1300,61 @@ export interface ScriptManifest {
   params: Record<string, ScriptParam>;
   /** [E95] Which of the squadron's markets the script trades; absent = hourly. */
   market?: 'hourly' | 'window' | 'ultra_short';
+  /** [E96] Script API level the viper needs; absent = 1. */
+  api_version?: number;
+  /** [E96] Where an imported viper came from. Kept through edits, so the page
+   *  can tell an unchanged import from an edited one. */
+  origin?: ScriptOrigin;
+}
+
+/** [E96] Provenance of an imported viper. */
+export interface ScriptOrigin {
+  /** `file` for a bundle file. */
+  source: string;
+  publisher?: string | null;
+  /** The name it was exported or published under. */
+  name: string;
+  version?: string | null;
+  sha256: string;
+  imported_at: string;
+}
+
+/** [E96] Local: written here. Imported: unchanged since import. Edited: imported, then changed. */
+export type ScriptProvenance = 'local' | 'imported' | 'edited';
+
+/** [E96] A viper as a bundle file. */
+export interface ViperBundle {
+  format: number;
+  manifest: ScriptManifest;
+  source: string;
+  readme?: string;
+  license?: string;
+  publisher?: string | null;
+  version?: string | null;
+  api_version?: number;
+  sha256: string;
+  registry_signature?: unknown;
+}
+
+/** [E96] What an import would do (`POST /api/vipers/import/check`). */
+export interface ImportCheck {
+  ok: boolean;
+  problems: string[];
+  name: string;
+  exists: boolean;
+  free_name: string;
+  digest: string;
+  manifest: ScriptManifest;
+  source: string;
+  readme: string;
+  license: string;
+  publisher: string | null;
+  version: string | null;
+  signed: boolean;
+  /** False when the viper declares venues that do not include this engine's. */
+  runs_here: boolean;
+  venue: string;
+  current: { manifest: ScriptManifest; source: string } | null;
 }
 
 export interface PaperSummary {
@@ -1376,6 +1431,9 @@ export interface ScriptListItem {
   strategy: string;
   manifest: ScriptManifest;
   version: string;
+  /** [E96] Full content digest. */
+  digest?: string;
+  provenance?: ScriptProvenance;
   saved_at: string;
   paper: PaperSummary;
   running_on: ScriptAttachment[];
@@ -1396,6 +1454,8 @@ export interface ScriptDetail {
   manifest?: ScriptManifest;
   source?: string | null;
   version?: string;
+  digest?: string;
+  provenance?: ScriptProvenance;
   saved_at?: string;
   paper?: PaperSummary;
   paper_rows?: PaperRow[];

@@ -32,7 +32,7 @@ use serde::Deserialize;
 
 use crate::api::server::ApiState;
 use crate::helpers::db;
-use crate::vipers::scripted::{adapter, manifest::Manifest, paper, store};
+use crate::vipers::scripted::{adapter, bundle, manifest::Manifest, paper, store};
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -43,7 +43,16 @@ pub fn routes() -> Router<ApiState> {
         .route("/api/vipers/scripts/{name}", get(read).put(save).delete(delete))
         .route("/api/vipers/scripts/{name}/dry-run", post(dry_run))
         .route("/api/vipers/scripts/{name}/reset-state", post(reset_state))
+        .route("/api/vipers/scripts/{name}/export", get(export))
+        // [E96] Outside `/api/vipers/scripts/`, so no script name can collide
+        // with them. Bodies are a bundle plus a few fields; anything larger is
+        // refused before it is parsed.
+        .route("/api/vipers/import/check", post(import_check).layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT)))
+        .route("/api/vipers/import", post(import).layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT)))
 }
+
+/// The bundle and the import's own fields.
+const IMPORT_BODY_LIMIT: usize = bundle::MAX_BUNDLE_BYTES + 4 * 1024;
 
 fn bad(status: StatusCode, problems: Vec<String>) -> Response {
     (status, Json(serde_json::json!({ "ok": false, "problems": problems }))).into_response()
@@ -100,6 +109,8 @@ async fn list() -> Response {
             "strategy": store::strategy_name(&s.manifest.name),
             "manifest": s.manifest,
             "version": s.hash,
+            "digest": bundle::content_digest(&s.manifest, &s.source),
+            "provenance": bundle::provenance(&s.manifest, &s.source),
             "saved_at": s.saved_at,
             "paper": paper_summary(&s.manifest.name).await,
             "running_on": running_on(&s.manifest.name),
@@ -187,6 +198,8 @@ async fn read(Path(name): Path<String>, Query(q): Query<LimitQuery>) -> Response
         "manifest": s.manifest,
         "source": s.source,
         "version": s.hash,
+        "digest": bundle::content_digest(&s.manifest, &s.source),
+        "provenance": bundle::provenance(&s.manifest, &s.source),
         "saved_at": s.saved_at,
         "paper": paper_summary(&name).await,
         "paper_rows": rows,
@@ -303,4 +316,138 @@ async fn reset_state(Path(name): Path<String>) -> Response {
 
 async fn templates() -> Response {
     Json(crate::vipers::scripted::templates::all()).into_response()
+}
+
+// ── [E96] Export and import ──────────────────────────────────────────────────
+
+/// GET /api/vipers/scripts/{name}/export — the viper as a bundle file.
+async fn export(Path(name): Path<String>) -> Response {
+    let Some(s) = store::get(&name) else {
+        return bad(StatusCode::NOT_FOUND, vec![format!("no script '{name}'")]);
+    };
+    let b = bundle::export(&s);
+    let body = match serde_json::to_vec_pretty(&b) {
+        Ok(v) => v,
+        Err(e) => return bad(StatusCode::INTERNAL_SERVER_ERROR, vec![e.to_string()]),
+    };
+    // `name` passed `store::get`, so it is a valid script name: no quotes,
+    // separators or anything else that could break the header.
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json".to_string()),
+            (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}.dradis-viper.json\"")),
+        ],
+        body,
+    ).into_response()
+}
+
+#[derive(Deserialize)]
+struct ImportBody {
+    bundle: bundle::Bundle,
+    /// The local name; the bundle's own name when absent.
+    #[serde(default)]
+    name: Option<String>,
+    /// Replace the viper of that name, if there is one.
+    #[serde(default)]
+    replace: bool,
+}
+
+fn taken(name: &str) -> bool {
+    store::get(name).is_some() || store::broken().iter().any(|b| b.name == name)
+}
+
+/// POST /api/vipers/import/check — what an import would do. Changes nothing.
+async fn import_check(Json(b): Json<ImportBody>) -> Response {
+    let name = b.name.clone().unwrap_or_else(|| b.bundle.manifest.name.clone());
+    let c = bundle::check_import(&b.bundle, Some(&name), chrono::Utc::now());
+    let current = store::get(&name);
+    Json(serde_json::json!({
+        "ok": c.problems.is_empty(),
+        "problems": c.problems,
+        "name": name,
+        "exists": taken(&name),
+        "free_name": bundle::free_name(&name, taken),
+        "digest": c.digest,
+        "manifest": c.manifest,
+        "source": c.source,
+        "readme": b.bundle.readme,
+        "license": b.bundle.license,
+        "publisher": b.bundle.publisher,
+        "version": b.bundle.version,
+        "signed": false,
+        // A viper declared for other venues imports fine but never attaches here.
+        "runs_here": c.manifest.runs_on(crate::venues::venue_name()),
+        "venue": crate::venues::venue_name(),
+        // What it would replace, for the page's diff.
+        "current": current.map(|s| serde_json::json!({ "manifest": s.manifest, "source": s.source })),
+    })).into_response()
+}
+
+/// POST /api/vipers/import — import a bundle. A new viper arrives switched
+/// off on the instance and every squadron, and on paper; replacing one keeps
+/// its on/off switches, puts it back on paper and clears its memory. Nothing
+/// here fetches anything: the bundle is the request body.
+async fn import(State(st): State<ApiState>, Json(b): Json<ImportBody>) -> Response {
+    let name = b.name.clone().unwrap_or_else(|| b.bundle.manifest.name.clone());
+    let c = bundle::check_import(&b.bundle, Some(&name), chrono::Utc::now());
+    if !c.problems.is_empty() {
+        return bad(StatusCode::UNPROCESSABLE_ENTITY, c.problems);
+    }
+    let exists = taken(&name);
+    if exists && !b.replace {
+        return bad(StatusCode::CONFLICT, vec![format!(
+            "a viper named '{name}' already exists; import it as '{}' or choose to replace it",
+            bundle::free_name(&name, taken)
+        )]);
+    }
+    if exists {
+        // A replacement changes the code that manages any position it holds.
+        let held = open_positions(&name).await;
+        if held > 0 {
+            return bad(StatusCode::CONFLICT, vec![format!(
+                "'{name}' holds {held} position(s); replace it once they have closed or settled"
+            )]);
+        }
+    }
+    // The switches go first. The global row is broadcast at once; squadron
+    // rows are written now but Kalshi and Polymarket US squadrons re-read
+    // theirs every ~30 s, so until then they find no entry and fall back to
+    // the global one (`DynamicConfig::custom_viper`), not to the default "on".
+    let switches = if exists {
+        serde_json::json!({ "custom_vipers": { &name: { "live": false } } })
+    } else {
+        serde_json::json!({ "custom_vipers": { &name: { "enabled": false, "live": false } } })
+    };
+    if let Err(e) = crate::api::server::apply_global_patch(&st, &switches.to_string(), true).await {
+        return bad(StatusCode::INTERNAL_SERVER_ERROR, vec![format!("could not set the imported viper's switches: {e}")]);
+    }
+    match store::save(c.manifest, c.source) {
+        Ok(s) => {
+            if exists { store::reset_state(&name); }
+            tracing::info!("📜 Imported viper '{name}' from a bundle (digest {}…){}", &c.digest[..12],
+                if exists { ", replacing the local one; back on paper" } else { "; off and on paper until switched on" });
+            Json(serde_json::json!({
+                "ok": true,
+                "name": name,
+                "version": s.hash,
+                "digest": c.digest,
+                "note": if exists {
+                    "replaced; it keeps its on/off switches, is back on paper, and its memory was cleared. Its paper ledger carries on under the same name, so its totals mix both versions"
+                } else {
+                    "imported; it is off on every squadron and on paper until you switch it on"
+                },
+            })).into_response()
+        }
+        Err(p) => {
+            // Best effort: a new import that did not save leaves no settings
+            // behind for a script that does not exist.
+            if !exists {
+                let undo = serde_json::json!({ "custom_vipers": { &name: null } });
+                if let Err(e) = crate::api::server::apply_global_patch(&st, &undo.to_string(), true).await {
+                    tracing::warn!("📜 Import of '{name}' failed and its settings were not removed: {e}");
+                }
+            }
+            bad(StatusCode::UNPROCESSABLE_ENTITY, p)
+        }
+    }
 }

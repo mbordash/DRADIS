@@ -60,6 +60,33 @@ pub struct Manifest {
     /// `ultra_short`.
     #[serde(default)]
     pub market: crate::orchestrator::strategy::MarketRole,
+    /// [E96] The script API level this viper needs (see
+    /// `bundle::API_VERSION`). Absent on every manifest saved before E96, and
+    /// left out of the file when absent, so an older build reads it unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<u32>,
+    /// [E96] Where an imported viper came from. Display and comparison only:
+    /// nothing is ever fetched from it. An older build ignores it on load and
+    /// drops it on its next save of the script.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
+}
+
+/// [E96] Provenance of an imported viper.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Origin {
+    /// `file` for a bundle file; the registry's name once there is one.
+    pub source: String,
+    #[serde(default)]
+    pub publisher: Option<String>,
+    /// The name it was published or exported under (the local copy may have
+    /// been renamed on import).
+    pub name: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    /// The content digest of the imported version (`bundle::content_digest`).
+    pub sha256: String,
+    pub imported_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -30,14 +30,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import useSWR from 'swr';
 import {
-  deleteScript, dryRunScript, getConfig, getScript, getScriptTemplates, listScripts,
+  deleteScript, dryRunScript, exportScript, getConfig, getScript, getScriptTemplates, listScripts,
   patchConfig, resetScriptState, saveScript, validateScript,
 } from '@/lib/api';
 import type {
   CustomViperConfig, ScriptDryRun, ScriptList, ScriptListItem, ScriptManifest, ScriptParam, ScriptParamType, ScriptTemplate,
+  ViperBundle,
 } from '@/lib/types';
 import { useConfirm } from './ConfirmDialog';
 import { toast } from './Toast';
+import { ImportPanel, readBundleFile } from './ViperImport';
 
 const inputCls = 'w-full bg-[#0a0a14] border border-[#1e1e32] rounded px-2 py-1.5 text-xs font-mono text-gray-200 focus:outline-none focus:border-teal-500/50 disabled:opacity-50';
 const labelCls = 'block text-[10px] font-mono uppercase tracking-wide text-gray-500 mb-1';
@@ -846,6 +848,9 @@ export default function BuildViperPage() {
   // Which button is working, so it can say so ("Saving…").
   const [pending, setPending] = useState<'check' | 'save' | 'delete' | null>(null);
   const problemsRef = useRef<HTMLDivElement>(null);
+  // [E96] A bundle file being reviewed for import; the editor shows the review instead.
+  const [importing, setImporting] = useState<{ bundle: ViperBundle; fileName: string } | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
   // Problems stay inline, where the operator reads them while fixing the
   // script; a toast says they are there and the list scrolls into view.
   const showProblems = (list: string[], what: 'Check' | 'Save' | 'Delete') => {
@@ -887,6 +892,7 @@ export default function BuildViperPage() {
       return;
     }
     if (seq !== openSeq.current) return;
+    setImporting(null);
     setTab('script');
     setSelected(name);
     if (d.manifest && typeof d.source === 'string') {
@@ -907,6 +913,7 @@ export default function BuildViperPage() {
   const startFrom = async (t: ScriptTemplate) => {
     if (dirty && !(await confirm({ title: 'Discard unsaved changes?', tone: 'danger', confirmLabel: 'Discard' }))) return;
     ++openSeq.current;
+    setImporting(null);
     setSelected(null); setProblems(null); setTab('script');
     setDraft(draftOf(structuredClone(t.manifest), t.source, true));
     setSaved(null);
@@ -977,6 +984,38 @@ export default function BuildViperPage() {
     }
   };
 
+  // [E96] Import: the browser reads the file and the engine receives it as a
+  // request body. The review panel replaces the editor until it is done.
+  const pickFile = async (f: File | undefined) => {
+    if (fileRef.current) fileRef.current.value = '';
+    if (!f) return;
+    if (dirty && !(await confirm({ title: 'Discard unsaved changes?', tone: 'danger', confirmLabel: 'Discard' }))) return;
+    try {
+      const bundle = await readBundleFile(f);
+      ++openSeq.current;
+      setSelected(null); setDraft(null); setSaved(null); setProblems(null);
+      setImporting({ bundle, fileName: f.name });
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  // [E96] Export the saved version as a bundle file.
+  const exportCurrent = async () => {
+    if (!selected) return;
+    try {
+      const b = await exportScript(selected);
+      const url = URL.createObjectURL(new Blob([JSON.stringify(b, null, 2)], { type: 'application/json' }));
+      const a = document.createElement('a');
+      a.href = url; a.download = `${selected}.dradis-viper.json`;
+      document.body.appendChild(a); a.click(); a.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+      toast.success(dirty ? `Exported the saved version of ${selected}; your unsaved changes are not in it.` : `Exported ${selected}.`);
+    } catch (e) {
+      toast.error(`Export failed: ${problemsOf(e).join('; ')}`);
+    }
+  };
+
   const current = useMemo(() => list?.scripts.find((s) => s.name === selected), [list, selected]);
   const cfg: CustomViperConfig = useMemo(
     () => (selected && config?.custom_vipers?.[selected]) || EMPTY_CFG,
@@ -1044,6 +1083,8 @@ export default function BuildViperPage() {
                   </div>
                   <div className="text-[10px] font-mono text-gray-500">
                     {s.name} · paper {s.paper.closed} closed, {money(s.paper.pnl)}
+                    {s.provenance === 'imported' && <span className="text-indigo-300"> · imported</span>}
+                    {s.provenance === 'edited' && <span className="text-indigo-300"> · imported, edited</span>}
                   </div>
                 </button>
               );
@@ -1055,6 +1096,16 @@ export default function BuildViperPage() {
                 <div className="text-[10px] font-mono text-red-300/70 truncate" title={b.error}>{b.error}</div>
               </button>
             ))}
+          </div>
+          <div className="card p-3 border border-[#1e1e32] space-y-2">
+            <p className={labelCls}>Import</p>
+            <p className="text-[10px] font-mono text-gray-500">
+              A viper exported from another DRADIS (a <span className="text-gray-400">.dradis-viper.json</span> file). You review it before
+              anything is saved, and it arrives off and on paper.
+            </p>
+            <input ref={fileRef} type="file" accept=".json,application/json" className="hidden"
+                   onChange={(e) => pickFile(e.target.files?.[0])} />
+            <button className={btnPlain} disabled={busy} onClick={() => fileRef.current?.click()}>Import a viper file…</button>
           </div>
           <div className="card p-3 border border-[#1e1e32] space-y-2">
             <p className={labelCls}>Templates</p>
@@ -1073,7 +1124,11 @@ export default function BuildViperPage() {
 
         {/* ── Editor ── */}
         <section className="lg:col-span-3 space-y-3">
-          {!draft ? (
+          {importing ? (
+            <ImportPanel bundle={importing.bundle} fileName={importing.fileName}
+                         onCancel={() => setImporting(null)}
+                         onDone={async (name) => { setImporting(null); await refreshList(); await refreshConfig(); await open(name); }} />
+          ) : !draft ? (
             <div className="card p-6 border border-[#1e1e32] text-xs font-mono text-gray-500 space-y-3">
               {problems && problems.length > 0 && (
                 <div ref={problemsRef} className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-red-300 whitespace-pre-wrap">{problems.join('\n')}</div>
@@ -1091,6 +1146,15 @@ export default function BuildViperPage() {
                   <div className="text-[10px] font-mono text-gray-500">
                     {draft.isNew ? 'new, not saved' : `Script:${draft.manifest.name}${current ? ` · version ${current.version}` : ''}`}
                   </div>
+                  {!draft.isNew && current?.manifest.origin && (
+                    <div className="text-[10px] font-mono text-indigo-300">
+                      {current.provenance === 'edited' ? 'Imported, then edited here' : 'Imported'}
+                      {` from ${current.manifest.origin.source === 'file' ? 'a file' : current.manifest.origin.source}`}
+                      {current.manifest.origin.name !== current.name ? ` as ${current.manifest.origin.name}` : ''}
+                      {current.manifest.origin.publisher ? ` · by ${current.manifest.origin.publisher}` : ''}
+                      {current.manifest.origin.version ? ` · version ${current.manifest.origin.version}` : ''}
+                    </div>
+                  )}
                 </div>
                 <div className="flex gap-1" role="tablist">
                   {tabs.map((t) => (
@@ -1123,6 +1187,8 @@ export default function BuildViperPage() {
                         Revert
                       </button>
                     )}
+                    {!draft.isNew && saved && <button className={btnPlain} disabled={busy} onClick={exportCurrent}
+                                                       title="Download the saved version as a bundle file another DRADIS can import">Export</button>}
                     {!draft.isNew && <button className={btnDanger} disabled={busy} onClick={remove}>{pending === 'delete' ? 'Deleting…' : 'Delete'}</button>}
                   </div>
                   <p className="text-[10px] font-mono text-gray-600">

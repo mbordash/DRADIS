@@ -778,6 +778,33 @@ export async function dryRunScript(name: string, squadron: string, source?: stri
   return res.json();
 }
 
+/** [E96] A saved viper as a bundle, to download. */
+export async function exportScript(name: string): Promise<import('./types').ViperBundle> {
+  const res = await fetch(`${BASE}/api/vipers/scripts/${encodeURIComponent(name)}/export`, { cache: 'no-store' });
+  if (!res.ok) throw await scriptError(res, `GET /api/vipers/scripts/${name}/export`);
+  return res.json();
+}
+
+/** [E96] What importing this bundle under `name` would do. Changes nothing. */
+export async function checkImport(bundle: import('./types').ViperBundle, name?: string): Promise<import('./types').ImportCheck> {
+  const res = await fetch(`${BASE}/api/vipers/import/check`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+    body: JSON.stringify({ bundle, name }),
+  });
+  if (!res.ok) throw await scriptError(res, 'POST /api/vipers/import/check');
+  return res.json();
+}
+
+/** [E96] Import a bundle. A new viper arrives off and on paper. */
+export async function importBundle(bundle: import('./types').ViperBundle, name: string, replace: boolean): Promise<{ name: string; version: string; note: string }> {
+  const res = await fetch(`${BASE}/api/vipers/import`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+    body: JSON.stringify({ bundle, name, replace }),
+  });
+  if (!res.ok) throw await scriptError(res, 'POST /api/vipers/import');
+  return res.json();
+}
+
 export async function resetScriptState(name: string): Promise<void> {
   const res = await fetch(`${BASE}/api/vipers/scripts/${encodeURIComponent(name)}/reset-state`, { method: 'POST', cache: 'no-store' });
   if (!res.ok) throw await scriptError(res, `POST /api/vipers/scripts/${name}/reset-state`);

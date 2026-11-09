@@ -314,7 +314,7 @@ impl ScriptedStrategy {
     /// still manages what it holds.
     fn settings(&self, ctx: &StrategyContext) -> Option<Live> {
         let script = store::get(&self.script)?;
-        let cfg = ctx.dynamic_config.custom_vipers.get(&self.script).cloned().unwrap_or_default();
+        let cfg = ctx.dynamic_config.custom_viper(&self.script);
         let instance_ghost = config::GHOST_MODE || ctx.dynamic_config.ghost_mode;
         let max_exposure = cfg.max_exposure_usdc
             .map_or(script.manifest.max_exposure_usdc, |m| m.min(script.manifest.max_exposure_usdc));

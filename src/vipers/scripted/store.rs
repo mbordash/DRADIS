@@ -418,11 +418,47 @@ fn states() -> &'static Mutex<HashMap<StateKey, Dynamic>> {
     S.get_or_init(Default::default)
 }
 
-/// Run `f` with this script's `this` state on this squadron.
+/// [E96] Largest `this` state a script may keep between calls, serialized.
+/// The sandbox's size caps bound each value a call builds, not what a script
+/// keeps adding to across ticks; at 20 ticks a second, a script appending a
+/// kilobyte a tick would hold a gigabyte within a day.
+pub const MAX_STATE_BYTES: usize = 64 * 1024;
+
+/// Run `f` with this script's `this` state on this squadron. A state left
+/// over [`MAX_STATE_BYTES`] is cleared, with a warning, after the call.
 pub fn with_state<R>(squadron: &str, script: &str, f: impl FnOnce(&mut Dynamic) -> R) -> R {
     let mut m = states().lock().unwrap_or_else(|p| p.into_inner());
     let st = m.entry((squadron.to_string(), script.to_string())).or_insert_with(|| Map::new().into());
-    f(st)
+    let out = f(st);
+    if let Some(n) = state_too_big(st) {
+        warn!("📜 Script viper '{script}' on {squadron}: its state grew past {MAX_STATE_BYTES} bytes (over {n}); cleared");
+        *st = Map::new().into();
+    }
+    out
+}
+
+/// The state's approximate size, when it is over the limit. A walk rather
+/// than a serialization: it runs after every entry and exit call under the
+/// shared state lock, allocates nothing, and stops as soon as the limit is
+/// passed. Strings, blobs and keys count their bytes; anything else 8.
+fn state_too_big(st: &Dynamic) -> Option<usize> {
+    fn size(v: &Dynamic, acc: &mut usize) {
+        if *acc > MAX_STATE_BYTES { return; }
+        if let Some(m) = v.read_lock::<Map>() {
+            for (k, x) in m.iter() { *acc += k.len(); size(x, acc); }
+        } else if let Some(a) = v.read_lock::<rhai::Array>() {
+            for x in a.iter() { size(x, acc); }
+        } else if let Some(s) = v.read_lock::<rhai::ImmutableString>() {
+            *acc += s.len();
+        } else if let Some(b) = v.read_lock::<rhai::Blob>() {
+            *acc += b.len();
+        } else {
+            *acc += 8;
+        }
+    }
+    let mut n = 0;
+    size(st, &mut n);
+    (n > MAX_STATE_BYTES).then_some(n)
 }
 
 /// A copy of the state, for the dry run, which must not change the real one.
@@ -550,6 +586,23 @@ pub(crate) mod tests {
     pub(crate) fn other_venue() -> &'static str {
         let here = crate::venues::venue_name();
         super::super::manifest::VENUES.iter().copied().find(|v| *v != here).unwrap()
+    }
+
+    #[test]
+    fn a_state_over_the_limit_is_cleared_after_the_call() {
+        let big: String = "x".repeat(4_000);
+        with_state("sq_state_test", "grower", |st| {
+            let mut m = Map::new();
+            for i in 0..20 { m.insert(format!("k{i}").into(), big.clone().into()); }
+            *st = m.into();
+        });
+        assert!(state_copy("sq_state_test", "grower").as_map_ref().unwrap().is_empty(), "80 KB of state is cleared");
+        with_state("sq_state_test", "small", |st| {
+            let mut m = Map::new();
+            m.insert("entered".into(), "KXBTC15M-26NOV091200-00".into());
+            *st = m.into();
+        });
+        assert!(!state_copy("sq_state_test", "small").as_map_ref().unwrap().is_empty(), "a small state is kept");
     }
 
     fn manifest(name: &str) -> Manifest {

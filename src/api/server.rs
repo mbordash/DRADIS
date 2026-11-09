@@ -760,66 +760,74 @@ struct PatchConfigQuery {
     scope: PatchScope,
 }
 
+/// Apply a config patch to the global row, broadcast it, and (with `fan_out`)
+/// write it to every deployed or persisted squadron row: the body of
+/// `PATCH /api/config`, shared with the viper import, which writes its "off"
+/// switches the same way.
+pub(crate) async fn apply_global_patch(s: &ApiState, body: &str, fan_out: bool) -> anyhow::Result<std::sync::Arc<DynamicConfig>> {
+    let current = s.config_rx.borrow().clone();
+    let new_cfg = DynamicConfig::apply_patch(&current, body).await?;
+    // Broadcast to all strategy tick loops.
+    let _ = s.config_tx.send(new_cfg.clone());
+
+    // Fan out to what is actually running. See `PatchScope`.
+    if fan_out {
+        // Target set = registered live handles UNION persisted squadron
+        // rows.
+        //
+        // The handle registry alone is not enough, and relying on it
+        // silently broke two of the three venues. Only the intl paths
+        // call `register_squadron_config_handle` (cag/run.rs and
+        // cag/adama.rs); the Kalshi and Polymarket US traders never do,
+        // so the registry is permanently EMPTY on those builds. That is
+        // why the 2026-08-11 profile fan-out has never worked there
+        // either: it reported success over zero squadrons while the
+        // Setup dialog told the operator "no squadrons are currently
+        // deployed" with PATROLLING squadrons listed beside it.
+        //
+        // Those traders hold a plain `Arc<DynamicConfig>` that they
+        // reload from the DB roughly every 30s, so writing the row is
+        // what reaches them. `apply_squadron_patch_as` writes the row and
+        // additionally pushes into the live handle when one is
+        // registered, so intl still applies on the next tick.
+        //
+        // Rows for stood-down squadrons are included deliberately: they
+        // are not running, so the write is harmless, and it means a
+        // squadron redeployed later starts from the operator's current
+        // settings rather than resurrecting stale ones.
+        let mut ids = crate::helpers::dynamic_config::registered_squadron_ids();
+        if let Some(pool) = crate::helpers::db::pool() {
+            for id in crate::helpers::db::squadron_config_list(pool).await {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        let mut reached = 0usize;
+        for id in &ids {
+            match DynamicConfig::apply_squadron_patch_as(id, body, "operator").await {
+                Ok(_) => reached += 1,
+                // Reported, never fatal: the global write already
+                // succeeded, and failing the request would leave the
+                // caller unsure whether ANY of it landed.
+                Err(e) => warn!("⚙️  Global patch did not reach squadron {id}: {e}"),
+            }
+        }
+        if !ids.is_empty() {
+            info!("⚙️  Global patch applied to {reached}/{} deployed squadron(s)", ids.len());
+        }
+    }
+    Ok(new_cfg)
+}
+
 async fn patch_config(
     State(s): State<ApiState>,
     Query(q): Query<PatchConfigQuery>,
     body: String,
 ) -> Response {
     info!("📥 Received PATCH /api/config (global) with body: {}", body);
-    let current = s.config_rx.borrow().clone();
-    match DynamicConfig::apply_patch(&current, &body).await {
+    match apply_global_patch(&s, &body, q.scope == PatchScope::GlobalAndDeployed).await {
         Ok(new_cfg) => {
-            // Broadcast to all strategy tick loops.
-            let _ = s.config_tx.send(new_cfg.clone());
-
-            // Fan out to what is actually running. See `PatchScope`.
-            if q.scope == PatchScope::GlobalAndDeployed {
-                // Target set = registered live handles UNION persisted squadron
-                // rows.
-                //
-                // The handle registry alone is not enough, and relying on it
-                // silently broke two of the three venues. Only the intl paths
-                // call `register_squadron_config_handle` (cag/run.rs and
-                // cag/adama.rs); the Kalshi and Polymarket US traders never do,
-                // so the registry is permanently EMPTY on those builds. That is
-                // why the 2026-08-11 profile fan-out has never worked there
-                // either: it reported success over zero squadrons while the
-                // Setup dialog told the operator "no squadrons are currently
-                // deployed" with PATROLLING squadrons listed beside it.
-                //
-                // Those traders hold a plain `Arc<DynamicConfig>` that they
-                // reload from the DB roughly every 30s, so writing the row is
-                // what reaches them. `apply_squadron_patch_as` writes the row and
-                // additionally pushes into the live handle when one is
-                // registered, so intl still applies on the next tick.
-                //
-                // Rows for stood-down squadrons are included deliberately: they
-                // are not running, so the write is harmless, and it means a
-                // squadron redeployed later starts from the operator's current
-                // settings rather than resurrecting stale ones.
-                let mut ids = crate::helpers::dynamic_config::registered_squadron_ids();
-                if let Some(pool) = crate::helpers::db::pool() {
-                    for id in crate::helpers::db::squadron_config_list(pool).await {
-                        if !ids.contains(&id) {
-                            ids.push(id);
-                        }
-                    }
-                }
-                let mut reached = 0usize;
-                for id in &ids {
-                    match DynamicConfig::apply_squadron_patch_as(id, &body, "operator").await {
-                        Ok(_) => reached += 1,
-                        // Reported, never fatal: the global write already
-                        // succeeded, and failing the request would leave the
-                        // caller unsure whether ANY of it landed.
-                        Err(e) => warn!("⚙️  Global patch did not reach squadron {id}: {e}"),
-                    }
-                }
-                if !ids.is_empty() {
-                    info!("⚙️  Global patch applied to {reached}/{} deployed squadron(s)", ids.len());
-                }
-            }
-
             match serde_json::to_value(new_cfg.as_ref()) {
                 Ok(val) => {
                     debug!("Successfully processed PATCH /api/config");

@@ -31,6 +31,7 @@
 //! * `templates` — the starters the Build a Viper page offers.
 
 pub mod adapter;
+pub mod bundle;
 pub mod context;
 pub mod manifest;
 pub mod paper;

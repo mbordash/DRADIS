@@ -2158,6 +2158,19 @@ pub fn reconcile_global_semantics(
     if viper_drift {
         corrected.push("custom_vipers (live, cap)");
     }
+    // [E96] A script the instance has switched off (an import arrives off)
+    // stays off on a squadron row that has no entry for it, instead of
+    // reading as "on" by default there. A squadron's own entry is its own.
+    let mut inherited = false;
+    for (name, g) in &global.custom_vipers {
+        if !g.enabled && !cfg.custom_vipers.contains_key(name) {
+            cfg.custom_vipers.insert(name.clone(), CustomViperConfig { enabled: false, live: g.live, max_exposure_usdc: g.max_exposure_usdc, ..Default::default() });
+            inherited = true;
+        }
+    }
+    if inherited {
+        corrected.push("custom_vipers (off, inherited)");
+    }
     corrected
 }
 
@@ -2239,6 +2252,19 @@ impl DynamicConfig {
     /// the Control Tower ribbon's disabled tally drifts for the length of the
     /// gap. Unknown names count as enabled, matching the executor, which runs
     /// everything the registry builds.
+    /// [E96] A scripted viper's settings as they apply under this config: its
+    /// own entry, else the instance's (the live global row), else the
+    /// defaults. Kalshi and Polymarket US squadrons reload their row only
+    /// every ~30 s, so a script imported "off" a moment ago is not yet named
+    /// there; reading the global row covers that gap instead of the default
+    /// "on". Everything that asks whether a script is on goes through here.
+    pub fn custom_viper(&self, name: &str) -> CustomViperConfig {
+        if let Some(c) = self.custom_vipers.get(name) { return c.clone(); }
+        global_config_tx()
+            .and_then(|tx| tx.borrow().custom_vipers.get(name).cloned())
+            .unwrap_or_default()
+    }
+
     pub fn strategy_enabled(&self, strategy_name: &str) -> bool {
         match crate::orchestrator::registry::strategy_name_to_kind(strategy_name) {
             "arbitrage"    => self.enable_arbitrage,
@@ -2257,7 +2283,7 @@ impl DynamicConfig {
             // real orders separately.
             "helm"         => self.helm_enabled,
             k => match k.strip_prefix(crate::vipers::scripted::store::KIND_PREFIX) {
-                Some(name) => self.custom_vipers.get(name).is_none_or(|c| c.enabled),
+                Some(name) => self.custom_viper(name).enabled,
                 None => true,
             },
         }
@@ -2569,7 +2595,7 @@ impl DynamicConfig {
             "anchor"       => self.anchor_enabled,
             "helm"         => self.helm_enabled,
             k => match k.strip_prefix(crate::vipers::scripted::store::KIND_PREFIX) {
-                Some(name) => self.custom_vipers.get(name).is_none_or(|c| c.enabled),
+                Some(name) => self.custom_viper(name).enabled,
                 None => return None,
             },
         })
@@ -2862,6 +2888,26 @@ mod custom_viper_patch_tests {
         assert!(!a.enabled, "the squadron's own Off stays");
         assert!(!sq.custom_vipers["ghost"].live, "a script the global row does not name is not live");
         assert!(sq.custom_vipers["beta"].live, "global live reaches a squadron with no row for it");
+        assert!(reconcile_global_semantics(&mut sq, &global).is_empty(), "idempotent");
+    }
+
+    /// [E96] An imported script arrives off on the global row; a squadron
+    /// row that has never named it must not run it.
+    #[test]
+    fn a_squadron_without_a_row_inherits_an_instance_off() {
+        let mut global = DynamicConfig::default();
+        global.custom_vipers.insert("imported".into(), CustomViperConfig { enabled: false, ..Default::default() });
+        global.custom_vipers.insert("mine".into(), CustomViperConfig { enabled: true, ..Default::default() });
+        let mut sq = DynamicConfig::default();
+        sq.custom_vipers.insert("kept_on".into(), CustomViperConfig::default());
+        let corrected = reconcile_global_semantics(&mut sq, &global);
+        assert!(corrected.contains(&"custom_vipers (off, inherited)"), "{corrected:?}");
+        assert_eq!(sq.viper_enabled("script:imported"), Some(false), "off on the instance, off here");
+        assert_eq!(sq.viper_enabled("script:mine"), Some(true), "an instance on is still the default");
+        let mut own = DynamicConfig::default();
+        own.custom_vipers.insert("imported".into(), CustomViperConfig { enabled: true, ..Default::default() });
+        reconcile_global_semantics(&mut own, &global);
+        assert!(own.custom_vipers["imported"].enabled, "a squadron's own entry stays its own");
         assert!(reconcile_global_semantics(&mut sq, &global).is_empty(), "idempotent");
     }
 
