@@ -68,9 +68,10 @@ pub struct Bundle {
     pub api_version: u32,
     /// The content digest; an import recomputes it and refuses a mismatch.
     pub sha256: String,
-    /// The registry's signature over the signed envelope (phase 2). Carried
-    /// through untouched; a file import is labeled unsigned whatever it holds,
-    /// since this build has no registry keys to check it against.
+    /// The registry's signature over the signed envelope
+    /// (`registry::Envelope`). An import checks it against this build's
+    /// trusted keys however the bundle arrived, and refuses one that does not
+    /// verify; a bundle without one imports as unsigned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registry_signature: Option<Value>,
 }
@@ -123,7 +124,7 @@ fn canonical_manifest(m: &Manifest) -> Value {
 /// build (no `preserve_order`), so `to_string` already sorts; this sorts
 /// explicitly anyway, so turning that feature on elsewhere cannot change a
 /// digest.
-fn canonical_json(v: &Value) -> String {
+pub(crate) fn canonical_json(v: &Value) -> String {
     fn sort(v: &Value) -> Value {
         match v {
             Value::Object(m) => {

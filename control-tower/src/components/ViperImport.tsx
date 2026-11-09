@@ -16,14 +16,16 @@
 // with this program. If not, see <https://www.gnu.org/licenses/>.
 
 /**
- * [E96] Importing a viper from a bundle file: the review the operator reads
- * before anything is written. It shows who says they wrote it, whether the
- * file is intact, the readme (as plain text: it is someone else's writing and
+ * [E96] Importing a viper from a bundle (a file, or a version from the
+ * community registry): the review the operator reads before anything is
+ * written. It shows who wrote it (verified when the registry signed it),
+ * whether the bundle is intact, the readme (as plain text: it is someone else's writing and
  * is never rendered as HTML), every parameter, the full source, and, when it
  * would replace a viper of the same name, a diff against that one.
  *
- * Nothing here fetches a file from anywhere: the operator picks a file, the
- * browser reads it, and the engine receives it as a request body.
+ * Nothing here fetches a file from anywhere: the operator picks a file (or
+ * the engine fetched a registry version from its compiled-in registry), and
+ * the engine receives the bundle as a request body and checks it again.
  */
 
 import { useEffect, useMemo, useState } from 'react';
@@ -142,14 +144,17 @@ export async function readBundleFile(f: File): Promise<ViperBundle> {
   return b as ViperBundle;
 }
 
-export function ImportPanel({ bundle, fileName, onDone, onCancel }: {
+export function ImportPanel({ bundle, fileName, initialName, onDone, onCancel }: {
   bundle: ViperBundle;
+  /** Where it came from, for the header: a file name or the registry. */
   fileName: string;
+  /** The local name to start from (an update names the installed copy). */
+  initialName?: string;
   /** Called with the local name after a successful import. */
   onDone: (name: string) => void;
   onCancel: () => void;
 }) {
-  const [name, setName] = useState(bundle.manifest.name);
+  const [name, setName] = useState(initialName ?? bundle.manifest.name);
   const [replace, setReplace] = useState(false);
   const [check, setCheck] = useState<ImportCheck | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -203,16 +208,25 @@ export function ImportPanel({ bundle, fileName, onDone, onCancel }: {
             {` · license ${bundle.license ?? 'MIT'}`}
           </div>
         </div>
-        <span className="text-[9px] font-mono uppercase border rounded px-1 text-amber-300 border-amber-500/40"
-              title="A file import is not checked against a registry signature. The digest proves the file is intact, not who wrote it.">
-          unsigned file
-        </span>
+        {check?.signed ? (
+          <span className="text-[9px] font-mono uppercase border rounded px-1 text-teal-300 border-teal-500/40"
+                title={`Signed by the dradis.live registry (key ${check.signed.key_id}) on ${check.signed.published_at}. The registry reviewed it before publishing; it did not test it for profitability.`}>
+            signed · dradis.live
+          </span>
+        ) : (
+          <span className="text-[9px] font-mono uppercase border rounded px-1 text-amber-300 border-amber-500/40"
+                title="Not signed by the registry. The digest proves the file is intact, not who wrote it.">
+            unsigned file
+          </span>
+        )}
       </div>
 
       <p className="text-[11px] font-mono text-gray-400">
-        {bundle.publisher
-          ? <>The publisher name comes from the file and is not verified. </>
-          : null}
+        {check?.signed
+          ? <>Published by <span className="text-gray-200">{check.signed.publisher}</span> (verified by the registry&apos;s signature). Community content, MIT licensed: not investment advice, and not reviewed for profitability. </>
+          : bundle.publisher
+            ? <>The publisher name comes from the file and is not verified. </>
+            : null}
         An imported viper arrives <span className="text-gray-200">switched off on every squadron and on paper</span>. Read the
         script before you switch it on: it trades under the same caps and checks as your own vipers.
       </p>

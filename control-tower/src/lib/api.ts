@@ -805,6 +805,23 @@ export async function importBundle(bundle: import('./types').ViperBundle, name: 
   return res.json();
 }
 
+/** [E96] The community registry's index. The engine fetches it from its
+ *  compiled-in registry and checks the signature; only on this call. */
+export async function fetchRegistry(): Promise<import('./types').RegistryListing> {
+  const res = await fetch(`${BASE}/api/vipers/registry`, { cache: 'no-store' });
+  if (!res.ok) throw await scriptError(res, 'GET /api/vipers/registry');
+  return res.json();
+}
+
+/** [E96] One published version, signature and index checked by the engine.
+ *  Read-only: importing it is `importBundle`. */
+export async function fetchRegistryBundle(publisher: string, name: string, version: string): Promise<{ bundle: import('./types').ViperBundle; signed: import('./types').RegistrySigned }> {
+  const path = [publisher, name, version].map(encodeURIComponent).join('/');
+  const res = await fetch(`${BASE}/api/vipers/registry/${path}`, { cache: 'no-store' });
+  if (!res.ok) throw await scriptError(res, `GET /api/vipers/registry/${path}`);
+  return res.json();
+}
+
 export async function resetScriptState(name: string): Promise<void> {
   const res = await fetch(`${BASE}/api/vipers/scripts/${encodeURIComponent(name)}/reset-state`, { method: 'POST', cache: 'no-store' });
   if (!res.ok) throw await scriptError(res, `POST /api/vipers/scripts/${name}/reset-state`);

@@ -40,6 +40,7 @@ import type {
 import { useConfirm } from './ConfirmDialog';
 import { toast } from './Toast';
 import { ImportPanel, readBundleFile } from './ViperImport';
+import { CommunityCard } from './ViperCommunity';
 
 const inputCls = 'w-full bg-[#0a0a14] border border-[#1e1e32] rounded px-2 py-1.5 text-xs font-mono text-gray-200 focus:outline-none focus:border-teal-500/50 disabled:opacity-50';
 const labelCls = 'block text-[10px] font-mono uppercase tracking-wide text-gray-500 mb-1';
@@ -849,7 +850,7 @@ export default function BuildViperPage() {
   const [pending, setPending] = useState<'check' | 'save' | 'delete' | null>(null);
   const problemsRef = useRef<HTMLDivElement>(null);
   // [E96] A bundle file being reviewed for import; the editor shows the review instead.
-  const [importing, setImporting] = useState<{ bundle: ViperBundle; fileName: string } | null>(null);
+  const [importing, setImporting] = useState<{ bundle: ViperBundle; fileName: string; localName?: string } | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   // Problems stay inline, where the operator reads them while fixing the
   // script; a toast says they are there and the list scrolls into view.
@@ -986,15 +987,19 @@ export default function BuildViperPage() {
 
   // [E96] Import: the browser reads the file and the engine receives it as a
   // request body. The review panel replaces the editor until it is done.
+  const openImport = async (next: { bundle: ViperBundle; fileName: string; localName?: string }) => {
+    if (dirty && !(await confirm({ title: 'Discard unsaved changes?', tone: 'danger', confirmLabel: 'Discard' }))) return;
+    ++openSeq.current;
+    setSelected(null); setDraft(null); setSaved(null); setProblems(null);
+    setImporting(next);
+  };
+
   const pickFile = async (f: File | undefined) => {
     if (fileRef.current) fileRef.current.value = '';
     if (!f) return;
-    if (dirty && !(await confirm({ title: 'Discard unsaved changes?', tone: 'danger', confirmLabel: 'Discard' }))) return;
     try {
       const bundle = await readBundleFile(f);
-      ++openSeq.current;
-      setSelected(null); setDraft(null); setSaved(null); setProblems(null);
-      setImporting({ bundle, fileName: f.name });
+      await openImport({ bundle, fileName: f.name });
     } catch (e) {
       toast.error(e instanceof Error ? e.message : String(e));
     }
@@ -1107,6 +1112,7 @@ export default function BuildViperPage() {
                    onChange={(e) => pickFile(e.target.files?.[0])} />
             <button className={btnPlain} disabled={busy} onClick={() => fileRef.current?.click()}>Import a viper file…</button>
           </div>
+          <CommunityCard disabled={busy} onReview={(bundle, label, localName) => openImport({ bundle, fileName: label, localName })} />
           <div className="card p-3 border border-[#1e1e32] space-y-2">
             <p className={labelCls}>Templates</p>
             <p className="text-[10px] font-mono text-gray-500">Pick one to start a new viper.</p>
@@ -1125,7 +1131,7 @@ export default function BuildViperPage() {
         {/* ── Editor ── */}
         <section className="lg:col-span-3 space-y-3">
           {importing ? (
-            <ImportPanel bundle={importing.bundle} fileName={importing.fileName}
+            <ImportPanel key={`${importing.fileName}:${importing.localName ?? ''}`} bundle={importing.bundle} fileName={importing.fileName} initialName={importing.localName}
                          onCancel={() => setImporting(null)}
                          onDone={async (name) => { setImporting(null); await refreshList(); await refreshConfig(); await open(name); }} />
           ) : !draft ? (
@@ -1149,7 +1155,7 @@ export default function BuildViperPage() {
                   {!draft.isNew && current?.manifest.origin && (
                     <div className="text-[10px] font-mono text-indigo-300">
                       {current.provenance === 'edited' ? 'Imported, then edited here' : 'Imported'}
-                      {` from ${current.manifest.origin.source === 'file' ? 'a file' : current.manifest.origin.source}`}
+                      {` from ${current.manifest.origin.source === 'file' ? 'a file' : `${current.manifest.origin.source} (signed)`}`}
                       {current.manifest.origin.name !== current.name ? ` as ${current.manifest.origin.name}` : ''}
                       {current.manifest.origin.publisher ? ` · by ${current.manifest.origin.publisher}` : ''}
                       {current.manifest.origin.version ? ` · version ${current.manifest.origin.version}` : ''}

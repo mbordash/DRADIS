@@ -18,6 +18,10 @@ default   = ["intl_clob"]
 intl_clob = ["dep:polymarket_client_sdk_v2", "dep:alloy"]
 us_retail = ["dep:polymarket-us"]
 kalshi    = ["dep:rsa"]
+# [E96] The community viper registry's publishing tool (`viper-registry`).
+# Off by default so the Docker build never compiles it; it runs on the
+# publisher's machine only, with the offline signing key.
+registry-tool = []
 
 [dependencies]
 polymarket_client_sdk_v2 = { version = "0.7.0", optional = true, features = ["clob", "ws", "data", "ctf"] }
@@ -56,6 +60,8 @@ sha1 = "0.10"
 sha2 = "0.10"
 argon2 = { version = "0.5", features = ["std"] }
 base64 = "0.22"
+# [E96] Registry signatures: engines verify, the offline tool signs.
+ed25519-dalek = "3"
 async-trait = "0.1"
 perpetual = "=3.0.0-rc.2"  # [E58] exact: a caret range would pull 3.0.0 final on `cargo update`
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
@@ -68,6 +74,11 @@ fs4 = { version = "1.1.0", features = ["sync"] }
 # `no_float` make every number with a decimal point a rust_decimal, the type the
 # engine trades in; `no_time`/`no_module` keep the clock and imports out of reach.
 rhai = { version = "1.27", default-features = false, features = ["std", "sync", "decimal", "no_float", "no_closure", "no_time", "no_module", "serde"] }
+
+[[bin]]
+name = "viper-registry"
+path = "src/bin/viper_registry.rs"
+required-features = ["registry-tool"]
 
 [profile.release]
 # Line tables in release builds, so a stall dump names source lines.

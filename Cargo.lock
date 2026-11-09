@@ -1913,6 +1913,7 @@ dependencies = [
  "chrono-tz",
  "dashmap",
  "dotenv",
+ "ed25519-dalek",
  "flate2",
  "fs4",
  "futures",

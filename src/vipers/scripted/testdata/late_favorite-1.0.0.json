@@ -1,0 +1,85 @@
+{
+  "format": 1,
+  "manifest": {
+    "name": "late_favorite",
+    "display_name": "Late Favorite",
+    "description": "In the last minutes of a crypto strike market, buy the side the price clearly favors when the model sees an edge, and hold to settlement.",
+    "classes": [
+      "crypto"
+    ],
+    "venues": [],
+    "max_exposure_usdc": "5",
+    "params": {
+      "basis": {
+        "type": "decimal",
+        "default": 0,
+        "min": "-200",
+        "max": "200",
+        "description": "Dollars the price feed reads above the settlement index (measure it for your venue and coin)"
+      },
+      "contracts": {
+        "type": "int",
+        "default": 5,
+        "min": "1",
+        "max": "100",
+        "description": "Contracts per entry."
+      },
+      "fair_cap": {
+        "type": "decimal",
+        "default": 0.95,
+        "min": "0.6",
+        "max": "0.999",
+        "description": "Highest probability the model may claim"
+      },
+      "hourly_vol": {
+        "type": "decimal",
+        "default": 0.003,
+        "min": "0.0005",
+        "max": "0.05",
+        "description": "Typical one-hour move of the underlying, as a fraction of the price (0.005 = 0.5%). Set it from the market you trade."
+      },
+      "max_price": {
+        "type": "decimal",
+        "default": 0.9,
+        "min": "0.01",
+        "max": "0.99",
+        "description": "Highest ask to buy."
+      },
+      "min_edge": {
+        "type": "decimal",
+        "default": 0.04,
+        "min": "0",
+        "max": "0.5",
+        "description": "Fair minus ask minus fee required."
+      },
+      "min_fair": {
+        "type": "decimal",
+        "default": 0.6,
+        "min": "0.5",
+        "max": "0.99",
+        "description": "Only buy a side rated at least this likely"
+      },
+      "window_secs": {
+        "type": "int",
+        "default": 600,
+        "min": "60",
+        "max": "3600",
+        "description": "Enter only in this many final seconds."
+      }
+    },
+    "market": "hourly"
+  },
+  "source": "// Late favorite: in the last minutes of a crypto market, when the price sits\n// well clear of the strike, buy the side it favors and hold it to settlement.\n//\n// The venue settles on its own index (Kalshi uses CF Benchmarks), not on the\n// feed in ctx.oracle (Binance), and the two can differ by tens of dollars. The\n// `basis` parameter is how far the feed reads ABOVE the settlement index; the\n// distance to the strike is measured from the feed minus that. `min_fair`\n// keeps it to real favorites rather than near-strike coin flips, and\n// `fair_cap` limits how sure it may be (BTC's tails are fat).\nfn entry(ctx) {\n    if ctx.oracle == () || ctx.strike == () || ctx.secs_to_close == () {\n        return #{ hold: \"needs an oracle, a strike and a close time\" };\n    }\n    let t = ctx.secs_to_close;\n    if t > ctx.params.window_secs || t < 30 { return #{ hold: `outside the last ${ctx.params.window_secs}s` }; }\n\n    // The price in the settlement's terms, and its distance to the strike in\n    // standard deviations over the time left. The typical one-hour move is a\n    // parameter (a fraction of the price), scaled by the square root of the\n    // time left.\n    let level = ctx.oracle - ctx.params.basis;\n    let move_left = ctx.params.hourly_vol * level * (to_decimal(t) / 3600).sqrt();\n    let z = (level - ctx.strike) / move_left;\n    let p_yes = norm_cdf(z);\n    let side = if p_yes > 0.5 { \"yes\" } else { \"no\" };\n    let fair = if side == \"yes\" { p_yes } else { 1 - p_yes };\n    // The normal curve's tails are too thin for BTC: cap the claim.\n    if fair > ctx.params.fair_cap { fair = ctx.params.fair_cap; }\n    if fair < ctx.params.min_fair { return #{ hold: `fair ${fair} below ${ctx.params.min_fair} (z ${z})` }; }\n\n    let book = if side == \"yes\" { ctx.yes } else { ctx.no };\n    if book.ask > ctx.params.max_price { return #{ hold: `ask ${book.ask} above ${ctx.params.max_price}` }; }\n    let edge = fair - book.ask - taker_fee(book.ask);\n    if edge < ctx.params.min_edge { return #{ hold: `edge ${edge} below ${ctx.params.min_edge}` }; }\n\n    #{ buy: side, price: book.ask, shares: ctx.params.contracts,\n       reason: `fair ${fair}, edge ${edge}, level ${level} vs strike ${ctx.strike}, z ${z}` }\n}\n\n// Held to the settlement: nothing to decide.\nfn exit(ctx, pos) {\n    ()\n}\n",
+  "readme": "# Late Favorite\n\nIn the last ten minutes of an hourly crypto strike market (\"Will Bitcoin be\nabove $74,400 at 2 PM?\"), the price is often far enough from the strike that\none side is a clear favorite. Late Favorite estimates how likely that side is\nto win, and buys it when the market's ask is cheap enough to leave an edge\nafter fees. It holds every position to settlement.\n\n## The idea\n\nWith `t` seconds left, the price has to move from where it is to the strike.\nThe script measures that distance in standard deviations of the typical move\nover the time remaining:\n\n    level = oracle - basis\n    move  = hourly_vol * level * sqrt(t / 3600)\n    z     = (level - strike) / move\n    fair  = norm_cdf(z)          (for YES; 1 - that for NO)\n\nIt then buys the favored side when:\n\n- `fair` is at least `min_fair` (a real favorite, not a coin flip),\n- the ask is at most `max_price`,\n- `fair - ask - taker fee` is at least `min_edge`.\n\n`fair` is capped at `fair_cap`, because crypto has fatter tails than the\nnormal curve: a \"99%\" favorite loses more often than one time in a hundred.\n\n## Parameters to set for your market\n\n- **`basis`** (default 0): how many dollars the price feed (`ctx.oracle`,\n  Binance) reads above the index the venue settles on. Kalshi settles BTC on\n  CF Benchmarks; on BTC we measured Binance about $20 above it. Polymarket\n  settles each market on the source its rules name. Measure the gap for your\n  venue and coin, and set it here; a wrong basis shifts every estimate.\n- **`hourly_vol`** (default 0.003 = 0.3%): the typical one-hour move as a\n  fraction of the price. BTC is usually 0.2–0.5%; ETH and SOL run higher. Too\n  low and the script is overconfident.\n- **`window_secs`** (default 600): how close to the close it may enter.\n\n## What to expect\n\nThis is an idea to try on paper, not a proven strategy. The original ran on\npaper on Kalshi BTC hourly markets for a few days in November 2026 with a\nhandful of trades. Its one early loss came from a missing-price bug since\nfixed in DRADIS (the oracle read as zero). Run it on paper for a few weeks\nbefore you consider it live, and compare its paper results with what the\nmarket priced.\n\nThings to watch:\n\n- A wrong `basis` or `hourly_vol` makes it confident where it should not be.\n- Near the close, books are thin; the default size is 5 contracts.\n- It holds to settlement. There is no stop.\n\n## Venues\n\nWritten for any venue with crypto strike markets: Kalshi, Polymarket US and\nPolymarket International. It needs a strike, an oracle price and a close time\n(`ctx.strike`, `ctx.oracle`, `ctx.secs_to_close`); on a market without them it\nholds and says why.\n\nCommunity content, MIT licensed. Not investment advice, and not reviewed for\nprofitability.\n",
+  "license": "MIT",
+  "publisher": "mbordash",
+  "version": "1.0.0",
+  "api_version": 1,
+  "sha256": "460e5bb7d803b988a09c327ddabd251258688fe87b162b1837f5b48e794bbc99",
+  "registry_signature": {
+    "envelope": 1,
+    "key_id": "reg-2026-11",
+    "published_at": "2026-11-09T20:11:52Z",
+    "sig": "42ef9e2f23e503b9a6ddd10efbc0cb2883592ea1a5459d77e2234bea4599ed56f861b954b3da379ed523ae31a5636056117e0ada818e0e284b018b2e3fbeba09"
+  }
+}

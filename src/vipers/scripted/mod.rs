@@ -35,6 +35,7 @@ pub mod bundle;
 pub mod context;
 pub mod manifest;
 pub mod paper;
+pub mod registry;
 pub mod runtime;
 pub mod store;
 pub mod templates;

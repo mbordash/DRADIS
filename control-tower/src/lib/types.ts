@@ -1309,7 +1309,8 @@ export interface ScriptManifest {
 
 /** [E96] Provenance of an imported viper. */
 export interface ScriptOrigin {
-  /** `file` for a bundle file. */
+  /** `file` for an unsigned bundle file; `dradis.live` for a bundle the
+   *  community registry signed. */
   source: string;
   publisher?: string | null;
   /** The name it was exported or published under. */
@@ -1336,6 +1337,51 @@ export interface ViperBundle {
   registry_signature?: unknown;
 }
 
+/** [E96] A registry signature the engine verified. */
+export interface RegistrySigned {
+  publisher: string;
+  version: string;
+  key_id: string;
+  published_at: string;
+}
+
+/** [E96] One published version in the community registry. */
+export interface RegistryVersion {
+  version: string;
+  sha256: string;
+  api_version: number;
+  published_at: string;
+  /** The reason, when the registry withdrew this version. */
+  yanked?: string | null;
+}
+
+/** [E96] One viper in the community registry, as `GET /api/vipers/registry` lists it. */
+export interface RegistryViper {
+  entry: {
+    publisher: string;
+    name: string;
+    display_name: string;
+    description: string;
+    classes: string[];
+    venues: string[];
+    market: string;
+    versions: RegistryVersion[];
+  };
+  /** The newest version this engine can run (not yanked, script API level met). */
+  available: string | null;
+  runs_here: boolean;
+  /** Local vipers imported from this entry. */
+  installed: { name: string; version: string | null; provenance: ScriptProvenance }[];
+}
+
+export interface RegistryListing {
+  registry: string;
+  generated_at: string;
+  api_version: number;
+  venue: string;
+  vipers: RegistryViper[];
+}
+
 /** [E96] What an import would do (`POST /api/vipers/import/check`). */
 export interface ImportCheck {
   ok: boolean;
@@ -1350,7 +1396,8 @@ export interface ImportCheck {
   license: string;
   publisher: string | null;
   version: string | null;
-  signed: boolean;
+  /** The registry's verified signature, or null for an unsigned bundle. */
+  signed: RegistrySigned | null;
   /** False when the viper declares venues that do not include this engine's. */
   runs_here: boolean;
   venue: string;

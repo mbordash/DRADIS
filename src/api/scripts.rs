@@ -32,7 +32,7 @@ use serde::Deserialize;
 
 use crate::api::server::ApiState;
 use crate::helpers::db;
-use crate::vipers::scripted::{adapter, bundle, manifest::Manifest, paper, store};
+use crate::vipers::scripted::{adapter, bundle, manifest::Manifest, paper, registry, store};
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -48,6 +48,8 @@ pub fn routes() -> Router<ApiState> {
         // with them. Bodies are a bundle plus a few fields; anything larger is
         // refused before it is parsed.
         .route("/api/vipers/import/check", post(import_check).layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT)))
+        .route("/api/vipers/registry", get(registry_index))
+        .route("/api/vipers/registry/{publisher}/{name}/{version}", get(registry_bundle))
         .route("/api/vipers/import", post(import).layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT)))
 }
 
@@ -356,10 +358,27 @@ fn taken(name: &str) -> bool {
     store::get(name).is_some() || store::broken().iter().any(|b| b.name == name)
 }
 
+/// `bundle::check_import` plus the registry signature: a bundle that carries
+/// one must verify (else it was changed after publishing, and is refused); a
+/// verified one records the registry as its origin and its signed publisher.
+fn checked(b: &bundle::Bundle, name: &str) -> (bundle::Checked, Option<registry::Signed>) {
+    let mut c = bundle::check_import(b, Some(name), chrono::Utc::now());
+    let signed = match registry::verify_bundle(b) {
+        Ok(s) => s,
+        Err(e) => { c.problems.push(e); None }
+    };
+    if let (Some(s), Some(o)) = (&signed, c.manifest.origin.as_mut()) {
+        o.source = registry::SOURCE.into();
+        o.publisher = Some(s.publisher.clone());
+        o.version = Some(s.version.clone());
+    }
+    (c, signed)
+}
+
 /// POST /api/vipers/import/check — what an import would do. Changes nothing.
 async fn import_check(Json(b): Json<ImportBody>) -> Response {
     let name = b.name.clone().unwrap_or_else(|| b.bundle.manifest.name.clone());
-    let c = bundle::check_import(&b.bundle, Some(&name), chrono::Utc::now());
+    let (c, signed) = checked(&b.bundle, &name);
     let current = store::get(&name);
     Json(serde_json::json!({
         "ok": c.problems.is_empty(),
@@ -374,7 +393,9 @@ async fn import_check(Json(b): Json<ImportBody>) -> Response {
         "license": b.bundle.license,
         "publisher": b.bundle.publisher,
         "version": b.bundle.version,
-        "signed": false,
+        // The registry's signature, checked against this build's trusted
+        // keys whichever way the bundle arrived; null when it carries none.
+        "signed": signed,
         // A viper declared for other venues imports fine but never attaches here.
         "runs_here": c.manifest.runs_on(crate::venues::venue_name()),
         "venue": crate::venues::venue_name(),
@@ -389,7 +410,7 @@ async fn import_check(Json(b): Json<ImportBody>) -> Response {
 /// here fetches anything: the bundle is the request body.
 async fn import(State(st): State<ApiState>, Json(b): Json<ImportBody>) -> Response {
     let name = b.name.clone().unwrap_or_else(|| b.bundle.manifest.name.clone());
-    let c = bundle::check_import(&b.bundle, Some(&name), chrono::Utc::now());
+    let (c, signed) = checked(&b.bundle, &name);
     if !c.problems.is_empty() {
         return bad(StatusCode::UNPROCESSABLE_ENTITY, c.problems);
     }
@@ -424,7 +445,9 @@ async fn import(State(st): State<ApiState>, Json(b): Json<ImportBody>) -> Respon
     match store::save(c.manifest, c.source) {
         Ok(s) => {
             if exists { store::reset_state(&name); }
-            tracing::info!("📜 Imported viper '{name}' from a bundle (digest {}…){}", &c.digest[..12],
+            tracing::info!("📜 Imported viper '{name}' from {} (digest {}…){}",
+                signed.as_ref().map_or("an unsigned bundle".to_string(), |s| format!("{}'s signed {} {}", registry::SOURCE, s.publisher, s.version)),
+                &c.digest[..12],
                 if exists { ", replacing the local one; back on paper" } else { "; off and on paper until switched on" });
             Json(serde_json::json!({
                 "ok": true,
@@ -448,6 +471,68 @@ async fn import(State(st): State<ApiState>, Json(b): Json<ImportBody>) -> Respon
                 }
             }
             bad(StatusCode::UNPROCESSABLE_ENTITY, p)
+        }
+    }
+}
+
+// ── [E96] phase 2: the community registry ───────────────────────────────────
+//
+// Both routes fetch from the compiled-in registry origin only, on the
+// operator's action; nothing here polls. A registry bundle is imported through
+// the same `/api/vipers/import` as a file: the Control Tower hands it back as
+// the request body, and the engine checks its signature again there.
+
+/// GET /api/vipers/registry — the signed index, with what this deployment can
+/// run and which entries it already has.
+async fn registry_index() -> Response {
+    let index = match registry::fetch_index().await {
+        Ok(i) => i,
+        Err(e) => return bad(StatusCode::BAD_GATEWAY, vec![e]),
+    };
+    let venue = crate::venues::venue_name();
+    let local = store::all();
+    let vipers: Vec<serde_json::Value> = index.vipers.iter().map(|e| {
+        let installed: Vec<serde_json::Value> = local.iter()
+            // Only signed imports: an unsigned file can claim any publisher.
+            .filter(|s| s.manifest.origin.as_ref().is_some_and(|o| o.source == registry::SOURCE
+                && o.publisher.as_deref() == Some(e.publisher.as_str()) && o.name == e.name))
+            .map(|s| serde_json::json!({
+                "name": s.manifest.name,
+                "version": s.manifest.origin.as_ref().and_then(|o| o.version.clone()),
+                "provenance": bundle::provenance(&s.manifest, &s.source),
+            }))
+            .collect();
+        serde_json::json!({
+            "entry": e,
+            "available": e.available().map(|v| v.version.clone()),
+            "runs_here": e.venues.is_empty() || e.venues.iter().any(|v| v == venue),
+            "installed": installed,
+        })
+    }).collect();
+    Json(serde_json::json!({
+        "registry": registry::SOURCE,
+        "generated_at": index.generated_at,
+        "api_version": bundle::API_VERSION,
+        "venue": venue,
+        "vipers": vipers,
+    })).into_response()
+}
+
+/// GET /api/vipers/registry/{publisher}/{name}/{version} — one published
+/// version, checked against its signature and the signed index (listed, same
+/// digest, not yanked). Read-only: the import is a separate step.
+async fn registry_bundle(Path((publisher, name, version)): Path<(String, String, String)>) -> Response {
+    match registry::fetch_bundle(&publisher, &name, &version).await {
+        Ok((b, signed)) => Json(serde_json::json!({ "bundle": b, "signed": signed })).into_response(),
+        Err(e) => {
+            use registry::FetchError::*;
+            let status = match &e {
+                Invalid(_) => StatusCode::BAD_REQUEST,
+                NotFound(_) => StatusCode::NOT_FOUND,
+                Yanked(_) => StatusCode::GONE,
+                Upstream(_) => StatusCode::BAD_GATEWAY,
+            };
+            bad(status, vec![e.to_string()])
         }
     }
 }
