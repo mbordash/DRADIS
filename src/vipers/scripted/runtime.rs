@@ -18,7 +18,7 @@
 //! returns into something the adapter can check.
 //!
 //! One `Engine` for the process. The language has no file, network or clock
-//! API in this build (`no_time`, `no_module`, `eval` disabled), and every call
+//! API in this build (`no_time`, `no_module`, `eval` and `sleep` disabled), and every call
 //! is bounded in operations, call depth and the size of what it can build, so
 //! a runaway script costs about half a millisecond and returns an error rather
 //! than eating the patrol's per-strategy budget. Numbers with a decimal point
@@ -71,6 +71,16 @@ fn build_engine() -> Engine {
     e.set_max_array_size(1_024);
     e.set_max_map_size(256);
     e.disable_symbol("eval");
+    // The core package's `sleep(seconds)` is a real `std::thread::sleep`: the
+    // operation counter never ticks during it and the patrol's per-strategy
+    // timeout cannot preempt a synchronous call, so one script could stall
+    // every scripted viper (their state lock is held across the call) until
+    // the watchdog restarts the process. `disable_symbol` does not reach a
+    // package function, so it is shadowed: functions registered on the
+    // engine itself are resolved before the global modules.
+    e.register_fn("sleep", |_: rhai::INT| -> Result<(), Box<EvalAltResult>> {
+        Err("sleep() is not available to scripts".into())
+    });
     e.on_print(|_| {});
     e.on_debug(|_, _, _| {});
     register_helpers(&mut e);
@@ -278,6 +288,14 @@ mod tests {
     #[test]
     fn the_sandbox_has_no_eval_import_or_clock_and_requires_both_functions() {
         assert!(compile("fn entry(ctx) { eval(\"1\") } fn exit(ctx, pos) { () }").is_err());
+        // `sleep` blocks the worker thread outside the operation cap: refused
+        // at compile time, or at the latest when called, and never slept.
+        let started = std::time::Instant::now();
+        let slept = compile("fn entry(ctx) { sleep(2); () } fn exit(ctx, pos) { () }")
+            .map_err(|_| ())
+            .and_then(|ast| call_entry(&ast, ctx(), &mut Dynamic::UNIT).map(|_| ()).map_err(|_| ()));
+        assert!(slept.is_err(), "sleep must not be callable");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500), "sleep must never block");
         assert!(compile("import \"x\" as y; fn entry(ctx) { () } fn exit(ctx, pos) { () }").is_err());
         let ast = compile("fn entry(ctx) { timestamp() } fn exit(ctx, pos) { () }").unwrap();
         assert!(call_entry(&ast, ctx(), &mut Dynamic::UNIT).is_err(), "no clock but ctx.now_secs");

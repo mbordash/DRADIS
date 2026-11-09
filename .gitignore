@@ -103,6 +103,7 @@ tools/dedupe-duplicate-settlements.sh
 docs/spikes/helm-design.md
 docs/spikes/scripted-viper-spike.md
 docs/spikes/ultra-short-market-spike.md
+docs/spikes/community-vipers-spike.md
 
 # Private keys
 *.pem
