@@ -4,6 +4,11 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
+## 1.8.1 (2026-11-10)
+
+- Restore: restoring a backup on a Marketplace instance failed with "Cross-device link (os error 18)" when the backup held a Build a Viper script (any backup made on 1.7.0 or later from an instance with a script viper). The restore stopped before changing anything. It now moves those files correctly: upload the same backup again and it restores, vipers included.
+- Community vipers: DRADIS now tells you when a viper you imported has a new version, or when the registry withdraws the version you run, without you having to open the Community card. Every six hours it reads the registry's signed index (the same anonymous request the Community card makes, and none at all when you have imported nothing). A new version shows as a line on the dashboard you can dismiss, and a badge on Build a Viper in the menu; a withdrawn version shows in red with the registry's reason until you update or remove that viper. DRADIS never updates or switches off a viper by itself: the Community card opens on its own so you can review the diff and update. Turn the check off in Setup (Community Updates); it takes effect without a restart.
+
 ## 1.8.0 (2026-11-09)
 
 - Community vipers: share script vipers between DRADIS instances. On the Build a Viper page, Export saves a viper (its script, parameters and readme) as a single file, and Import a viper file shows you the readme, parameters and source before anything is saved. The new Community card browses the registry at dradis.live/vipers: every version there is signed by the registry, and DRADIS checks that signature before it shows or imports anything. Imported vipers always arrive switched off and on paper, are labeled Imported (or Imported, edited once you change them), and are offered newer versions with a diff. A version the registry withdraws shows its reason. Community content is MIT licensed, not investment advice and not reviewed for profitability. To contribute one, open a pull request on github.com/mbordash/dradis-contrib.
