@@ -1845,7 +1845,7 @@ mod lone_leg_timeline_tests {
         let close = Some(t("2026-10-01T11:00:00Z"));
         let rest = hold_leg_rest_secs(close, placed, 180, super::MAX_WAIT_SECS_HOURLY);
         assert_eq!(rest, 1176);
-        assert!(rest > 180 && rest > 5);
+        assert!(rest > 180);
     }
 
     /// Close to expiry, or with no close time known, the window falls back to the
