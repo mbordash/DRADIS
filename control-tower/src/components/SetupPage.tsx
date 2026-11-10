@@ -237,6 +237,9 @@ function groupsForVenue(venue: VenueId) {
   // by GET /api/setup/raptors so a new Raptor needs no change to this file.
   groups.push(
     { title: 'Telegram Alerts', blurb: 'Bot token + chat ID for trade notifications (optional).', keys: ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'], test: 'telegram' },
+    // [E97] Not a credential: whether the engine checks dradis.live every six
+    // hours for new or withdrawn versions of imported community vipers.
+    { title: 'Community Updates', blurb: 'Every six hours, checks dradis.live for new versions and withdrawals of vipers you imported, and shows them on the dashboard and on Build a Viper. It never changes a viper by itself. On unless turned off; takes effect at the next check.', keys: ['COMMUNITY_UPDATE_CHECK'] },
     { title: 'LLM Advisor', blurb: 'Optional. Pick a preset below — the fields shown adapt to it. Applies on restart.', keys: ['LLM_PROVIDER', 'OLLAMA_URL', 'OLLAMA_MODEL', 'LLM_API_BASE', 'LLM_API_KEY', 'LLM_MODEL'], test: 'llm' },
   );
   return groups;

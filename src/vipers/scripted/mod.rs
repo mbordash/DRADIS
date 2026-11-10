@@ -39,6 +39,7 @@ pub mod registry;
 pub mod runtime;
 pub mod store;
 pub mod templates;
+pub mod updates;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

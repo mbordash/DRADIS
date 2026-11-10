@@ -571,6 +571,10 @@ async fn run() -> Result<()> {
             dradis::vipers::bookline_board::run_bookline_board(cfg.clone())
         });
     }
+    // [E97] Community update notices: reads the signed registry index every six
+    // hours so the Control Tower can say when an imported viper has a new
+    // version or a withdrawn one. Tells only; never changes a viper.
+    spawn_supervised("community-updates", dradis::vipers::scripted::updates::run_update_watch);
     let (tennis_tx, tennis_rx) =
         watch::channel(dradis::raptors::tennis::TennisSnapshot::default());
     {

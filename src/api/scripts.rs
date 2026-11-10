@@ -32,7 +32,7 @@ use serde::Deserialize;
 
 use crate::api::server::ApiState;
 use crate::helpers::db;
-use crate::vipers::scripted::{adapter, bundle, manifest::Manifest, paper, registry, store};
+use crate::vipers::scripted::{adapter, bundle, manifest::Manifest, paper, registry, store, updates};
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -50,6 +50,8 @@ pub fn routes() -> Router<ApiState> {
         .route("/api/vipers/import/check", post(import_check).layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT)))
         .route("/api/vipers/registry", get(registry_index))
         .route("/api/vipers/registry/{publisher}/{name}/{version}", get(registry_bundle))
+        // [E97] What the last check found; reads no network.
+        .route("/api/vipers/updates", get(registry_updates))
         .route("/api/vipers/import", post(import).layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT)))
 }
 
@@ -478,7 +480,8 @@ async fn import(State(st): State<ApiState>, Json(b): Json<ImportBody>) -> Respon
 // ── [E96] phase 2: the community registry ───────────────────────────────────
 //
 // Both routes fetch from the compiled-in registry origin only, on the
-// operator's action; nothing here polls. A registry bundle is imported through
+// operator's action. The one background read is the update check
+// (`updates::run_update_watch`, [E97]), which Setup can turn off. A registry bundle is imported through
 // the same `/api/vipers/import` as a file: the Control Tower hands it back as
 // the request body, and the engine checks its signature again there.
 
@@ -489,6 +492,8 @@ async fn registry_index() -> Response {
         Ok(i) => i,
         Err(e) => return bad(StatusCode::BAD_GATEWAY, vec![e]),
     };
+    // The update notices follow what the operator is looking at.
+    updates::remember(&index);
     let venue = crate::venues::venue_name();
     let local = store::all();
     let vipers: Vec<serde_json::Value> = index.vipers.iter().map(|e| {
@@ -516,6 +521,14 @@ async fn registry_index() -> Response {
         "venue": venue,
         "vipers": vipers,
     })).into_response()
+}
+
+/// GET /api/vipers/updates — [E97] imported vipers with a newer version, or
+/// whose installed version the registry withdrew, from the last index the
+/// engine read. No network: the background check and the Community card do
+/// the fetching.
+async fn registry_updates() -> Response {
+    Json(updates::snapshot()).into_response()
 }
 
 /// GET /api/vipers/registry/{publisher}/{name}/{version} — one published

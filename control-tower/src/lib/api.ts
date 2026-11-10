@@ -813,6 +813,14 @@ export async function fetchRegistry(): Promise<import('./types').RegistryListing
   return res.json();
 }
 
+/** [E97] Imported vipers with a newer or withdrawn version, from the last
+ *  registry index the engine read. Reads no network on the engine's side. */
+export async function fetchCommunityUpdates(): Promise<import('./types').CommunityUpdates> {
+  const res = await fetch(`${BASE}/api/vipers/updates`, { cache: 'no-store' });
+  if (!res.ok) throw await scriptError(res, 'GET /api/vipers/updates');
+  return res.json();
+}
+
 /** [E96] One published version, signature and index checked by the engine.
  *  Read-only: importing it is `importBundle`. */
 export async function fetchRegistryBundle(publisher: string, name: string, version: string): Promise<{ bundle: import('./types').ViperBundle; signed: import('./types').RegistrySigned }> {

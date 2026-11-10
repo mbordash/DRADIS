@@ -135,7 +135,25 @@ const MANAGED_KEYS: &[(&str, &str, &str, &str, &str)] = &[
     ("ENABLE_LLM_ADVISOR",       "Run the LLM Advisor", "shared", "integration", "bool"),
     ("LLM_API_KEY",              "Hosted LLM API key",            "shared", "integration", "text"),
     ("LLM_MODEL",                "Hosted LLM model",              "shared", "integration", "text"),
+    // [E97] Not a credential: whether the engine checks the community registry
+    // every six hours for new versions and withdrawals of imported vipers. On
+    // unless set to false; read at each check, so no restart is needed.
+    ("COMMUNITY_UPDATE_CHECK",   "Check the community registry for viper updates (on unless turned off)", "shared", "integration", "bool"),
 ];
+
+/// Managed keys the engine reads from the process environment each time it
+/// needs them, so a save (which sets the process env) applies without a
+/// restart. Asking for one anyway would have an operator restart a live
+/// engine, and cancel its resting quotes, for nothing.
+const LIVE_KEYS: &[&str] = &["COMMUNITY_UPDATE_CHECK"];
+
+/// Whether a set of changes (`KEY` or `KEY (removed)`) needs a restart.
+fn needs_restart(changed: &[String]) -> bool {
+    changed.iter().any(|c| {
+        let key = c.split(' ').next().unwrap_or(c);
+        !LIVE_KEYS.contains(&key)
+    })
+}
 
 /// Raptor signal sources rendered as cards in the Setup view's Raptor panel.
 ///
@@ -876,7 +894,8 @@ async fn put_credentials(Json(body): Json<PutCredentials>) -> Response {
     match write_secrets(&map) {
         Ok(()) => {
             info!("🔐 Setup: credentials updated via UI: {}", changed.join(", "));
-            Json(json!({"ok": true, "changed": changed, "restart_required": true})).into_response()
+            let restart_required = needs_restart(&changed);
+            Json(json!({"ok": true, "changed": changed, "restart_required": restart_required})).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR,
                    Json(json!({"error": format!("failed to write secrets file: {}", e)}))).into_response(),
@@ -1850,6 +1869,14 @@ pub fn public_routes() -> Router {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_community_update_switch_needs_no_restart() {
+        assert!(!super::needs_restart(&["COMMUNITY_UPDATE_CHECK".into()]));
+        assert!(!super::needs_restart(&["COMMUNITY_UPDATE_CHECK (removed)".into()]));
+        assert!(super::needs_restart(&["COMMUNITY_UPDATE_CHECK".into(), "TELEGRAM_CHAT_ID".into()]));
+        assert!(super::needs_restart(&["KALSHI_API_KEY_ID".into()]));
+    }
+
     use super::*;
 
     /// Every embedded profile must be a complete, currently-valid DynamicConfig

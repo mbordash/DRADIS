@@ -1374,6 +1374,30 @@ export interface RegistryViper {
   installed: { name: string; version: string | null; provenance: ScriptProvenance }[];
 }
 
+/** [E97] An imported viper with a newer version, or a withdrawn one. */
+export interface CommunityNotice {
+  /** The local name (an import may have been renamed). */
+  name: string;
+  publisher: string;
+  registry_name: string;
+  installed: string;
+  /** A newer version this engine can run. */
+  available: string | null;
+  /** The registry's reason, when it withdrew the installed version. */
+  yanked: string | null;
+  /** Edited here since the import: updating replaces the edits. */
+  edited: boolean;
+}
+
+/** [E97] `GET /api/vipers/updates`: what the last registry check found. */
+export interface CommunityUpdates {
+  /** The six-hourly check (Setup: COMMUNITY_UPDATE_CHECK). */
+  enabled: boolean;
+  checked_at: string | null;
+  error: string | null;
+  notices: CommunityNotice[];
+}
+
 export interface RegistryListing {
   registry: string;
   generated_at: string;

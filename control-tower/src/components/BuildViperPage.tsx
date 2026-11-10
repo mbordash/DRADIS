@@ -32,6 +32,7 @@ import useSWR from 'swr';
 import {
   deleteScript, dryRunScript, exportScript, getConfig, getScript, getScriptTemplates, listScripts,
   patchConfig, resetScriptState, saveScript, validateScript,
+  fetchCommunityUpdates,
 } from '@/lib/api';
 import type {
   CustomViperConfig, ScriptDryRun, ScriptList, ScriptListItem, ScriptManifest, ScriptParam, ScriptParamType, ScriptTemplate,
@@ -838,6 +839,14 @@ export default function BuildViperPage() {
   const { data: list, mutate: refreshList, error: listError } = useSWR('scripts', listScripts, { refreshInterval: 5_000 });
   const { data: config, mutate: refreshConfig, error: configError } = useSWR('config', getConfig);
   const { data: templates } = useSWR('script-templates', getScriptTemplates);
+  // [E97] Shared with the dashboard's badge, and quick while this page is
+  // open so an update or a delete clears the notice at once.
+  const { data: communityUpdates, mutate: refreshUpdates } = useSWR('community-updates', fetchCommunityUpdates, { refreshInterval: 10_000 });
+  // Auto-open the Community card once per notice per browser session, and
+  // not at all when the operator turned the check off.
+  const noticeKey = communityUpdates?.enabled
+    ? communityUpdates.notices.map((n) => `${n.name}@${n.installed}>${n.available ?? ''}|${n.yanked ?? ''}`).join(',')
+    : '';
   const [confirm, confirmDialog] = useConfirm();
 
   const [selected, setSelected] = useState<string | null>(null);
@@ -958,6 +967,7 @@ export default function BuildViperPage() {
       setDraft({ ...draft, manifest: m, isNew: false });
       setSaved({ manifest: JSON.stringify(m), source: draft.source });
       await refreshList();
+      void refreshUpdates();
     } catch (e) {
       showProblems(problemsOf(e), 'Save');
     } finally {
@@ -978,6 +988,7 @@ export default function BuildViperPage() {
       setSelected(null); setDraft(null); setSaved(null); setProblems(null);
       toast.success(`Deleted ${selected}.`);
       await refreshList();
+      void refreshUpdates();
     } catch (e) {
       showProblems(problemsOf(e), 'Delete');
     } finally {
@@ -1112,7 +1123,8 @@ export default function BuildViperPage() {
                    onChange={(e) => pickFile(e.target.files?.[0])} />
             <button className={btnPlain} disabled={busy} onClick={() => fileRef.current?.click()}>Import a viper file…</button>
           </div>
-          <CommunityCard disabled={busy} onReview={(bundle, label, localName) => openImport({ bundle, fileName: label, localName })} />
+          <CommunityCard disabled={busy} autoBrowseKey={noticeKey} updates={communityUpdates}
+                         onReview={(bundle, label, localName) => openImport({ bundle, fileName: label, localName })} />
           <div className="card p-3 border border-[#1e1e32] space-y-2">
             <p className={labelCls}>Templates</p>
             <p className="text-[10px] font-mono text-gray-500">Pick one to start a new viper.</p>
@@ -1133,7 +1145,7 @@ export default function BuildViperPage() {
           {importing ? (
             <ImportPanel key={`${importing.fileName}:${importing.localName ?? ''}`} bundle={importing.bundle} fileName={importing.fileName} initialName={importing.localName}
                          onCancel={() => setImporting(null)}
-                         onDone={async (name) => { setImporting(null); await refreshList(); await refreshConfig(); await open(name); }} />
+                         onDone={async (name) => { setImporting(null); await refreshList(); void refreshUpdates(); await refreshConfig(); await open(name); }} />
           ) : !draft ? (
             <div className="card p-6 border border-[#1e1e32] text-xs font-mono text-gray-500 space-y-3">
               {problems && problems.length > 0 && (

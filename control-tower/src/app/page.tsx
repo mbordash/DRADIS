@@ -38,8 +38,9 @@ import VenueGate       from '@/components/VenueGate';
 import SeededConfigNotice from '@/components/SeededConfigNotice';
 import ErrorBoundary   from '@/components/ErrorBoundary';
 import Footer          from '@/components/Footer';
+import { CommunityUpdatesBanner } from '@/components/CommunityUpdatesBanner';
 import { ViperHealthStrip } from '@/components/ViperHealthStrip';
-import { getAssets, getConfig, getPnlHistory, getPnlSpan, getTrades, getTradeStats, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, getPortfolioValue, getVenueIncome, getSquadrons, refusalText } from '@/lib/api';
+import { fetchCommunityUpdates, getAssets, getConfig, getPnlHistory, getPnlSpan, getTrades, getTradeStats, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, getPortfolioValue, getVenueIncome, getSquadrons, refusalText } from '@/lib/api';
 import {
   type PnlRange, PNL_HISTORY_POINTS, PNL_RANGE_STORE_KEY, isPnlRange, availableHours, hoursForRange,
   rangeEnabled, tradeLimitForHours, windowLabel,
@@ -575,9 +576,12 @@ const VIEW_DEFS: { id: AppView; label: string; icon: string }[] = [
 function NavMenu({
   active,
   onChange,
+  badges,
 }: {
   active: AppView;
   onChange: (v: AppView) => void;
+  /** [E97] A count beside a view, and a dot on the menu button. */
+  badges?: Partial<Record<AppView, number>>;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -609,6 +613,9 @@ function NavMenu({
       >
         <span>{current.icon}</span>
         <span>{current.label}</span>
+        {badges && Object.values(badges).some((n) => (n ?? 0) > 0) && (
+          <span className="h-1.5 w-1.5 rounded-full bg-teal-400" aria-label="Updates available" />
+        )}
         <span className={`text-[9px] transition-transform ${open ? 'rotate-180' : ''}`}>▼</span>
       </button>
       {open && (
@@ -630,6 +637,9 @@ function NavMenu({
             >
               <span>{t.icon}</span>
               <span>{t.label}</span>
+              {(badges?.[t.id] ?? 0) > 0 && (
+                <span className="ml-1 rounded-full bg-teal-500/20 px-1.5 text-[9px] text-teal-300">{badges?.[t.id]}</span>
+              )}
               {active === t.id && <span className="ml-auto text-[9px]">✓</span>}
             </button>
           ))}
@@ -702,6 +712,11 @@ export default function DashboardPage() {
 
   const { data: config, mutate: refreshConfig, isLoading: configLoading } =
     useSWR('config', getConfig, { refreshInterval: 0, revalidateOnFocus: false });
+  // [E97] Imported community vipers with a new or withdrawn version. The engine
+  // answers from its last registry check, so polling this costs no network.
+  const { data: communityUpdates } =
+    useSWR('community-updates', fetchCommunityUpdates, { refreshInterval: 300_000 });
+  const navBadges = { vipers: communityUpdates?.notices.length ?? 0 };
 
   // Portfolio chart window. The page owns it because the history fetch key
   // depends on it; the chart renders the control. Remembered per browser as
@@ -955,7 +970,7 @@ export default function DashboardPage() {
                 <span className="font-mono font-bold text-lg tracking-wide text-indigo-400">DRADIS</span>
                 <span className="text-gray-600 text-lg">|</span>
               </div>
-              <NavMenu active={activeView} onChange={(v) => navigate(v)} />
+              <NavMenu active={activeView} onChange={(v) => navigate(v)} badges={navBadges} />
             </div>
 
             {/* Center — BSG motto */}
@@ -1013,7 +1028,7 @@ export default function DashboardPage() {
               <span className="font-mono font-bold text-lg tracking-wide text-indigo-400">DRADIS</span>
               <span className="text-gray-600 text-lg">|</span>
             </div>
-            <NavMenu active={activeView} onChange={(v) => navigate(v)} />
+            <NavMenu active={activeView} onChange={(v) => navigate(v)} badges={navBadges} />
           </div>
 
           {/* Center — BSG motto */}
@@ -1172,6 +1187,7 @@ export default function DashboardPage() {
 
         {/* Ghost mode banner */}
         {config?.ghost_mode && <GhostBanner ghost />}
+          <CommunityUpdatesBanner notices={communityUpdates?.notices} onOpen={() => navigate('vipers')} />
           <DarkFeedBanner feeds={status?.dark_market_feeds} />
           <OddsFeedBanner feed={status?.odds_feed} />
 
