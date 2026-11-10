@@ -14,25 +14,24 @@
 // You should have received a copy of the GNU Affero General Public License along
 // with this program. If not, see <https://www.gnu.org/licenses/>.
 
+use alloy::primitives::{Address, U256};
+use alloy::signers::local::LocalSigner;
+use anyhow::Result;
+use chrono::Utc;
+use regex::Regex;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use regex::Regex;
-use anyhow::Result;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::str::FromStr;
-use alloy::primitives::{U256, Address};
-use alloy::signers::local::LocalSigner;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
-use chrono::Utc;
 use tracing::{debug, error, info, warn};
 
-use polymarket_client_sdk_v2::clob::{Client as ClobClient};
-use polymarket_client_sdk_v2::auth::state::Authenticated;
-use polymarket_client_sdk_v2::auth::Normal;
-use polymarket_client_sdk_v2::clob::types::request::{BalanceAllowanceRequest, OrdersRequest, PriceRequest};
+use crate::venues::intl::trading_client::TradingClient;
+use polymarket_client_sdk_v2::clob::types::request::{BalanceAllowanceRequest, OrdersRequest, PriceRequest,
+};
 use polymarket_client_sdk_v2::clob::types::{AssetType, Side};
 
 use crate::helpers::metrics;
@@ -46,7 +45,7 @@ pub use crate::state::{Position, PositionKey, PositionMap};
 /// Canonical definition lives in `crate::state` (venue-neutral); re-exported here
 /// for the intl balance/orphan handlers that historically referenced
 /// `helpers::balance::PhantomCooldowns`.
-pub use crate::state::{PhantomCooldowns, OrphanTombstones};
+pub use crate::state::{OrphanTombstones, PhantomCooldowns};
 
 /// How long to block re-entry after a phantom removal (seconds).
 ///
@@ -101,7 +100,7 @@ pub async fn sync_position_balance(
     // PositionKey built below, so two squadrons trading the same token each
     // reconcile their own position rather than one another's.
     squadron_id: &str,
-    client: &Arc<ClobClient<Authenticated<Normal>>>,
+    client: &Arc<TradingClient>,
     positions: &Arc<Mutex<PositionMap>>,
     strategy_name: &str,
     token_id: &MarketId,
@@ -116,6 +115,30 @@ pub async fn sync_position_balance(
     let market = market_id_from_u256(token_id);
     let key = PositionKey::new(squadron_id, strategy_name, market.clone());
     let check_interval_ms: u64 = 3000;
+    let owned_orders:Vec<_>=client.tracked_orders(squadron_id).await?.into_iter().filter(|owner|owner.side==Side::Buy as u8&&owner.strategy==strategy_name&&owner.token_id==token_id.to_string()).collect();
+    anyhow::ensure!(owned_orders.len()<=1,"position sync has ambiguous working order ownership");
+    if let Some(owner)=owned_orders.first() {
+        // This order's own cumulative count is the authority. A wallet balance
+        // includes manual holdings and other strategies and cannot confirm it.
+        let started=Instant::now();
+        loop {
+            let order=client.order(&owner.order_id).await?;
+            anyhow::ensure!(order.maker_address==client.wallet().funder&&order.asset_id==token_id&&order.side==Side::Buy,"position sync order identity changed");
+            let mut map=positions.lock().await;
+            let Some(position)=map.get_mut(&key)else{return Ok(false)};
+            if position.fill_confirmed_at.is_some(){return Ok(true);}
+            if order.size_matched>Decimal::ZERO {
+                position.shares=order.size_matched;
+                position.avg_entry=(owner.initial_notional+(order.size_matched-owner.initial_filled).max(Decimal::ZERO)*owner.limit_price)/order.size_matched;
+                position.entry_fee=owner.entry_fee;position.fill_confirmed_at=Some(Utc::now());return Ok(true);
+            }
+            if matches!(order.status,polymarket_client_sdk_v2::clob::types::OrderStatusType::Canceled){return Ok(false);}
+            drop(map);
+            if started.elapsed()>=Duration::from_secs(max_wait_secs.max(0) as u64){client.cancel_orders(&[owner.order_id.as_str()]).await?;}
+            tokio::time::sleep(Duration::from_millis(check_interval_ms)).await;
+        }
+    }
+
 
         tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -125,7 +148,9 @@ pub async fn sync_position_balance(
         req.token_id = Some(token_id);
 
         let raw_shares = match client.balance_allowance(req).await {
-            Ok(resp) => Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
+            Ok(resp) => {
+                Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000)
+            }
             Err(e) => {
                 warn!("Position Sync API error [{}]: {}", strategy_name, e);
                 tokio::time::sleep(Duration::from_millis(check_interval_ms)).await;
@@ -184,7 +209,8 @@ pub async fn sync_position_balance(
                     // zero balance AND zero resting orders while Polygon settles the fill.
                     // After cancelling, wait one grace period and re-check the balance
                     // before declaring phantom — this catches the settlement-lag race.
-                    let had_resting = cancel_resting_orders(client, token_id, RestingSide::Both).await.any_found();
+                    let had_resting = cancel_resting_orders(client, token_id, RestingSide::Both).await?
+                        .any_found();
                     if had_resting {
                         // Order was live → may have been matching. Wait for on-chain settlement.
                         tokio::time::sleep(Duration::from_secs(20)).await;
@@ -343,31 +369,47 @@ fn tally_by_side(orders: impl Iterator<Item = (Side, Decimal)>) -> RestingCancel
 /// filled in the 16s window); callers MUST inspect the matched size on THEIR
 /// side and adopt (bid) or book (ask) those shares instead of discarding them.
 async fn cancel_resting_orders(
-    client: &Arc<ClobClient<Authenticated<Normal>>>,
+    client: &Arc<TradingClient>,
     token_id: U256,
     target: RestingSide,
-) -> RestingCancel {
-    let req = OrdersRequest::builder().asset_id(token_id).build();
-    let orders = match client.orders(&req, None).await {
-        Ok(page) => page.data,
-        Err(_) => return RestingCancel::default(),
-    };
-    let ours: Vec<_> = orders.into_iter().filter(|o| target.includes(o.side)).collect();
-    if ours.is_empty() {
-        return RestingCancel::default();
+) -> Result<RestingCancel> {
+    let request = OrdersRequest::builder().asset_id(token_id).build();
+    let mut orders = Vec::new();
+    let mut cursor = None;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        let page = client.orders(&request, cursor).await?;
+        orders.extend(page.data.into_iter().filter(|order| {
+            order.maker_address == client.wallet().funder && target.includes(order.side)
+        }));
+        if page.next_cursor.is_empty() || page.next_cursor == "LTE=" {
+            break;
+        }
+        anyhow::ensure!(
+            seen.insert(page.next_cursor.clone()),
+            "CLOB order pagination repeated a cursor"
+        );
+        cursor = Some(page.next_cursor);
     }
-    let tally = tally_by_side(ours.iter().map(|o| (o.side, o.size_matched)));
-    let order_ids: Vec<String> = ours.into_iter().map(|o| o.id).collect();
-    let id_refs: Vec<&str> = order_ids.iter().map(|s| s.as_str()).collect();
-    let mut detail = String::new();
-    if tally.bid_matched > dec!(0) { detail.push_str(&format!(" (bid: {:.4} shares already matched)", tally.bid_matched)); }
-    if tally.ask_matched > dec!(0) { detail.push_str(&format!(" (ask: {:.4} shares already matched)", tally.ask_matched)); }
-    warn!(" Cancelling {} resting GTC {}order(s) for token {} — preventing orphan fills{}",
-          id_refs.len(),
-          if target.label().is_empty() { String::new() } else { format!("{} ", target.label()) },
-          token_id, detail);
-    let _ = client.cancel_orders(&id_refs).await;
-    tally
+    if orders.is_empty() {
+        return Ok(RestingCancel::default());
+    }
+    let ids: Vec<_> = orders.iter().map(|order| order.id.as_str()).collect();
+    client.cancel_orders(&ids).await?;
+    // The fill count after confirmed cancellation captures trades racing the
+    // original listing. Any failed query leaves the owning guard in place.
+    let mut final_orders = Vec::new();
+    for previous in orders {
+        let current = client.order(&previous.id).await?;
+        anyhow::ensure!(
+            current.maker_address == client.wallet().funder && current.asset_id == token_id,
+            "cancelled order identity changed"
+        );
+        final_orders.push((
+            current.side,
+            current.size_matched.max(previous.size_matched),
+        )); }
+    Ok(tally_by_side(final_orders.into_iter()))
 }
 
 #[cfg(test)]
@@ -440,8 +482,7 @@ mod resting_cancel_tests {
 /// engine's own leftovers are swept by the next live run, the human's are
 /// theirs to keep.
 pub async fn report_resting_orders_while_simulating(
-    client: &ClobClient<Authenticated<Normal>>,
-) {
+    client: &TradingClient) {
     let req = OrdersRequest::builder().build();
     let orders = match tokio::time::timeout(Duration::from_secs(8), client.orders(&req, None)).await {
         Ok(Ok(page)) => page.data,
@@ -521,15 +562,18 @@ mod ghost_sweep_report_tests {
 /// mis-adopted under MomentumStrategy at market switch and SL'd for −$0.40).
 /// Returns 0 on lookup failure — callers treat that as "no shares detected".
 pub async fn onchain_balance_for_token(
-    client: &Arc<ClobClient<Authenticated<Normal>>>,
+    client: &Arc<TradingClient>,
     token_id: &MarketId,
 ) -> Decimal {
-    let token_u = match u256_from_market_id(token_id) { Ok(u) => u, Err(_) => return dec!(0) };
+    let token_u = match u256_from_market_id(token_id) { Ok(u) => u, Err(_) => return dec!(0),
+    };
     let mut req = BalanceAllowanceRequest::default();
     req.asset_type = AssetType::Conditional;
     req.token_id = Some(token_u);
     match tokio::time::timeout(Duration::from_secs(10), client.balance_allowance(req)).await {
-        Ok(Ok(resp)) => Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
+        Ok(Ok(resp)) => {
+            Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000)
+        }
         _ => dec!(0),
     }
 }
@@ -547,14 +591,11 @@ pub async fn onchain_balance_for_token(
 /// - `*_matched` is the total shares MATCHED on the cancelled order(s), which
 ///   is cumulative since placement — not since the caller last looked.
 pub async fn cancel_resting_orders_for_token(
-    client: &Arc<ClobClient<Authenticated<Normal>>>,
+    client: &Arc<TradingClient>,
     token_id: &MarketId,
     target: RestingSide,
-) -> RestingCancel {
-    match u256_from_market_id(token_id) {
-        Ok(u) => cancel_resting_orders(client, u, target).await,
-        Err(_) => RestingCancel::default(),
-    }
+) -> Result<RestingCancel> {
+    cancel_resting_orders(client, u256_from_market_id(token_id)?, target).await
 }
 
 /// Ordered strategy names to try when adopting an orphaned position, best first.
@@ -658,7 +699,7 @@ pub async fn reconcile_orphaned_positions(
     // PositionKey built below, so two squadrons trading the same token each
     // reconcile their own position rather than one another's.
     squadron_id: &str,
-    client: &Arc<ClobClient<Authenticated<Normal>>>,
+    client: &Arc<TradingClient>,
     positions: &Arc<Mutex<PositionMap>>,
     tokens: &[(MarketId, &str)],
     market_name: &str,
@@ -670,7 +711,8 @@ pub async fn reconcile_orphaned_positions(
     for (token_id, side_label) in tokens {
         // Slice 2b: keys are neutral MarketId; resolve the on-chain U256 at the SDK edge.
         let market = token_id.clone();
-        let token_u = match u256_from_market_id(token_id) { Ok(t) => t, Err(_) => continue };
+        let token_u = match u256_from_market_id(token_id) { Ok(t) => t, Err(_) => continue,
+        };
         // ── Tombstone check ───────────────────────────────────────────────────
         // If this token has been through orphan-detection this session, skip it
         // permanently.  Without this, cleanup removes the orphan, phantom_cooldowns
@@ -694,7 +736,9 @@ pub async fn reconcile_orphaned_positions(
             Duration::from_secs(10),
             client.balance_allowance(req),
         ).await {
-            Ok(Ok(resp)) => Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
+            Ok(Ok(resp)) => {
+                Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000)
+            }
             Ok(Err(e)) => {
                 warn!("⚠️ RECONCILE: balance query failed for token {} ({}): {}", token_id, side_label, e);
                 continue;
@@ -744,7 +788,8 @@ pub async fn reconcile_orphaned_positions(
             None => {
                 // No log found — credit an artificial entry below current bid so profit_margin
                 // is immediately above every strategy's take-profit threshold on the next tick.
-                (current_bid * (dec!(1) - crate::config::RECONCILE_ADOPTED_ENTRY_DISCOUNT), None)
+                (current_bid * (dec!(1) - crate::config::RECONCILE_ADOPTED_ENTRY_DISCOUNT), None,
+                )
             }
         };
 
@@ -762,7 +807,9 @@ pub async fn reconcile_orphaned_positions(
                 adoption_order,
             );
             let map = positions.lock().await;
-            candidates.into_iter().find(|s| !map.contains_key(&PositionKey::new(squadron_id, s.clone(), market.clone())))
+            candidates.into_iter().find(|s| {
+                !map.contains_key(&PositionKey::new(squadron_id, s.clone(), market.clone()))
+            })
         };
 
         if let Some(strategy_name) = adopted_strategy {
@@ -820,7 +867,8 @@ pub async fn reconcile_orphaned_positions(
                 pair_token_id: market.clone(),
                 fill_confirmed_at: Some(Utc::now()),
                 paired_leg_token_id: None, entry_fee: Decimal::ZERO, // fixed up below
-            });
+            },
+            );
 
             let source = if logged_strategy.is_some() { "DB" } else {
                 &format!("discount@{:.0}%", crate::config::RECONCILE_ADOPTED_ENTRY_DISCOUNT * dec!(100))
@@ -850,9 +898,7 @@ pub async fn reconcile_orphaned_positions(
     // Only ArbitrageStrategy / TimeDecayStrategy emit `pair_params: Some`.
     if tokens.len() == 2 {
         // Mirrors the strategies that enter with `pair_params: Some(..)`.
-        let is_paired_strategy = |s: &str| {
-            matches!(s, "ArbitrageStrategy" | "TimeDecayStrategy")
-        };
+        let is_paired_strategy = |s: &str| matches!(s, "ArbitrageStrategy" | "TimeDecayStrategy");
 
         let market_a = tokens[0].0.clone();
         let market_b = tokens[1].0.clone();
@@ -956,7 +1002,7 @@ pub async fn arb_pair_fill_monitor(
     // PositionKey built below, so two squadrons trading the same token each
     // reconcile their own position rather than one another's.
     squadron_id: &str,
-    client: Arc<ClobClient<Authenticated<Normal>>>,
+    client: Arc<TradingClient>,
     nonce_manager: Arc<AtomicU64>,
     signer: LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
     safe_address: Address,
@@ -1020,8 +1066,10 @@ pub async fn arb_pair_fill_monitor(
     let leg_a_token = u256_from_market_id(leg_a_token).unwrap_or_default();
     let leg_b_token = u256_from_market_id(leg_b_token).unwrap_or_default();
 
-    let key_a = PositionKey::new(squadron_id, strategy_name.clone(), market_id_from_u256(leg_a_token));
-    let key_b = PositionKey::new(squadron_id, strategy_name.clone(), market_id_from_u256(leg_b_token));
+    let key_a = PositionKey::new(squadron_id, strategy_name.clone(), market_id_from_u256(leg_a_token),
+    );
+    let key_b = PositionKey::new(squadron_id, strategy_name.clone(), market_id_from_u256(leg_b_token),
+    );
 
     // Hard deadline for the neither-filled case; also a backstop upper bound for the
     // asymmetric case so we never wait past the original window.
@@ -1102,15 +1150,18 @@ pub async fn arb_pair_fill_monitor(
     };
 
     // ── Asymmetric fill: one leg confirmed, the other is missing ──────────────
-    let (filled_token, missing_token, missing_baseline, missing_vc, missing_side, filled_vc, filled_side) =
+    let (filled_token, missing_token, missing_baseline, missing_vc, missing_side, filled_vc, filled_side,
+    ) =
         if a_confirmed {
             warn!("⚡ ARB ARBITER [{}]: Leg A ({}) filled ({} shares) but Leg B ({}) is MISSING — initiating orphan-leg cleanup",
                   strategy_name, leg_a_token, a_shares, leg_b_token);
-            (leg_a_token, leg_b_token, leg_b_baseline, vc_b, leg_b_side_label.as_str(), vc_a, leg_a_side_label.as_str())
+            (leg_a_token, leg_b_token, leg_b_baseline, vc_b, leg_b_side_label.as_str(), vc_a, leg_a_side_label.as_str(),
+        )
         } else {
             warn!("⚡ ARB ARBITER [{}]: Leg B ({}) filled ({} shares) but Leg A ({}) is MISSING — initiating orphan-leg cleanup",
                   strategy_name, leg_b_token, b_shares, leg_a_token);
-            (leg_b_token, leg_a_token, leg_a_baseline, vc_a, leg_a_side_label.as_str(), vc_b, leg_b_side_label.as_str())
+            (leg_b_token, leg_a_token, leg_a_baseline, vc_a, leg_a_side_label.as_str(), vc_b, leg_b_side_label.as_str(),
+        )
         };
 
     // Slice 2a: neutral keys for map ops; raw U256 retained for SDK/chain calls.
@@ -1120,7 +1171,10 @@ pub async fn arb_pair_fill_monitor(
     // Step 1: Cancel any remaining GTC on the missing leg (idempotent if already cancelled
     //         by the individual sync task — the CLOB rejects cancels of non-existent orders
     //         gracefully).
-    let _ = cancel_resting_orders(&client, missing_token, RestingSide::Both).await;
+    if let Err(error) = cancel_resting_orders(&client, missing_token, RestingSide::Both).await {
+        warn!("Arb repair deferred: cancellation was not confirmed: {error}");
+        return;
+    }
 
     // Step 2: Short settlement grace — the cancel may have raced against a taker fill
     //         that was mid-settlement on-chain. Live knob (was a hardcoded 10s, the
@@ -1167,7 +1221,8 @@ pub async fn arb_pair_fill_monitor(
             if pos.fill_confirmed_at.is_none() { pos.fill_confirmed_at = Some(Utc::now()); }
         } else {
             // Sync task already phantom-removed it; re-insert with data from the filled leg.
-            let reference = map.get(&PositionKey::new(squadron_id, strategy_name.clone(), filled_market.clone())).cloned();
+            let reference = map.get(&PositionKey::new(squadron_id, strategy_name.clone(), filled_market.clone(),
+                )).cloned();
             if let Some(ref_pos) = reference {
                 map.insert(key_m, Position {
                     shares: settled_shares,
@@ -1178,7 +1233,8 @@ pub async fn arb_pair_fill_monitor(
                     pair_token_id: missing_market.clone(),
                     fill_confirmed_at: Some(Utc::now()),
                     paired_leg_token_id: Some(filled_market.clone()), entry_fee: Decimal::ZERO,
-                });
+                },
+                );
             }
         }
         // Drop the positions guard BEFORE acquiring phantom_cooldowns to prevent an ABBA
@@ -1215,7 +1271,8 @@ pub async fn arb_pair_fill_monitor(
     // Match the filled leg's confirmed share count AND entry price so we can compute a
     // breakeven ceiling — without this we'd cap at a fixed $0.99 and could lock in a loss.
     let (filled_shares_recorded, filled_avg_entry, filled_entry_fee) = positions.lock().await
-        .get(&PositionKey::new(squadron_id, strategy_name.clone(), filled_market.clone()))
+        .get(&PositionKey::new(squadron_id, strategy_name.clone(), filled_market.clone(),
+        ))
         .map(|p| (p.shares, p.avg_entry, p.entry_fee))
         .unwrap_or((dec!(0), dec!(0), dec!(0)));
     // PARTIAL-FILL GUARD (2026-07-26 trade 296): fill-confirm stamps a leg "filled"
@@ -1271,7 +1328,13 @@ pub async fn arb_pair_fill_monitor(
         ).await {
             Ok((order_id, making, taking)) => {
                 let fill = rehedge_fill(making, taking, fak_qty, rehedge_price,
-                    crate::venues::intl::live_taker_fee_rate());
+                    crate::venues::intl::live_taker_fee_rate(),
+                );
+                if fill.shares <= Decimal::ZERO {
+                    warn!("FAK re-hedge matched nothing; retaining the existing exposure");
+                    let _ = client.acknowledge_placement(&order_id).await;
+                    return;
+                }
                 if fill.reported {
                     warn!("✅ ARB ARBITER [{}]: FAK re-hedge filled (order_id={}) — {:.4} shares @ ${:.4}, taker fee ${:.4} — delta exposure closed",
                           strategy_name, order_id, fill.shares, fill.price, fill.fee);
@@ -1283,11 +1346,14 @@ pub async fn arb_pair_fill_monitor(
                 // Put the fill on the missing leg, overwriting the resting bid's row
                 // if the sync task has not phantom-removed it.
                 let reference = positions.lock().await
-                    .get(&PositionKey::new(squadron_id, strategy_name.clone(), filled_market.clone()))
+                    .get(&PositionKey::new(squadron_id, strategy_name.clone(), filled_market.clone(),
+                    ))
                     .cloned();
                 if let Some(ref_pos) = reference {
-                    let key_m = PositionKey::new(squadron_id, strategy_name.clone(), missing_market.clone());
-                    apply_rehedge_fill(&mut *positions.lock().await, key_m, &ref_pos, &filled_market, &fill);
+                    let key_m = PositionKey::new(squadron_id, strategy_name.clone(), missing_market.clone(),
+                    );
+                    apply_rehedge_fill(&mut *positions.lock().await, key_m, &ref_pos, &filled_market, &fill,
+                    );
 
                     // Clear phantom cooldown so a future cycle can enter this market again.
                     phantom_cooldowns.lock().await
@@ -1297,20 +1363,15 @@ pub async fn arb_pair_fill_monitor(
                     // row, so the fill's cost and fee are written onto it explicitly.
                     if let Some(pool) = crate::helpers::db::pool_for(&asset) {
                         let token_s = missing_token.to_string();
-                        crate::helpers::db::record_open_position(&pool, &scope, squadron_id,
-                            &strategy_name,
-                            &token_s,
-                            &ref_pos.market_name,
-                            missing_side,
-                            fill.price,
-                            fill.shares,
-                            false,
-                        ).await;
-                        crate::helpers::db::set_open_position_entry_price(&pool, &token_s, fill.price).await;
-                        crate::helpers::db::set_open_position_entry_fee(&pool, &token_s, fill.fee).await;
+                        if let Err(error)=crate::helpers::db::record_order_entry_checked(&pool,&scope,&order_id,squadron_id,&strategy_name,&token_s,&ref_pos.market_name,missing_side,fill.price,fill.shares,fill.fee,"confirmed").await {
+                            warn!("Re-hedge adoption failed; receipt quarantined: {error}");return;
+                        }
                     }
                 }
-                // Re-hedge complete — the pair is whole again. Do NOT fall through to flatten.
+                // A partial re-hedge remains under management for later reconciliation.
+                if let Err(error) = client.acknowledge_placement(&order_id).await {
+                    warn!("Re-hedge journal remains quarantined: {error}");
+                }
                 return;
             }
             Err(e) => {
@@ -1347,7 +1408,8 @@ pub async fn arb_pair_fill_monitor(
         None => dec!(0),
     };
 
-    positions.lock().await.remove(&PositionKey::new(squadron_id, strategy_name.clone(), missing_market.clone()));
+    positions.lock().await.remove(&PositionKey::new(squadron_id, strategy_name.clone(), missing_market.clone(),
+    ));
     token_ownership.lock().await.remove(&missing_market);
     if let Some(pool) = crate::helpers::db::pool_for(&asset) {
         crate::helpers::db::close_open_position(&pool, &strategy_name, &missing_token.to_string()).await;
@@ -1358,7 +1420,8 @@ pub async fn arb_pair_fill_monitor(
     // at the live bid. Worst case is the spread (~1–3¢/share) instead of a full leg
     // resolving to $0. This is the hard guarantee: exposure is always closed now.
     let market_name = positions.lock().await
-        .get(&PositionKey::new(squadron_id, strategy_name.clone(), filled_market.clone()))
+        .get(&PositionKey::new(squadron_id, strategy_name.clone(), filled_market.clone(),
+        ))
         .map(|p| p.market_name.clone())
         .unwrap_or_default();
 
@@ -1386,7 +1449,7 @@ pub async fn arb_pair_fill_monitor(
         bid_price * crate::config::ARB_FLATTEN_BID_HAIRCUT_PCT,
     );
     let sell_price = crate::helpers::price::floor_to_tick_size(
-        (bid_price - cross).max(crate::config::MIN_SELL_LIMIT_PRICE)
+        (bid_price - cross).max(crate::config::MIN_SELL_LIMIT_PRICE),
     );
 
     warn!(" ARB ARBITER [{}]: Flattening naked leg {} — FAK SELL {} @ {:.4} (bid={:.4}, entry={:.4})",
@@ -1399,65 +1462,42 @@ pub async fn arb_pair_fill_monitor(
         0, crate::venues::core::TimeInForce::Fak, false, 0, &*http,
     ).await {
         Ok((order_id, making_amount, taking_amount)) => {
-            // Book the ACTUAL average fill price from the CLOB match, not the
-            // intended `sell_price` limit. For a SELL the matched proceeds/size
-            // give the real price (ratio is unit-invariant); clamp to a valid
-            // (0,1] binary price and fall back to the limit if the response
-            // orientation is unexpected or nothing matched (partial/again later).
-            let exit_price = if making_amount > dec!(0) && taking_amount > dec!(0) {
-                let p = taking_amount / making_amount;
-                if p > dec!(0) && p <= dec!(1) { p } else { sell_price }
+            let price = if making_amount > dec!(0) && taking_amount > dec!(0) {
+                Some(taking_amount / making_amount)
+                    .filter(|price| *price > dec!(0) && *price <= dec!(1))
             } else {
-                sell_price
+                None
             };
-            // Net of BOTH legs' fees, mirroring the normal exit path in
-            // patrol_impl. This flatten is an FAK — always a taker fill, always
-            // charged — while the entry fee is whatever the venue took to open
-            // (zero for the resting GTC these strategies usually enter on).
-            // Prorated when a partial fill made us size the repair off-chain, so
-            // the fee follows the shares actually being closed.
-            let gross = (exit_price - filled_avg_entry) * filled_shares;
-            let entry_fee_share = if filled_shares_recorded > dec!(0) {
-                filled_entry_fee * (filled_shares / filled_shares_recorded)
+            let entry_fee = if filled_shares_recorded > dec!(0) {
+                filled_entry_fee * filled_shares / filled_shares_recorded
             } else {
                 dec!(0)
             };
-            let fees = entry_fee_share
-                + crate::venues::intl::taker_fee(
-                    crate::venues::intl::live_taker_fee_rate(), exit_price, filled_shares,
-                );
-            let realized = gross - fees;
-            warn!("✅ ARB ARBITER [{}]: Naked leg flattened (order_id={}) — exposure closed @ {:.4} (limit {:.4}), realized ${:.4} (gross ${:.4} − fees ${:.4})",
-                  strategy_name, order_id, exit_price, sell_price, realized, gross, fees);
-            // Credit session P&L here too. This path recorded to `trades` but
-            // never touched the running counter, so the dashboard's session
-            // number silently diverged from the ledger by the full amount of
-            // every orphan flatten (12 of them, −$2.25, since July).
-            *total_pnl.lock().await += realized;
-            // The leg is closed — drop it from tracking so it isn't counted as open.
-            positions.lock().await.remove(&PositionKey::new(squadron_id, strategy_name.clone(), filled_market.clone()));
-            // The filled leg has been flattened — release its token claim so other
-            // strategies aren't blocked on a position we no longer hold.
-            token_ownership.lock().await.remove(&filled_market);
-            // Purge the filled leg's DB row too, so it can't linger as a phantom if the
-            // on-chain-keyed backstop races or misses it (defense in depth).
-            if let Some(pool) = crate::helpers::db::pool_for(&asset) {
-                crate::helpers::db::close_open_position(&pool, &strategy_name, &filled_token.to_string()).await;
-            }
-            // Record the realized result so the dashboard reflects the true (small) loss.
-            crate::helpers::metrics::record_trade(
-                &crate::state::TradeScope::crypto(
-                    &asset, crate::venues::intl::INTL_VENUE, &asset),
-                fees,
-                strategy_name.clone(),
-                market_name.clone(),
-                filled_side.to_string(),
-                filled_avg_entry,
-                exit_price,
+            let sale = crate::squadron::fak_exit::settle(
                 filled_shares,
-                realized,
-                "Orphan flatten (bid exit)".to_string(),
-            ).await;
+                Some(making_amount),
+                price,
+                sell_price,
+                filled_avg_entry,
+                entry_fee,
+                crate::venues::intl::live_taker_fee_rate(),
+            );
+            if sale.filled <= dec!(0) {
+                warn!("Arb flatten matched nothing; position remains managed");
+                let _ = client.acknowledge_placement(&order_id).await;
+                return;
+            }
+            let requested=filled_shares_recorded.max(filled_shares);
+            let booking=match crate::helpers::metrics::record_exit_trade_checked(&scope,&order_id,Some(squadron_id),strategy_name.clone(),filled_token.to_string(),market_name.clone(),filled_side.to_string(),filled_avg_entry,sale.exit_price,requested,sale.filled,filled_entry_fee,sale.exit_fee,"Orphan flatten (bid exit)".into()).await {
+                Ok(booking)=>booking,Err(error)=>{warn!("Flatten bookkeeping failed; receipt quarantined: {error}");return;}
+            };
+            let key=PositionKey::new(squadron_id,strategy_name.clone(),filled_market.clone());
+            if booking.remaining>Decimal::ZERO {
+                if let Some(position)=positions.lock().await.get_mut(&key){position.shares=booking.remaining;position.entry_fee=booking.remaining_entry_fee;position.paired_leg_token_id=None;}
+            }else{positions.lock().await.remove(&key);token_ownership.lock().await.remove(&filled_market);}
+            if booking.inserted{*total_pnl.lock().await+=booking.pnl;}
+            if let Err(error)=client.acknowledge_placement(&order_id).await{warn!("Flatten journal remains quarantined: {error}");}
+
         }
         Err(e) => {
             warn!("❌ ARB ARBITER [{}]: Bid-flatten FAILED for naked leg {}: {} — the 5-min cleanup backstop will retry",
@@ -1495,13 +1535,16 @@ pub async fn arb_pair_fill_monitor(
 
             // Entry price/side from the entries ledger (record_open_position wrote it on fill).
             let late_entry = match crate::helpers::db::pool_for(&asset) {
-                Some(p) => crate::helpers::db::lookup_entry_price_db(&p, &missing_token.to_string()).await.unwrap_or(dec!(0)),
+                Some(p) => {
+                    crate::helpers::db::lookup_entry_price_db(&p, &missing_token.to_string()).await.unwrap_or(dec!(0))
+                }
                 None => dec!(0),
             };
             let late_bid = {
                 // side=Buy → best bid (see /price side semantics note above)
                 let req = PriceRequest::builder().token_id(missing_token).side(Side::Buy).build();
-                match client.price(&req).await { Ok(r) => r.price, Err(_) => dec!(0.01) }
+                match client.price(&req).await { Ok(r) => r.price, Err(_) => dec!(0.01),
+                }
             };
             let late_sell = (late_bid - dec!(0.01)).max(dec!(0.01));
 
@@ -1512,44 +1555,36 @@ pub async fn arb_pair_fill_monitor(
                 0, crate::venues::core::TimeInForce::Fak, false, 0, &*http,
             ).await {
                 Ok((order_id, making_amount, taking_amount)) => {
-                    let exit_price = if making_amount > dec!(0) && taking_amount > dec!(0) {
-                        let p = taking_amount / making_amount;
-                        if p > dec!(0) && p <= dec!(1) { p } else { late_sell }
+                    let price = if making_amount > dec!(0) && taking_amount > dec!(0) {
+                        Some(taking_amount / making_amount)
+                            .filter(|price| *price > dec!(0) && *price <= dec!(1))
                     } else {
-                        late_sell
+                        None
                     };
-                    // Same round-trip netting as the primary flatten above; the
-                    // entry fee was captured before this leg's row was purged.
-                    let gross = (exit_price - late_entry) * late_shares;
-                    let fees = missing_entry_fee
-                        + crate::venues::intl::taker_fee(
-                            crate::venues::intl::live_taker_fee_rate(), exit_price, late_shares,
-                        );
-                    let realized = gross - fees;
-                    warn!("✅ ARB ARBITER [{}]: Late-fill naked leg flattened (order_id={}) — exposure closed @ {:.4} (limit {:.4}), realized ${:.4} (gross ${:.4} − fees ${:.4})",
-                          strategy_name, order_id, exit_price, late_sell, realized, gross, fees);
-                    *total_pnl.lock().await += realized;
-                    positions.lock().await.remove(&PositionKey::new(squadron_id, strategy_name.clone(), missing_market.clone()));
-                    token_ownership.lock().await.remove(&missing_market);
-                    // (B) Book synchronously (awaited, not fire-and-forget) so a restart
-                    // mid-cleanup cannot drop the record — the July-3 invisibility mode.
-                    crate::helpers::metrics::record_trade(
-                        &crate::state::TradeScope::crypto(
-                            &asset, crate::venues::intl::INTL_VENUE, &asset),
-                        fees,
-                        strategy_name.clone(),
-                        market_name.clone(),
-                        missing_side.to_string(),
-                        late_entry,
-                        exit_price,
+                    let sale = crate::squadron::fak_exit::settle(
                         late_shares,
-                        realized,
-                        "Orphan flatten (late-fill race)".to_string(),
-                    ).await;
-                    let mut cd = phantom_cooldowns.lock().await;
-                    cd.insert(format!("{}:{}", strategy_name, leg_a_token), tokio::time::Instant::now());
-                    cd.insert(format!("{}:{}", strategy_name, leg_b_token), tokio::time::Instant::now());
+                        Some(making_amount),
+                        price,
+                        late_sell,
+                        late_entry,
+                        missing_entry_fee,
+                        crate::venues::intl::live_taker_fee_rate(),
+                    );
+                    if sale.filled <= dec!(0) {
+                        let _ = client.acknowledge_placement(&order_id).await;
+                        return;
+                    }
+                    let booking=match crate::helpers::metrics::record_exit_trade_checked(&scope,&order_id,Some(squadron_id),strategy_name.clone(),missing_token.to_string(),market_name.clone(),missing_side.to_string(),late_entry,sale.exit_price,late_shares,sale.filled,missing_entry_fee,sale.exit_fee,"Orphan flatten (late-fill race)".into()).await {
+                        Ok(booking)=>booking,Err(error)=>{warn!("Late flatten bookkeeping failed; receipt quarantined: {error}");return;}
+                    };
+                    let key=PositionKey::new(squadron_id,strategy_name.clone(),missing_market.clone());
+                    if booking.remaining>Decimal::ZERO {
+                        if let Some(position)=positions.lock().await.get_mut(&key){position.shares=booking.remaining;position.entry_fee=booking.remaining_entry_fee;position.paired_leg_token_id=None;}
+                    }else{positions.lock().await.remove(&key);token_ownership.lock().await.remove(&missing_market);}
+                    if booking.inserted{*total_pnl.lock().await+=booking.pnl;}
+                    if let Err(error)=client.acknowledge_placement(&order_id).await{warn!("Late flatten journal remains quarantined: {error}");}
                     return;
+
                 }
                 Err(e) => {
                     warn!("❌ ARB ARBITER [{}]: Late-fill flatten FAILED for {}: {} — leaving position for the 30s lifecycle sweep to retry",
@@ -1567,13 +1602,16 @@ pub async fn arb_pair_fill_monitor(
     // `sync_position_balance` to age it out at `max_wait_secs`. This stops the redundant
     // Position-Sync retry loop on the next poll and frees the token immediately so
     // higher-priority strategies aren't rejected by TOKEN SOVEREIGNTY for ~minutes.
-    positions.lock().await.remove(&PositionKey::new(squadron_id, strategy_name.clone(), missing_market.clone()));
+    positions.lock().await.remove(&PositionKey::new(squadron_id, strategy_name.clone(), missing_market.clone(),
+    ));
     token_ownership.lock().await.remove(&missing_market);
 
     // Block re-entry on BOTH legs until the operator/cleanup confirms the state is clean.
     let mut cd = phantom_cooldowns.lock().await;
-    cd.insert(format!("{}:{}", strategy_name, leg_a_token), tokio::time::Instant::now());
-    cd.insert(format!("{}:{}", strategy_name, leg_b_token), tokio::time::Instant::now());
+    cd.insert(format!("{}:{}", strategy_name, leg_a_token), tokio::time::Instant::now(),
+    );
+    cd.insert(format!("{}:{}", strategy_name, leg_b_token), tokio::time::Instant::now(),
+    );
 }
 
 pub async fn quick_confirm_fill(
@@ -1581,7 +1619,7 @@ pub async fn quick_confirm_fill(
     // PositionKey built below, so two squadrons trading the same token each
     // reconcile their own position rather than one another's.
     squadron_id: &str,
-    client: &Arc<ClobClient<Authenticated<Normal>>>,
+    client: &Arc<TradingClient>,
     strategy_name: &str,
     token_id: &MarketId,
     positions: &Arc<Mutex<PositionMap>>,
@@ -1598,9 +1636,11 @@ pub async fn quick_confirm_fill(
     // FAK orders are self-cancelling at the exchange (evaluate-and-discard).
     // There are no resting FAK orders to cancel, so skip straight to the fill check.
     let req2 = OrdersRequest::builder().asset_id(token_id).build();
-    if !(match client.orders(&req2, None).await { Ok(p) => p.data.is_empty(), Err(_) => true }) {
+    if !(match client.orders(&req2, None).await { Ok(p) => p.data.is_empty(), Err(_) => true,
+    }) {
         let mut pos_map = positions.lock().await;
-        if let Some(pos) = pos_map.get_mut(&PositionKey::new(squadron_id, strategy_name, market_id_from_u256(token_id))) {
+        if let Some(pos) = pos_map.get_mut(&PositionKey::new(squadron_id, strategy_name, market_id_from_u256(token_id),
+        )) {
             pos.fill_confirmed_at = Some(Utc::now());
             info!("✅ QUICK CONFIRM FILL [{}]: Token {} filled instantly", strategy_name, token_id);
             return Ok(true);
@@ -1625,7 +1665,7 @@ pub(crate) struct RehedgeFill {
 pub(crate) fn rehedge_fill(
     making: Decimal,
     taking: Decimal,
-    requested: Decimal,
+    _requested: Decimal,
     limit: Decimal,
     fee_rate: Decimal,
 ) -> RehedgeFill {
@@ -1640,8 +1680,8 @@ pub(crate) fn rehedge_fill(
         }
     }
     RehedgeFill {
-        shares: requested, price: limit,
-        fee: crate::venues::intl::taker_fee(fee_rate, limit, requested),
+        shares: Decimal::ZERO, price: limit,
+        fee: Decimal::ZERO,
         reported: false,
     }
 }
@@ -1661,6 +1701,9 @@ pub(crate) fn apply_rehedge_fill(
     filled_market: &MarketId,
     fill: &RehedgeFill,
 ) {
+    if fill.shares <= Decimal::ZERO {
+        return;
+    }
     let now = Utc::now();
     match map.get_mut(&key) {
         Some(p) => {
@@ -1682,7 +1725,8 @@ pub(crate) fn apply_rehedge_fill(
                 fill_confirmed_at: Some(now),
                 paired_leg_token_id: Some(filled_market.clone()),
                 entry_fee: fill.fee,
-            });
+            },
+            );
         }
     }
 }
@@ -1744,10 +1788,10 @@ mod rehedge_fill_tests {
     /// No matched amounts in the response: the request at the limit, the most
     /// it could have cost, stands in until position sync reads the chain.
     #[test]
-    fn an_unreported_rehedge_stands_in_at_the_limit_for_the_requested_size() {
+    fn an_unfilled_rehedge_books_no_shares_or_fee() {
         let fill = rehedge_fill(dec!(0), dec!(0), dec!(26), dec!(0.64), RATE);
         assert!(!fill.reported);
-        assert_eq!((fill.shares, fill.price), (dec!(26), dec!(0.64)));
+        assert_eq!((fill.shares, fill.price, fill.fee), (dec!(0), dec!(0.64), dec!(0)));
     }
 }
 

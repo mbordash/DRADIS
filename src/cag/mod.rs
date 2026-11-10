@@ -214,6 +214,9 @@ struct CagInner {
     /// The first asset registered is the "primary" for backward-compat callers.
     /// `RwLock` allows concurrent reads from API handlers without blocking.
     sessions: RwLock<HashMap<String, SessionState>>,
+    /// Wallet reads remain available even when no trading session is running.
+    #[cfg(feature = "intl_clob")]
+    intl_venue: RwLock<Option<Arc<crate::venues::intl::IntlClobVenue>>>,
 }
 
 impl Cag {
@@ -224,11 +227,23 @@ impl Cag {
                 registry:    DashMap::new(),
                 asset_tasks: DashMap::new(),
                 sessions:    RwLock::new(HashMap::new()),
+                #[cfg(feature = "intl_clob")]
+                intl_venue: RwLock::new(None),
             }),
         }
     }
 
     // ── Session state ────────────────────────────────────────────────────────
+
+    #[cfg(feature = "intl_clob")]
+    pub fn set_intl_venue(&self, venue: Arc<crate::venues::intl::IntlClobVenue>) {
+        *self.inner.intl_venue.write().expect("CAG venue lock poisoned") = Some(venue);
+    }
+
+    #[cfg(feature = "intl_clob")]
+    pub fn intl_venue(&self) -> Option<Arc<crate::venues::intl::IntlClobVenue>> {
+        self.inner.intl_venue.read().expect("CAG venue lock poisoned").clone()
+    }
 
     /// Store a session state bundle in the CAG, keyed by `session.asset`.
     ///

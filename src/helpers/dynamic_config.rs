@@ -3628,7 +3628,7 @@ mod seeding_tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut newer = DynamicConfig::default();
-        newer.ghost_mode = false;
+        newer.ghost_mode = !newer.ghost_mode;
         newer.time_decay_max_entry_price = Decimal::new(50, 2);
         newer.sports_ledger_enabled = true;
         let mut older = DynamicConfig::default();

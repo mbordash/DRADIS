@@ -515,6 +515,9 @@ pub trait Execution: Send + Sync {
     /// Place two legs in a single round-trip (network-atomic, not engine-atomic).
     async fn place_atomic(&self, legs: [OrderIntent; 2]) -> Result<[Fill; 2]>;
 
+    /// Release a durable placement claim after the caller has persisted its ownership and fills.
+    async fn acknowledge_order_adoption(&self, _id: &OrderId) -> Result<()> { Ok(()) }
+
     /// Cancel a resting order by id.
     async fn cancel(&self, id: OrderId) -> Result<()>;
 

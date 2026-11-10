@@ -80,6 +80,11 @@ name = "viper-registry"
 path = "src/bin/viper_registry.rs"
 required-features = ["registry-tool"]
 
+[[example]]
+name = "polymarket-balance"
+path = "examples/polymarket-balance.rs"
+required-features = ["intl_clob"]
+
 [profile.release]
 # Line tables in release builds, so a stall dump names source lines.
 #

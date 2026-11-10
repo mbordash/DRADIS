@@ -23,11 +23,11 @@
 ///    where the first leg filled but the second leg never did.
 /// 3. Prune expired TimeDecay position metadata.
 /// 4. Sync open_positions DB table against live on-chain holdings (purge stale rows).
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use std::sync::Arc;
 
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use alloy::sol;
 use alloy::sol_types::SolCall;
@@ -38,9 +38,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout as tokio_timeout;
 use tracing::{debug, info, warn};
 
-use polymarket_client_sdk_v2::clob::Client as ClobClient;
-use polymarket_client_sdk_v2::auth::state::Authenticated;
-use polymarket_client_sdk_v2::auth::Normal;
+use crate::venues::intl::trading_client::TradingClient;
 use polymarket_client_sdk_v2::clob::types::request::OrdersRequest;
 // Data API v2 (v1 retired 2026-11-02; the SDK's data client still calls v1).
 use crate::venues::intl::data_api;
@@ -52,6 +50,8 @@ use crate::helpers::balance::OrphanTombstones;
 use crate::state::{Position, PositionKey, PositionMap};
 use crate::venues::core::MarketId;
 use crate::venues::intl::u256_from_market_id;
+use crate::venues::intl::wallet::WalletType;
+use crate::venues::intl::wallet_executor::{ExecutionEffect, WalletExecutor};
 use crate::vipers::time_decay_impl::TimeDecayPosition;
 use sqlx;
 // ── On-chain settlement contracts ────────────────────────────────────────────
@@ -71,8 +71,8 @@ use sqlx;
 /// with USDC.e collateral — redeeming those with pUSD computes the wrong position ID
 /// and silently no-ops (6 stuck redeemables, each "redeemed" successfully at
 /// 2026-07-20 23:19 with 0 tokens burned, then blacklisted forever by
-/// PERMANENTLY_SETTLED_CONDITIONS).  Use `detect_condition_collateral` to pick the
-/// right collateral per condition instead of assuming pUSD.
+/// PERMANENTLY_SETTLED_CONDITIONS). Settlement validates each held token ID
+/// against its collateral before choosing the execution contract.
 pub(crate) const PUSD_COLLATERAL: Address = alloy_address!("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB");
 
 /// USDC.e (bridged USDC) on Polygon — collateral for pre-pUSD-migration positions.
@@ -133,13 +133,6 @@ static FAILED_SETTLEMENT_CONDITIONS: LazyLock<Mutex<HashMap<B256, DateTime<Utc>>
 static AUTO_SETTLE_RUN_LOCK: LazyLock<Mutex<()>> =
     LazyLock::new(|| Mutex::new(()));
 
-fn is_retryable_settlement_submit_error(err: &anyhow::Error) -> bool {
-    let msg = err.to_string().to_ascii_lowercase();
-    msg.contains("replacement transaction underpriced")
-        || msg.contains("in-flight transaction limit reached")
-        || msg.contains("nonce too low")
-        || msg.contains("already known")
-}
 
 sol! {
     /// Gnosis Safe 1.3 — we only need execTransaction.
@@ -157,6 +150,15 @@ sol! {
             address refundReceiver,
             bytes   memory signatures
         ) external payable returns (bool success);
+    }
+
+    #[sol(rpc)]
+    interface ISettlementTokens {
+        function balanceOf(address account, uint256 id) external view returns (uint256);
+        function isApprovedForAll(address account, address operator) external view returns (bool);
+    }
+    interface IProtocolRouter {
+        function redeem(bytes31 conditionId, uint256 outcomeIndex, uint256 amount) external;
     }
 
     /// CTF view functions (called via RPC, not through the Safe).
@@ -196,148 +198,6 @@ sol! {
     }
 }
 
-/// Execute a contract call through the Gnosis Safe.
-///
-/// The Safe holds all ERC1155 outcome tokens. CTF methods operate on `msg.sender`'s
-/// balance, so we must call CTF *from within* the Safe using `execTransaction`.
-///
-/// ## Signature scheme
-/// For a 1-of-1 Safe where the EOA is the direct owner AND msg.sender == owner,
-/// Gnosis Safe accepts a pre-approved-owner signature without any hash computation:
-///   - r = EOA address (right-aligned in 32 bytes)
-///   - s = 0x00…00 (32 zero bytes)
-///   - v = 0x01
-/// Safe checks `msg.sender == address(r)` → passes for threshold = 1.
-async fn execute_via_safe<P: Provider + Clone>(
-    provider: P,
-    safe_address: Address,
-    eoa_address: Address,
-    ctf_contract: Address,
-    calldata: Vec<u8>,
-) -> anyhow::Result<alloy::primitives::TxHash> {
-    send_via_safe(provider, safe_address, eoa_address, ctf_contract, calldata)
-        .await
-        .map(|(hash, _)| hash)
-}
-
-/// `execute_via_safe`, but an on-chain revert is an error.
-///
-/// The Safe reverts the outer transaction (GS013) when the inner call fails, so
-/// the receipt's status is the inner call's status. `execute_via_safe` returns
-/// the hash regardless, which is right for redemption, where the callers treat
-/// a landed transaction as settled and re-check the chain later; the collateral
-/// sweep moves the operator's cash and must not report a reverted wrap as a
-/// success.
-pub(crate) async fn execute_via_safe_confirmed<P: Provider + Clone>(
-    provider: P,
-    safe_address: Address,
-    eoa_address: Address,
-    target: Address,
-    calldata: Vec<u8>,
-) -> anyhow::Result<alloy::primitives::TxHash> {
-    let (hash, succeeded) = send_via_safe(provider, safe_address, eoa_address, target, calldata).await?;
-    if !succeeded {
-        anyhow::bail!("Safe transaction {} reverted on-chain", hash);
-    }
-    Ok(hash)
-}
-
-/// Submit one Safe `execTransaction` and wait for its receipt; returns the hash
-/// and whether the receipt reports success.
-async fn send_via_safe<P: Provider + Clone>(
-    provider: P,
-    safe_address: Address,
-    eoa_address: Address,
-    ctf_contract: Address,
-    calldata: Vec<u8>,
-) -> anyhow::Result<(alloy::primitives::TxHash, bool)> {
-    // Build the pre-approved owner signature (65 bytes).
-    let mut sig = Vec::with_capacity(65);
-    sig.extend_from_slice(&[0u8; 12]);           // left-pad address to 32 bytes
-    sig.extend_from_slice(eoa_address.as_slice()); // 20-byte EOA address
-    sig.extend_from_slice(&[0u8; 32]);           // s = 0
-    sig.push(0x01u8);                            // v = 1 (owner pre-approve)
-
-    let safe = IGnosisSafe::new(safe_address, provider);
-    let pending = safe
-        .execTransaction(
-            ctf_contract,
-            U256::ZERO,            // ETH value
-            Bytes::from(calldata), // inner calldata
-            0u8,                   // operation: CALL
-            U256::ZERO,            // safeTxGas
-            U256::ZERO,            // baseGas
-            U256::ZERO,            // gasPrice
-            Address::ZERO,         // gasToken
-            Address::ZERO,         // refundReceiver
-            Bytes::from(sig),      // packed signature
-        )
-        .send()
-        .await?;
-
-    let tx_hash = *pending.tx_hash();
-
-    // Hard 30s cap on receipt wait — Polygon block time is ~2s; 30s is generous.
-    // Without this the call can hang indefinitely if the RPC stalls post-submission,
-    // which blocks the entire tokio select! event loop.
-    let receipt = tokio::time::timeout(std::time::Duration::from_secs(30), pending.get_receipt())
-        .await
-        .map_err(|_| anyhow::anyhow!("execute_via_safe: get_receipt timed out (30s)"))?
-        .map_err(|e| anyhow::anyhow!("execute_via_safe: get_receipt error: {}", e))?;
-
-    Ok((tx_hash, receipt.status()))
-}
-
-/// Detect which collateral token a resolved condition's outcome tokens were minted with.
-///
-/// The ERC1155 position ID is `keccak256(collateralToken ++ collectionId)`, so a redeem
-/// call with the wrong collateral computes a different position ID, finds balance = 0,
-/// and the TX "succeeds" as a silent no-op (observed 2026-07-20: six pre-pUSD-migration
-/// positions "redeemed" with pUSD collateral, 0 tokens burned, then blacklisted forever).
-///
-/// We fetch the collection ID for the leg's index set via the CTF view function (it uses
-/// elliptic-curve math, so it can't be computed locally), then keccak-match the position's
-/// actual token ID against candidate collaterals.  Falls back to pUSD (the current
-/// default) if the RPC call fails or nothing matches.
-async fn detect_condition_collateral<P: Provider + Clone>(
-    provider: P,
-    condition_id: B256,
-    leg_token_id: U256,
-    leg_outcome_index: i32,
-) -> Address {
-    use alloy::primitives::keccak256;
-
-    let index_set = U256::from(1u64) << (leg_outcome_index as usize); // outcome 0 → 0b01, 1 → 0b10
-    let ctf = ICtfView::new(CTF_ADDRESS, provider);
-    let collection_id = match tokio_timeout(
-        std::time::Duration::from_secs(10),
-        ctf.getCollectionId(B256::ZERO, condition_id, index_set).call(),
-    ).await {
-        Ok(Ok(cid)) => cid,
-        Ok(Err(e)) => {
-            warn!("Auto-settle: getCollectionId failed for condition {} — assuming pUSD: {}", condition_id, e);
-            return PUSD_COLLATERAL;
-        }
-        Err(_) => {
-            warn!("Auto-settle: getCollectionId timed out for condition {} — assuming pUSD", condition_id);
-            return PUSD_COLLATERAL;
-        }
-    };
-
-    for collateral in [PUSD_COLLATERAL, USDCE_COLLATERAL] {
-        let mut buf = [0u8; 52];
-        buf[..20].copy_from_slice(collateral.as_slice());
-        buf[20..].copy_from_slice(collection_id.as_slice());
-        if U256::from_be_bytes(keccak256(buf).0) == leg_token_id {
-            return collateral;
-        }
-    }
-    warn!(
-        "Auto-settle: token {} of condition {} matches neither pUSD nor USDC.e position ID — assuming pUSD",
-        leg_token_id, condition_id
-    );
-    PUSD_COLLATERAL
-}
 
 /// Remove all positions for a market that has expired or is expiring within 60s
 /// from the map. Their rows stay: a real one for the chain reconciler, a
@@ -435,7 +295,7 @@ pub struct OrphanExit {
 
 pub async fn reconcile_orphaned_positions(
     positions: Arc<Mutex<PositionMap>>,
-    clob_client: &Arc<ClobClient<Authenticated<Normal>>>,
+    clob_client: &Arc<TradingClient>,
     phantom_cooldowns: &PhantomCooldowns,
     orphan_tombstones: &OrphanTombstones,
     tg_token: &str,
@@ -1157,223 +1017,399 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
 ///
 /// **IMPORTANT**: Requires POLYGON_RPC_URL set to a paid RPC (Alchemy / QuickNode / Infura).
 pub async fn auto_settle_closed_positions<P: Provider + Clone>(
-    wallet_provider: P,
-    safe_address: Address,
+    executor: Arc<WalletExecutor<P>>,
+    wallet_address: Address,
     eoa_address: Address,
 ) -> bool {
-    crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::Settlement);
-    // Avoid concurrent settlement scans/submits from multiple squadron tasks.
-    let _settle_guard = match AUTO_SETTLE_RUN_LOCK.try_lock() {
-        Ok(g) => g,
-        Err(_) => {
-            debug!("Auto-settle: another run is already in progress; skipping this cycle");
-            return false;
-        }
-    };
-
-    let positions = match tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        data_api::positions(safe_address),
-    )
-        .await
-    {
-        Ok(Ok(p)) => p,
-        Ok(Err(e)) => {
-            warn!("Auto-settle: Data API positions() error: {}", e);
-            return false;
-        }
-        Err(_) => {
-            warn!("Auto-settle: Data API positions() timed out (20s)");
-            return false;
-        }
-    };
-
-    let mut by_condition: HashMap<B256, Vec<_>> = HashMap::new();
-    for p in positions.into_iter().filter(|p| p.size > Decimal::ZERO) {
-        by_condition.entry(p.condition_id).or_default().push(p);
+    if executor.wallet().funder != wallet_address || executor.wallet().signer != eoa_address {
+        warn!("Auto-settle skipped: wallet identity mismatch");
+        return false;
     }
-
+    if crate::helpers::dynamic_config::ghosting_now()
+        || crate::helpers::dynamic_config::read_only_mode()
+    {
+        return false;
+    }
+    crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::Settlement);
+    let _guard = match AUTO_SETTLE_RUN_LOCK.try_lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let positions = match tokio_timeout(
+        std::time::Duration::from_secs(20),
+        data_api::positions(wallet_address),
+    )
+    .await
+    {
+        Ok(Ok(positions)) => positions,
+        _ => {
+            warn!("Auto-settle: position read failed; no submission");
+            return false;
+        }
+    };
+    let mut groups: HashMap<(data_api::PositionSystem, B256), Vec<data_api::Position>> =
+        HashMap::new();
+    for position in positions.into_iter().filter(|p| p.size > Decimal::ZERO) {
+        groups
+            .entry((position.position_system, position.condition_id))
+            .or_default()
+            .push(position);
+    }
     let mut settled_any = false;
-
-    for (condition_id, legs) in by_condition {
-        // ── Permanently-settled guard: skip if we already redeemed this condition ──
-        // After a successful redeemPositions TX the Data API can return the position
-        // as redeemable: true for many minutes (indexer lag).  Without this guard
-        // every settlement_ticker cycle would submit a new blockchain TX, burning
-        // gas and advancing the wallet nonce unnecessarily (observed 2026-05-21:
-        // 8 duplicate redeems of condition 0xd633214b within ~1 hour).
+    // A previous successful receipt can outlive the request or process that
+    // submitted it. Never create a new nonce before verifying that intent.
+    match executor.pending_operation().await {
+        Ok(Some((target, calldata, hash))) => {
+            let matched = pending_settlement_key(target, &calldata);
+            if let Err(error) = executor.confirm_effect(hash).await {
+                warn!(
+                    "Auto-settle: pending token effect is not verified: {}",
+                    error
+                );
+                return false;
+            }
+            if let Some(key) = matched {
+                if let Some(legs) = groups.get(&key) {
+                    if settlement_effect(executor.provider().clone(), wallet_address, legs).await {
+                        finish_settlement(key.1, legs).await;
+                        settled_any = true;
+                    }
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            warn!("Auto-settle: pending operation unresolved: {}", error);
+            return false;
+        }
+    }
+    for ((system, condition_id), legs) in groups {
+        if !legs.iter().any(|p| p.redeemable) {
+            continue;
+        }
+        if PERMANENTLY_SETTLED_CONDITIONS
+            .lock()
+            .await
+            .contains(&condition_id)
         {
-            if PERMANENTLY_SETTLED_CONDITIONS.lock().await.contains(&condition_id) {
+            continue;
+        }
+        if let Some(last) = FAILED_SETTLEMENT_CONDITIONS.lock().await.get(&condition_id) {
+            if (Utc::now() - *last).num_seconds() < SETTLEMENT_CONDITION_ERROR_COOLDOWN_SECS {
                 continue;
             }
         }
-        // ── Success cooldown: skip if we submitted successfully recently ────────
-        {
-            let recent = RECENT_SETTLEMENT_SUBMITS.lock().await;
-            if let Some(last_submit_at) = recent.get(&condition_id) {
-                if (Utc::now() - *last_submit_at).num_seconds() < SETTLEMENT_CONDITION_COOLDOWN_SECS {
-                    continue;
-                }
+        let calls = match settlement_calls(executor.as_ref(), system, condition_id, &legs).await {
+            Ok(calls) if !calls.is_empty() => calls,
+            Ok(_) => continue,
+            Err(error) => {
+                warn!("Auto-settle: route verification failed: {}", error);
+                continue;
             }
-        }
-        // ── Error cooldown: skip conditions that produced non-retryable errors ──
-        {
-            let failed = FAILED_SETTLEMENT_CONDITIONS.lock().await;
-            if let Some(failed_at) = failed.get(&condition_id) {
-                if (Utc::now() - *failed_at).num_seconds() < SETTLEMENT_CONDITION_ERROR_COOLDOWN_SECS {
-                    continue;
-                }
-            }
-        }
-
-        // Only settle conditions where at least one leg is flagged as redeemable.
-        // Merge-only conditions (active markets with both YES and NO) are intentionally
-        // skipped — trying to merge them causes GS013 reverts on NegRisk markets and
-        // wastes gas/event-loop time on non-resolved positions.
-        let has_redeemable = legs.iter().any(|p| p.redeemable);
-        if !has_redeemable {
-            continue;
-        }
-
-        let is_neg_risk = legs.iter().any(|p| p.negative_risk);
-
-        let mut outcome_units: BTreeMap<i32, u128> = BTreeMap::new();
-        for p in &legs {
-            let units = shares_to_base_units(p.size);
-            if units == 0 { continue; }
-            *outcome_units.entry(p.outcome_index).or_insert(0) += units;
-        }
-
-        let yes_units = *outcome_units.get(&0).unwrap_or(&0);
-        let no_units  = *outcome_units.get(&1).unwrap_or(&0);
-
-        if yes_units == 0 && no_units == 0 {
-            info!("Auto-settle: condition {} marked redeemable but zero units — skipping", condition_id);
-            continue;
-        }
-
-        info!(
-            "Auto-settle: attempting redeem for condition {} | YES: {} | NO: {} units | neg_risk={}",
-            condition_id, yes_units, no_units, is_neg_risk
-        );
-
-        if is_neg_risk {
-            // Neg-risk redemption via the NegRisk adapter.
-            let calldata = INegRiskDirect::redeemPositionsCall {
-                conditionId: condition_id,
-                amounts: vec![U256::from(yes_units), U256::from(no_units)],
-            }.abi_encode();
-
-            match execute_via_safe(
-                wallet_provider.clone(),
-                safe_address,
-                eoa_address,
-                NEG_RISK_ADAPTER_ADDRESS,
-                calldata,
-            ).await {
-                Ok(tx_hash) => {
-                    settled_any = true;
-                    RECENT_SETTLEMENT_SUBMITS.lock().await.insert(condition_id, Utc::now());
-                    PERMANENTLY_SETTLED_CONDITIONS.lock().await.insert(condition_id);
-                    info!("✅ Auto-settle: redeemed neg-risk condition {} (tx {})", condition_id, tx_hash);
-                    // Immediately purge open_positions DB rows for all legs in this condition
-                    // so they don't linger during Data API indexer lag after redemption.
-                    purge_settled_legs(&legs).await;
-                    // Record the settled arb trade so it appears in the Recent Trades card.
-                    record_settled_arb_trade(&legs).await;
-                }
-                Err(e) => {
-                    warn!("Auto-settle: neg-risk redeem failed for condition {}: {}", condition_id, e);
-                    if is_retryable_settlement_submit_error(&e) {
-                        debug!(
-                            "Auto-settle: transient submit error for condition {} (no error cooldown): {}",
-                            condition_id,
-                            e
-                        );
-                    } else {
-                        FAILED_SETTLEMENT_CONDITIONS.lock().await.insert(condition_id, Utc::now());
-                    }
-                }
-            }
-        } else {
-            // Standard binary market redemption via CTF.
-            // Detect the collateral from a held leg's actual token ID: pre-pUSD-migration
-            // positions were minted with USDC.e, and redeeming with the wrong collateral
-            // silently no-ops (see PUSD_COLLATERAL doc).
-            let collateral = match legs.iter().find(|p| shares_to_base_units(p.size) > 0) {
-                Some(leg) => detect_condition_collateral(
-                    wallet_provider.clone(),
-                    condition_id,
-                    leg.asset,
-                    leg.outcome_index,
-                ).await,
-                None => PUSD_COLLATERAL, // unreachable: zero-units guard above
+        };
+        let mut failed = false;
+        for (target, calldata, token_ids) in calls {
+            let effect = ExecutionEffect::TokenBalancesZero {
+                contract: token_contract(system),
+                token_ids: token_ids.clone(),
             };
-            if collateral != PUSD_COLLATERAL {
-                info!("Auto-settle: condition {} uses legacy USDC.e collateral", condition_id);
-            }
-            let calldata = ICtfDirect::redeemPositionsCall {
-                collateralToken: collateral,
-                parentCollectionId: B256::ZERO,
-                conditionId: condition_id,
-                indexSets: vec![U256::from(1u64), U256::from(2u64)],
-            }.abi_encode();
-
-            match execute_via_safe(
-                wallet_provider.clone(),
-                safe_address,
-                eoa_address,
-                CTF_ADDRESS,
-                calldata,
-            ).await {
-                Ok(tx_hash) => {
-                    settled_any = true;
-                    RECENT_SETTLEMENT_SUBMITS.lock().await.insert(condition_id, Utc::now());
-                    PERMANENTLY_SETTLED_CONDITIONS.lock().await.insert(condition_id);
-                    info!(
-                        "✅ Auto-settle: redeemed condition {} (tx {}) — YES:{} NO:{} units",
-                        condition_id, tx_hash, yes_units, no_units
-                    );
-                    // Immediately purge open_positions DB rows for all legs in this condition
-                    // so they don't linger during Data API indexer lag after redemption.
-                    purge_settled_legs(&legs).await;
-                    // Record the settled arb trade so it appears in the Recent Trades card.
-                    record_settled_arb_trade(&legs).await;
-                }
-                Err(e) => {
-                    warn!("Auto-settle: redeem failed for condition {}: {}", condition_id, e);
-                    if is_retryable_settlement_submit_error(&e) {
-                        debug!(
-                            "Auto-settle: transient submit error for condition {} (no error cooldown): {}",
-                            condition_id,
-                            e
-                        );
-                    } else {
-                        FAILED_SETTLEMENT_CONDITIONS.lock().await.insert(condition_id, Utc::now());
+            match executor.execute_with_effect(target, calldata, effect).await {
+                Ok(hash) => {
+                    let proof_legs: Vec<_> = legs
+                        .iter()
+                        .filter(|leg| token_ids.contains(&leg.asset))
+                        .cloned()
+                        .collect();
+                    if !settlement_effect(executor.provider().clone(), wallet_address, &proof_legs)
+                        .await
+                    {
+                        warn!("Auto-settle: tx {} confirmed but token redemption is unverified; intent retained", hash);
+                        failed = true;
+                        break;
+                    }
+                    if let Err(error) = executor.confirm_effect(hash).await {
+                        warn!("Auto-settle: could not persist verified effect: {}", error);
+                        failed = true;
+                        break;
                     }
                 }
+                Err(error) => {
+                    warn!("Auto-settle: execution unresolved or failed: {}", error);
+                    FAILED_SETTLEMENT_CONDITIONS
+                        .lock()
+                        .await
+                        .insert(condition_id, Utc::now());
+                    failed = true;
+                    break;
+                }
             }
+        }
+        if !failed && settlement_effect(executor.provider().clone(), wallet_address, &legs).await {
+            finish_settlement(condition_id, &legs).await;
+            settled_any = true;
         }
     }
-
     settled_any
 }
 
-/// Record a combined settlement trade for an ArbitrageStrategy pair so it appears
-/// in the Recent Trades card.
-///
-/// Arb always holds equal YES + NO shares and collects $1.00 per pair at settlement
-/// regardless of which side wins.  We therefore record ONE combined row per condition:
-///
-///   entry_price = YES_avg_price + NO_avg_price  (total cost per YES+NO pair, in $)
-///   exit_price  = $1.00                          (guaranteed CTF payout per pair)
-///   shares      = min(YES_size, NO_size)          (number of complete pairs)
-///   pnl         = (1.00 − entry_price) × shares
-///   side        = "YES"                           (renders green in the UI)
-///   reason      = "Settlement (YES+NO → $1.00)"
-///
-/// If the condition has only one leg (e.g. an orphaned single-leg position that was
-/// adopted back in), we record it as a single-leg settlement with appropriate PNL.
+const CTF_COLLATERAL_ADAPTER: Address =
+    alloy_address!("0xAdA100Db00Ca00073811820692005400218FcE1f");
+const NEG_RISK_COLLATERAL_ADAPTER: Address =
+    alloy_address!("0xadA2005600Dec949baf300f4C6120000bDB6eAab");
+const POSITION_MANAGER: Address = alloy_address!("0x006F54F7f9A22e0000CC2AB60031000000ae9fEF");
+const PROTOCOL_ROUTER: Address = alloy_address!("0x12121212006e4CD160D18e3f00711DA5c3372600");
+
+type SettlementCall = (Address, Vec<u8>, Vec<U256>);
+
+fn token_contract(system: data_api::PositionSystem) -> Address {
+    match system {
+        data_api::PositionSystem::Ctf => CTF_ADDRESS,
+        data_api::PositionSystem::ProtocolV2 => POSITION_MANAGER,
+    }
+}
+
+async fn held_units<P: Provider + Clone>(
+    provider: P,
+    system: data_api::PositionSystem,
+    wallet: Address,
+    token: U256,
+) -> anyhow::Result<U256> {
+    let contract = ISettlementTokens::new(token_contract(system), provider);
+    tokio_timeout(
+        std::time::Duration::from_secs(10),
+        contract.balanceOf(wallet, token).call(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("settlement balance read timed out"))?
+    .map_err(|_| anyhow::anyhow!("settlement balance read failed"))
+}
+
+async fn settlement_effect<P: Provider + Clone>(
+    provider: P,
+    wallet: Address,
+    legs: &[data_api::Position],
+) -> bool {
+    if legs.is_empty() {
+        return false;
+    }
+    for leg in legs {
+        match held_units(provider.clone(), leg.position_system, wallet, leg.asset).await {
+            Ok(balance) if balance.is_zero() => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+async fn finish_settlement(condition: B256, legs: &[data_api::Position]) {
+    RECENT_SETTLEMENT_SUBMITS
+        .lock()
+        .await
+        .insert(condition, Utc::now());
+    PERMANENTLY_SETTLED_CONDITIONS
+        .lock()
+        .await
+        .insert(condition);
+    purge_settled_legs(legs).await;
+    record_settled_arb_trade(legs).await;
+    info!(
+        "Auto-settle: condition {} redeemed; token effect verified",
+        condition
+    );
+}
+
+async fn settlement_calls<P: Provider + Clone>(
+    executor: &WalletExecutor<P>,
+    system: data_api::PositionSystem,
+    condition: B256,
+    legs: &[data_api::Position],
+) -> anyhow::Result<Vec<SettlementCall>> {
+    use alloy::primitives::keccak256;
+    use anyhow::ensure;
+    ensure!(!legs.is_empty(), "settlement has no legs");
+    ensure!(
+        legs.iter().all(|p| p.position_system == system
+            && p.condition_id == condition
+            && matches!(p.outcome_index, 0 | 1)),
+        "settlement metadata conflicts"
+    );
+    let provider = executor.provider().clone();
+    let wallet = executor.wallet();
+    let neg_risk = legs[0].negative_risk;
+    ensure!(
+        legs.iter().all(|p| p.negative_risk == neg_risk),
+        "conflicting neg-risk metadata"
+    );
+    let mut held = Vec::new();
+    let mut collateral = None;
+    for leg in legs {
+        if system == data_api::PositionSystem::Ctf {
+            let ctf = ICtfView::new(CTF_ADDRESS, provider.clone());
+            let collection = tokio_timeout(
+                std::time::Duration::from_secs(10),
+                ctf.getCollectionId(B256::ZERO, condition, U256::from(1u64 << leg.outcome_index))
+                    .call(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("CTF collection read timed out"))?
+            .map_err(|_| anyhow::anyhow!("CTF collection read failed"))?;
+            let matched = [PUSD_COLLATERAL, USDCE_COLLATERAL]
+                .into_iter()
+                .find(|candidate| {
+                    let mut bytes = candidate.as_slice().to_vec();
+                    bytes.extend_from_slice(collection.as_slice());
+                    U256::from_be_bytes(keccak256(bytes).0) == leg.asset
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("token ID does not match a supported CTF collateral")
+                })?;
+            ensure!(
+                collateral.is_none_or(|prior| prior == matched),
+                "mixed collateral in settlement condition"
+            );
+            collateral = Some(matched);
+        } else {
+            let encoded = leg.asset.to_be_bytes::<32>();
+            ensure!(
+                encoded[..31] == condition.as_slice()[..31]
+                    && encoded[31] == leg.outcome_index as u8,
+                "Protocol V2 token metadata mismatch"
+            );
+        }
+        let units = held_units(provider.clone(), system, wallet.funder, leg.asset).await?;
+        // The supplied token must belong to one ledger only.
+        let other = match system {
+            data_api::PositionSystem::Ctf => data_api::PositionSystem::ProtocolV2,
+            _ => data_api::PositionSystem::Ctf,
+        };
+        ensure!(
+            held_units(provider.clone(), other, wallet.funder, leg.asset)
+                .await?
+                .is_zero(),
+            "token held in multiple position systems"
+        );
+        if !units.is_zero() {
+            held.push((leg.asset, leg.outcome_index, units));
+        }
+    }
+    if held.is_empty() {
+        return Ok(Vec::new());
+    }
+    let target = match system {
+        data_api::PositionSystem::ProtocolV2 => PROTOCOL_ROUTER,
+        data_api::PositionSystem::Ctf if wallet.wallet_type == WalletType::Poly1271 => {
+            ensure!(
+                collateral == Some(PUSD_COLLATERAL),
+                "Deposit Wallet CTF settlement requires verified pUSD collateral"
+            );
+            if neg_risk {
+                NEG_RISK_COLLATERAL_ADAPTER
+            } else {
+                CTF_COLLATERAL_ADAPTER
+            }
+        }
+        data_api::PositionSystem::Ctf => {
+            if neg_risk {
+                NEG_RISK_ADAPTER_ADDRESS
+            } else {
+                CTF_ADDRESS
+            }
+        }
+    };
+    if target != CTF_ADDRESS
+        && !(wallet.wallet_type == WalletType::GnosisSafe
+            && system == data_api::PositionSystem::Ctf
+            && neg_risk)
+    {
+        let tokens = ISettlementTokens::new(token_contract(system), provider.clone());
+        let approved = tokio_timeout(
+            std::time::Duration::from_secs(10),
+            tokens.isApprovedForAll(wallet.funder, target).call(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("settlement approval read timed out"))?
+        .map_err(|_| anyhow::anyhow!("settlement approval read failed"))?;
+        ensure!(
+            approved,
+            "settlement contract lacks required ERC1155 operator approval"
+        );
+    }
+    if system == data_api::PositionSystem::ProtocolV2 {
+        return Ok(held
+            .into_iter()
+            .map(|(token, outcome, units)| {
+                let mut condition31 = [0u8; 31];
+                condition31.copy_from_slice(&condition.as_slice()[..31]);
+                (
+                    target,
+                    IProtocolRouter::redeemCall {
+                        conditionId: condition31.into(),
+                        outcomeIndex: U256::from(outcome as u64),
+                        amount: units,
+                    }
+                    .abi_encode(),
+                    vec![token],
+                )
+            })
+            .collect());
+    }
+    let data = if wallet.wallet_type == WalletType::GnosisSafe && neg_risk {
+        let mut amounts = vec![U256::ZERO; 2];
+        for (_, outcome, units) in &held {
+            amounts[*outcome as usize] += *units;
+        }
+        INegRiskDirect::redeemPositionsCall {
+            conditionId: condition,
+            amounts,
+        }
+        .abi_encode()
+    } else {
+        ICtfDirect::redeemPositionsCall {
+            collateralToken: collateral.unwrap(),
+            parentCollectionId: B256::ZERO,
+            conditionId: condition,
+            indexSets: vec![U256::from(1), U256::from(2)],
+        }
+        .abi_encode()
+    };
+    Ok(vec![(
+        target,
+        data,
+        held.into_iter().map(|(token, _, _)| token).collect(),
+    )])
+}
+
+fn pending_settlement_key(
+    target: Address,
+    data: &[u8],
+) -> Option<(data_api::PositionSystem, B256)> {
+    if target == PROTOCOL_ROUTER {
+        let call = IProtocolRouter::redeemCall::abi_decode(data).ok()?;
+        let mut condition = [0u8; 32];
+        condition[..31].copy_from_slice(call.conditionId.as_slice());
+        Some((data_api::PositionSystem::ProtocolV2, B256::from(condition)))
+    } else if matches!(
+        target,
+        CTF_ADDRESS | CTF_COLLATERAL_ADAPTER | NEG_RISK_COLLATERAL_ADAPTER
+    ) {
+        Some((
+            data_api::PositionSystem::Ctf,
+            ICtfDirect::redeemPositionsCall::abi_decode(data)
+                .ok()?
+                .conditionId,
+        ))
+    } else if target == NEG_RISK_ADAPTER_ADDRESS {
+        Some((
+            data_api::PositionSystem::Ctf,
+            INegRiskDirect::redeemPositionsCall::abi_decode(data)
+                .ok()?
+                .conditionId,
+        ))
+    } else {
+        None
+    }
+}
+
 async fn record_settled_arb_trade(
     legs: &[data_api::Position],
 ) {
@@ -2040,6 +2076,254 @@ mod settlement_evidence_tests {
         assert_eq!(infer_asset_from_title("Solana Up or Down on September 17?"), Some("sol"));
     }
 
+}
+
+#[cfg(test)]
+mod settlement_routing_tests {
+    use super::*;
+    use alloy::primitives::keccak256;
+    use alloy::signers::local::LocalSigner;
+    use axum::{extract::State, routing::post, Json, Router};
+
+    #[derive(Clone)]
+    struct Views {
+        system: data_api::PositionSystem,
+        approved: bool,
+        wallet: Address,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn respond(
+        State(views): State<Views>,
+        Json(request): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        assert_eq!(
+            request["method"], "eth_call",
+            "routing must never dispatch a transaction"
+        );
+        views
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let call = &request["params"][0];
+        let target = call["to"].as_str().unwrap().parse::<Address>().unwrap();
+        let input = call
+            .get("input")
+            .or_else(|| call.get("data"))
+            .unwrap()
+            .as_str()
+            .unwrap();
+        let input = alloy::primitives::hex::decode(input.trim_start_matches("0x")).unwrap();
+        let result = if input.starts_with(&ICtfView::getCollectionIdCall::SELECTOR) {
+            assert_eq!(target, CTF_ADDRESS);
+            let call = ICtfView::getCollectionIdCall::abi_decode(&input).unwrap();
+            U256::from_be_bytes(B256::repeat_byte(call.indexSet.to::<u8>()).0)
+        } else if input.starts_with(&ISettlementTokens::balanceOfCall::SELECTOR) {
+            let call = ISettlementTokens::balanceOfCall::abi_decode(&input).unwrap();
+            assert_eq!(call.account, views.wallet);
+            if target == token_contract(views.system) {
+                U256::from(2_000_000)
+            } else {
+                U256::ZERO
+            }
+        } else {
+            assert!(input.starts_with(&ISettlementTokens::isApprovedForAllCall::SELECTOR));
+            let call = ISettlementTokens::isApprovedForAllCall::abi_decode(&input).unwrap();
+            assert_eq!(call.account, views.wallet);
+            U256::from(u8::from(views.approved))
+        };
+        Json(
+            serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":format!("0x{result:064x}")}),
+        )
+    }
+
+    struct Fixture<P> {
+        executor: WalletExecutor<P>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        server: tokio::task::JoinHandle<()>,
+    }
+    impl<P> Drop for Fixture<P> {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    async fn fixture(
+        wallet_type: WalletType,
+        system: data_api::PositionSystem,
+        approved: bool,
+    ) -> Fixture<impl Provider + Clone> {
+        let signer = LocalSigner::from_slice(&[1u8; 32]).unwrap();
+        let wallet = crate::venues::intl::wallet::WalletConfig {
+            wallet_type,
+            signer: signer.address(),
+            funder: alloy_address!("2222222222222222222222222222222222222222"),
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = Router::new().route("/", post(respond)).with_state(Views {
+            system,
+            approved,
+            wallet: wallet.funder,
+            calls: Arc::clone(&calls),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = alloy::providers::ProviderBuilder::new().connect_http(host.parse().unwrap());
+        Fixture {
+            executor: WalletExecutor::for_read_tests(provider, signer, wallet),
+            calls,
+            server,
+        }
+    }
+
+    fn position(
+        system: data_api::PositionSystem,
+        outcome: i32,
+        neg_risk: bool,
+    ) -> data_api::Position {
+        let condition_id = if system == data_api::PositionSystem::ProtocolV2 {
+            let mut bytes = [0x11; 32];
+            bytes[31] = 0;
+            B256::from(bytes)
+        } else {
+            B256::repeat_byte(0x11)
+        };
+        let asset = if system == data_api::PositionSystem::Ctf {
+            let mut bytes = PUSD_COLLATERAL.as_slice().to_vec();
+            bytes.extend_from_slice(B256::repeat_byte((outcome + 1) as u8).as_slice());
+            U256::from_be_bytes(keccak256(bytes).0)
+        } else {
+            let mut bytes = condition_id.0;
+            bytes[31] = outcome as u8;
+            U256::from_be_bytes(bytes)
+        };
+        data_api::Position {
+            asset,
+            condition_id,
+            position_system: system,
+            size: Decimal::from(2),
+            avg_price: Decimal::new(5, 1),
+            current_value: Decimal::from(2),
+            cur_price: Decimal::ONE,
+            redeemable: true,
+            negative_risk: neg_risk,
+            title: "Synthetic settlement".into(),
+            outcome: outcome.to_string(),
+            outcome_index: outcome,
+        }
+    }
+
+    #[tokio::test]
+    async fn ctf_routes_preserve_safe_abi_and_select_deposit_collateral_adapters() {
+        for wallet_type in [WalletType::GnosisSafe, WalletType::Poly1271] {
+            for neg_risk in [false, true] {
+                let fixture = fixture(wallet_type, data_api::PositionSystem::Ctf, true).await;
+                let legs = vec![
+                    position(data_api::PositionSystem::Ctf, 0, neg_risk),
+                    position(data_api::PositionSystem::Ctf, 1, neg_risk),
+                ];
+                let calls = settlement_calls(
+                    &fixture.executor,
+                    data_api::PositionSystem::Ctf,
+                    legs[0].condition_id,
+                    &legs,
+                )
+                .await
+                .unwrap();
+                assert_eq!(calls.len(), 1);
+                let (target, data, tokens) = &calls[0];
+                assert_eq!(
+                    tokens,
+                    &legs.iter().map(|leg| leg.asset).collect::<Vec<_>>()
+                );
+                if wallet_type == WalletType::GnosisSafe && neg_risk {
+                    assert_eq!(*target, NEG_RISK_ADAPTER_ADDRESS);
+                    let call = INegRiskDirect::redeemPositionsCall::abi_decode(data).unwrap();
+                    assert_eq!(call.conditionId, legs[0].condition_id);
+                    assert_eq!(call.amounts, vec![U256::from(2_000_000); 2]);
+                } else {
+                    assert_eq!(
+                        *target,
+                        match (wallet_type, neg_risk) {
+                            (WalletType::GnosisSafe, _) => CTF_ADDRESS,
+                            (_, false) => CTF_COLLATERAL_ADAPTER,
+                            (_, true) => NEG_RISK_COLLATERAL_ADAPTER,
+                        }
+                    );
+                    let call = ICtfDirect::redeemPositionsCall::abi_decode(data).unwrap();
+                    assert_eq!(call.collateralToken, PUSD_COLLATERAL);
+                    assert_eq!(call.parentCollectionId, B256::ZERO);
+                    assert_eq!(call.conditionId, legs[0].condition_id);
+                    assert_eq!(call.indexSets, vec![U256::from(1), U256::from(2)]);
+                }
+                assert!(fixture.calls.load(std::sync::atomic::Ordering::Relaxed) > 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn protocol_v2_routes_each_outcome_through_the_router() {
+        for wallet_type in [WalletType::GnosisSafe, WalletType::Poly1271] {
+            let fixture = fixture(wallet_type, data_api::PositionSystem::ProtocolV2, true).await;
+            let legs = vec![
+                position(data_api::PositionSystem::ProtocolV2, 0, false),
+                position(data_api::PositionSystem::ProtocolV2, 1, false),
+            ];
+            let calls = settlement_calls(
+                &fixture.executor,
+                data_api::PositionSystem::ProtocolV2,
+                legs[0].condition_id,
+                &legs,
+            )
+            .await
+            .unwrap();
+            assert_eq!(calls.len(), 2);
+            for ((target, data, tokens), leg) in calls.iter().zip(&legs) {
+                assert_eq!(*target, PROTOCOL_ROUTER);
+                let call = IProtocolRouter::redeemCall::abi_decode(data).unwrap();
+                assert_eq!(
+                    call.conditionId.as_slice(),
+                    &leg.condition_id.as_slice()[..31]
+                );
+                assert_eq!(call.outcomeIndex, U256::from(leg.outcome_index as u64));
+                assert_eq!(call.amount, U256::from(2_000_000));
+                assert_eq!(tokens, &vec![leg.asset]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_metadata_and_missing_approvals_never_produce_executable_calls() {
+        for system in [
+            data_api::PositionSystem::Ctf,
+            data_api::PositionSystem::ProtocolV2,
+        ] {
+            let allowed = fixture(WalletType::Poly1271, system, true).await;
+            let mut leg = position(system, 0, false);
+            leg.asset = U256::ZERO;
+            assert!(
+                settlement_calls(&allowed.executor, system, leg.condition_id, &[leg])
+                    .await
+                    .is_err()
+            );
+            let mut leg = position(system, 0, false);
+            leg.outcome_index = 2;
+            assert!(
+                settlement_calls(&allowed.executor, system, leg.condition_id, &[leg])
+                    .await
+                    .is_err()
+            );
+            let fixture = fixture(WalletType::Poly1271, system, false).await;
+            let leg = position(system, 0, false);
+            assert!(
+                settlement_calls(&fixture.executor, system, leg.condition_id, &[leg])
+                    .await
+                    .is_err()
+            );
+        }
+    }
 }
 
 // The simulated-settlement pieces are venue-neutral and live in

@@ -58,7 +58,8 @@ use crate::venues::core::{
 /// gone, a sell that matched nothing is retried by its exit arm, and an
 /// acknowledgment with no id cannot be cancelled or tracked, so it is reported
 /// the old way and left to the account sweep [B74].
-pub fn acknowledged_resting(side: Side, tif: TimeInForce, filled: Decimal, order_id: &OrderId) -> bool {
+pub fn acknowledged_resting(side: Side, tif: TimeInForce, filled: Decimal, order_id: &OrderId,
+) -> bool {
     matches!(side, Side::Buy)
         && matches!(tif, TimeInForce::Gtc | TimeInForce::Gtd)
         && filled <= Decimal::ZERO
@@ -70,6 +71,8 @@ pub fn acknowledged_resting(side: Side, tif: TimeInForce, filled: Decimal, order
 /// itself has no DB access and stays venue-neutral.
 #[derive(Debug, Clone)]
 pub struct FlattenedLeg {
+    pub order_id:OrderId,
+    pub exit_fee:Decimal,
     pub strategy:    String,
     pub market_name: String,
     pub shares:      Decimal,
@@ -80,6 +83,10 @@ pub struct FlattenedLeg {
     /// venue-neutral and has no YES/NO mapping).
     pub token_id:    MarketId,
 }
+
+/// A matched re-hedge awaiting checked durable position bookkeeping.
+#[derive(Clone,Debug)]
+pub struct RehedgedLeg {pub fill:Fill,pub strategy:String,pub market_name:String,pub pair_market:MarketId}
 
 /// Tunables for the lifecycle engine. Each venue/caller supplies its own window
 /// sizes so intl (slow daily/window markets) and US (fast custodial fills) can
@@ -206,7 +213,9 @@ pub const RESTING_QUOTE_STALE_SECS: u64 = 1800;
 /// Polymarket International already rested it for 30 minutes.
 pub fn pair_leg_stale_secs(strategy: &str, venue_stale_secs: u64) -> u64 {
     match crate::state::lone_leg_policy(strategy) {
-        crate::state::LoneLegPolicy::HoldAndManage => venue_stale_secs.max(RESTING_QUOTE_STALE_SECS),
+        crate::state::LoneLegPolicy::HoldAndManage => {
+            venue_stale_secs.max(RESTING_QUOTE_STALE_SECS)
+        }
         crate::state::LoneLegPolicy::Repair => venue_stale_secs,
     }
 }
@@ -234,6 +243,7 @@ pub struct ReleasedQuote {
 /// what actually traded rather than what was asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfirmedFill {
+    pub order_id:OrderId,
     pub strategy: String,
     pub market: MarketId,
     pub filled: Decimal,
@@ -266,6 +276,7 @@ pub struct OrderLifecycle {
     released: Mutex<Vec<ReleasedQuote>>,
     /// Tracked orders the fill feed confirmed since the caller last drained them.
     confirmed: Mutex<Vec<ConfirmedFill>>,
+    rehedged:Mutex<Vec<RehedgedLeg>>,
 }
 
 /// The fill listener's task, aborted when dropped. A market loop that returns
@@ -330,6 +341,7 @@ impl OrderLifecycle {
             killed_flattens: Mutex::new(HashSet::new()),
             released: Mutex::new(Vec::new()),
             confirmed: Mutex::new(Vec::new()),
+            rehedged:Mutex::new(Vec::new()),
         }
     }
 
@@ -372,7 +384,33 @@ impl OrderLifecycle {
         tif: TimeInForce,
         pair_market: Option<MarketId>,
     ) {
-        self.track_with_stale(fill, strategy, tif, pair_market, self.cfg.stale_order_secs, false).await;
+        self.track_with_stale(fill, strategy, tif, pair_market, self.cfg.stale_order_secs, false,
+        )
+        .await;
+    }
+
+    /// Track actual fills separately from the original signed quantity. Even
+    /// an unfilled acknowledgement has a working order that must be reconciled
+    /// by its own ID rather than by another strategy's holdings.
+    pub async fn track_with_size(
+        &self,
+        fill: &Fill,
+        placed_quantity: Decimal,
+        strategy: &str,
+        tif: TimeInForce,
+        pair_market: Option<MarketId>,
+    ) {
+        if placed_quantity <= Decimal::ZERO {
+            return;
+        }
+        let mut tracking = fill.clone();
+        tracking.filled = placed_quantity;
+        let stale = if pair_market.is_some() {
+            pair_leg_stale_secs(strategy, self.cfg.stale_order_secs)
+        } else {
+            RESTING_QUOTE_STALE_SECS
+        };
+        self.track_with_stale(&tracking, strategy, tif, pair_market, stale, true).await;
     }
 
     /// Register a resting quote the venue acknowledged UNFILLED (`filled` on
@@ -387,7 +425,8 @@ impl OrderLifecycle {
         tif: TimeInForce,
         pair_market: Option<MarketId>,
     ) {
-        self.track_with_stale(fill, strategy, tif, pair_market, RESTING_QUOTE_STALE_SECS, true).await;
+        self.track_with_stale(fill, strategy, tif, pair_market, RESTING_QUOTE_STALE_SECS, true,
+        ).await;
     }
 
     /// Register one leg of a paired entry (arbitrage, Time Decay) that the
@@ -418,7 +457,11 @@ impl OrderLifecycle {
         if !matches!(tif, TimeInForce::Gtc | TimeInForce::Gtd) {
             return;
         }
-        self.tracked.lock().await.push(TrackedLeg {
+        let mut tracked = self.tracked.lock().await;
+        if tracked.iter().any(|order| order.id == fill.order_id) {
+            return;
+        }
+        tracked.push(TrackedLeg {
             id: fill.order_id.clone(),
             market: fill.market.clone(),
             strategy: strategy.to_string(),
@@ -432,6 +475,26 @@ impl OrderLifecycle {
             pair_market,
         });
     }
+
+    /// Reconcile a durable CLOB receipt only against an order this lifecycle
+    /// already owns. Unknown orders must remain quarantined at the venue.
+    pub async fn confirm_recovered_fill(
+        &self,
+        positions: &Arc<Mutex<PositionMap>>,
+        event: &FillEvent,
+    ) -> bool {
+        if self.tracked_owner(&event.order_id).await.is_none() {
+            return false;
+        }
+        self.confirm_on_fill(positions, event).await;
+        true
+    }
+
+    pub async fn take_rehedged(&self)->Vec<RehedgedLeg>{std::mem::take(&mut*self.rehedged.lock().await)}
+    pub async fn retry_rehedged(&self,leg:RehedgedLeg){self.rehedged.lock().await.push(leg);}
+
+    /// A caller durably reconciled a terminal order by its own identity.
+    pub async fn finish_recovered_order(&self,id:&OrderId){self.tracked.lock().await.retain(|order|&order.id!=id);}
 
     /// Ids of every tracked order, for a loop that has to leave a market with
     /// orders it could not settle and must say so.
@@ -475,11 +538,13 @@ impl OrderLifecycle {
     /// cumulative count, never above what was placed, whether the guard was
     /// unconfirmed (a quote carrying the size placed) or already confirmed (a
     /// quote lifted in part, then in more).
-    async fn size_and_confirm(&self, positions: &Arc<Mutex<PositionMap>>, ord: &TrackedLeg, traded: Decimal, price: Decimal) -> bool {
+    async fn size_and_confirm(&self, positions: &Arc<Mutex<PositionMap>>, ord: &TrackedLeg, traded: Decimal, price: Decimal,
+    ) -> bool {
         let mut filled = if traded > Decimal::ZERO { traded.min(ord.quantity) } else { ord.quantity };
         let found = {
             let mut map = positions.lock().await;
-            match map.get_mut(&PositionKey::new(&self.squadron_id, &ord.strategy, ord.market.clone())).filter(|p| owns_guard(ord, p)) {
+            match map.get_mut(&PositionKey::new(&self.squadron_id, &ord.strategy, ord.market.clone(),
+                )).filter(|p| owns_guard(ord, p)) {
                 Some(p) => {
                     if p.fill_confirmed_at.is_none() {
                         p.shares = filled;
@@ -504,6 +569,7 @@ impl OrderLifecycle {
         // land on whatever row that strategy writes on the leg next.
         if found {
             self.confirmed.lock().await.push(ConfirmedFill {
+                order_id:ord.id.clone(),
                 strategy: ord.strategy.clone(), market: ord.market.clone(), filled, price,
             });
         }
@@ -513,7 +579,8 @@ impl OrderLifecycle {
     /// Release a quote that never filled: its unconfirmed guard leaves the map
     /// and the caller is told to close its row. A confirmed guard is a position
     /// and is left alone.
-    async fn release_quote(&self, positions: &Arc<Mutex<PositionMap>>, ord: &TrackedLeg, why: &str) -> bool {
+    async fn release_quote(&self, positions: &Arc<Mutex<PositionMap>>, ord: &TrackedLeg, why: &str,
+    ) -> bool {
         // Check and remove under one lock: a fill event confirming the guard
         // between the two would otherwise lose a position.
         let removed = {
@@ -525,7 +592,8 @@ impl OrderLifecycle {
             return false;
         }
         info!("🧹 [{}] quote {} on {} released — {why}", ord.strategy, ord.id, ord.market);
-        self.released.lock().await.push(ReleasedQuote { strategy: ord.strategy.clone(), market: ord.market.clone() });
+        self.released.lock().await.push(ReleasedQuote { strategy: ord.strategy.clone(), market: ord.market.clone(),
+        });
         true
     }
 
@@ -533,7 +601,8 @@ impl OrderLifecycle {
     /// it is gone, or the call failed): ask the order. Traded contracts confirm
     /// and size the guard; nothing traded releases it (the order was already
     /// gone); no answer leaves it tracked and working for the next attempt.
-    async fn settle_refused_cancel<V: Execution + ?Sized>(&self, venue: &V, positions: &Arc<Mutex<PositionMap>>, ord: &TrackedLeg, refusal: &str) -> Option<CancelOutcome> {
+    async fn settle_refused_cancel<V: Execution + ?Sized>(&self, venue: &V, positions: &Arc<Mutex<PositionMap>>, ord: &TrackedLeg, refusal: &str,
+    ) -> Option<CancelOutcome> {
         match venue.order_state(&ord.id).await {
             // Still on the book: the cancel never landed (a timeout, a rate
             // limit, a routing miss). The order works on, tracked, and the
@@ -552,7 +621,9 @@ impl OrderLifecycle {
                         // the venue says it no longer works.
                         gone.then_some(CancelOutcome::Traded)
                     }
-                    Some(_) if gone => Some(if self.release_quote(positions, ord, "cancel refused and nothing traded (already gone)").await { CancelOutcome::Released } else { CancelOutcome::Traded }),
+                    Some(_) if gone => Some(if self.release_quote(positions, ord, "cancel refused and nothing traded (already gone)",
+                            ).await { CancelOutcome::Released } else { CancelOutcome::Traded },
+                    ),
                     _ => {
                         // Done at the venue but with no stated count: no longer
                         // working, so it must not block a quote or an exit; the
@@ -576,7 +647,8 @@ impl OrderLifecycle {
     /// (or a venue that does not report single orders) releases it; a failed
     /// read settles nothing, and the caller keeps the order tracked for the
     /// next reconcile pass, where an unconfirmed tracked guard is inert.
-    async fn settle_cancel<V: Execution + ?Sized>(&self, venue: &V, positions: &Arc<Mutex<PositionMap>>, ord: &TrackedLeg, why: &str) -> CancelOutcome {
+    async fn settle_cancel<V: Execution + ?Sized>(&self, venue: &V, positions: &Arc<Mutex<PositionMap>>, ord: &TrackedLeg, why: &str,
+    ) -> CancelOutcome {
         match venue.order_state(&ord.id).await {
             Ok(Some(OrderState { filled: Some(traded), .. })) if traded > Decimal::ZERO => {
                 info!("[{}] order {} on {} had traded {traded} of {} before the cancel — kept as a position", ord.strategy, ord.id, ord.market, ord.quantity);
@@ -769,7 +841,8 @@ impl OrderLifecycle {
                             if let Err(e) = other { warn!("[{}] could not read cancelled order {} ({}): {e}", ord.strategy, ord.id, ord.market); }
                             let since = *ord.missing_since.get_or_insert_with(Instant::now);
                             if since.elapsed().as_secs() >= VANISHED_QUOTE_GRACE_SECS {
-                                if !self.release_quote(positions, &ord, "cancelled; the venue never said what traded").await {
+                                if !self.release_quote(positions, &ord, "cancelled; the venue never said what traded",
+                                    ).await {
                                     warn!("[{}] cancelled order {} ({}) never answered about its fill — its confirmed guard is kept as sized and the order forgotten", ord.strategy, ord.id, ord.market);
                                 }
                             } else {
@@ -850,7 +923,8 @@ impl OrderLifecycle {
                         Ok(Some(OrderState { filled: Some(traded), .. })) if traded > Decimal::ZERO => {
                             self.size_and_confirm(positions, &ord, traded, Decimal::ZERO).await;
                         }
-                        Ok(Some(OrderState { filled: Some(_), resting: Some(false) })) => {
+                        Ok(Some(OrderState { filled: Some(_), resting: Some(false),
+                        })) => {
                             self.release_quote(positions, &ord, "no longer open at the venue and nothing traded (expired or pulled)").await;
                         }
                         // No usable answer (the venue does not report single
@@ -863,7 +937,8 @@ impl OrderLifecycle {
                             if let Err(e) = other { warn!("[{}] could not read order {} ({}): {e}", ord.strategy, ord.id, ord.market); }
                             let since = *ord.missing_since.get_or_insert_with(Instant::now);
                             if since.elapsed().as_secs() >= VANISHED_QUOTE_GRACE_SECS {
-                                if !self.release_quote(positions, &ord, "vanished without a reported fill").await {
+                                if !self.release_quote(positions, &ord, "vanished without a reported fill",
+                                    ).await {
                                     warn!("[{}] order {} on {} is no longer open and never answered about its fill — its confirmed guard is kept as sized and the order forgotten", ord.strategy, ord.id, ord.market);
                                 } else {
                                     warn!("[{}] order {} on {} was no longer open and the venue reported no fill for {}s — guard released; a fill will be adopted by the account sweep",
@@ -888,10 +963,21 @@ impl OrderLifecycle {
             }
             if stale {
                 match venue.cancel(ord.id.clone()).await {
-                    Ok(_)  => info!(" [{}] cancelled stale resting order {} ({})", ord.strategy, ord.id, ord.market),
-                    Err(e) => warn!("[{}] stale cancel failed for {} ({}): {e}", ord.strategy, ord.id, ord.market),
+                    Ok(_)  => {
+                        if self.settle_cancel(venue, positions, &ord, "stale").await
+                            == CancelOutcome::Unknown
+                        {
+                            ord.cancelled = true;
+                            ord.missing_since.get_or_insert_with(Instant::now);
+                            keep.push(ord);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "[{}] stale cancel failed for {} ({}): {e} — retaining guard", ord.strategy, ord.id, ord.market);
+                        keep.push(ord);
+                    }
                 }
-                clear_guard(positions, &self.squadron_id, &ord.strategy, &ord.market).await;
                 continue;
             }
             keep.push(ord);
@@ -935,7 +1021,8 @@ impl OrderLifecycle {
                     let partner_held    = held.get(partner.as_str()).copied().unwrap_or_default() > Decimal::ZERO;
                     let partner_resting = resting_tokens.contains(partner.as_str());
                     if p.fill_confirmed_at.is_some() && i_held && !partner_held && !partner_resting {
-                        Some((s.clone(), t.clone(), p.shares, p.market_name.clone(), p.avg_entry, partner.clone()))
+                        Some((s.clone(), t.clone(), p.shares, p.market_name.clone(), p.avg_entry, partner.clone(),
+                        ))
                     } else {
                         None
                     }
@@ -957,8 +1044,12 @@ impl OrderLifecycle {
             } else {
                 let map = positions.lock().await;
                 map.iter()
-                    .filter(|(k, _)| k.squadron == self.squadron_id && killed.contains(k.market.as_str()))
-                    .filter(|(k, _)| held.get(k.market.as_str()).copied().unwrap_or_default() <= Decimal::ZERO)
+                    .filter(|(k, _)| {
+                        k.squadron == self.squadron_id && killed.contains(k.market.as_str())
+                    })
+                    .filter(|(k, _)| {
+                        held.get(k.market.as_str()).copied().unwrap_or_default() <= Decimal::ZERO
+                    })
                     .map(|(k, _)| (k.strategy.clone(), k.market.clone()))
                     .collect()
             }
@@ -1016,7 +1107,8 @@ impl OrderLifecycle {
                                     entry_fee: f.fee,
                                 },
                             );
-                            continue; // pair completed — no flatten
+                            self.rehedged.lock().await.push(RehedgedLeg {fill:f,strategy:strategy.clone(),market_name:market_name.clone(),pair_market:token.clone()});
+                            continue; // filled shares await durable adoption
                         }
                         Ok(_)  => warn!("[{strategy}] re-hedge FAK missed for {partner} — falling back to flatten"),
                         Err(e) => warn!("[{strategy}] re-hedge failed for {partner}: {e} — falling back to flatten"),
@@ -1058,6 +1150,8 @@ impl OrderLifecycle {
                     self.killed_flattens.lock().await.remove(token.as_str());
                     info!("️ [{strategy}] flattened naked leg {token} (order {}) — {exit_shares} @ {exit_price:.4}", f.order_id);
                     flattened.push(FlattenedLeg {
+                        order_id:f.order_id,
+                        exit_fee:f.fee,
                         strategy: strategy.clone(),
                         market_name,
                         shares: exit_shares,
@@ -1066,10 +1160,17 @@ impl OrderLifecycle {
                         token_id: token.clone(),
                     });
                 }
-                Err(e) => warn!("[{strategy}] flatten of {token} failed: {e} — will retry next reconcile"),
+                Err(e) => {warn!("[{strategy}] flatten of {token} failed: {e} — retaining guard");continue;}
             }
-            // Clear the guard so we don't re-flatten before the sell settles.
-            clear_guard(positions, &self.squadron_id, &strategy, &token).await;
+            if let Some(leg)=flattened.last() {
+                let remainder=(shares-leg.shares).max(Decimal::ZERO);
+                if remainder>Decimal::ZERO {
+                    if let Some(position)=positions.lock().await.get_mut(&PositionKey::new(&self.squadron_id,&strategy,token.clone())) {
+                        if shares>Decimal::ZERO{position.entry_fee*=remainder/shares;}
+                        position.shares=remainder;position.paired_leg_token_id=None;
+                    }
+                }else{clear_guard(positions,&self.squadron_id,&strategy,&token).await;}
+            }
         }
         flattened
     }
@@ -1096,9 +1197,11 @@ impl OrderLifecycle {
         let mut settled: HashSet<String> = HashSet::new();
         for ord in orders {
             match venue.cancel(ord.id.clone()).await {
-                Ok(()) => match self.settle_cancel(venue, positions, &ord, "cancelled at rotation or stand-down").await {
+                Ok(()) => match self.settle_cancel(venue, positions, &ord, "cancelled at rotation or stand-down",
+                    ).await {
                     CancelOutcome::Released => {
-                        released.push(ReleasedQuote { strategy: ord.strategy.clone(), market: ord.market.clone() });
+                        released.push(ReleasedQuote { strategy: ord.strategy.clone(), market: ord.market.clone(),
+                        });
                         settled.insert(ord.id.0.clone());
                     }
                     CancelOutcome::Traded => { settled.insert(ord.id.0.clone()); }
@@ -1111,7 +1214,8 @@ impl OrderLifecycle {
                 // order is tracked.
                 Err(e) => match self.settle_refused_cancel(venue, positions, &ord, &e.to_string()).await {
                     Some(CancelOutcome::Released) => {
-                        released.push(ReleasedQuote { strategy: ord.strategy.clone(), market: ord.market.clone() });
+                        released.push(ReleasedQuote { strategy: ord.strategy.clone(), market: ord.market.clone(),
+                        });
                         settled.insert(ord.id.0.clone());
                     }
                     Some(_) => { settled.insert(ord.id.0.clone()); }
@@ -1216,7 +1320,8 @@ impl OrderLifecycle {
 /// afterwards. 2026-11-02 21:41 ET, production: Anchor bought NO at 0.36, the
 /// guard stayed unconfirmed, and the take-profit exit (which sells only a
 /// confirmed holding) watched the bid reach 0.92 without acting.
-pub(crate) async fn confirm_guard(positions: &Arc<Mutex<PositionMap>>, squadron: &str, strategy: &str, token: &MarketId) {
+pub(crate) async fn confirm_guard(positions: &Arc<Mutex<PositionMap>>, squadron: &str, strategy: &str, token: &MarketId,
+) {
     if let Some(p) = positions.lock().await.get_mut(&PositionKey::new(squadron, strategy, token.clone())) {
         if p.fill_confirmed_at.is_none() {
             p.fill_confirmed_at = Some(Utc::now());
@@ -1232,7 +1337,8 @@ fn owns_guard(ord: &TrackedLeg, p: &crate::state::Position) -> bool {
 }
 
 /// Drop a strategy's position guard for a token (so the viper may re-enter).
-async fn clear_guard(positions: &Arc<Mutex<PositionMap>>, squadron: &str, strategy: &str, token: &MarketId) {
+async fn clear_guard(positions: &Arc<Mutex<PositionMap>>, squadron: &str, strategy: &str, token: &MarketId,
+) {
     positions.lock().await.remove(&PositionKey::new(squadron, strategy, token.clone()));
 }
 
@@ -1245,11 +1351,13 @@ async fn clear_guard(positions: &Arc<Mutex<PositionMap>>, squadron: &str, strate
 /// the leg stayed at the venue. Every venue now reports the honest count, so
 /// zero means the leg is still held and nothing is booked. A fill with no
 /// reported price books at the limit sent, as before.
-fn flatten_booking(filled: Decimal, price: Decimal, limit_sent: Decimal) -> Option<(Decimal, Decimal)> {
+fn flatten_booking(filled: Decimal, price: Decimal, limit_sent: Decimal,
+) -> Option<(Decimal, Decimal)> {
     if filled <= Decimal::ZERO {
         return None;
     }
-    Some((filled, if price > Decimal::ZERO { price } else { limit_sent }))
+    Some((filled, if price > Decimal::ZERO { price } else { limit_sent },
+    ))
 }
 
 /// Naked-leg re-hedge economics (mirrors intl's ARB ARBITER, `balance.rs`).
@@ -1258,7 +1366,8 @@ fn flatten_booking(filled: Decimal, price: Decimal, limit_sent: Decimal) -> Opti
 /// $1.00 at settlement. Viable iff
 /// `ask + 0.01 ≤ 1.00 − filled_avg_entry − buffer`; returns the FAK limit price
 /// when viable, `None` when flattening is the better exit.
-fn rehedge_limit_if_viable(ask: Decimal, filled_avg_entry: Decimal, buffer: Decimal) -> Option<Decimal> {
+fn rehedge_limit_if_viable(ask: Decimal, filled_avg_entry: Decimal, buffer: Decimal,
+) -> Option<Decimal> {
     if ask <= Decimal::ZERO {
         return None;
     }
@@ -1329,11 +1438,11 @@ mod tests {
 #[cfg(test)]
 mod resting_quote_tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::sync::Mutex as StdMutex;
-    use async_trait::async_trait;
     use crate::state::Position;
     use crate::venues::core::{MarketFacts, Position as Held};
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
 
     /// A venue that records the cancels it receives, refuses the ids it is
     /// told to, and reports whatever holdings and open orders the test set.
@@ -1356,7 +1465,8 @@ mod resting_quote_tests {
 
     impl QuoteVenue {
         fn new() -> Self {
-            Self { cancelled: StdMutex::new(Vec::new()), refuse: Vec::new(), held: Vec::new(), open: Vec::new(), fills: HashMap::new(), states: HashMap::new(), open_err: false, fill_err: false }
+            Self { cancelled: StdMutex::new(Vec::new()), refuse: Vec::new(), held: Vec::new(), open: Vec::new(), fills: HashMap::new(), states: HashMap::new(), open_err: false, fill_err: false,
+            }
         }
         fn cancelled(&self) -> Vec<String> { self.cancelled.lock().unwrap().clone() }
     }
@@ -1379,7 +1489,8 @@ mod resting_quote_tests {
         async fn order_state(&self, id: &OrderId) -> anyhow::Result<Option<OrderState>> {
             if self.fill_err { anyhow::bail!("HTTP 429 Too Many Requests"); }
             if let Some(st) = self.states.get(&id.0) { return Ok(Some(*st)); }
-            Ok(self.fills.get(&id.0).map(|n| OrderState { filled: Some(*n), resting: None }))
+            Ok(self.fills.get(&id.0).map(|n| OrderState { filled: Some(*n), resting: None,
+            }))
         }
         async fn best_bid(&self, _: &MarketId) -> anyhow::Result<Option<Decimal>> { Ok(None) }
         async fn market_facts(&self, _: &MarketId) -> anyhow::Result<Option<MarketFacts>> { Ok(None) }
@@ -1388,16 +1499,19 @@ mod resting_quote_tests {
     const SQ: &str = "btc-open";
     const LEG: &str = "KXBTCD-26OCT2917-T80499.99#yes";
 
-    fn guard(map: &mut PositionMap, strategy: &str, leg: &str, shares: Decimal, price: Decimal, confirmed: bool) {
+    fn guard(map: &mut PositionMap, strategy: &str, leg: &str, shares: Decimal, price: Decimal, confirmed: bool,
+    ) {
         map.insert(PositionKey::new(SQ, strategy, MarketId::new(leg)), Position {
             shares, avg_entry: price, opened_at: Utc::now(), close_time: None,
             market_name: "Bitcoin price on Oct 29, 2026?".into(), pair_token_id: MarketId::new(leg),
             fill_confirmed_at: confirmed.then(Utc::now), paired_leg_token_id: None, entry_fee: Decimal::ZERO,
-        });
+        },
+        );
     }
 
     fn ack(id: &str, leg: &str, placed: Decimal, price: Decimal) -> Fill {
-        Fill { order_id: OrderId(id.into()), market: MarketId::new(leg), filled: placed, price, fee: Decimal::ZERO }
+        Fill { order_id: OrderId(id.into()), market: MarketId::new(leg), filled: placed, price, fee: Decimal::ZERO,
+        }
     }
 
     /// [B77] A leg with an order working in ANY squadron's lifecycle reads as
@@ -1409,7 +1523,8 @@ mod resting_quote_tests {
         let a = OrderLifecycle::shared(LifecycleConfig::us(), "btc-open");
         let b = OrderLifecycle::shared(LifecycleConfig::us(), "sports-open");
         assert!(!any_lifecycle_tracks_leg(&MarketId::new(LEG)).await);
-        a.track_resting(&ack("q-reg-1", LEG, dec!(10), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        a.track_resting(&ack("q-reg-1", LEG, dec!(10), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
         assert!(any_lifecycle_tracks_leg(&MarketId::new(LEG)).await, "a's order is seen from anywhere");
         assert!(!b.tracks_leg(&MarketId::new(LEG)).await, "b itself tracks nothing on it");
         assert!(!any_lifecycle_tracks_leg(&MarketId::new(OTHER)).await);
@@ -1420,11 +1535,13 @@ mod resting_quote_tests {
 
     fn open(id: &str, leg: &str, placed: Decimal, filled: Decimal) -> OpenOrder {
         OpenOrder { order_id: OrderId(id.into()), market: MarketId::new(leg), side: Side::Buy, price: dec!(0.30),
-            original_qty: placed, filled_qty: filled, tif: TimeInForce::Gtc, pair_market: None }
+            original_qty: placed, filled_qty: filled, tif: TimeInForce::Gtc, pair_market: None,
+        }
     }
 
     fn event(id: &str, leg: &str, filled: Decimal, price: Decimal) -> FillEvent {
-        FillEvent { order_id: OrderId(id.into()), market: MarketId::new(leg), side: Side::Buy, filled, price, complete: false }
+        FillEvent { order_id: OrderId(id.into()), market: MarketId::new(leg), side: Side::Buy, filled, price, complete: false,
+        }
     }
 
     async fn shares_of(map: &Arc<Mutex<PositionMap>>, strategy: &str) -> Option<(Decimal, bool)> {
@@ -1439,10 +1556,14 @@ mod resting_quote_tests {
         let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
         let venue = QuoteVenue::new();
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
-        guard(&mut *map.lock().await, "FairValueStrategy", "other#no", dec!(5), dec!(0.40), true);
-        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
-        lc.track(&ack("f1", "other#no", dec!(5), dec!(0.40)), "FairValueStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false,
+        );
+        guard(&mut *map.lock().await, "FairValueStrategy", "other#no", dec!(5), dec!(0.40), true,
+        );
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
+        lc.track(&ack("f1", "other#no", dec!(5), dec!(0.40)), "FairValueStrategy", TimeInForce::Gtc, None,
+        ).await;
 
         let released = lc.cancel_all(&venue, &map).await;
 
@@ -1463,15 +1584,19 @@ mod resting_quote_tests {
     async fn a_fill_event_confirms_and_sizes_only_the_order_it_names() {
         let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
-        guard(&mut *map.lock().await, "TimeDecayStrategy", LEG, dec!(10), dec!(0.28), false);
-        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
-        lc.track_resting(&ack("q2", LEG, dec!(10), dec!(0.28)), "TimeDecayStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false,
+        );
+        guard(&mut *map.lock().await, "TimeDecayStrategy", LEG, dec!(10), dec!(0.28), false,
+        );
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
+        lc.track_resting(&ack("q2", LEG, dec!(10), dec!(0.28)), "TimeDecayStrategy", TimeInForce::Gtc, None,
+        ).await;
 
         lc.confirm_on_fill(&map, &event("q1", LEG, dec!(10), dec!(0.30))).await;
         assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(10), true)), "sized to what traded, confirmed");
         assert_eq!(shares_of(&map, "TimeDecayStrategy").await, Some((dec!(10), false)), "the other viper's quote is untouched");
-        assert_eq!(lc.take_confirmed().await, vec![ConfirmedFill { strategy: "MakerStrategy".into(), market: MarketId::new(LEG), filled: dec!(10), price: dec!(0.30) }]);
+        assert_eq!(lc.take_confirmed().await, vec![ConfirmedFill {order_id:OrderId("q1".into()), strategy: "MakerStrategy".into(), market: MarketId::new(LEG), filled: dec!(10), price: dec!(0.30) }]);
         assert!(lc.resting_for("MakerStrategy", &MarketId::new(LEG)).await, "part of it still works");
 
         lc.confirm_on_fill(&map, &event("q1", LEG, dec!(26.67), dec!(0.30))).await;
@@ -1487,7 +1612,8 @@ mod resting_quote_tests {
     async fn an_untracked_fill_event_confirms_the_leg_as_before() {
         let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-        guard(&mut *map.lock().await, "AnchorStrategy", LEG, dec!(5), dec!(0.30), false);
+        guard(&mut *map.lock().await, "AnchorStrategy", LEG, dec!(5), dec!(0.30), false,
+        );
         lc.confirm_on_fill(&map, &event("fak-1", LEG, dec!(5), dec!(0.30))).await;
         assert_eq!(shares_of(&map, "AnchorStrategy").await, Some((dec!(5), true)));
         assert!(lc.take_confirmed().await.is_empty(), "nothing tracked, nothing to resize");
@@ -1503,13 +1629,15 @@ mod resting_quote_tests {
         // The feed's event arrives first: no guard on the leg yet.
         lc.confirm_on_fill(&map, &event("anchor-fak", LEG, dec!(5), dec!(0.36))).await;
         // The order call returns and the dispatcher writes the guard.
-        guard(&mut *map.lock().await, "AnchorStrategy", LEG, dec!(5), dec!(0.36), false);
+        guard(&mut *map.lock().await, "AnchorStrategy", LEG, dec!(5), dec!(0.36), false,
+        );
         assert_eq!(shares_of(&map, "AnchorStrategy").await, Some((dec!(5), false)), "the race leaves the guard unconfirmed");
         // The response said 5 traded, so the dispatcher confirms it.
         confirm_guard(&map, SQ, "AnchorStrategy", &MarketId::new(LEG)).await;
         assert_eq!(shares_of(&map, "AnchorStrategy").await, Some((dec!(5), true)));
         // Only that strategy's guard in that squadron.
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(10), dec!(0.30), false);
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(10), dec!(0.30), false,
+        );
         confirm_guard(&map, "eth-open", "MakerStrategy", &MarketId::new(LEG)).await;
         assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(10), false)));
     }
@@ -1522,9 +1650,12 @@ mod resting_quote_tests {
     async fn another_vipers_fill_on_the_leg_leaves_a_resting_quote_alone() {
         let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
-        guard(&mut *map.lock().await, "AnchorStrategy", LEG, dec!(5), dec!(0.31), false);
-        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false,
+        );
+        guard(&mut *map.lock().await, "AnchorStrategy", LEG, dec!(5), dec!(0.31), false,
+        );
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
 
         let mut sell = event("fv-tp", LEG, dec!(5), dec!(0.40));
         sell.side = Side::Sell;
@@ -1551,12 +1682,15 @@ mod resting_quote_tests {
             (lc, map)
         };
         let mut venue = QuoteVenue::new();
-        venue.held = vec![Held { market: MarketId::new(LEG), shares: dec!(5), avg_price: dec!(0.31) }]; // FairValue's
+        venue.held = vec![Held { market: MarketId::new(LEG), shares: dec!(5), avg_price: dec!(0.31),
+        }]; // FairValue's
 
         // Traded in full before vanishing.
         let (lc, map) = mk();
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
-        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false,
+        );
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
         venue.fills.insert("q1".into(), dec!(26.67));
         lc.reconcile(&venue, &map).await;
         assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(26.67), true)));
@@ -1565,8 +1699,10 @@ mod resting_quote_tests {
 
         // Traded in part: sized to what traded.
         let (lc, map) = mk();
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
-        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false,
+        );
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
         venue.fills.insert("q1".into(), dec!(10));
         lc.reconcile(&venue, &map).await;
         assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(10), true)), "the guard carries what traded, not what was placed");
@@ -1575,10 +1711,14 @@ mod resting_quote_tests {
         // pulled by the venue): released. A zero with no status word is not
         // enough: that waits out the grace below.
         let (lc, map) = mk();
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
-        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false,
+        );
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
         venue.fills.remove("q1");
-        venue.states.insert("q1".into(), OrderState { filled: Some(Decimal::ZERO), resting: Some(false) });
+        venue.states.insert("q1".into(), OrderState { filled: Some(Decimal::ZERO), resting: Some(false),
+            },
+        );
         lc.reconcile(&venue, &map).await;
         assert_eq!(shares_of(&map, "MakerStrategy").await, None);
         assert_eq!(lc.take_released().await, vec![ReleasedQuote { strategy: "MakerStrategy".into(), market: MarketId::new(LEG) }]);
@@ -1586,8 +1726,10 @@ mod resting_quote_tests {
 
         // The venue cannot say: the guard waits, unconfirmed, inside the grace.
         let (lc, map) = mk();
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
-        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false,
+        );
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
         venue.fills.remove("q1");
         lc.reconcile(&venue, &map).await;
         assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(26.67), false)), "FairValue's five contracts never confirm the Maker's quote");
@@ -1607,15 +1749,18 @@ mod resting_quote_tests {
     async fn a_reconcile_confirm_is_sized_and_a_later_event_keeps_the_venues_count() {
         let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
         let mut venue = QuoteVenue::new();
-        venue.held = vec![Held { market: MarketId::new(LEG), shares: dec!(10), avg_price: dec!(0.30) }];
+        venue.held = vec![Held { market: MarketId::new(LEG), shares: dec!(10), avg_price: dec!(0.30),
+        }];
         venue.open = vec![open("q1", LEG, dec!(26.67), dec!(10))];
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
-        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false,
+        );
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
 
         lc.reconcile(&venue, &map).await;
         assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(10), true)), "confirmed at the ten that traded, not the 26.67 placed");
-        assert_eq!(lc.take_confirmed().await, vec![ConfirmedFill { strategy: "MakerStrategy".into(), market: MarketId::new(LEG), filled: dec!(10), price: Decimal::ZERO }]);
+        assert_eq!(lc.take_confirmed().await, vec![ConfirmedFill {order_id:OrderId("q1".into()), strategy: "MakerStrategy".into(), market: MarketId::new(LEG), filled: dec!(10), price: Decimal::ZERO }]);
 
         lc.confirm_on_fill(&map, &event("q1", LEG, dec!(10), dec!(0.30))).await;
         assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(10), true)));
@@ -1634,10 +1779,14 @@ mod resting_quote_tests {
         venue.refuse = vec!["q1".into()];
         venue.fills.insert("q2".into(), dec!(7));
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
-        guard(&mut *map.lock().await, "TimeDecayStrategy", LEG, dec!(10), dec!(0.28), false);
-        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
-        lc.track_resting(&ack("q2", LEG, dec!(10), dec!(0.28)), "TimeDecayStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false,
+        );
+        guard(&mut *map.lock().await, "TimeDecayStrategy", LEG, dec!(10), dec!(0.28), false,
+        );
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
+        lc.track_resting(&ack("q2", LEG, dec!(10), dec!(0.28)), "TimeDecayStrategy", TimeInForce::Gtc, None,
+        ).await;
 
         let released = lc.cancel_all(&venue, &map).await;
         assert!(released.is_empty(), "nothing was cancelled unfilled: {released:?}");
@@ -1656,11 +1805,14 @@ mod resting_quote_tests {
     async fn a_paired_leg_is_confirmed_by_holdings_whatever_the_listing_says() {
         let lc = OrderLifecycle::new(LifecycleConfig::intl(), SQ);
         let mut venue = QuoteVenue::new();
-        venue.held = vec![Held { market: MarketId::new(LEG), shares: dec!(5), avg_price: dec!(0.40) }];
+        venue.held = vec![Held { market: MarketId::new(LEG), shares: dec!(5), avg_price: dec!(0.40),
+        }];
         venue.open = vec![open("arb-1", LEG, dec!(5), Decimal::ZERO)];
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-        guard(&mut *map.lock().await, "ArbitrageStrategy", LEG, dec!(5), dec!(0.40), false);
-        lc.track(&ack("arb-1", LEG, dec!(5), dec!(0.40)), "ArbitrageStrategy", TimeInForce::Gtc, Some(MarketId::new("other#no"))).await;
+        guard(&mut *map.lock().await, "ArbitrageStrategy", LEG, dec!(5), dec!(0.40), false,
+        );
+        lc.track(&ack("arb-1", LEG, dec!(5), dec!(0.40)), "ArbitrageStrategy", TimeInForce::Gtc, Some(MarketId::new("other#no")),
+        ).await;
         lc.reconcile(&venue, &map).await;
         assert_eq!(shares_of(&map, "ArbitrageStrategy").await, Some((dec!(5), true)));
         assert!(!lc.resting_for("ArbitrageStrategy", &MarketId::new(LEG)).await);
@@ -1675,8 +1827,10 @@ mod resting_quote_tests {
         let mut venue = QuoteVenue::new();
         venue.fill_err = true;
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
-        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false,
+        );
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
 
         assert_eq!(lc.cancel_resting_for(&venue, &map, "MakerStrategy", &MarketId::new(LEG)).await, 1, "cancelled at the venue, but not settled");
         assert_eq!(venue.cancelled(), vec!["q1".to_string()]);
@@ -1694,7 +1848,9 @@ mod resting_quote_tests {
 
         // The grace runs out with the venue still not answering: the unfilled
         // guard is released for the account sweep, and the order forgotten.
-        lc.tracked.lock().await.iter_mut().for_each(|o| o.missing_since = Some(Instant::now() - std::time::Duration::from_secs(VANISHED_QUOTE_GRACE_SECS + 1)));
+        lc.tracked.lock().await.iter_mut().for_each(|o| {
+            o.missing_since = Some(Instant::now() - std::time::Duration::from_secs(VANISHED_QUOTE_GRACE_SECS + 1))
+        });
         lc.reconcile(&venue, &map).await;
         assert_eq!(shares_of(&map, "MakerStrategy").await, None);
         assert!(!lc.tracks_anything().await);
@@ -1710,8 +1866,10 @@ mod resting_quote_tests {
         let mut venue = QuoteVenue::new();
         venue.fill_err = true;
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
-        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false,
+        );
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
         lc.confirm_on_fill(&map, &event("q1", LEG, dec!(3), dec!(0.30))).await;
         assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(3), true)));
 
@@ -1719,7 +1877,9 @@ mod resting_quote_tests {
         assert!(!lc.working_for("MakerStrategy", &MarketId::new(LEG)).await, "cancelled: the exit arm may sell the three");
         assert!(lc.holds_anything(&map).await);
 
-        lc.tracked.lock().await.iter_mut().for_each(|o| o.missing_since = Some(Instant::now() - std::time::Duration::from_secs(VANISHED_QUOTE_GRACE_SECS + 1)));
+        lc.tracked.lock().await.iter_mut().for_each(|o| {
+            o.missing_since = Some(Instant::now() - std::time::Duration::from_secs(VANISHED_QUOTE_GRACE_SECS + 1))
+        });
         lc.reconcile(&venue, &map).await;
         assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(3), true)), "the position stays");
         assert!(!lc.tracks_anything().await, "the order is forgotten");
@@ -1736,8 +1896,10 @@ mod resting_quote_tests {
         let mut venue = QuoteVenue::new();
         venue.fill_err = true;
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(10), dec!(0.30), false);
-        lc.track_resting(&ack("q1", LEG, dec!(10), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(10), dec!(0.30), false,
+        );
+        lc.track_resting(&ack("q1", LEG, dec!(10), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
         lc.confirm_on_fill(&map, &event("q1", LEG, dec!(3), dec!(0.30))).await;
         assert_eq!(lc.take_confirmed().await.len(), 1, "the event's own confirmation, drained by the loop");
         lc.cancel_resting_for(&venue, &map, "MakerStrategy", &MarketId::new(LEG)).await;
@@ -1746,12 +1908,16 @@ mod resting_quote_tests {
         // The exit sells the three and drops the guard; the viper re-quotes.
         map.lock().await.remove(&PositionKey::new(SQ, "MakerStrategy", MarketId::new(LEG)));
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.28), false);
-        lc.track_resting(&ack("q2", LEG, dec!(26.67), dec!(0.28)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.28), false,
+        );
+        lc.track_resting(&ack("q2", LEG, dec!(26.67), dec!(0.28)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
 
         // The venue finally answers about q1: three traded, long since sold.
         venue.fill_err = false;
-        venue.states.insert("q1".into(), OrderState { filled: Some(dec!(3)), resting: Some(false) });
+        venue.states.insert("q1".into(), OrderState { filled: Some(dec!(3)), resting: Some(false),
+            },
+        );
         venue.open = vec![open("q2", LEG, dec!(26.67), Decimal::ZERO)];
         lc.reconcile(&venue, &map).await;
         assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(26.67), false)), "q2's guard is untouched by q1's answer");
@@ -1763,14 +1929,20 @@ mod resting_quote_tests {
         // nothing of the quote that replaced it.
         let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(10), dec!(0.30), false);
-        lc.track_resting(&ack("q3", LEG, dec!(10), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(10), dec!(0.30), false,
+        );
+        lc.track_resting(&ack("q3", LEG, dec!(10), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
         lc.mark_cancelled(&OrderId("q3".into())).await;
         map.lock().await.remove(&PositionKey::new(SQ, "MakerStrategy", MarketId::new(LEG)));
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.28), false);
-        lc.track_resting(&ack("q4", LEG, dec!(26.67), dec!(0.28)), "MakerStrategy", TimeInForce::Gtc, None).await;
-        venue.states.insert("q3".into(), OrderState { filled: Some(Decimal::ZERO), resting: Some(false) });
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.28), false,
+        );
+        lc.track_resting(&ack("q4", LEG, dec!(26.67), dec!(0.28)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
+        venue.states.insert("q3".into(), OrderState { filled: Some(Decimal::ZERO), resting: Some(false),
+            },
+        );
         venue.open = vec![open("q4", LEG, dec!(26.67), Decimal::ZERO)];
         lc.reconcile(&venue, &map).await;
         assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(26.67), false)), "q4's guard is untouched by q3's answer");
@@ -1786,10 +1958,14 @@ mod resting_quote_tests {
         let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
         let mut venue = QuoteVenue::new();
         venue.refuse = vec!["q1".into()];
-        venue.states.insert("q1".into(), OrderState { filled: Some(Decimal::ZERO), resting: Some(true) });
+        venue.states.insert("q1".into(), OrderState { filled: Some(Decimal::ZERO), resting: Some(true),
+            },
+        );
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
-        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false,
+        );
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
 
         assert_eq!(lc.cancel_resting_for(&venue, &map, "MakerStrategy", &MarketId::new(LEG)).await, 0);
         assert!(lc.working_for("MakerStrategy", &MarketId::new(LEG)).await);
@@ -1814,15 +1990,21 @@ mod resting_quote_tests {
         let mut venue = QuoteVenue::new();
         venue.fill_err = true;
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
-        guard(&mut *map.lock().await, "TimeDecayStrategy", LEG, dec!(10), dec!(0.28), false);
-        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
-        lc.track_resting(&ack("q2", LEG, dec!(10), dec!(0.28)), "TimeDecayStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false,
+        );
+        guard(&mut *map.lock().await, "TimeDecayStrategy", LEG, dec!(10), dec!(0.28), false,
+        );
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
+        lc.track_resting(&ack("q2", LEG, dec!(10), dec!(0.28)), "TimeDecayStrategy", TimeInForce::Gtc, None,
+        ).await;
         lc.confirm_on_fill(&map, &event("q2", LEG, dec!(4), dec!(0.28))).await;
 
         lc.reconcile(&venue, &map).await;
         assert!(lc.working_for("MakerStrategy", &MarketId::new(LEG)).await, "inside the grace it waits");
-        lc.tracked.lock().await.iter_mut().for_each(|o| o.missing_since = Some(Instant::now() - std::time::Duration::from_secs(VANISHED_QUOTE_GRACE_SECS + 1)));
+        lc.tracked.lock().await.iter_mut().for_each(|o| {
+            o.missing_since = Some(Instant::now() - std::time::Duration::from_secs(VANISHED_QUOTE_GRACE_SECS + 1))
+        });
         lc.reconcile(&venue, &map).await;
         assert_eq!(shares_of(&map, "MakerStrategy").await, None, "the unfilled quote is released for the account sweep");
         assert_eq!(shares_of(&map, "TimeDecayStrategy").await, Some((dec!(4), true)), "the confirmed four stay");
@@ -1839,11 +2021,15 @@ mod resting_quote_tests {
         let mut venue = QuoteVenue::new();
         venue.fill_err = true;
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
-        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false,
+        );
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
 
         lc.reconcile(&venue, &map).await; // missed and unreadable: the clock starts
-        lc.tracked.lock().await.iter_mut().for_each(|o| o.missing_since = Some(Instant::now() - std::time::Duration::from_secs(VANISHED_QUOTE_GRACE_SECS - 1)));
+        lc.tracked.lock().await.iter_mut().for_each(|o| {
+            o.missing_since = Some(Instant::now() - std::time::Duration::from_secs(VANISHED_QUOTE_GRACE_SECS - 1))
+        });
         venue.open = vec![open("q1", LEG, dec!(26.67), Decimal::ZERO)];
         lc.reconcile(&venue, &map).await; // listed: the clock stops
         venue.open.clear();
@@ -1853,7 +2039,9 @@ mod resting_quote_tests {
 
         // Reported resting though not listed: the same, and a partial it states is sized.
         venue.fill_err = false;
-        venue.states.insert("q1".into(), OrderState { filled: Some(dec!(4)), resting: Some(true) });
+        venue.states.insert("q1".into(), OrderState { filled: Some(dec!(4)), resting: Some(true),
+            },
+        );
         lc.reconcile(&venue, &map).await;
         assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(4), true)));
         assert!(lc.working_for("MakerStrategy", &MarketId::new(LEG)).await);
@@ -1866,8 +2054,10 @@ mod resting_quote_tests {
         for cfg in [LifecycleConfig::us(), LifecycleConfig::intl()] {
             let venue_secs = cfg.stale_order_secs;
             let lc = OrderLifecycle::new(cfg, SQ);
-            lc.track_pair_leg(&ack("arb-1", LEG, dec!(10), dec!(0.40)), "ArbitrageStrategy", TimeInForce::Gtc, Some(MarketId::new("other#no"))).await;
-            lc.track_pair_leg(&ack("td-1", LEG, dec!(10), dec!(0.40)), "TimeDecayStrategy", TimeInForce::Gtc, Some(MarketId::new("other#no"))).await;
+            lc.track_pair_leg(&ack("arb-1", LEG, dec!(10), dec!(0.40)), "ArbitrageStrategy", TimeInForce::Gtc, Some(MarketId::new("other#no")),
+            ).await;
+            lc.track_pair_leg(&ack("td-1", LEG, dec!(10), dec!(0.40)), "TimeDecayStrategy", TimeInForce::Gtc, Some(MarketId::new("other#no")),
+            ).await;
             let t = lc.tracked.lock().await;
             assert_eq!(t[0].stale_after_secs, venue_secs, "arbitrage: the venue's naked-leg window");
             assert_eq!(t[1].stale_after_secs, RESTING_QUOTE_STALE_SECS.max(venue_secs), "time decay: the partner rests");
@@ -1884,8 +2074,10 @@ mod resting_quote_tests {
         let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
         let venue = QuoteVenue::new();
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-        guard(&mut *map.lock().await, "TimeDecayStrategy", LEG, dec!(10), dec!(0.40), false);
-        lc.track_pair_leg(&ack("td-1", LEG, dec!(10), dec!(0.40)), "TimeDecayStrategy", TimeInForce::Gtc, Some(MarketId::new("other#no"))).await;
+        guard(&mut *map.lock().await, "TimeDecayStrategy", LEG, dec!(10), dec!(0.40), false,
+        );
+        lc.track_pair_leg(&ack("td-1", LEG, dec!(10), dec!(0.40)), "TimeDecayStrategy", TimeInForce::Gtc, Some(MarketId::new("other#no")),
+        ).await;
         assert!(!lc.holds_anything(&map).await, "an unfilled pair leg is a quote, not a holding");
         assert_eq!(lc.tracked.lock().await[0].stale_after_secs, RESTING_QUOTE_STALE_SECS, "a Time Decay partner rests [B87]");
 
@@ -1905,8 +2097,10 @@ mod resting_quote_tests {
     async fn a_paired_leg_is_a_holding_before_it_is_confirmed() {
         let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-        guard(&mut *map.lock().await, "TimeDecayStrategy", LEG, dec!(5), dec!(0.40), false);
-        lc.track(&ack("td-1", LEG, dec!(5), dec!(0.40)), "TimeDecayStrategy", TimeInForce::Gtc, Some(MarketId::new("other#no"))).await;
+        guard(&mut *map.lock().await, "TimeDecayStrategy", LEG, dec!(5), dec!(0.40), false,
+        );
+        lc.track(&ack("td-1", LEG, dec!(5), dec!(0.40)), "TimeDecayStrategy", TimeInForce::Gtc, Some(MarketId::new("other#no")),
+        ).await;
         assert!(lc.holds_anything(&map).await);
     }
 
@@ -1918,8 +2112,10 @@ mod resting_quote_tests {
         let mut venue = QuoteVenue::new();
         venue.open = vec![open("q1", LEG, dec!(26.67), dec!(10))];
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
-        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false,
+        );
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
         lc.confirm_on_fill(&map, &event("q1", LEG, dec!(12), dec!(0.30))).await;
         lc.reconcile(&venue, &map).await;
         assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(12), true)));
@@ -1933,10 +2129,14 @@ mod resting_quote_tests {
         let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
         let mut venue = QuoteVenue::new();
         venue.refuse = vec!["q1".into()];
-        venue.states.insert("q1".into(), OrderState { filled: Some(dec!(26.67)), resting: Some(false) });
+        venue.states.insert("q1".into(), OrderState { filled: Some(dec!(26.67)), resting: Some(false),
+            },
+        );
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
-        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false,
+        );
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
         assert!(!lc.holds_anything(&map).await, "a working quote does not pin the squadron to its market");
 
         assert!(lc.cancel_all(&venue, &map).await.is_empty());
@@ -1953,12 +2153,16 @@ mod resting_quote_tests {
     async fn a_working_quote_is_not_confirmed_by_anothers_holding_and_goes_stale_on_its_own_clock() {
         let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
         let mut venue = QuoteVenue::new();
-        venue.held = vec![Held { market: MarketId::new(LEG), shares: dec!(5), avg_price: dec!(0.31) }];
+        venue.held = vec![Held { market: MarketId::new(LEG), shares: dec!(5), avg_price: dec!(0.31),
+        }];
         venue.open = vec![open("q1", LEG, dec!(26.67), Decimal::ZERO)];
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-        guard(&mut *map.lock().await, "FairValueStrategy", LEG, dec!(5), dec!(0.31), true);
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
-        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "FairValueStrategy", LEG, dec!(5), dec!(0.31), true,
+        );
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false,
+        );
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
 
         lc.reconcile(&venue, &map).await;
         assert_eq!(shares_of(&map, "MakerStrategy").await, Some((dec!(26.67), false)), "FairValue's five contracts are not the Maker's fill");
@@ -1966,7 +2170,8 @@ mod resting_quote_tests {
 
         // The same quote tracked with no window left: the reconciler cancels it.
         let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
-        lc.track_with_stale(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None, 0, true).await;
+        lc.track_with_stale(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None, 0, true,
+        ).await;
         lc.reconcile(&venue, &map).await;
         assert_eq!(venue.cancelled(), vec!["q1".to_string()]);
         assert_eq!(shares_of(&map, "MakerStrategy").await, None);
@@ -1980,11 +2185,14 @@ mod resting_quote_tests {
     async fn a_partly_traded_working_quote_is_confirmed_and_stays_tracked() {
         let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
         let mut venue = QuoteVenue::new();
-        venue.held = vec![Held { market: MarketId::new(LEG), shares: dec!(10), avg_price: dec!(0.30) }];
+        venue.held = vec![Held { market: MarketId::new(LEG), shares: dec!(10), avg_price: dec!(0.30),
+        }];
         venue.open = vec![open("q1", LEG, dec!(26.67), dec!(10))];
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
-        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false,
+        );
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
         lc.reconcile(&venue, &map).await;
         assert_eq!(shares_of(&map, "MakerStrategy").await.map(|(_, c)| c), Some(true));
         assert!(lc.resting_for("MakerStrategy", &MarketId::new(LEG)).await, "the remainder still works");
@@ -1998,9 +2206,12 @@ mod resting_quote_tests {
         let lc = OrderLifecycle::new(LifecycleConfig::us(), SQ);
         let venue = QuoteVenue::new();
         let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false);
-        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None).await;
-        lc.track_resting(&ack("q2", LEG, dec!(10), dec!(0.28)), "TimeDecayStrategy", TimeInForce::Gtc, None).await;
+        guard(&mut *map.lock().await, "MakerStrategy", LEG, dec!(26.67), dec!(0.30), false,
+        );
+        lc.track_resting(&ack("q1", LEG, dec!(26.67), dec!(0.30)), "MakerStrategy", TimeInForce::Gtc, None,
+        ).await;
+        lc.track_resting(&ack("q2", LEG, dec!(10), dec!(0.28)), "TimeDecayStrategy", TimeInForce::Gtc, None,
+        ).await;
 
         assert_eq!(lc.cancel_resting_for(&venue, &map, "MakerStrategy", &MarketId::new(LEG)).await, 1);
         assert_eq!(venue.cancelled(), vec!["q1".to_string()]);
@@ -2015,4 +2226,3 @@ mod resting_quote_tests {
         assert!(lc.take_released().await.is_empty());
     }
 }
-

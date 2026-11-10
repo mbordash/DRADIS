@@ -162,6 +162,55 @@ pub async fn record_trade_with_timestamp(
     }
 }
 
+/// Checked trade persistence for callers that must retain order quarantine on failure.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_trade_checked(
+    scope: &TradeScope, fees: Decimal, strategy: String, market: String, side: String,
+    entry_price: Decimal, exit_price: Decimal, shares: Decimal, profit_usdc: Decimal, reason: String,
+) -> anyhow::Result<()> {
+    let pool = db::pool_for(&scope.shard).ok_or_else(|| anyhow::anyhow!("trade database unavailable"))?;
+    db::record_trade_db_checked(&pool, scope, fees, &strategy, &market, &side,
+        entry_price, exit_price, shares, profit_usdc, &reason, None).await?;
+    if let Ok(mut acc) = REALISED_PNL.lock() { *acc += profit_usdc; }
+    Ok(())
+}
+
+/// Commit a venue order's trade and remaining position as one idempotent write.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_exit_trade_checked(
+    scope: &TradeScope, order_id: &str, squadron_id: Option<&str>, strategy: String,
+    token_id: String, market: String, side: String, entry_price: Decimal, exit_price: Decimal,
+    requested_shares: Decimal, filled_shares: Decimal, entry_fee: Decimal, exit_fee: Decimal,
+    reason: String,
+) -> anyhow::Result<db::ExitTradeBooking> {
+    let pool = db::pool_for(&scope.shard).ok_or_else(|| anyhow::anyhow!("trade database unavailable"))?;
+    let booking = db::record_exit_trade_checked(&pool, scope, order_id, squadron_id, &strategy,
+        &token_id, &market, &side, entry_price, exit_price, requested_shares, filled_shares,
+        entry_fee, exit_fee, &reason).await?;
+    if booking.inserted {
+        if let Ok(mut acc) = REALISED_PNL.lock() { *acc += booking.pnl; }
+    }
+    Ok(booking)
+}
+
+/// Persist a resting order's additional fills exactly once across polling retries.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_cumulative_exit_trade_checked(
+    scope: &TradeScope, order_id: &str, squadron_id: Option<&str>, strategy: String,
+    token_id: String, market: String, side: String, entry_price: Decimal, exit_price: Decimal,
+    requested_shares: Decimal, filled_shares: Decimal, entry_fee: Decimal, exit_fee: Decimal,
+    reason: String,
+) -> anyhow::Result<db::ExitTradeBooking> {
+    let pool = db::pool_for(&scope.shard).ok_or_else(|| anyhow::anyhow!("trade database unavailable"))?;
+    let booking = db::record_cumulative_exit_trade_checked(&pool, scope, order_id, squadron_id, &strategy,
+        &token_id, &market, &side, entry_price, exit_price, requested_shares, filled_shares,
+        entry_fee, exit_fee, &reason).await?;
+    if booking.inserted {
+        if let Ok(mut acc) = REALISED_PNL.lock() { *acc += booking.pnl; }
+    }
+    Ok(booking)
+}
+
 /// Records a position entry event to the database for recovery after bot restarts.
 ///
 /// `scope` — the trade's filing dimensions. `scope.shard` drives SQLite pool

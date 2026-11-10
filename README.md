@@ -107,6 +107,8 @@ dependencies are stripped from the binary.
 | `us_retail`          | Polymarket US (custodial, CFTC)    | Ed25519 challenge-response → JWT        | `api.prod.polymarketexchange.com`    |
 | `kalshi`             | Kalshi (custodial, CFTC)           | RSA-PSS request signing                 | `external-api.kalshi.com` (demo: `external-api.demo.kalshi.co`) |
 
+Deposit Wallet configuration and current execution limits: [Polymarket wallets](docs/POLYMARKET_WALLETS.md).
+
 ### Start locally
 
 ```bash

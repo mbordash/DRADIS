@@ -26,39 +26,132 @@
 //! that uses Polymarket's `/orders` endpoint to submit both legs simultaneously.
 
 use anyhow::Result;
-use std::borrow::Cow;
-use std::sync::Arc;
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::time::timeout;
 
-use polymarket_client_sdk_v2::clob::{Client as ClobClient};
-use polymarket_client_sdk_v2::auth::state::Authenticated;
-use polymarket_client_sdk_v2::auth::Normal;
-use polymarket_client_sdk_v2::clob::types::{OrderType, Side, SignatureType, Order, SignedOrder, OrderPayload};
-use polymarket_client_sdk_v2::{POLYGON};
-use alloy::primitives::{U256, Address, B256};
+use super::trading_client::TradingClient;
+use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::LocalSigner;
-use alloy::signers::Signer;
-use alloy::dyn_abi::Eip712Domain;
-use alloy::sol_types::SolStruct;
 use chrono::Utc;
+use polymarket_client_sdk_v2::clob::types::response::PostOrderResponse;
+use polymarket_client_sdk_v2::clob::types::{
+    Order, OrderPayload, OrderType, Side, SignableOrder, SignedOrder,
+};
 use rust_decimal::Decimal;
-use tracing::warn;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::warn;
 
-use rust_decimal::prelude::ToPrimitive;
-use crate::helpers::price::{round_to_tick_size, floor_to_tick_size};
+use super::wallet::WalletConfig;
 use crate::helpers::nonce::fetch_next_nonce;
+use crate::helpers::price::{floor_to_tick_size, round_to_tick_size};
 use crate::venues::core::MarketId;
 use crate::venues::core::TimeInForce;
 use crate::venues::intl::u256_from_market_id;
+use rust_decimal::prelude::ToPrimitive;
 
-const ORDER_NAME: &str = "Polymarket CTF Exchange";
-/// EIP-712 domain version for the V2 CTF Exchange (pUSD collateral migration)
-const VERSION: &str = "2";
 /// Polymarket requires expiration timestamp to be >= now + 1 minute + 30 seconds.
 /// We add 90 seconds (1.5 minutes) as a safety buffer.
 const EXPIRATION_BUFFER_SECS: u64 = 90;
+
+fn order_wallet(
+    client: &TradingClient,
+    signer: &LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
+    supplied_funder: Address,
+    supplied_eoa: Address,
+) -> Result<WalletConfig> {
+    let wallet = client.wallet();
+    anyhow::ensure!(
+        wallet.signer == supplied_eoa,
+        "supplied EOA differs from immutable client wallet"
+    );
+    anyhow::ensure!(
+        wallet.funder == supplied_funder
+            && wallet.signer == signer.address()
+            && wallet.signer == client.address(),
+        "Order wallet does not match the authenticated signer and configured funder"
+    );
+    Ok(wallet)
+}
+
+#[derive(Clone, Debug)]
+pub struct OrderReceipt {
+    pub order_id: String,
+    pub signed_quantity: Decimal,
+    pub making_amount: Decimal,
+    pub taking_amount: Decimal,
+}
+
+#[derive(Debug)]
+pub struct PartialBatchError {
+    pub legs: [Option<OrderReceipt>; 2],
+}
+impl std::fmt::Display for PartialBatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "CLOB batch partially accepted; accepted legs require reconciliation"
+        )
+    }
+}
+impl std::error::Error for PartialBatchError {}
+
+pub fn signed_quantity(order: &SignedOrder) -> Result<Decimal> {
+    use std::str::FromStr;
+    let value = order.order();
+    let amount = if value.side == Side::Buy as u8 {
+        value.takerAmount
+    } else {
+        value.makerAmount
+    };
+    Ok(Decimal::from_str(&amount.to_string())? / Decimal::from(1_000_000u32))
+}
+
+fn validate_order_response(response: &PostOrderResponse) -> Result<()> {
+    anyhow::ensure!(
+        response.success
+            && !matches!(
+                response.status,
+                polymarket_client_sdk_v2::clob::types::OrderStatusType::Unknown(_)
+                    | polymarket_client_sdk_v2::clob::types::OrderStatusType::Delayed
+                    | polymarket_client_sdk_v2::clob::types::OrderStatusType::Unmatched
+            )
+            && !response.order_id.trim().is_empty()
+            && response
+                .error_msg
+                .as_deref()
+                .is_none_or(|message| message.trim().is_empty()),
+        "Order was not accepted: id={} status={} error={}",
+        response.order_id,
+        response.status,
+        response
+            .error_msg
+            .as_deref()
+            .unwrap_or("missing order acceptance")
+    );
+    Ok(())
+}
+
+fn validate_batch_response(responses: &[PostOrderResponse]) -> Result<()> {
+    anyhow::ensure!(
+        responses.len() == 2,
+        "Atomic batch returned {} responses (expected 2)",
+        responses.len()
+    );
+    for (index, response) in responses.iter().enumerate() {
+        validate_order_response(response).map_err(|error| {
+            anyhow::anyhow!(
+                "Batch leg {} failed: {error}; returned order IDs: [{}, {}]",
+                index + 1,
+                responses[0].order_id,
+                responses[1].order_id
+            )
+        })?;
+    }
+    Ok(())
+}
 
 /// How an order-placement failure should be charged by the caller's fault
 /// accounting (the patrol loop's trade cooldown and circuit breaker).
@@ -146,10 +239,9 @@ fn to_clob(tif: TimeInForce) -> OrderType {
 /// both `place_limit_order` (single) and `place_limit_orders_atomic` (batch) can
 /// reuse the same logic without duplication.
 async fn build_signed_order(
-    client: &Arc<ClobClient<Authenticated<Normal>>>,
+    client: &Arc<TradingClient>,
     signer: &LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
-    safe_address: Address,
-    eoa_address: Address,
+    wallet: &WalletConfig,
     verifying_contract: Address,
     token_id: U256,
     side: Side,
@@ -159,11 +251,44 @@ async fn build_signed_order(
     post_only: bool,
     expiration_secs: u64,
 ) -> Result<SignedOrder> {
+    client.verify_ctf_token(token_id).await?;
+    anyhow::ensure!(quantity > Decimal::ZERO, "Order quantity must be positive");
+    anyhow::ensure!(
+        limit_price > Decimal::ZERO && limit_price < Decimal::ONE,
+        "Order price must be between zero and one"
+    );
+    anyhow::ensure!(
+        matches!(order_type, OrderType::GTD) == (expiration_secs > 0),
+        "GTD orders require expiration; other order types require zero expiration"
+    );
+    anyhow::ensure!(
+        !post_only || matches!(order_type, OrderType::GTC | OrderType::GTD),
+        "postOnly is only supported for GTC and GTD orders"
+    );
+    anyhow::ensure!(
+        signer.address() == wallet.signer && client.address() == wallet.signer,
+        "Order signer does not match the authenticated wallet"
+    );
+    // Preserve the trusted market routing supplied by existing callers while
+    // letting the SDK choose and sign its supported V2 domain.
+    let neg_risk = if verifying_contract == super::exchange_verifying_contract(false) {
+        false
+    } else if verifying_contract == super::exchange_verifying_contract(true) {
+        true
+    } else {
+        anyhow::bail!("Unsupported V2 exchange verifying contract");
+    };
+    client.set_neg_risk(token_id, neg_risk);
+
     // V2: expiration lives in OrderPayload (outside the signed struct).
     let expiration_v2 = if expiration_secs > 0 {
         let now_unix = Utc::now().timestamp() as u64;
         let buffer = expiration_secs.max(EXPIRATION_BUFFER_SECS);
-        U256::from(now_unix + buffer)
+        U256::from(
+            now_unix
+                .checked_add(buffer)
+                .ok_or_else(|| anyhow::anyhow!("Order expiration overflow"))?,
+        )
     } else {
         U256::ZERO
     };
@@ -171,13 +296,17 @@ async fn build_signed_order(
     // timestamp_ms: milliseconds since UNIX epoch — required field in V2 order struct
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("time before epoch")
-        .as_millis();
+        .map_err(|_| anyhow::anyhow!("System clock is before the Unix epoch"))?;
+    let timestamp_ms = timestamp_ms.as_millis();
 
     let mut order_struct = Order::default();
-    order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
-    order_struct.maker = safe_address;
-    order_struct.signer = eoa_address;
+    static SALT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let salt = RandomState::new()
+        .hash_one((timestamp_ms, SALT_SEQUENCE.fetch_add(1, Ordering::Relaxed)))
+        & ((1_u64 << 53) - 1);
+    order_struct.salt = U256::from(salt);
+    order_struct.maker = wallet.funder;
+    order_struct.signer = wallet.order_signer();
     order_struct.tokenId = token_id;
     order_struct.timestamp = U256::from(timestamp_ms);
     order_struct.metadata = B256::ZERO;
@@ -191,6 +320,10 @@ async fn build_signed_order(
     } else {
         round_to_tick_size(limit_price)
     };
+    anyhow::ensure!(
+        rounded_price > Decimal::ZERO && rounded_price < Decimal::ONE,
+        "Rounded order price must be between zero and one"
+    );
 
     // Convert price to integer cents (e.g. 0.63 → 63) for exact arithmetic.
     // Polymarket validates: makerAmount / takerAmount must be an exact multiple of 0.01.
@@ -203,30 +336,44 @@ async fn build_signed_order(
         Side::Buy => {
             // makerAmount (USDC you pay)       = max 2dp → in 1e6, divisible by 10000
             // takerAmount (shares you receive) = max 4dp → in 1e6, divisible by 100
-            let usdc_cents = (quantity * rounded_price * Decimal::from(100))
+            let usdc_cents = quantity
+                .checked_mul(rounded_price)
+                .and_then(|notional| notional.checked_mul(Decimal::from(100)))
+                .ok_or_else(|| anyhow::anyhow!("Order notional exceeds supported precision"))?
                 .floor()
                 .to_u128()
-                .unwrap_or(0);
+                .ok_or_else(|| anyhow::anyhow!("Order notional cannot be represented"))?;
             let usdc_cents_aligned = if price_cents > 0 {
                 (usdc_cents / price_cents) * price_cents
             } else {
                 usdc_cents
             };
-            let maker_raw = usdc_cents_aligned * 10000u128;
-            let taker_raw = if price_cents > 0 { maker_raw * 100 / price_cents } else { 0 };
+            let maker_raw = usdc_cents_aligned
+                .checked_mul(10000u128)
+                .ok_or_else(|| anyhow::anyhow!("Order maker amount overflow"))?;
+            let taker_raw = maker_raw
+                .checked_mul(100)
+                .ok_or_else(|| anyhow::anyhow!("Order taker amount overflow"))?
+                / price_cents;
             order_struct.makerAmount = U256::from(maker_raw);
             order_struct.takerAmount = U256::from(taker_raw);
         }
         Side::Sell => {
             // makerAmount (shares you give)    = max 4dp → in 1e6, divisible by 100
             // takerAmount (USDC you receive)   = max 2dp → in 1e6, divisible by 10000
-            let shares_2dp = (quantity * Decimal::from(100))
+            let shares_2dp = quantity
+                .checked_mul(Decimal::from(100))
+                .ok_or_else(|| anyhow::anyhow!("Order quantity exceeds supported precision"))?
                 .floor()
                 .to_u128()
-                .unwrap_or(0);
-            let maker_raw = shares_2dp * 10000u128;
-            let usdc_cents = if price_cents > 0 { shares_2dp * price_cents } else { 0 };
-            let taker_raw = usdc_cents * 100u128;
+                .ok_or_else(|| anyhow::anyhow!("Order quantity cannot be represented"))?;
+            let maker_raw = shares_2dp
+                .checked_mul(10000u128)
+                .ok_or_else(|| anyhow::anyhow!("Order maker amount overflow"))?;
+            let taker_raw = shares_2dp
+                .checked_mul(price_cents)
+                .and_then(|amount| amount.checked_mul(100u128))
+                .ok_or_else(|| anyhow::anyhow!("Order taker amount overflow"))?;
             order_struct.makerAmount = U256::from(maker_raw);
             order_struct.takerAmount = U256::from(taker_raw);
         }
@@ -234,28 +381,22 @@ async fn build_signed_order(
     }
 
     order_struct.side = side as u8;
-    order_struct.signatureType = SignatureType::GnosisSafe as u8;
-
-    let domain = Eip712Domain {
-        name: Some(Cow::Borrowed(ORDER_NAME)),
-        version: Some(Cow::Borrowed(VERSION)),
-        chain_id: Some(U256::from(POLYGON)),
-        verifying_contract: Some(verifying_contract),
-        ..Eip712Domain::default()
-    };
-
-    let hash = order_struct.eip712_signing_hash(&domain);
-    let signature = signer.sign_hash(&hash).await
-        .map_err(|e| anyhow::anyhow!("Signing failed: {}", e))?;
+    order_struct.signatureType = wallet.signature_type() as u8;
+    anyhow::ensure!(
+        order_struct.makerAmount > U256::ZERO && order_struct.takerAmount > U256::ZERO,
+        "Order amount rounds to zero or exceeds supported precision"
+    );
 
     let payload = OrderPayload::new(order_struct, expiration_v2);
-    Ok(SignedOrder::builder()
+    let signable = SignableOrder::builder()
         .payload(payload)
-        .signature(signature)
         .order_type(order_type)
-        .owner(client.credentials().key())
         .post_only(post_only)
-        .build())
+        .build();
+    client
+        .sign(signer, signable)
+        .await
+        .map_err(|e| anyhow::anyhow!("Signing failed: {e}"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -264,8 +405,8 @@ async fn build_signed_order(
 
 /// Generic order placement helper — works for any token, buy/sell, strategy.
 ///
-/// Handles: nonce management, EIP-712 signing, posting to CLOB, retry on
-/// transient errors (nonce conflict, execution-engine 500).
+/// Handles wallet validation, SDK signing, posting to CLOB, and bounded retry
+/// only when the venue definitively refused to process the request.
 ///
 /// Returns `(order_id, making_amount, taking_amount)` — the matched amounts come
 /// straight from the CLOB `POST /order` response. For a marketable FAK/FOK order
@@ -273,7 +414,7 @@ async fn build_signed_order(
 /// fill price); for a resting GTC/GTD order they are typically zero until a match
 /// occurs. Use [`place_limit_order`] if you only need the order id.
 pub async fn place_limit_order_filled(
-    client: &Arc<ClobClient<Authenticated<Normal>>>,
+    client: &Arc<TradingClient>,
     nonce_manager: &Arc<AtomicU64>,
     signer: &LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
     safe_address: Address,
@@ -289,9 +430,53 @@ pub async fn place_limit_order_filled(
     expiration_secs: u64,
     http: &reqwest::Client,
 ) -> Result<(String, Decimal, Decimal)> {
+    let receipt = place_limit_order_receipt(
+        client,
+        nonce_manager,
+        signer,
+        safe_address,
+        eoa_address,
+        verifying_contract,
+        token_id,
+        side,
+        quantity,
+        limit_price,
+        _fee_rate_bps,
+        order_type,
+        post_only,
+        expiration_secs,
+        http,
+    )
+    .await?;
+    Ok((
+        receipt.order_id,
+        receipt.making_amount,
+        receipt.taking_amount,
+    ))
+}
+
+pub async fn place_limit_order_receipt(
+    client: &Arc<TradingClient>,
+    nonce_manager: &Arc<AtomicU64>,
+    signer: &LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
+    safe_address: Address,
+    eoa_address: Address,
+    verifying_contract: Address,
+    token_id: &MarketId,
+    side: Side,
+    quantity: Decimal,
+    limit_price: Decimal,
+    _fee_rate_bps: u16,
+    order_type: TimeInForce,
+    post_only: bool,
+    expiration_secs: u64,
+    http: &reqwest::Client,
+) -> Result<OrderReceipt> {
     // Every Polymarket International order passes through here or the batch
     // below, so this is where a retired instance stops trading (E64).
     crate::helpers::migration::refuse_if_retired()?;
+    let wallet = order_wallet(client, signer, safe_address, eoa_address)?;
+    client.require_mutation_allowed()?;
     // Convert the neutral key to the on-chain id at the venue boundary (slice 2b).
     let token_id = u256_from_market_id(token_id)?;
     // Map the neutral TIF onto the SDK enum once, at the venue boundary.
@@ -301,16 +486,27 @@ pub async fn place_limit_order_filled(
         let _current_nonce = nonce_manager.load(Ordering::SeqCst);
 
         let signed_order = build_signed_order(
-            client, signer, safe_address, eoa_address, verifying_contract,
-            token_id, side, quantity, limit_price,
-            order_type.clone(), post_only, expiration_secs,
-        ).await?;
+            client,
+            signer,
+            &wallet,
+            verifying_contract,
+            token_id,
+            side,
+            quantity,
+            limit_price,
+            order_type.clone(),
+            post_only,
+            expiration_secs,
+        )
+        .await?;
 
+        let placed_quantity = signed_quantity(&signed_order)?;
         // Hard 12-second timeout: prevents a TCP stall from freezing the tokio::select! arm.
         let post_result = timeout(
             std::time::Duration::from_secs(12),
             client.post_order(signed_order),
-        ).await;
+        )
+        .await;
         let post_result = match post_result {
             Err(_elapsed) => {
                 warn!("⚠️ post_order timed out after 12s (attempt {}) — treating as transient failure", attempt + 1);
@@ -319,7 +515,15 @@ pub async fn place_limit_order_filled(
             Ok(r) => r,
         };
         match post_result {
-            Ok(resp) => return Ok((resp.order_id, resp.making_amount, resp.taking_amount)),
+            Ok(resp) => {
+                validate_order_response(&resp)?;
+                return Ok(OrderReceipt {
+                    order_id: resp.order_id,
+                    signed_quantity: placed_quantity,
+                    making_amount: resp.making_amount,
+                    taking_amount: resp.taking_amount,
+                });
+            }
             Err(e) => {
                 let err_msg = format!("{:?}", e).to_lowercase();
                 // "invalid nonce" is a resend that STAYS: it is a
@@ -378,7 +582,7 @@ pub async fn place_limit_order_filled(
 /// order id (the historical signature). The matched amounts are discarded.
 #[allow(clippy::too_many_arguments)]
 pub async fn place_limit_order(
-    client: &Arc<ClobClient<Authenticated<Normal>>>,
+    client: &Arc<TradingClient>,
     nonce_manager: &Arc<AtomicU64>,
     signer: &LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
     safe_address: Address,
@@ -395,10 +599,23 @@ pub async fn place_limit_order(
     http: &reqwest::Client,
 ) -> Result<String> {
     let (order_id, _making, _taking) = place_limit_order_filled(
-        client, nonce_manager, signer, safe_address, eoa_address, verifying_contract,
-        token_id, side, quantity, limit_price, fee_rate_bps, order_type, post_only,
-        expiration_secs, http,
-    ).await?;
+        client,
+        nonce_manager,
+        signer,
+        safe_address,
+        eoa_address,
+        verifying_contract,
+        token_id,
+        side,
+        quantity,
+        limit_price,
+        fee_rate_bps,
+        order_type,
+        post_only,
+        expiration_secs,
+        http,
+    )
+    .await?;
     Ok(order_id)
 }
 
@@ -430,7 +647,7 @@ pub async fn place_limit_order(
 /// A partial response (< 2 items) is also treated as an error.
 #[allow(clippy::too_many_arguments)]
 pub async fn place_limit_orders_atomic(
-    client: &Arc<ClobClient<Authenticated<Normal>>>,
+    client: &Arc<TradingClient>,
     nonce_manager: &Arc<AtomicU64>,
     signer: &LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
     safe_address: Address,
@@ -455,6 +672,60 @@ pub async fn place_limit_orders_atomic(
     expiration_b: u64,
     http: &reqwest::Client,
 ) -> Result<(String, String)> {
+    let [a, b] = place_limit_orders_atomic_filled(
+        client,
+        nonce_manager,
+        signer,
+        safe_address,
+        eoa_address,
+        vc_a,
+        token_id_a,
+        side_a,
+        quantity_a,
+        price_a,
+        order_type_a,
+        post_only_a,
+        expiration_a,
+        vc_b,
+        token_id_b,
+        side_b,
+        quantity_b,
+        price_b,
+        order_type_b,
+        post_only_b,
+        expiration_b,
+        http,
+    )
+    .await?;
+    Ok((a.order_id, b.order_id))
+}
+
+pub async fn place_limit_orders_atomic_filled(
+    client: &Arc<TradingClient>,
+    nonce_manager: &Arc<AtomicU64>,
+    signer: &LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
+    safe_address: Address,
+    eoa_address: Address,
+    // ── Leg A ──
+    vc_a: Address,
+    token_id_a: &MarketId,
+    side_a: Side,
+    quantity_a: Decimal,
+    price_a: Decimal,
+    order_type_a: TimeInForce,
+    post_only_a: bool,
+    expiration_a: u64,
+    // ── Leg B ──
+    vc_b: Address,
+    token_id_b: &MarketId,
+    side_b: Side,
+    quantity_b: Decimal,
+    price_b: Decimal,
+    order_type_b: TimeInForce,
+    post_only_b: bool,
+    expiration_b: u64,
+    http: &reqwest::Client,
+) -> Result<[OrderReceipt; 2]> {
     // Convert the neutral keys to on-chain ids at the venue boundary (slice 2b).
     let token_id_a = u256_from_market_id(token_id_a)?;
     let token_id_b = u256_from_market_id(token_id_b)?;
@@ -469,11 +740,14 @@ pub async fn place_limit_orders_atomic(
             return Err(anyhow::anyhow!(
                 "place_limit_orders_atomic: {} uses {:?} — only GTC/GTD orders \
                  may be batched via POST /orders. Use place_limit_order instead.",
-                label, ot
+                label,
+                ot
             ));
         }
     }
     crate::helpers::migration::refuse_if_retired()?;
+    let wallet = order_wallet(client, signer, safe_address, eoa_address)?;
+    client.require_mutation_allowed()?;
     // Map the neutral TIFs onto the SDK enum once, past the batch-eligibility guard.
     let order_type_a = to_clob(order_type_a);
     let order_type_b = to_clob(order_type_b);
@@ -481,39 +755,80 @@ pub async fn place_limit_orders_atomic(
         let _current_nonce = nonce_manager.load(Ordering::SeqCst);
 
         let order_a = build_signed_order(
-            client, signer, safe_address, eoa_address, vc_a,
-            token_id_a, side_a, quantity_a, price_a,
-            order_type_a.clone(), post_only_a, expiration_a,
-        ).await?;
+            client,
+            signer,
+            &wallet,
+            vc_a,
+            token_id_a,
+            side_a,
+            quantity_a,
+            price_a,
+            order_type_a.clone(),
+            post_only_a,
+            expiration_a,
+        )
+        .await?;
 
         let order_b = build_signed_order(
-            client, signer, safe_address, eoa_address, vc_b,
-            token_id_b, side_b, quantity_b, price_b,
-            order_type_b.clone(), post_only_b, expiration_b,
-        ).await?;
+            client,
+            signer,
+            &wallet,
+            vc_b,
+            token_id_b,
+            side_b,
+            quantity_b,
+            price_b,
+            order_type_b.clone(),
+            post_only_b,
+            expiration_b,
+        )
+        .await?;
 
+        let signed_quantities = [signed_quantity(&order_a)?, signed_quantity(&order_b)?];
         // Slightly longer timeout than single-order to account for batch validation.
         let post_result = timeout(
             std::time::Duration::from_secs(15),
             client.post_orders(vec![order_a, order_b]),
-        ).await;
+        )
+        .await;
 
         let post_result = match post_result {
             Err(_elapsed) => {
-                warn!("⚠️ post_orders (atomic) timed out after 15s (attempt {})", attempt + 1);
-                return Err(anyhow::anyhow!("Atomic order placement timed out after 15s"));
+                warn!(
+                    "⚠️ post_orders (atomic) timed out after 15s (attempt {})",
+                    attempt + 1
+                );
+                return Err(anyhow::anyhow!(
+                    "Atomic order placement timed out after 15s"
+                ));
             }
             Ok(r) => r,
         };
 
         match post_result {
             Ok(resps) => {
-                if resps.len() < 2 {
-                    return Err(anyhow::anyhow!(
-                        "Atomic batch returned {} responses (expected 2)", resps.len()
-                    ));
+                // Each response is independent. Preserve accepted IDs in the
+                // error so reconciliation can find an accepted orphan leg.
+                if resps.len() != 2 {
+                    anyhow::bail!("CLOB batch acceptance is uncertain");
                 }
-                return Ok((resps[0].order_id.clone(), resps[1].order_id.clone()));
+                let legs: [Option<OrderReceipt>; 2] = std::array::from_fn(|index| {
+                    validate_order_response(&resps[index])
+                        .ok()
+                        .map(|_| OrderReceipt {
+                            order_id: resps[index].order_id.clone(),
+                            signed_quantity: signed_quantities[index],
+                            making_amount: resps[index].making_amount,
+                            taking_amount: resps[index].taking_amount,
+                        })
+                });
+                if legs.iter().any(Option::is_none) {
+                    return Err(PartialBatchError { legs }.into());
+                }
+                let [Some(a), Some(b)] = legs else {
+                    unreachable!("validated both legs")
+                };
+                return Ok([a, b]);
             }
             Err(e) => {
                 let err_msg = format!("{:?}", e).to_lowercase();
@@ -524,7 +839,10 @@ pub async fn place_limit_orders_atomic(
                     warn!("⚠️ Nonce error in atomic batch — re-syncing from API...");
                     if let Some(fresh_nonce) = fetch_next_nonce(http, safe_address).await {
                         nonce_manager.store(fresh_nonce, Ordering::SeqCst);
-                        warn!("🔄 Nonce re-synced to {} — retrying atomic batch", fresh_nonce);
+                        warn!(
+                            "🔄 Nonce re-synced to {} — retrying atomic batch",
+                            fresh_nonce
+                        );
                     }
                     continue;
                 }
@@ -541,6 +859,310 @@ pub async fn place_limit_orders_atomic(
     Err(anyhow::anyhow!("Max retries reached for atomic batch"))
 }
 
+#[cfg(test)]
+mod signing_tests {
+    use super::super::wallet::WalletType;
+    use super::*;
+    use alloy::dyn_abi::Eip712Domain;
+    use alloy::primitives::{address, keccak256, Signature};
+    use alloy::signers::Signer;
+    use alloy::sol_types::{SolStruct, SolValue};
+    use polymarket_client_sdk_v2::auth::Credentials;
+    use polymarket_client_sdk_v2::clob::types::{OrderSignature, SignatureType};
+    use polymarket_client_sdk_v2::clob::{Client as SdkClient, Config};
+    use polymarket_client_sdk_v2::POLYGON;
+    use rust_decimal_macros::dec;
+    use std::borrow::Cow;
+    use std::str::FromStr;
+
+    type TestSigner = LocalSigner<alloy::signers::k256::ecdsa::SigningKey>;
+
+    async fn offline_wallet(
+        wallet_type: WalletType,
+    ) -> Result<(Arc<TradingClient>, TestSigner, WalletConfig)> {
+        // Public deterministic test key. Credentials are synthetic and are
+        // supplied directly, so authentication performs no HTTP requests.
+        let signer =
+            LocalSigner::from_str(&format!("{:064x}", 1_u64))?.with_chain_id(Some(POLYGON));
+        let wallet = WalletConfig {
+            wallet_type,
+            signer: signer.address(),
+            funder: address!("0x1111111111111111111111111111111111111111"),
+        };
+        let client = SdkClient::new("http://127.0.0.1:9", Config::default())?
+            .authentication_builder(&signer)
+            .credentials(Credentials::new(
+                Default::default(),
+                "c3ludGhldGlj".into(),
+                "offline".into(),
+            ))
+            .funder(wallet.funder)
+            .signature_type(wallet.signature_type())
+            .authenticate()
+            .await?;
+        let client = TradingClient::for_test(
+            client,
+            wallet,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await?;
+        Ok((Arc::new(client), signer, wallet))
+    }
+
+    fn domain(neg_risk: bool) -> Eip712Domain {
+        Eip712Domain {
+            name: Some(Cow::Borrowed("Polymarket CTF Exchange")),
+            version: Some(Cow::Borrowed("2")),
+            chain_id: Some(U256::from(POLYGON)),
+            verifying_contract: Some(super::super::exchange_verifying_contract(neg_risk)),
+            ..Eip712Domain::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn safe_signatures_recover_the_eoa_for_both_exchange_domains() -> Result<()> {
+        let (client, signer, wallet) = offline_wallet(WalletType::GnosisSafe).await?;
+        for neg_risk in [false, true] {
+            let signed = build_signed_order(
+                &client,
+                &signer,
+                &wallet,
+                super::super::exchange_verifying_contract(neg_risk),
+                U256::from(1),
+                Side::Buy,
+                dec!(6.3796),
+                dec!(0.63),
+                OrderType::GTC,
+                false,
+                0,
+            )
+            .await?;
+            assert_eq!(signed.order().maker, wallet.funder);
+            assert_eq!(signed.order().signer, signer.address());
+            assert_eq!(
+                signed.order().signatureType,
+                SignatureType::GnosisSafe as u8
+            );
+            assert_eq!(signed.order().makerAmount, U256::from(3_780_000));
+            assert_eq!(signed.order().takerAmount, U256::from(6_000_000));
+            assert_eq!(signed.v2().expiration, U256::ZERO);
+            let OrderSignature::Ecdsa(signature) = &signed.signature else {
+                anyhow::bail!("Safe order must carry an ECDSA signature");
+            };
+            let hash = signed.order().eip712_signing_hash(&domain(neg_risk));
+            assert_eq!(
+                signature.recover_address_from_prehash(&hash)?,
+                signer.address()
+            );
+            let other_hash = signed.order().eip712_signing_hash(&domain(!neg_risk));
+            assert_ne!(
+                signature.recover_address_from_prehash(&other_hash)?,
+                signer.address()
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poly1271_wraps_the_wallet_signature_for_both_exchange_domains() -> Result<()> {
+        let (client, signer, wallet) = offline_wallet(WalletType::Poly1271).await?;
+        for neg_risk in [false, true] {
+            let signed = build_signed_order(
+                &client,
+                &signer,
+                &wallet,
+                super::super::exchange_verifying_contract(neg_risk),
+                U256::from(1),
+                Side::Sell,
+                dec!(6.3796),
+                dec!(0.63),
+                OrderType::GTC,
+                false,
+                0,
+            )
+            .await?;
+            assert_eq!(signed.order().maker, wallet.funder);
+            assert_eq!(signed.order().signer, wallet.funder);
+            assert_eq!(signed.order().signatureType, SignatureType::Poly1271 as u8);
+            assert_eq!(signed.order().makerAmount, U256::from(6_370_000));
+            assert_eq!(signed.order().takerAmount, U256::from(4_013_100));
+            let OrderSignature::Wrapped(signature) = &signed.signature else {
+                anyhow::bail!("Deposit wallet order must carry a wrapped signature");
+            };
+            let order_type = "Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)";
+            assert_eq!(
+                signature.len(),
+                2 + 130 + 64 + 64 + order_type.len() * 2 + 4
+            );
+            let app_domain = domain(neg_risk).hash_struct();
+            let contents_hash = signed.order().eip712_hash_struct();
+            assert_eq!(
+                format!("0x{}", &signature[132..196]),
+                app_domain.to_string()
+            );
+            assert_eq!(
+                format!("0x{}", &signature[196..260]),
+                contents_hash.to_string()
+            );
+
+            // Independently recover the owner from the wrapped TypedDataSign
+            // digest. The deposit wallet is the inner verifying contract.
+            let typed_data_type = format!("TypedDataSign(Order contents,string name,string version,uint256 chainId,address verifyingContract,bytes32 salt){order_type}");
+            let typed_data_hash = keccak256(
+                (
+                    keccak256(typed_data_type.as_bytes()),
+                    contents_hash,
+                    keccak256(b"DepositWallet"),
+                    keccak256(b"1"),
+                    U256::from(POLYGON),
+                    wallet.funder,
+                    B256::ZERO,
+                )
+                    .abi_encode(),
+            );
+            let digest = keccak256(
+                [
+                    &[0x19_u8, 0x01][..],
+                    app_domain.as_slice(),
+                    typed_data_hash.as_slice(),
+                ]
+                .concat(),
+            );
+            let inner_signature = Signature::from_str(&signature[..132])?;
+            assert_eq!(
+                inner_signature.recover_address_from_prehash(&digest)?,
+                signer.address()
+            );
+            let json = serde_json::to_value(&signed)?;
+            assert_eq!(json["order"]["signatureType"], 3);
+            assert_eq!(json["order"]["signature"], signature.as_str());
+            assert!(json["order"].get("nonce").is_none());
+            assert!(json["order"].get("feeRateBps").is_none());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gtd_and_post_only_preserve_expiration_and_bid_flooring() -> Result<()> {
+        let (client, signer, wallet) = offline_wallet(WalletType::GnosisSafe).await?;
+        let before = Utc::now().timestamp() as u64;
+        let signed = build_signed_order(
+            &client,
+            &signer,
+            &wallet,
+            super::super::exchange_verifying_contract(false),
+            U256::from(1),
+            Side::Buy,
+            dec!(5.9),
+            dec!(0.318),
+            OrderType::GTD,
+            true,
+            30,
+        )
+        .await?;
+        let after = Utc::now().timestamp() as u64;
+        assert!(signed.v2().expiration >= U256::from(before + 90));
+        assert!(signed.v2().expiration <= U256::from(after + 90));
+        assert_eq!(signed.order().makerAmount, U256::from(1_550_000));
+        assert_eq!(signed.order().takerAmount, U256::from(5_000_000));
+        assert_eq!(signed.post_only, Some(true));
+        assert_eq!(signed.order_type, OrderType::GTD);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_amounts_time_in_force_and_domains_fail_before_signing() -> Result<()> {
+        let (client, signer, wallet) = offline_wallet(WalletType::GnosisSafe).await?;
+        let exchange = super::super::exchange_verifying_contract(false);
+        for (quantity, price, tif, post_only, expiration) in [
+            (dec!(0), dec!(0.5), OrderType::GTC, false, 0),
+            (dec!(-1), dec!(0.5), OrderType::GTC, false, 0),
+            (dec!(0.001), dec!(0.5), OrderType::GTC, false, 0),
+            (dec!(1), dec!(0), OrderType::GTC, false, 0),
+            (dec!(1), dec!(1), OrderType::GTC, false, 0),
+            (dec!(1), dec!(0.001), OrderType::GTC, false, 0),
+            (dec!(1), dec!(0.999), OrderType::GTC, false, 0),
+            (dec!(1), dec!(0.5), OrderType::GTD, false, 0),
+            (dec!(1), dec!(0.5), OrderType::GTC, false, 60),
+            (dec!(1), dec!(0.5), OrderType::FAK, true, 0),
+            (dec!(1), dec!(0.5), OrderType::FOK, true, 0),
+            (Decimal::MAX, dec!(0.5), OrderType::GTC, false, 0),
+        ] {
+            assert!(build_signed_order(
+                &client,
+                &signer,
+                &wallet,
+                exchange,
+                U256::from(1),
+                Side::Buy,
+                quantity,
+                price,
+                tif,
+                post_only,
+                expiration,
+            )
+            .await
+            .is_err());
+        }
+        assert!(build_signed_order(
+            &client,
+            &signer,
+            &wallet,
+            Address::ZERO,
+            U256::from(1),
+            Side::Buy,
+            dec!(5),
+            dec!(0.5),
+            OrderType::GTC,
+            false,
+            0,
+        )
+        .await
+        .is_err());
+        Ok(())
+    }
+
+    fn order_response(success: bool, id: &str, error: Option<&str>) -> PostOrderResponse {
+        serde_json::from_value(serde_json::json!({
+            "success": success, "orderID": id, "errorMsg": error,
+            "status": "live", "makingAmount": "", "takingAmount": ""
+        }))
+        .expect("valid public response fixture")
+    }
+
+    #[test]
+    fn order_acceptance_requires_success_id_and_no_error() {
+        assert!(validate_order_response(&order_response(true, "accepted", None)).is_ok());
+        assert!(validate_order_response(&order_response(true, "accepted", Some(""))).is_ok());
+        assert!(
+            validate_order_response(&order_response(false, "", Some("balance / allowance")))
+                .is_err()
+        );
+        assert!(validate_order_response(&order_response(true, "", None)).is_err());
+        assert!(
+            validate_order_response(&order_response(true, "accepted", Some("rejected"))).is_err()
+        );
+    }
+
+    #[test]
+    fn batch_acceptance_checks_each_leg_and_retains_accepted_ids() {
+        assert!(validate_batch_response(&[
+            order_response(true, "first", None),
+            order_response(true, "second", None)
+        ])
+        .is_ok());
+        let error = validate_batch_response(&[
+            order_response(true, "accepted-orphan", None),
+            order_response(false, "", Some("rejected")),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Batch leg 2"));
+        assert!(error.contains("accepted-orphan"));
+        assert!(validate_batch_response(&[]).is_err());
+        assert!(validate_batch_response(&[order_response(true, "first", None)]).is_err());
+    }
+}
 
 #[cfg(test)]
 mod placement_fault_tests {
@@ -558,9 +1180,12 @@ mod placement_fault_tests {
     fn a_425_order_manager_not_ready_is_the_venues_fault_not_the_strategys() {
         let e = anyhow::Error::msg(
             "Order placement failed: Status: error(425 Too Early) making POST \
-             call to /order with {\"error\":\"order manager not ready, please retry\"}"
+             call to /order with {\"error\":\"order manager not ready, please retry\"}",
         );
-        assert_eq!(classify_placement_error(&e), PlacementFault::VenueUnavailable);
+        assert_eq!(
+            classify_placement_error(&e),
+            PlacementFault::VenueUnavailable
+        );
     }
 
     /// The status-code form must classify on its own: the body text is the
@@ -572,7 +1197,10 @@ mod placement_fault_tests {
             "Order placement failed: Status: error(425 Too Early) making POST \
              call to /order with try later"
         );
-        assert_eq!(classify_placement_error(&e), PlacementFault::VenueUnavailable);
+        assert_eq!(
+            classify_placement_error(&e),
+            PlacementFault::VenueUnavailable
+        );
     }
 
     /// The 17:44:46 failure from the same production day: a FAK that found no
@@ -584,7 +1212,7 @@ mod placement_fault_tests {
         let e = anyhow::Error::msg(
             "Order placement failed: Status: error(400 Bad Request) making POST \
              call to /order with {\"error\":\"no orders found to match with FAK order. \
-             FAK orders are partially filled or killed if no match is found.\"}"
+             FAK orders are partially filled or killed if no match is found.\"}",
         );
         assert_eq!(classify_placement_error(&e), PlacementFault::BookRace);
     }
@@ -603,7 +1231,7 @@ mod placement_fault_tests {
     fn an_execution_engine_500_is_ambiguous_never_resent_and_never_charged() {
         let e = anyhow::Error::msg(
             "Order placement failed: Status: error(500 Internal Server Error) making POST \
-             call to /order with {\"error\":\"could not run the execution\"}"
+             call to /order with {\"error\":\"could not run the execution\"}",
         );
         assert_eq!(classify_placement_error(&e), PlacementFault::Ambiguous);
     }

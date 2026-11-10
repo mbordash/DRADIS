@@ -36,9 +36,7 @@ use tokio::sync::{watch, Mutex};
 use tokio::time::{Duration, Instant};
 use tracing::{info, warn};
 
-use polymarket_client_sdk_v2::clob::Client as ClobClient;
-use polymarket_client_sdk_v2::auth::state::Authenticated;
-use polymarket_client_sdk_v2::auth::Normal;
+use crate::venues::intl::trading_client::TradingClient;
 
 use crate::cag::{Cag, SessionState};
 use crate::helpers::dynamic_config::DynamicConfig;
@@ -61,7 +59,7 @@ pub struct RunArgs<P> {
     /// CAG registry — squadrons are registered/updated here on each rotation.
     pub cag: Cag,
     /// Authenticated CLOB REST client.
-    pub trading_client: Arc<ClobClient<Authenticated<Normal>>>,
+    pub trading_client: Arc<TradingClient>,
     /// Shared reqwest HTTP client (DNS pre-pinned in main.rs).
     pub shared_http: Arc<reqwest::Client>,
     /// Session-scoped nonce manager (Maker/Safe wallet).
@@ -73,7 +71,7 @@ pub struct RunArgs<P> {
     /// Externally owned account address.
     pub eoa_address: Address,
     /// Alloy wallet provider — used only by the settlement task.
-    pub wallet_provider: P,
+    pub wallet_provider: Arc<crate::venues::intl::wallet_executor::WalletExecutor<P>>,
     /// Lowercase crypto symbol (e.g. `"btc"`) for market discovery.
     pub crypto_filter: String,
     /// Raptor signal receivers — cloned into each new Squadron on rotation.

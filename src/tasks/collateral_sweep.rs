@@ -67,7 +67,9 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::config;
-use crate::tasks::cleanup::{execute_via_safe_confirmed, PUSD_COLLATERAL, USDCE_COLLATERAL};
+use crate::tasks::cleanup::{PUSD_COLLATERAL, USDCE_COLLATERAL};
+use crate::venues::intl::wallet_executor::WalletExecutor;
+use std::sync::Arc;
 
 /// Polymarket's permissionless USDC/USDC.e → pUSD on-ramp on Polygon.
 ///
@@ -83,7 +85,7 @@ pub const COLLATERAL_ONRAMP: Address = alloy_address!("0x93070a847efEf7F70739046
 const FAILURE_COOLDOWN_SECS: i64 = 30 * 60;
 
 /// Per-call cap on the view calls. The Safe transactions carry their own
-/// 30-second receipt cap inside `execute_via_safe_confirmed`.
+/// bounded receipt wait inside the wallet executor.
 const VIEW_TIMEOUT_SECS: u64 = 10;
 
 sol! {
@@ -207,10 +209,19 @@ fn publish_stranded(v: Decimal) {
 /// so a redemption's payout is seen in the same cycle that produced it. Safe
 /// to call concurrently: a second caller finds the lock held and returns.
 pub async fn sweep_stranded_collateral<P: Provider + Clone>(
-    provider: P,
+    executor: Arc<WalletExecutor<P>>,
     safe_address: Address,
     eoa_address: Address,
 ) {
+    if executor.wallet().funder != safe_address || executor.wallet().signer != eoa_address {
+        warn!("Collateral sweep skipped: immutable wallet identity mismatch");
+        return;
+    }
+    if let Err(error) = executor.reconcile_pending_effect().await {
+        debug!("Collateral sweep: prior wallet execution is unresolved: {}", error);
+        return;
+    }
+    let provider = executor.provider().clone();
     crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::Settlement);
     let _guard = match SWEEP_RUN_LOCK.try_lock() {
         Ok(g) => g,
@@ -232,6 +243,9 @@ pub async fn sweep_stranded_collateral<P: Provider + Clone>(
     let stranded = base_units_to_decimal(raw);
     publish_stranded(stranded);
 
+    if crate::helpers::dynamic_config::ghosting_now() || crate::helpers::dynamic_config::read_only_mode() {
+        return;
+    }
     let (enabled, min_usdc) = knobs();
     let last_failure = *LAST_FAILURE.lock().unwrap_or_else(|e| e.into_inner());
     match sweep_decision(enabled, stranded, min_usdc, last_failure, Utc::now()) {
@@ -298,8 +312,14 @@ pub async fn sweep_stranded_collateral<P: Provider + Clone>(
     };
     if allowance < raw {
         let calldata = IERC20::approveCall { spender: COLLATERAL_ONRAMP, amount: raw }.abi_encode();
-        match execute_via_safe_confirmed(provider.clone(), safe_address, eoa_address, USDCE_COLLATERAL, calldata).await {
-            Ok(tx) => info!("Collateral sweep: approved on-ramp for ${:.4} USDC.e (tx {})", stranded, tx),
+        match executor.execute(USDCE_COLLATERAL, calldata).await {
+            Ok(tx) => {
+                if let Err(error) = executor.confirm_effect(tx).await {
+                    warn!("Collateral sweep: approval effect remains unverified: {}", error);
+                    return;
+                }
+                info!("Collateral sweep: approved on-ramp for ${:.4} USDC.e (tx {})", stranded, tx);
+            }
             Err(e) => {
                 warn!("Collateral sweep: approve failed: {}", e);
                 record_failure();
@@ -311,7 +331,7 @@ pub async fn sweep_stranded_collateral<P: Provider + Clone>(
     }
 
     let calldata = ICollateralOnramp::wrapCall { asset: USDCE_COLLATERAL, to: safe_address, amount: raw }.abi_encode();
-    let wrap_tx = match execute_via_safe_confirmed(provider.clone(), safe_address, eoa_address, COLLATERAL_ONRAMP, calldata).await {
+    let wrap_tx = match executor.execute(COLLATERAL_ONRAMP, calldata).await {
         Ok(tx) => tx,
         Err(e) => {
             warn!("Collateral sweep: wrap failed: {}", e);
@@ -341,6 +361,10 @@ pub async fn sweep_stranded_collateral<P: Provider + Clone>(
             wrap_tx, base_units_to_decimal(after)
         );
         record_failure();
+        return;
+    }
+    if let Err(error) = executor.confirm_effect(wrap_tx).await {
+        warn!("Collateral sweep: wrap effect remains unverified: {}", error);
         return;
     }
     let after_dec = base_units_to_decimal(after);

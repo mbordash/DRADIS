@@ -640,8 +640,40 @@ pub fn operator_exit_reason(kind: OperatorExit, price: Decimal, sold: Decimal, o
     }
 }
 
-/// Request body for manual "Return to Base" exit.
-///
+/// Durable position owner resolved before a manual exit reaches the venue.
+#[derive(Debug, sqlx::FromRow)]
+struct ManualExitPositionRow {
+    entry_price: String,
+    shares: String,
+    /// Simulated rows hold nothing at the venue. The first version of this
+    /// handler had no ghost gate and fired a REAL sell for shares the wallet
+    /// did not hold; the order normally bounced, but a completed exit was
+    /// booked either way.
+    ghost_mode: i64,
+    /// Dollars already paid to open the position. The automated exit books
+    /// `entry_fee + exit_fee`; a manual close that booked neither overstated
+    /// P&L by the entry fee and then deleted the row that carried it.
+    entry_fee: Option<String>,
+    squadron_id: String,
+}
+
+/// Resolve a unique durable owner before any venue quote or placement occurs.
+async fn load_manual_exit_position(
+    pool: &sqlx::SqlitePool, token_id: &str, strategy: &str,
+) -> Result<ManualExitPositionRow, (StatusCode, &'static str)> {
+    let mut rows = sqlx::query_as::<_, ManualExitPositionRow>(
+        "SELECT entry_price,shares,ghost_mode,entry_fee,squadron_id FROM open_positions WHERE token_id = ? AND strategy = ? LIMIT 2"
+    ).bind(token_id).bind(strategy).fetch_all(pool).await.map_err(|e| {
+        error!("Close Now: database error while resolving durable position owner: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Database error")
+    })?;
+    match rows.len() {
+        0 => Err((StatusCode::NOT_FOUND, "Position not found")),
+        1 => Ok(rows.remove(0)),
+        _ => Err((StatusCode::CONFLICT, "Multiple position owners match this token and strategy; reconcile ownership before closing it")),
+    }
+}
+
 /// POST /api/positions/manual-exit
 ///
 /// Executes an immediate FAK (Fill-And-Kill) market sell order for the
@@ -691,6 +723,48 @@ async fn health() -> &'static str {
 async fn get_assets() -> Response {
     debug!("Received GET /api/assets request");
     Json(db::available_assets()).into_response()
+}
+
+/// Observable wallet capabilities; no credentials or private execution payloads.
+#[derive(Serialize)]
+struct VenueCapabilities {
+    wallet_type: Option<&'static str>,
+    signature_type: Option<u8>,
+    trading_address: Option<String>,
+    supports_simulation: bool,
+    execution_ready: bool,
+    settlement_ready: bool,
+    blockers: Vec<String>,
+    ghost_mode: bool,
+}
+
+async fn get_venue_capabilities(State(state): State<ApiState>) -> Json<VenueCapabilities> {
+    let ghost_mode = crate::config::GHOST_MODE || state.config_rx.borrow().ghost_mode;
+    #[cfg(feature = "intl_clob")]
+    let response = match state.cag.intl_venue() {
+        Some(venue) => {
+            let wallet = venue.wallet();
+            let blockers = venue.refresh_live_readiness().await;
+            let ready = blockers.is_empty();
+            VenueCapabilities { wallet_type: Some(match wallet.wallet_type {
+                    crate::venues::intl::wallet::WalletType::GnosisSafe => "gnosis_safe",
+                    crate::venues::intl::wallet::WalletType::Poly1271 => "poly1271",
+                }), signature_type: Some(wallet.signature_type() as u8),
+                trading_address: Some(wallet.funder.to_string()), supports_simulation: true,
+                execution_ready: ready, settlement_ready: ready, blockers, ghost_mode }
+        }
+        None => VenueCapabilities { wallet_type: None, signature_type: None, trading_address: None,
+            supports_simulation: true, execution_ready: false, settlement_ready: false,
+            blockers: vec!["Venue is not connected".into()], ghost_mode },
+    };
+    #[cfg(not(feature = "intl_clob"))]
+    let response = {
+        let ready = state.cag.session().is_some();
+        VenueCapabilities { wallet_type: None, signature_type: None, trading_address: None,
+            supports_simulation: true, execution_ready: ready, settlement_ready: ready,
+            blockers: if ready { Vec::new() } else { vec!["Venue is not connected".into()] }, ghost_mode }
+    };
+    Json(response)
 }
 
 /// GET /api/config
@@ -766,6 +840,15 @@ struct PatchConfigQuery {
 /// switches the same way.
 pub(crate) async fn apply_global_patch(s: &ApiState, body: &str, fan_out: bool) -> anyhow::Result<std::sync::Arc<DynamicConfig>> {
     let current = s.config_rx.borrow().clone();
+    #[cfg(feature = "intl_clob")]
+    {
+        let patch: serde_json::Value = serde_json::from_str(body)?;
+        if patch.get("ghost_mode").and_then(serde_json::Value::as_bool) == Some(false) {
+            let venue = s.cag.intl_venue().ok_or_else(|| anyhow::anyhow!("LIVE unavailable: venue is not connected"))?;
+            let blockers = venue.refresh_live_readiness().await;
+            anyhow::ensure!(blockers.is_empty(), "LIVE unavailable: {}", blockers.join("; "));
+        }
+    }
     let new_cfg = DynamicConfig::apply_patch(&current, body).await?;
     // Broadcast to all strategy tick loops.
     let _ = s.config_tx.send(new_cfg.clone());
@@ -1963,7 +2046,7 @@ async fn manual_exit(
     // stop that would fire while this runs stands aside. Released when this
     // function returns, by Drop. Taken BEFORE the row is read, so a loop exit that
     // books and closes the row cannot slip in between the read and the sale.
-    let Some(_exit_claim) = db::ExitClaim::take(&req.token_id) else {
+    let Some(exit_claim) = db::ExitClaim::take(&req.token_id) else {
         warn!("Close Now: an exit for {} is already in flight", req.token_id);
         return (
             StatusCode::CONFLICT,
@@ -1971,30 +2054,9 @@ async fn manual_exit(
         ).into_response();
     };
 
-    #[derive(sqlx::FromRow)]
-    struct PositionRow {
-        entry_price: String,
-        shares: String,
-        /// Simulated rows hold nothing at the venue. The first version of this
-        /// handler had no ghost gate and fired a REAL sell for shares the wallet
-        /// did not hold; the order normally bounced, but a completed exit was
-        /// booked either way.
-        ghost_mode: i64,
-        /// Dollars already paid to open the position. The automated exit books
-        /// `entry_fee + exit_fee`; a manual close that booked neither overstated
-        /// P&L by the entry fee and then deleted the row that carried it.
-        entry_fee: Option<String>,
-    }
+    let pos_result = load_manual_exit_position(&pool, &req.token_id, &req.strategy).await;
 
-    let pos_result = sqlx::query_as::<_, PositionRow>(
-        "SELECT entry_price, shares, ghost_mode, entry_fee FROM open_positions WHERE token_id = ? AND strategy = ?"
-    )
-    .bind(&req.token_id)
-    .bind(&req.strategy)
-    .fetch_one(&pool)
-    .await;
-
-    let (entry_price, shares, position_is_ghost, entry_fee) = match pos_result {
+    let (entry_price, shares, position_is_ghost, entry_fee, position_squadron) = match pos_result {
         Ok(row) => {
             let entry = match Decimal::from_str(&row.entry_price) {
                 Ok(p) => p,
@@ -2010,19 +2072,16 @@ async fn manual_exit(
                     return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid shares").into_response();
                 }
             };
-            let entry_fee = row.entry_fee.as_deref()
-                .and_then(|f| Decimal::from_str(f).ok())
-                .unwrap_or(Decimal::ZERO);
-            (entry, shares, row.ghost_mode != 0, entry_fee)
+            let entry_fee = match row.entry_fee.as_deref().map(Decimal::from_str).transpose() {
+                Ok(fee) => fee.unwrap_or(Decimal::ZERO),
+                Err(e) => {
+                    error!("Close Now: invalid entry fee in DB: {e}");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid entry fee").into_response();
+                }
+            };
+            (entry, shares, row.ghost_mode != 0, entry_fee, row.squadron_id)
         }
-        Err(sqlx::Error::RowNotFound) => {
-            warn!("Close Now: position not found (token={}, strategy={})", req.token_id, req.strategy);
-            return (StatusCode::NOT_FOUND, "Position not found").into_response();
-        }
-        Err(e) => {
-            error!("Close Now: database error: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
-        }
+        Err((status, message)) => return (status, message).into_response(),
     };
     if shares <= Decimal::ZERO {
         warn!("Close Now: row for {} [{}] holds {} shares — nothing to sell", req.token_id, req.strategy, shares);
@@ -2162,7 +2221,8 @@ async fn manual_exit(
           fill.filled, shares, fill.price, market, fill.order_id, fill.fee);
 
     // ── Step 5: book what filled, net of both legs' fees ──────────────────────
-    let booking = book_exit(entry_price, shares, entry_fee, fill.filled, fill.price, fill.fee, crate::config::MIN_ORDER_SHARES);
+    let minimum_remainder = if cfg!(feature = "intl_clob") { Decimal::ZERO } else { crate::config::MIN_ORDER_SHARES };
+    let booking = book_exit(entry_price, shares, entry_fee, fill.filled, fill.price, fill.fee, minimum_remainder);
     let partial = booking.partial();
     info!(" Close Now: {} — {:.2} of {:.2} shares | entry ${:.4} → exit ${:.4} | P&L ${:.4} (net of ${:.4} fees)",
           if partial { "PARTIAL" } else { "closed" },
@@ -2170,72 +2230,57 @@ async fn manual_exit(
 
     // A manual exit knows which book to write to but nothing about the market's
     // taxonomy: file it under the shard and leave the rest NULL.
-    metrics::record_trade(
-        &crate::state::TradeScope::shard_only(&req.asset),
-        booking.fees,
-        req.strategy.clone(),
-        req.market.clone(),
-        req.side.clone(),
-        entry_price,
-        fill.price,
-        booking.booked_shares,
-        booking.pnl,
+    let durable = match metrics::record_exit_trade_checked(
+        &crate::state::TradeScope::shard_only(&req.asset), &fill.order_id.to_string(), Some(&position_squadron),
+        req.strategy.clone(), req.token_id.clone(), req.market.clone(), req.side.clone(),
+        entry_price, fill.price, shares, booking.booked_shares, entry_fee, fill.fee,
         operator_exit_reason(
             if partial { OperatorExit::Partial } else { OperatorExit::Full },
             fill.price, booking.booked_shares, shares,
         ),
-    ).await;
-    // Every automated exit credits the session; a manual one that did not left
-    // the drawdown guard working from an incomplete figure.
-    *session.total_pnl.lock().await += booking.pnl;
-
-    if partial {
-        // The rest is still on the book and still ours. Booking a full close
-        // here is what left real shares with no strategy managing them. The
-        // surviving entry fee goes with the surviving shares, as the
-        // chain-adoption path rewrites it; the full fee on a reduced row would
-        // be charged a second time by whatever closes the remainder.
-        if let Err(e) = sqlx::query(
-            "UPDATE open_positions SET shares = ?, entry_fee = ? WHERE token_id = ? AND strategy = ?"
-        )
-        .bind(booking.remaining.to_string())
-        .bind(booking.remaining_entry_fee.to_string())
-        .bind(&req.token_id)
-        .bind(&req.strategy)
-        .execute(&pool)
-        .await {
-            error!("Close Now: could not reduce the row after a partial fill: {e}");
+    ).await {
+        Ok(booked) => booked,
+        Err(e) => {
+            error!("Close Now: accepted order {} could not be durably booked: {e}", fill.order_id);
+            exit_claim.retain();
+            return (StatusCode::SERVICE_UNAVAILABLE,
+                "The venue filled the exit, but durable bookkeeping failed. The token remains blocked; check the venue before recovery.").into_response();
         }
+    };
+    if durable.inserted { *session.total_pnl.lock().await += durable.pnl; }
+
+    if durable.remaining > Decimal::ZERO {
         let mut pos_map = session.positions.lock().await;
         for (k, p) in pos_map.iter_mut() {
             if k.strategy == req.strategy && k.market == market {
-                // The automated exit computes fees from the in-memory Position,
-                // so it has to scale with the row.
-                if p.shares > Decimal::ZERO {
-                    p.entry_fee = p.entry_fee * (booking.remaining / p.shares);
-                }
-                p.shares = booking.remaining;
+                p.entry_fee = durable.remaining_entry_fee;
+                p.shares = durable.remaining;
             }
         }
-        warn!("Close Now: partial fill — {:.2} shares remain open and still managed", booking.remaining);
+        warn!("Close Now: partial fill — {:.2} shares remain open and still managed", durable.remaining);
     } else {
-        forget_position(&session, &pool, &req.strategy, &market).await;
-        if req.strategy == crate::vipers::anchor_impl::STRATEGY_NAME {
-            close_anchor_ledger_row(&pool, &req.asset, &req.token_id, fill.price, fill.fee).await;
-        }
+        // The checked transaction already deleted the durable row.
+        forget_position_memory(&session, &req.strategy, &market).await;
+
+    }
+    if let Err(e) = venue.acknowledge_order_adoption(&fill.order_id).await {
+        error!("Close Now: durable order {} remains quarantined: {e}", fill.order_id);
+        exit_claim.retain();
+        return (StatusCode::SERVICE_UNAVAILABLE,
+            "The exit was booked, but releasing the venue order quarantine failed. The token remains blocked for recovery.").into_response();
     }
 
     info!("✅ Close Now: manual exit complete — order {}", fill.order_id);
     Json(ExitResponse {
         success: true,
-        status: if partial { "partial" } else { "closed" },
+        status: if durable.remaining > Decimal::ZERO { "partial" } else { "closed" },
         ghost: false,
         order_id: fill.order_id.to_string(),
         exit_price: fill.price.to_string(),
         filled_shares: fill.filled.to_string(),
-        remaining_shares: booking.remaining.to_string(),
-        pnl: booking.pnl.to_string(),
-        fees: booking.fees.to_string(),
+        remaining_shares: durable.remaining.to_string(),
+        pnl: durable.pnl.to_string(),
+        fees: durable.fees.to_string(),
     }).into_response()
 }
 
@@ -2287,6 +2332,14 @@ async fn forget_position(
     market: &MarketId,
 ) {
     db::close_open_position(pool, strategy, market.as_str()).await;
+    forget_position_memory(session, strategy, market).await;
+}
+
+async fn forget_position_memory(
+    session: &crate::cag::session::SessionState,
+    strategy: &str,
+    market: &MarketId,
+) {
     db::note_operator_release(strategy, market.as_str());
     {
         let mut pos_map = session.positions.lock().await;
@@ -2309,10 +2362,15 @@ async fn forget_position(
 /// at the price it actually ended at, net of both fees; the control lane's row
 /// for the same market is untouched and settles on its own.
 async fn close_anchor_ledger_row(pool: &sqlx::SqlitePool, asset: &str, token_id: &str, exit_price: Decimal, exit_fee: Decimal) {
+    if let Err(e) = close_anchor_ledger_row_checked(pool, asset, token_id, exit_price, exit_fee).await {
+        warn!("Close Now: Anchor ledger update failed: {e}");
+    }
+}
+
+async fn close_anchor_ledger_row_checked(pool: &sqlx::SqlitePool, asset: &str, token_id: &str, exit_price: Decimal, exit_fee: Decimal) -> anyhow::Result<()> {
     use rust_decimal::prelude::ToPrimitive;
     let Some(rows) = db::anchor_shadow_open_rows(pool, asset).await else {
-        warn!("Close Now: could not read the Anchor ledger for {asset}; its row for {token_id} stays open");
-        return;
+        anyhow::bail!("could not read the Anchor ledger for {asset}");
     };
     let px = exit_price.to_f64().unwrap_or(0.0);
     let exit_fee = exit_fee.to_f64().unwrap_or(0.0);
@@ -2320,8 +2378,11 @@ async fn close_anchor_ledger_row(pool: &sqlx::SqlitePool, asset: &str, token_id:
         let pnl = (px - row.entry_price) * row.shares - row.entry_fee * row.shares - exit_fee;
         if db::anchor_shadow_close(pool, row.id, px, "operator exit", pnl).await {
             info!("⚓ Close Now: Anchor ledger row {} closed at ${px:.4} (P&L ${pnl:.4})", row.id);
+        } else {
+            anyhow::bail!("Anchor ledger row {} was not durably closed", row.id);
         }
     }
+    Ok(())
 }
 
 /// The ledger consequences of one exit fill against one open row.
@@ -2385,6 +2446,24 @@ mod manual_exit_booking_tests {
     use super::*;
     use rust_decimal_macros::dec;
 
+    #[tokio::test]
+    async fn ambiguous_manual_exit_owner_is_rejected_before_venue_work() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE open_positions (entry_price TEXT, shares TEXT, ghost_mode INTEGER, entry_fee TEXT, squadron_id TEXT, token_id TEXT, strategy TEXT)")
+            .execute(&pool).await.unwrap();
+        for (squadron, ghost) in [("first", 0), ("second", 1)] {
+            sqlx::query("INSERT INTO open_positions VALUES ('0.4','5',?,'0.1',?,'token','Strategy')")
+                .bind(ghost).bind(squadron).execute(&pool).await.unwrap();
+        }
+        assert!(matches!(load_manual_exit_position(&pool, "token", "Strategy").await,
+            Err((StatusCode::CONFLICT, _))));
+        sqlx::query("DELETE FROM open_positions WHERE squadron_id = 'second'").execute(&pool).await.unwrap();
+        let unique = load_manual_exit_position(&pool, "token", "Strategy").await.unwrap();
+        assert_eq!(unique.squadron_id, "first");
+        assert_eq!(unique.ghost_mode, 0);
+    }
+
     /// A fill of the whole row closes it: every share booked, the whole entry
     /// fee plus the exit fee netted, nothing left on the row.
     #[test]
@@ -2429,6 +2508,17 @@ mod manual_exit_booking_tests {
         assert_eq!(b.fees, dec!(0.15));
         // (0.50 − 0.40) × 5 − 0.15: the dust is valued at the fill price.
         assert_eq!(b.pnl, dec!(0.35));
+    }
+
+    #[test]
+    fn intl_dust_remainder_keeps_unsold_shares_and_their_entry_fee() {
+        let b = book_exit(dec!(0.40), dec!(5), dec!(0.10), dec!(4.5), dec!(0.50), dec!(0.05), Decimal::ZERO);
+        assert!(b.partial());
+        assert_eq!(b.booked_shares, dec!(4.5));
+        assert_eq!(b.remaining, dec!(0.5));
+        assert_eq!(b.remaining_entry_fee, dec!(0.01));
+        assert_eq!(b.fees, dec!(0.14));
+        assert_eq!(b.pnl, dec!(0.31));
     }
 
     /// A sale under the entry books a negative P&L with the fees on top of the
@@ -2681,6 +2771,13 @@ fn resolve_collateral(
     }
 }
 
+#[cfg(feature = "intl_clob")]
+fn portfolio_wallet(cag: &Cag, assets: &[String]) -> Option<Arc<crate::venues::intl::IntlClobVenue>> {
+    cag.intl_venue().or_else(|| {
+        assets.iter().find_map(|asset| cag.session_for_asset(asset).map(|session| session.venue))
+    })
+}
+
 async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
     debug!("Received GET /api/portfolio request");
     // `s` is only consulted for the intl on-chain balance probe below.
@@ -2701,47 +2798,21 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
     let live_collateral: Option<Decimal> = None;
     #[cfg(feature = "intl_clob")]
     let live_collateral = {
-        use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
-        use polymarket_client_sdk_v2::clob::types::AssetType;
-
-        // Get first available session to access trading_client
-        let session = assets.iter().find_map(|a| s.cag.session_for_asset(a));
-
-        if let Some(sess) = session {
-            let mut req = BalanceAllowanceRequest::default();
-            req.asset_type = AssetType::Collateral;
-
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                sess.venue.trading_client().balance_allowance(req),
-            ).await {
-                Ok(Ok(resp)) => {
-                    // A balance we cannot parse is "no reading", not a live
-                    // zero: reporting $0.00 as a fresh venue answer is the
-                    // one thing worse than reporting nothing.
-                    match Decimal::from_str(&resp.balance.to_string()) {
-                        Ok(raw) => {
-                            let balance = raw / Decimal::from_str("1000000").unwrap();
-                            debug!(" Live wallet collateral from CLOB: ${:.4}", balance);
-                            Some(balance)
-                        }
-                        Err(e) => {
-                            warn!("⚠️ CLOB balance '{}' did not parse in /api/portfolio: {}", resp.balance, e);
-                            None
-                        }
-                    }
-                }
-                Ok(Err(e)) => {
-                    warn!("⚠️ CLOB balance fetch failed in /api/portfolio: {}", e);
+        use crate::venues::core::Execution;
+        // Wallet connectivity is independent of a running strategy session.
+        let venue = portfolio_wallet(&s.cag, &assets);
+        match venue {
+            Some(venue) => match venue.collateral().await {
+                Ok(balance) => Some(balance),
+                Err(error) => {
+                    warn!(%error, "CLOB collateral unavailable in /api/portfolio; using snapshot if present");
                     None
                 }
-                Err(_) => {
-                    warn!("⚠️ CLOB balance fetch timed out (10s) in /api/portfolio");
-                    None
-                }
+            },
+            None => {
+                debug!("CLOB collateral unavailable: wallet is not connected");
+                None
             }
-        } else {
-            None
         }
     };
 
@@ -4929,7 +5000,8 @@ pub async fn run_api_server(
     // Registered here and not in the intl-only block below: until 1.5.4 it lived
     // there, and the Kalshi and US builds answered the button with 405 [B73].
     let protected_routes = protected_routes
-        .route("/api/positions/manual-exit", axum::routing::post(manual_exit));
+        .route("/api/positions/manual-exit", axum::routing::post(manual_exit))
+        .route("/api/venue/capabilities", get(get_venue_capabilities));
 
     // Intl-only endpoint: self-custody chain-sync against the Safe's holdings.
     #[cfg(feature = "intl_clob")]
@@ -5301,5 +5373,90 @@ mod venue_income_summary_tests {
         assert_eq!(session.to_string(), "1.2592");
         assert_eq!(by_kind["MAKER_REBATE"].to_string(), "2.8927");
         assert_eq!(by_kind["TAKER_REBATE"].to_string(), "10");
+    }
+}
+
+#[cfg(all(test, feature = "intl_clob"))]
+mod deposit_wallet_portfolio_tests {
+    use super::*;
+    use crate::venues::core::Execution;
+
+    #[test]
+    fn capabilities_contract_exposes_readiness_and_no_secret_fields() {
+        let value = serde_json::to_value(VenueCapabilities {
+            wallet_type: Some("poly1271"), signature_type: Some(3),
+            trading_address: Some("0x1111111111111111111111111111111111111111".into()),
+            supports_simulation: true, execution_ready: false, settlement_ready: false,
+            blockers: vec!["Configure relayer credentials".into()], ghost_mode: true,
+        }).unwrap();
+        let mut fields: Vec<_> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        fields.sort_unstable();
+        let mut expected = vec!["wallet_type", "signature_type", "trading_address", "supports_simulation",
+            "execution_ready", "settlement_ready", "blockers", "ghost_mode"];
+        expected.sort_unstable();
+        assert_eq!(fields, expected);
+        assert_eq!(value["wallet_type"], "poly1271");
+        assert_eq!(value["signature_type"], 3);
+        assert_eq!(value["execution_ready"], false);
+    }
+
+    fn capability_state() -> ApiState {
+        let (config_tx, config_rx) = watch::channel(Arc::new(DynamicConfig::default()));
+        ApiState { config_tx: Arc::new(config_tx), config_rx,
+            markets_rx: watch::channel(HashMap::new()).1,
+            raptor_health_rx: watch::channel(HashMap::new()).1,
+            api_key: None, read_only: false, safe_address: Address::ZERO,
+            cag: Cag::new(), telemetry_history: Arc::new(Mutex::new(HashMap::new())) }
+    }
+
+    #[tokio::test]
+    async fn blocked_live_patch_preserves_config_and_keeps_ghost_settings_usable() {
+        let state = capability_state();
+        let original = state.config_rx.borrow().clone();
+        let error = apply_global_patch(&state, r#"{"ghost_mode":false}"#, false).await.unwrap_err();
+        assert!(error.to_string().contains("venue is not connected"));
+        assert!(Arc::ptr_eq(&original, &state.config_rx.borrow()));
+
+        let venue = Arc::new(crate::venues::intl::IntlClobVenue::test_connection("http://127.0.0.1:1").await);
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&probes);
+        venue.set_readiness_probe(Arc::new(move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { vec!["Relayer is unavailable".to_owned()] })
+        }));
+        state.cag.set_intl_venue(venue);
+        let error = apply_global_patch(&state, r#"{"ghost_mode":false}"#, false).await.unwrap_err();
+        assert!(error.to_string().contains("Relayer is unavailable"));
+        assert!(Arc::ptr_eq(&original, &state.config_rx.borrow()));
+        assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let settings = apply_global_patch(&state, r#"{"ghost_mode":true}"#, false).await.unwrap();
+        assert!(settings.ghost_mode);
+        assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let settings = apply_global_patch(&state, r#"{"enable_momentum":false}"#, false).await.unwrap();
+        assert!(!settings.enable_momentum);
+        assert!(settings.ghost_mode);
+    }
+
+    #[tokio::test]
+    async fn portfolio_reads_clob_without_a_trading_session() {
+        let app = axum::Router::new().route("/balance-allowance", get(|| async {
+            Json(serde_json::json!({"balance":"123456789", "allowances":{}}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let cag = Cag::new();
+        assert!(portfolio_wallet(&cag, &[]).is_none());
+        cag.set_intl_venue(Arc::new(crate::venues::intl::IntlClobVenue::test_connection(&host).await));
+        assert!(cag.session().is_none());
+        let venue = portfolio_wallet(&cag, &[]).expect("connected wallet must not require a session");
+        let live = venue.collateral().await.unwrap();
+        let (balance, source, age) = resolve_collateral(Some(live), None, chrono::Utc::now());
+        assert_eq!(balance, Some(rust_decimal::Decimal::new(123456789, 6)));
+        assert_eq!(source, CollateralSource::Live);
+        assert_eq!(age, None);
+        assert!(venue.is_balance_only());
+        assert!(venue.cancel(crate::venues::core::OrderId("never-send".into())).await.is_err());
+        server.abort();
     }
 }

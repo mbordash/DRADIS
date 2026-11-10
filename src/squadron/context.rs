@@ -49,9 +49,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{watch, Mutex};
 use tokio::time::Instant;
 
-use polymarket_client_sdk_v2::clob::Client as ClobClient;
-use polymarket_client_sdk_v2::auth::state::Authenticated;
-use polymarket_client_sdk_v2::auth::Normal;
+use crate::venues::intl::trading_client::TradingClient;
 
 use crate::cag::{Cag, SessionState};
 use crate::helpers::dynamic_config::DynamicConfig;
@@ -72,7 +70,7 @@ pub struct PatrolContext<P> {
     pub session: SessionState,
 
     // ── Trading infrastructure ───────────────────────────────────────────────
-    pub trading_client: Arc<ClobClient<Authenticated<Normal>>>,
+    pub trading_client: Arc<TradingClient>,
     pub nonce_manager:  Arc<AtomicU64>,
     /// Wallet signing key — cheaply cloned per order placement.
     pub signer: LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
@@ -80,7 +78,7 @@ pub struct PatrolContext<P> {
     pub eoa_address:  Address,
     pub shared_http:  Arc<reqwest::Client>,
     /// Alloy wallet provider — consumed only by `auto_settle_closed_positions`.
-    pub wallet_provider: P,
+    pub wallet_provider: Arc<crate::venues::intl::wallet_executor::WalletExecutor<P>>,
 
     // ── Market rotation ──────────────────────────────────────────────────────
     /// Market-state channel — patrol() watches this to detect rotation.

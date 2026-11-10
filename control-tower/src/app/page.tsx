@@ -39,7 +39,7 @@ import SeededConfigNotice from '@/components/SeededConfigNotice';
 import ErrorBoundary   from '@/components/ErrorBoundary';
 import Footer          from '@/components/Footer';
 import { ViperHealthStrip } from '@/components/ViperHealthStrip';
-import { getAssets, getConfig, getPnlHistory, getPnlSpan, getTrades, getTradeStats, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, getPortfolioValue, getVenueIncome, getSquadrons, refusalText } from '@/lib/api';
+import { getAssets, getConfig, getVenueCapabilities, getPnlHistory, getPnlSpan, getTrades, getTradeStats, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, getPortfolioValue, getVenueIncome, getSquadrons, refusalText } from '@/lib/api';
 import {
   type PnlRange, PNL_HISTORY_POINTS, PNL_RANGE_STORE_KEY, isPnlRange, availableHours, hoursForRange,
   rangeEnabled, tradeLimitForHours, windowLabel,
@@ -702,6 +702,8 @@ export default function DashboardPage() {
 
   const { data: config, mutate: refreshConfig, isLoading: configLoading } =
     useSWR('config', getConfig, { refreshInterval: 0, revalidateOnFocus: false });
+  const { data: capabilities, error: capabilitiesError, isValidating: capabilitiesChecking, mutate: refreshCapabilities } =
+    useSWR(!DEMO_MODE ? 'venue-capabilities' : null, getVenueCapabilities, { refreshInterval: 15_000 });
 
   // Portfolio chart window. The page owns it because the history fetch key
   // depends on it; the chart renders the control. Remembered per browser as
@@ -918,15 +920,71 @@ export default function DashboardPage() {
   // The GHOST/LIVE switch is the most consequential control on the page; a
   // refused switch must say so rather than leave the button as it was ([B43]).
   const [ghostErr, setGhostErr] = useState<string | null>(null);
+  const [modeChanging, setModeChanging] = useState(false);
+  const ghostMode = capabilities?.ghost_mode ?? config?.ghost_mode;
+  const readinessReason = capabilitiesError
+    ? 'LIVE unavailable: execution readiness could not be verified.'
+    : !capabilities || capabilitiesChecking
+      ? 'Checking execution readiness…'
+      : !capabilities.execution_ready || !capabilities.settlement_ready
+        ? capabilities.blockers.join(' · ') || 'LIVE unavailable: execution and settlement are not ready.'
+        : null;
   const toggleGhost = useCallback(async () => {
-    if (!config) return;
+    if (!config || modeChanging) return;
+    const nextGhost = !ghostMode;
     setGhostErr(null);
+    setModeChanging(true);
     try {
-      await handlePatch({ ghost_mode: !config.ghost_mode });
+      if (!nextGhost) {
+        // Recheck on intent: a cached ready response cannot authorize LIVE.
+        const latest = await getVenueCapabilities();
+        await refreshCapabilities(latest, { revalidate: false });
+        if (!latest.execution_ready || !latest.settlement_ready) {
+          throw new Error(latest.blockers.join(' · ') || 'Execution and settlement are not ready.');
+        }
+      }
+      await handlePatch({ ghost_mode: nextGhost });
+      await refreshCapabilities();
     } catch (e) {
       setGhostErr(refusalText(e));
+    } finally {
+      setModeChanging(false);
     }
-  }, [config, handlePatch]);
+  }, [config, ghostMode, modeChanging, handlePatch, refreshCapabilities]);
+
+  const modeControl = config && !DEMO_MODE && (
+    <div className="flex flex-col items-end gap-1 max-w-[20rem]">
+      <div className="flex items-center gap-2">
+        {capabilities?.wallet_type && (
+          <span className="text-[10px] font-mono text-gray-400">
+            {capabilities.wallet_type === 'poly1271' ? 'Deposit Wallet · Poly1271' : 'Gnosis Safe'}
+          </span>
+        )}
+        <button
+          onClick={toggleGhost}
+          disabled={modeChanging || (!!ghostMode && !!readinessReason)}
+          aria-label={ghostMode ? 'Switch to LIVE trading' : 'Switch to GHOST simulation'}
+          aria-describedby={readinessReason || ghostErr ? 'execution-readiness' : undefined}
+          aria-busy={modeChanging}
+          title={ghostMode ? readinessReason ?? 'Switch to LIVE trading' : 'Switch to GHOST simulation'}
+          className={[
+            'flex items-center gap-2 text-xs font-mono px-3 py-1.5 rounded-lg border transition-colors disabled:opacity-60 disabled:cursor-not-allowed focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-400',
+            ghostMode
+              ? 'bg-amber-500/10 border-amber-500/30 text-amber-300 enabled:hover:bg-amber-500/20'
+              : 'bg-indigo-500/15 border-indigo-400/50 text-indigo-200 enabled:hover:bg-indigo-500/25 enabled:hover:border-indigo-300 shadow-[0_0_10px_-2px_rgba(99,102,241,0.5)]',
+          ].join(' ')}
+        >
+          <span>{ghostMode ? '' : '⚡'}</span>
+          <span>{ghostMode ? 'GHOST' : 'LIVE'}</span>
+        </button>
+      </div>
+      {(ghostErr || readinessReason) && (
+        <span id="execution-readiness" role={ghostErr ? 'alert' : 'status'} className={`text-[10px] font-mono text-right ${ghostErr ? 'text-red-400' : 'text-amber-300'}`}>
+          {ghostErr || readinessReason}
+        </span>
+      )}
+    </div>
+  );
 
 
   // ── Squadron navigation ────────────────────────────────────────────────────
@@ -967,21 +1025,7 @@ export default function DashboardPage() {
             <div className="flex items-center gap-3">
               <SessionBadge startedAt={status?.session_started_at} />
               <EngineStatus health={health} />
-              {ghostErr && <span className="text-[10px] font-mono text-red-400 max-w-[16rem]">{ghostErr}</span>}
-              {config && !DEMO_MODE && (
-                <button
-                  onClick={toggleGhost}
-                  className={[
-                    'flex items-center gap-2 text-xs font-mono px-3 py-1.5 rounded-lg border transition-colors',
-                    config.ghost_mode
-                      ? 'bg-amber-500/10 border-amber-500/30 text-amber-300 hover:bg-amber-500/20'
-                      : 'bg-indigo-500/15 border-indigo-400/50 text-indigo-200 hover:bg-indigo-500/25 hover:border-indigo-300 shadow-[0_0_10px_-2px_rgba(99,102,241,0.5)]',
-                  ].join(' ')}
-                >
-                  <span>{config.ghost_mode ? '' : '⚡'}</span>
-                  <span>{config.ghost_mode ? 'GHOST' : 'LIVE'}</span>
-                </button>
-              )}
+              {modeControl}
             </div>
           </div>
         </header>
@@ -1025,21 +1069,7 @@ export default function DashboardPage() {
           <div className="flex items-center gap-3">
             <SessionBadge startedAt={status?.session_started_at} />
             <EngineStatus health={health} />
-              {ghostErr && <span className="text-[10px] font-mono text-red-400 max-w-[16rem]">{ghostErr}</span>}
-            {config && !DEMO_MODE && (
-              <button
-                onClick={toggleGhost}
-                className={[
-                  'flex items-center gap-2 text-xs font-mono px-3 py-1.5 rounded-lg border transition-colors',
-                  config.ghost_mode
-                    ? 'bg-amber-500/10 border-amber-500/30 text-amber-300 hover:bg-amber-500/20'
-                    : 'bg-indigo-500/15 border-indigo-400/50 text-indigo-200 hover:bg-indigo-500/25 hover:border-indigo-300 shadow-[0_0_10px_-2px_rgba(99,102,241,0.5)]',
-                ].join(' ')}
-              >
-                <span>{config.ghost_mode ? '' : '⚡'}</span>
-                <span>{config.ghost_mode ? 'GHOST' : 'LIVE'}</span>
-              </button>
-            )}
+            {modeControl}
           </div>
         </div>
       </header>

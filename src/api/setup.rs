@@ -107,6 +107,11 @@ const INTERNAL_KEYS: &[&str] = &["DRADIS_ADMIN_HASH", "DRADIS_SESSION_KEY"];
 /// had to carry "(true/false)" to explain what to type.
 const MANAGED_KEYS: &[(&str, &str, &str, &str, &str)] = &[
     ("POLYMARKET_PRIVATE_KEY",   "Polymarket wallet private key", "intl",   "venue", "text"),
+    ("POLYMARKET_WALLET_TYPE",   "Wallet type: gnosis_safe or poly1271", "intl", "venue", "text"),
+    ("POLYMARKET_FUNDER_ADDRESS", "Trading funder address (required for poly1271)", "intl", "venue", "text"),
+    ("POLYMARKET_RELAYER_API_KEY", "Polymarket Relayer API key (Deposit Wallet settlement)", "intl", "venue", "text"),
+    ("POLYMARKET_RELAYER_API_KEY_ADDRESS", "Relayer API key owner address", "intl", "venue", "text"),
+    ("POLYMARKET_RELAYER_URL", "Relayer URL (optional; official HTTPS service by default)", "intl", "venue", "text"),
     ("POLYGON_RPC_URL",          "Polygon RPC endpoint",          "intl",   "venue", "text"),
     ("POLYMARKET_US_KEY_ID",     "Polymarket US API key ID",      "us",     "venue", "text"),
     ("POLYMARKET_US_SECRET_KEY", "Polymarket US secret key",      "us",     "venue", "text"),
@@ -842,6 +847,13 @@ async fn put_credentials(Json(body): Json<PutCredentials>) -> Response {
                     Json(json!({"error": format!("'{}' is not a managed credential", key)}))).into_response();
         }
     }
+    // Reject invalid wallet inputs before changing either disk or process env.
+    #[cfg(feature = "intl_clob")]
+    for (key, value) in &body.credentials {
+        if let Err(error) = validate_intl_credential(key, value.trim()) {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response();
+        }
+    }
     let mut map = read_secrets();
     let mut changed: Vec<String> = Vec::new();
     for (key, value) in &body.credentials {
@@ -991,35 +1003,69 @@ async fn test_connection(Json(body): Json<TestRequest>) -> Response {
     }
 }
 
-/// Validate an intl wallet key: parse → derive EOA + Safe → full CLOB authenticate.
+/// Validate candidate wallet settings without retaining or echoing secret inputs.
+#[cfg(feature = "intl_clob")]
+fn validate_intl_credential(key: &str, value: &str) -> Result<(), String> {
+    use alloy::{primitives::Address, signers::local::LocalSigner};
+    use std::str::FromStr;
+    if value.is_empty() { return Ok(()); }
+    match key {
+        "POLYMARKET_PRIVATE_KEY" => {
+            LocalSigner::from_str(value).map_err(|_| "POLYMARKET_PRIVATE_KEY must be a valid 32-byte private key".to_string())?;
+        }
+        "POLYMARKET_WALLET_TYPE" => {
+            value.parse::<crate::venues::intl::wallet::WalletType>().map_err(|error| error.to_string())?;
+        }
+        "POLYMARKET_FUNDER_ADDRESS" | "POLYMARKET_RELAYER_API_KEY_ADDRESS" => {
+            let address: Address = value.parse().map_err(|_| "POLYMARKET_FUNDER_ADDRESS must be a valid address".to_string())?;
+            if address.is_zero() { return Err("POLYMARKET_FUNDER_ADDRESS must be nonzero".into()); }
+        }
+        "POLYMARKET_RELAYER_API_KEY" => {
+            if value.len() > 4096 || value.contains(['\r', '\n']) {
+                return Err("Relayer API key has an invalid header format".into());
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Validate the selected wallet mode using the same identity rules as startup.
 #[cfg(feature = "intl_clob")]
 async fn test_intl_wallet(body: &TestRequest) -> Result<serde_json::Value, String> {
-    use alloy::signers::local::LocalSigner;
-    use alloy::signers::Signer;
-    use polymarket_client_sdk_v2::clob::{Client as ClobClient, Config};
-    use polymarket_client_sdk_v2::clob::types::SignatureType;
-    use polymarket_client_sdk_v2::{derive_safe_wallet, POLYGON};
+    use alloy::signers::{local::LocalSigner, Signer};
+    use polymarket_client_sdk_v2::{clob::{Client as ClobClient, Config}, POLYGON};
+    use crate::venues::intl::{balance, wallet::WalletConfig};
     use std::str::FromStr;
 
     let key = test_cred(body, "POLYMARKET_PRIVATE_KEY")
         .ok_or("POLYMARKET_PRIVATE_KEY not provided or stored")?;
-    let signer = LocalSigner::from_str(key.trim())
-        .map_err(|e| format!("invalid private key: {}", e))?
+    validate_intl_credential("POLYMARKET_PRIVATE_KEY", key.trim())?;
+    let signer = LocalSigner::from_str(key.trim()).map_err(|_| "invalid private key")?
         .with_chain_id(Some(POLYGON));
-    let eoa = signer.address();
-    let safe = derive_safe_wallet(eoa, POLYGON).ok_or("Safe derivation failed".to_string())?;
-
-    let auth = ClobClient::new(crate::config::CLOB_API_BASE, Config::default())
-        .map_err(|e| format!("CLOB client init failed: {}", e))?
-        .authentication_builder(&signer)
-        .signature_type(SignatureType::GnosisSafe)
-        .authenticate();
-    tokio::time::timeout(std::time::Duration::from_secs(15), auth)
-        .await
-        .map_err(|_| "CLOB authentication timed out (15s)".to_string())?
-        .map_err(|e| format!("CLOB authentication failed: {}", e))?;
-
-    Ok(json!({"eoa": eoa.to_string(), "safe": safe.to_string(), "clob": "authenticated"}))
+    let mode = test_cred(body, "POLYMARKET_WALLET_TYPE");
+    let funder = test_cred(body, "POLYMARKET_FUNDER_ADDRESS");
+    let wallet = WalletConfig::resolve(signer.address(), mode.as_deref(), funder.as_deref())
+        .map_err(|error| error.to_string())?;
+    let client = ClobClient::new(crate::config::CLOB_API_BASE, Config::default())
+        .map_err(|error| balance::sdk_error("client", error).to_string())?;
+    // A Test button never creates credentials or signs an executable order.
+    let credentials = tokio::time::timeout(std::time::Duration::from_secs(15),
+        client.derive_api_key(&signer, None)).await
+        .map_err(|_| "CLOB credential derivation timed out (15s)")?
+        .map_err(|error| balance::sdk_error("derive_api_key", error).to_string())?;
+    let clob = client.authentication_builder(&signer).credentials(credentials)
+        .funder(wallet.funder).signature_type(wallet.signature_type()).authenticate().await
+        .map_err(|error| balance::sdk_error("authenticate", error).to_string())?;
+    let collateral = balance::read_collateral(&clob, wallet.signature_type()).await
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "eoa": wallet.signer.to_string(), "funder": wallet.funder.to_string(),
+        "safe": wallet.on_chain_safe().map(|address| address.to_string()),
+        "wallet_type": mode.unwrap_or_else(|| "gnosis_safe".into()),
+        "clob": "authenticated", "collateral": collateral.to_string(),
+        "execution_enabled": false
+    }))
 }
 
 /// Validate a Polygon RPC endpoint with `eth_blockNumber`.
@@ -2444,5 +2490,24 @@ mod tests {
                 key,
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "intl_clob"))]
+mod intl_wallet_validation_tests {
+    use super::validate_intl_credential;
+
+    #[test]
+    fn invalid_wallet_credentials_are_rejected_without_echoing_values() {
+        let candidate = "synthetic-invalid-private-key";
+        let error = validate_intl_credential("POLYMARKET_PRIVATE_KEY", candidate).unwrap_err();
+        assert!(!error.contains(candidate));
+        assert!(validate_intl_credential("POLYMARKET_PRIVATE_KEY", &"01".repeat(32)).is_ok());
+        for value in ["", "gnosis_safe", "poly1271"] {
+            assert!(validate_intl_credential("POLYMARKET_WALLET_TYPE", value).is_ok());
+        }
+        assert!(validate_intl_credential("POLYMARKET_WALLET_TYPE", "unknown").is_err());
+        assert!(validate_intl_credential("POLYMARKET_FUNDER_ADDRESS", "0x0000000000000000000000000000000000000000").is_err());
+        assert!(validate_intl_credential("POLYMARKET_FUNDER_ADDRESS", "invalid").is_err());
     }
 }

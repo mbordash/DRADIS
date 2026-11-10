@@ -38,9 +38,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use polymarket_client_sdk_v2::clob::Client as ClobClient;
-use polymarket_client_sdk_v2::auth::state::Authenticated;
-use polymarket_client_sdk_v2::auth::Normal;
+use crate::venues::intl::trading_client::TradingClient;
 
 use crate::cag::{Cag, SessionState};
 use crate::helpers::dynamic_config::DynamicConfig;
@@ -58,13 +56,13 @@ use crate::venues::intl::u256_from_market_id;
 /// Generic over `P` (wallet provider) to match `PatrolContext<P>`.
 pub struct AdamaInfrastructure<P> {
     // ── Trading infrastructure ───────────────────────────────────────────────
-    pub trading_client: Arc<ClobClient<Authenticated<Normal>>>,
+    pub trading_client: Arc<TradingClient>,
     pub signer: LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
     pub nonce_manager: Arc<AtomicU64>,
     pub safe_address: Address,
     pub eoa_address: Address,
     pub shared_http: Arc<reqwest::Client>,
-    pub wallet_provider: P,
+    pub wallet_provider: Arc<crate::venues::intl::wallet_executor::WalletExecutor<P>>,
 
     // ── CAG and session ──────────────────────────────────────────────────────
     /// The shard every deployed squadron files its rows under.
@@ -570,6 +568,11 @@ pub async fn fetch_market_info(http: &reqwest::Client, condition_id: &str) -> Op
         warn!(%condition_id, "Gamma knows no market with this condition id, open or closed");
         return None;
     };
+
+    if !crate::venues::intl::protocol::supported_gamma_ctf_market(market) {
+        warn!("Gamma market requires an unsupported exchange protocol — refusing deployment");
+        return None;
+    }
 
     // Refuse anything that is not the market that was asked for. Deploying the
     // wrong market is worse than not deploying at all: the squadron trades real

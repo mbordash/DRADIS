@@ -341,6 +341,29 @@ pub(crate) async fn init_schema(pool: &SqlitePool) -> Result<()> {
         )"
     ).execute(pool).await?;
 
+    // Written in the same transaction as an exit trade and its retained position.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS execution_exit_bookings (
+            order_id TEXT PRIMARY KEY, token_id TEXT NOT NULL, strategy TEXT NOT NULL,
+            squadron_id TEXT, shares TEXT NOT NULL, remaining TEXT NOT NULL,
+            remaining_entry_fee TEXT NOT NULL, fees TEXT NOT NULL, pnl TEXT NOT NULL
+        )"
+    ).execute(pool).await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS execution_entry_bookings (
+            order_id TEXT PRIMARY KEY, token_id TEXT NOT NULL, strategy TEXT NOT NULL,
+            squadron_id TEXT NOT NULL, status TEXT NOT NULL,
+            shares TEXT NOT NULL, entry_fee TEXT NOT NULL, price TEXT NOT NULL
+        )"
+    ).execute(pool).await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS execution_exit_progress (
+            order_id TEXT PRIMARY KEY, shares TEXT NOT NULL, exit_fee TEXT NOT NULL
+        )"
+    ).execute(pool).await?;
+
     // entries: fill events logged by record_entry()
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS entries (
@@ -2479,10 +2502,43 @@ pub async fn record_trade_db(
     reason: &str,
     timestamp: Option<DateTime<Utc>>,
 ) {
+    if let Err(e) = record_trade_db_checked(pool, scope, fees, strategy, market, side,
+        entry_price, exit_price, shares, pnl, reason, timestamp).await {
+        error!("❌ DB trade write failed: {}", e);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn record_trade_db_checked(
+    pool: &SqlitePool,
+    scope: &TradeScope,
+    fees: Decimal,
+    strategy: &str,
+    market: &str,
+    side: &str,
+    entry_price: Decimal,
+    exit_price: Decimal,
+    shares: Decimal,
+    pnl: Decimal,
+    reason: &str,
+    timestamp: Option<DateTime<Utc>>,
+) -> Result<()> {
+    let venue = resolved_venue_for(scope, pool);
+    let mut connection = pool.acquire().await?;
+    insert_trade_checked(&mut connection, scope, &venue, fees, strategy, market, side,
+        entry_price, exit_price, shares, pnl, reason, timestamp).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_trade_checked(
+    connection: &mut sqlx::SqliteConnection, scope: &TradeScope, venue: &Option<String>,
+    fees: Decimal, strategy: &str, market: &str, side: &str, entry_price: Decimal,
+    exit_price: Decimal, shares: Decimal, pnl: Decimal, reason: &str,
+    timestamp: Option<DateTime<Utc>>,
+) -> Result<()> {
     let ts = timestamp.unwrap_or_else(|| Utc::now()).to_rfc3339();
     let sid = current_session_id();
-    let venue = resolved_venue_for(scope, pool);
-    if let Err(e) = sqlx::query(
+    sqlx::query(
         "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, session_id,
                              venue, market_class, underlying, fees, ghost)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -2502,10 +2558,157 @@ pub async fn record_trade_db(
     .bind(scope.underlying.clone())
     .bind(fees.to_string())
     .bind(scope.ghost as i32)
-    .execute(pool)
-    .await {
-        error!("❌ DB trade write failed: {}", e);
+    .execute(connection)
+    .await?;
+    Ok(())
+}
+
+/// An exit and its retained ownership committed together. `inserted` distinguishes
+/// a retry of the same order, so in-memory P&L is credited only once.
+#[derive(Debug, Clone)]
+pub struct ExitTradeBooking {
+    pub shares: Decimal,
+    pub remaining: Decimal,
+    pub remaining_entry_fee: Decimal,
+    pub fees: Decimal,
+    pub pnl: Decimal,
+    pub inserted: bool,
+}
+
+/// Atomically book an accepted exit and reduce only its strategy/squadron row.
+/// An untracked orphan can have no row; its supplied quantities still provide
+/// durable strategy ownership in the trade. Multiple candidate rows fail closed.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_exit_trade_checked(
+    pool: &SqlitePool, scope: &TradeScope, order_id: &str, squadron_id: Option<&str>,
+    strategy: &str, token_id: &str, market: &str, side: &str,
+    entry_price: Decimal, exit_price: Decimal, requested_shares: Decimal,
+    filled_shares: Decimal, entry_fee: Decimal, exit_fee: Decimal, reason: &str,
+) -> Result<ExitTradeBooking> {
+    record_exit_trade_inner(pool, scope, order_id, squadron_id, strategy, token_id, market, side,
+        entry_price, exit_price, requested_shares, filled_shares, entry_fee, exit_fee, reason, false).await
+}
+
+/// Book only the additional shares and fee in a cumulative resting-order fill.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_cumulative_exit_trade_checked(
+    pool: &SqlitePool, scope: &TradeScope, order_id: &str, squadron_id: Option<&str>,
+    strategy: &str, token_id: &str, market: &str, side: &str,
+    entry_price: Decimal, exit_price: Decimal, requested_shares: Decimal,
+    filled_shares: Decimal, entry_fee: Decimal, exit_fee: Decimal, reason: &str,
+) -> Result<ExitTradeBooking> {
+    record_exit_trade_inner(pool, scope, order_id, squadron_id, strategy, token_id, market, side,
+        entry_price, exit_price, requested_shares, filled_shares, entry_fee, exit_fee, reason, true).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_exit_trade_inner(
+    pool: &SqlitePool, scope: &TradeScope, order_id: &str, squadron_id: Option<&str>,
+    strategy: &str, token_id: &str, market: &str, side: &str,
+    entry_price: Decimal, exit_price: Decimal, requested_shares: Decimal,
+    filled_shares: Decimal, entry_fee: Decimal, exit_fee: Decimal, reason: &str, cumulative: bool,
+) -> Result<ExitTradeBooking> {
+    anyhow::ensure!(!order_id.is_empty(), "accepted exit has no order id");
+    anyhow::ensure!(requested_shares > Decimal::ZERO && filled_shares > Decimal::ZERO && filled_shares <= requested_shares,
+        "exit booking requires positive filled shares within the requested quantity");
+    let mut tx = pool.begin().await?;
+    let marker = if cumulative { format!("{order_id}:cumulative:{filled_shares}") } else { order_id.to_string() };
+    let progress: Option<(String, String)> = if cumulative {
+        sqlx::query_as("SELECT shares,exit_fee FROM execution_exit_progress WHERE order_id = ?")
+            .bind(order_id).fetch_optional(&mut *tx).await?
+    } else { None };
+    let prior_shares = progress.as_ref().map(|p| p.0.parse::<Decimal>()).transpose()?.unwrap_or(Decimal::ZERO);
+    let prior_exit_fee = progress.as_ref().map(|p| p.1.parse::<Decimal>()).transpose()?.unwrap_or(Decimal::ZERO);
+    let cumulative_shares = filled_shares;
+    let cumulative_exit_fee = exit_fee;
+    let filled_shares = if cumulative { (filled_shares - prior_shares).max(Decimal::ZERO) } else { filled_shares };
+    let exit_fee = if cumulative { (exit_fee - prior_exit_fee).max(Decimal::ZERO) } else { exit_fee };
+    let previous: Option<(String, String, Option<String>, String, String, String, String, String)> =
+        sqlx::query_as("SELECT token_id, strategy, squadron_id, shares, remaining, remaining_entry_fee, fees, pnl FROM execution_exit_bookings WHERE order_id = ?")
+            .bind(&marker).fetch_optional(&mut *tx).await?;
+    if let Some((token, owner, squadron, shares, remaining, remaining_fee, fees, pnl)) = previous {
+        anyhow::ensure!(token == token_id && owner == strategy && squadron.as_deref() == squadron_id,
+            "order exit booking belongs to another position");
+        return Ok(ExitTradeBooking { shares: shares.parse()?, remaining: remaining.parse()?,
+            remaining_entry_fee: remaining_fee.parse()?, fees: fees.parse()?, pnl: pnl.parse()?, inserted: false });
     }
+    let rows: Vec<(i64, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT id, shares, entry_fee, entry_price FROM open_positions WHERE token_id = ? AND strategy = ? AND ghost_mode = ? AND (? IS NULL OR squadron_id = ? OR squadron_id = '')"
+    ).bind(token_id).bind(strategy).bind(scope.ghost as i32).bind(squadron_id).bind(squadron_id)
+        .fetch_all(&mut *tx).await?;
+    anyhow::ensure!(rows.len() <= 1, "exit has ambiguous durable position ownership");
+    let (owned, owned_entry_fee, entry_price) = if let Some((_, shares, fee, price)) = rows.first() {
+        (shares.parse::<Decimal>()?, fee.as_deref().map(str::parse::<Decimal>).transpose()?.unwrap_or(entry_fee), price.parse::<Decimal>()?)
+    } else if cumulative {
+        let remaining = (requested_shares - prior_shares).max(Decimal::ZERO);
+        (remaining, entry_fee * remaining / requested_shares, entry_price)
+    } else { (requested_shares, entry_fee, entry_price) };
+    if cumulative && filled_shares == Decimal::ZERO {
+        return Ok(ExitTradeBooking { shares: Decimal::ZERO, remaining: owned,
+            remaining_entry_fee: owned_entry_fee, fees: Decimal::ZERO, pnl: Decimal::ZERO, inserted: false });
+    }
+    anyhow::ensure!(owned > Decimal::ZERO && filled_shares <= owned,
+        "exit fill exceeds durable position shares");
+    let remaining = owned - filled_shares;
+    let booked_entry_fee = owned_entry_fee * filled_shares / owned;
+    let remaining_entry_fee = (owned_entry_fee - booked_entry_fee).max(Decimal::ZERO);
+    let fees = booked_entry_fee + exit_fee;
+    let pnl = (exit_price - entry_price) * filled_shares - fees;
+    let venue = resolved_venue_for(scope, pool);
+    insert_trade_checked(&mut tx, scope, &venue, fees, strategy, market, side,
+        entry_price, exit_price, filled_shares, pnl, reason, None).await?;
+    if let Some((id, _, _, _)) = rows.first() {
+        let result = if remaining > Decimal::ZERO {
+            sqlx::query("UPDATE open_positions SET shares = ?, entry_fee = ? WHERE id = ?")
+                .bind(remaining.to_string()).bind(remaining_entry_fee.to_string()).bind(id)
+                .execute(&mut *tx).await?
+        } else {
+            sqlx::query("DELETE FROM open_positions WHERE id = ?").bind(id).execute(&mut *tx).await?
+        };
+        anyhow::ensure!(result.rows_affected() == 1, "accepted exit position update was not persisted");
+    } else if remaining > Decimal::ZERO {
+        // An orphan without a prior row still needs an owner for its unsold shares.
+        sqlx::query("INSERT INTO open_positions (ts,session_id,strategy,token_id,market,side,entry_price,shares,entry_fee,ghost_mode,status,squadron_id,venue,market_class,underlying,engine_attributed) VALUES (?,?,?,?,?,?,?,?,?,?,'confirmed',?,?,?,?,1)")
+            .bind(Utc::now().to_rfc3339()).bind(current_session_id()).bind(strategy).bind(token_id)
+            .bind(market).bind(side).bind(entry_price.to_string()).bind(remaining.to_string())
+            .bind(remaining_entry_fee.to_string()).bind(scope.ghost as i32).bind(squadron_id.unwrap_or(""))
+            .bind(&venue).bind(&scope.market_class).bind(&scope.underlying).execute(&mut *tx).await?;
+    }
+    if strategy == crate::vipers::anchor_impl::STRATEGY_NAME {
+        use rust_decimal::prelude::ToPrimitive;
+        let anchor_rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT id FROM anchor_shadow WHERE asset = ? AND token_id = ? AND lane = ? AND closed_at IS NULL AND COALESCE(ghost, 1) = ? AND (? IS NULL OR squadron_id = ? OR squadron_id = '')"
+        ).bind(&scope.shard).bind(token_id).bind(ANCHOR_LANE_ENTRY).bind(scope.ghost as i32)
+            .bind(squadron_id).bind(squadron_id).fetch_all(&mut *tx).await?;
+        anyhow::ensure!(anchor_rows.len() <= 1, "exit has ambiguous Anchor ledger ownership");
+        if let Some((id,)) = anchor_rows.first() {
+            let changed = if remaining > Decimal::ZERO {
+                // Anchor stores its entry fee per share, unlike open_positions.
+                sqlx::query("UPDATE anchor_shadow SET shares = ?, entry_fee = ? WHERE id = ? AND closed_at IS NULL")
+                    .bind(remaining.to_f64().ok_or_else(|| anyhow::anyhow!("invalid Anchor remaining shares"))?)
+                    .bind((remaining_entry_fee / remaining).to_f64().ok_or_else(|| anyhow::anyhow!("invalid Anchor remaining fee"))?)
+                    .bind(id).execute(&mut *tx).await?
+            } else {
+                sqlx::query("UPDATE anchor_shadow SET closed_at = ?, exit_price = ?, exit_reason = ?, pnl = ? WHERE id = ? AND closed_at IS NULL")
+                    .bind(Utc::now().to_rfc3339()).bind(exit_price.to_f64().ok_or_else(|| anyhow::anyhow!("invalid Anchor exit price"))?)
+                    .bind(reason).bind(pnl.to_f64().ok_or_else(|| anyhow::anyhow!("invalid Anchor exit P&L"))?)
+                    .bind(id).execute(&mut *tx).await?
+            };
+            anyhow::ensure!(changed.rows_affected() == 1, "Anchor exit ledger update was not persisted");
+        }
+    }
+    sqlx::query("INSERT INTO execution_exit_bookings (order_id,token_id,strategy,squadron_id,shares,remaining,remaining_entry_fee,fees,pnl) VALUES (?,?,?,?,?,?,?,?,?)")
+        .bind(&marker).bind(token_id).bind(strategy).bind(squadron_id)
+        .bind(filled_shares.to_string()).bind(remaining.to_string()).bind(remaining_entry_fee.to_string())
+        .bind(fees.to_string()).bind(pnl.to_string()).execute(&mut *tx).await?;
+    if cumulative {
+        sqlx::query("INSERT INTO execution_exit_progress(order_id,shares,exit_fee) VALUES (?,?,?) ON CONFLICT(order_id) DO UPDATE SET shares = excluded.shares, exit_fee = excluded.exit_fee")
+            .bind(order_id).bind(cumulative_shares.to_string()).bind(cumulative_exit_fee.to_string())
+            .execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    if remaining == Decimal::ZERO { note_recent_exit(token_id); }
+    Ok(ExitTradeBooking { shares: filled_shares, remaining, remaining_entry_fee, fees, pnl, inserted: true })
 }
 
 /// What a settlement write actually did.
@@ -4304,6 +4507,29 @@ async fn insert_open_position(
     status: &str,
     engine_attributed: bool,
 ) {
+    if let Err(e) = insert_open_position_checked(pool, scope, squadron_id, strategy, token_id,
+        market, side, entry_price, shares, ghost_mode, status, engine_attributed).await {
+        error!("❌ DB record_open_position failed: {}", e);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_open_position_checked(
+    pool: &SqlitePool,
+    // Filing dimensions — see `record_open_position`.
+    scope: &TradeScope,
+    // Squadron that owns the position; '' for callers that predate squadrons.
+    squadron_id: &str,
+    strategy: &str,
+    token_id: &str,
+    market: &str,
+    side: &str,
+    entry_price: Decimal,
+    shares: Decimal,
+    ghost_mode: bool,
+    status: &str,
+    engine_attributed: bool,
+) -> Result<()> {
     // A row written straight in as `confirmed` (an immediate fill, or a holding
     // the venue reported) is a confirmation the Data API may not have indexed
     // yet, exactly like a later `confirm_position_status`. Noted even when the
@@ -4320,7 +4546,7 @@ async fn insert_open_position(
     // strategy top-ups an existing position or when chain-sync has already adopted it.
     // If a row for this token already exists (chain-adopted or from a prior cycle),
     // we skip the insert — chain-sync will keep the shares count accurate via UPDATE.
-    match sqlx::query(
+    sqlx::query(
         // `engine_attributed = 1`: this row's share count comes from the engine's
         // own order, so a later wallet-level read must not overwrite it. Set here
         // and never by `update_position_from_chain`, which is why `chain_adopted`
@@ -4354,10 +4580,8 @@ async fn insert_open_position(
     .bind(strategy)
     .bind(squadron_id)
     .execute(pool)
-    .await {
-        Ok(_)  => {}
-        Err(e) => { error!("❌ DB record_open_position failed: {}", e); }
-    }
+    .await?;
+    Ok(())
 }
 
 /// Record a position the engine filled through its own order.
@@ -4383,6 +4607,95 @@ pub async fn record_open_position_with_status(
         pool, scope, squadron_id, strategy, token_id, market, side,
         entry_price, shares, ghost_mode, status, true,
     ).await;
+}
+
+/// Durable entry ownership for accepted orders. SQLite failure propagates to the caller.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_open_position_with_status_checked(
+    pool: &SqlitePool, scope: &TradeScope, squadron_id: &str, strategy: &str,
+    token_id: &str, market: &str, side: &str, entry_price: Decimal,
+    shares: Decimal, ghost_mode: bool, status: &str,
+) -> Result<()> {
+    insert_open_position_checked(pool, scope, squadron_id, strategy, token_id, market, side,
+        entry_price, shares, ghost_mode, status, true).await?;
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT shares FROM open_positions WHERE token_id = ? AND strategy = ? AND (squadron_id = ? OR squadron_id = '') AND ghost_mode = ?"
+    ).bind(token_id).bind(strategy).bind(squadron_id).bind(ghost_mode as i32).fetch_all(pool).await?;
+    anyhow::ensure!(rows.len() == 1, "accepted entry has no unique durable position owner");
+    anyhow::ensure!(rows[0].0.parse::<Decimal>()? >= shares, "durable position does not cover accepted entry shares");
+    Ok(())
+}
+
+/// Adopt cumulative fills for one accepted entry and its exact durable owner.
+/// The same order may grow a confirmed position; a different order cannot replace it.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_order_entry_checked(
+    pool: &SqlitePool, scope: &TradeScope, order_id: &str, squadron_id: &str,
+    strategy: &str, token_id: &str, market: &str, side: &str, price: Decimal,
+    shares: Decimal, entry_fee: Decimal, status: &str,
+) -> Result<()> {
+    anyhow::ensure!(!order_id.is_empty() && shares > Decimal::ZERO && price > Decimal::ZERO,
+        "accepted entry has invalid identity, shares or price");
+    anyhow::ensure!(status == "pending" || status == "confirmed", "invalid entry status");
+    let mut tx = pool.begin().await?;
+    let previous: Option<(String, String, String, String, String, String, String)> = sqlx::query_as(
+        "SELECT token_id,strategy,squadron_id,status,shares,entry_fee,price FROM execution_entry_bookings WHERE order_id = ?"
+    ).bind(order_id).fetch_optional(&mut *tx).await?;
+    let (prior_shares, prior_fee, prior_price, prior_confirmed) = if let Some((token, owner, squadron, prior_status, prior_shares, prior_fee, prior_price)) = &previous {
+        anyhow::ensure!(token == token_id && owner == strategy && squadron == squadron_id,
+            "accepted entry order belongs to another position");
+        let confirmed = prior_status == "confirmed";
+        let prior_shares = if confirmed { prior_shares.parse::<Decimal>()? } else { Decimal::ZERO };
+        if status == "pending" || (confirmed && shares <= prior_shares) { return Ok(()); }
+        (prior_shares, if confirmed { prior_fee.parse::<Decimal>()? } else { Decimal::ZERO },
+            prior_price.parse::<Decimal>()?, confirmed)
+    } else { (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, false) };
+    let delta = if status == "confirmed" { shares - prior_shares } else { shares };
+    let delta_fee = (entry_fee - prior_fee).max(Decimal::ZERO);
+    let delta_price = if prior_shares > Decimal::ZERO {
+        (price * shares - prior_price * prior_shares) / delta
+    } else { price };
+    anyhow::ensure!(delta_price > Decimal::ZERO, "accepted entry cumulative notional regressed");
+    let rows: Vec<(i64, String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, COALESCE(status, 'confirmed'), shares, entry_price, entry_fee FROM open_positions WHERE token_id = ? AND strategy = ? AND ghost_mode = ? AND (squadron_id = ? OR squadron_id = '')"
+    ).bind(token_id).bind(strategy).bind(scope.ghost as i32).bind(squadron_id).fetch_all(&mut *tx).await?;
+    anyhow::ensure!(rows.len() <= 1, "accepted entry has ambiguous position ownership");
+    let (owned_shares, owned_fee, owned_price) = if let Some((_, previous_status, owned, owned_price, owned_fee)) = rows.first() {
+        anyhow::ensure!(previous_status == "pending" || prior_confirmed,
+            "accepted entry cannot replace another order's confirmed holding");
+        if previous_status == "confirmed" && prior_confirmed {
+            let owned = owned.parse::<Decimal>()?;
+            let total = owned + delta;
+            (total, owned_fee.as_deref().unwrap_or("0").parse::<Decimal>()? + delta_fee,
+                (owned_price.parse::<Decimal>()? * owned + delta_price * delta) / total)
+        } else { (shares, entry_fee, price) }
+    } else if prior_confirmed { (delta, delta_fee, delta_price) }
+    else { (shares, entry_fee, price) };
+    if let Some((id, _, _, _, _)) = rows.first() {
+        let changed = sqlx::query("UPDATE open_positions SET entry_price = ?, shares = ?, entry_fee = ?, status = ?, squadron_id = ?, engine_attributed = 1 WHERE id = ?")
+            .bind(owned_price.to_string()).bind(owned_shares.to_string()).bind(owned_fee.to_string()).bind(status)
+            .bind(squadron_id).bind(id).execute(&mut *tx).await?;
+        anyhow::ensure!(changed.rows_affected() == 1, "accepted entry row update failed");
+    } else {
+        sqlx::query("INSERT INTO open_positions (ts,session_id,strategy,token_id,market,side,entry_price,shares,entry_fee,ghost_mode,status,squadron_id,venue,market_class,underlying,engine_attributed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)")
+            .bind(Utc::now().to_rfc3339()).bind(current_session_id()).bind(strategy).bind(token_id)
+            .bind(market).bind(side).bind(owned_price.to_string()).bind(owned_shares.to_string()).bind(owned_fee.to_string())
+            .bind(scope.ghost as i32).bind(status).bind(squadron_id).bind(resolved_venue_for(scope, pool))
+            .bind(&scope.market_class).bind(&scope.underlying).execute(&mut *tx).await?;
+    }
+    if status == "confirmed" {
+        sqlx::query("INSERT INTO entries (ts,session_id,strategy,token_id,market,side,entry_price,shares,venue,market_class,underlying) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(Utc::now().to_rfc3339()).bind(current_session_id()).bind(strategy).bind(token_id)
+            .bind(market).bind(side).bind(delta_price.to_string()).bind(delta.to_string())
+            .bind(resolved_venue_for(scope, pool)).bind(&scope.market_class).bind(&scope.underlying)
+            .execute(&mut *tx).await?;
+    }
+    sqlx::query("INSERT INTO execution_entry_bookings (order_id,token_id,strategy,squadron_id,status,shares,entry_fee,price) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(order_id) DO UPDATE SET status = excluded.status, shares = excluded.shares, entry_fee = excluded.entry_fee, price = excluded.price")
+        .bind(order_id).bind(token_id).bind(strategy).bind(squadron_id).bind(status)
+        .bind(shares.to_string()).bind(entry_fee.to_string()).bind(price.to_string()).execute(&mut *tx).await?;
+    tx.commit().await?;
+    if status == "confirmed" && !scope.ghost { note_confirmation(token_id); }
+    Ok(())
 }
 
 /// Record a venue-reported holding as an open position, NOT attributed to a fill.
@@ -5995,17 +6308,22 @@ pub fn exit_claimed(token_id: &str) -> bool {
 
 /// The claim one exit holds on a token while it runs; released by Drop on every
 /// return path, so no error leaves the token locked.
-pub struct ExitClaim(String);
+pub struct ExitClaim(Option<String>);
 
 impl ExitClaim {
     /// Claim `token_id` for an exit. `None` when another exit holds it.
     pub fn take(token_id: &str) -> Option<Self> {
-        begin_exit_claim(token_id).then(|| Self(token_id.to_string()))
+        begin_exit_claim(token_id).then(|| Self(Some(token_id.to_string())))
     }
+
+    /// Keep the token blocked after a real sale whose durable adoption failed.
+    pub fn retain(mut self) { self.0.take(); }
 }
 
 impl Drop for ExitClaim {
-    fn drop(&mut self) { end_exit_claim(&self.0); }
+    fn drop(&mut self) {
+        if let Some(token_id) = &self.0 { end_exit_claim(token_id); }
+    }
 }
 
 /// Positions the operator closed by hand (`POST /api/positions/manual-exit`),
@@ -11397,4 +11715,260 @@ mod pnl_snapshot_index_tests {
             assert!(!p.contains("SCAN pnl_snapshots") || p.contains("USING"), "{sql}: {p}");
         }
     }
+}
+
+#[cfg(test)]
+mod checked_order_booking_tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    async fn migrated_pool() -> SqlitePool {
+        let pool = memory_pool_for_tests().await;
+        run_migrations(&pool).await;
+        pool
+    }
+
+    async fn position(pool: &SqlitePool) {
+        record_open_position_with_status_checked(pool, &TradeScope::shard_only("test"),
+            "squad", "Strategy", "token", "Market", "YES", dec!(0.4), dec!(10), false,
+            "confirmed").await.unwrap();
+        sqlx::query("UPDATE open_positions SET entry_fee = '0.2' WHERE token_id = 'token'")
+            .execute(pool).await.unwrap();
+    }
+
+    async fn book(pool: &SqlitePool, filled: Decimal) -> Result<ExitTradeBooking> {
+        record_exit_trade_checked(pool, &TradeScope::shard_only("test"), "order", Some("squad"),
+            "Strategy", "token", "Market", "YES", dec!(0.4), dec!(0.5), dec!(10), filled,
+            dec!(0.2), dec!(0.05), "Test exit").await
+    }
+
+    #[tokio::test]
+    async fn partial_exit_commits_remaining_shares_and_fees_once() {
+        let pool = migrated_pool().await;
+        position(&pool).await;
+        let first = book(&pool, dec!(4)).await.unwrap();
+        assert!(first.inserted);
+        assert_eq!(first.shares, dec!(4));
+        assert_eq!(first.remaining, dec!(6));
+        assert_eq!(first.remaining_entry_fee, dec!(0.12));
+        assert_eq!(first.fees, dec!(0.13));
+        assert_eq!(first.pnl, dec!(0.27));
+        assert!(!book(&pool, dec!(4)).await.unwrap().inserted);
+        let row: (String, String) = sqlx::query_as("SELECT shares, entry_fee FROM open_positions WHERE token_id = 'token'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!((row.0.parse::<Decimal>().unwrap(), row.1.parse::<Decimal>().unwrap()), (dec!(6), dec!(0.12)));
+        let trades: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades").fetch_one(&pool).await.unwrap();
+        assert_eq!(trades, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_position_write_rolls_back_trade_and_order_marker() {
+        let pool = migrated_pool().await;
+        position(&pool).await;
+        sqlx::query("CREATE TRIGGER reject_exit_update BEFORE UPDATE ON open_positions BEGIN SELECT RAISE(ABORT, 'position write failed'); END")
+            .execute(&pool).await.unwrap();
+        assert!(book(&pool, dec!(4)).await.is_err());
+        let trades: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades").fetch_one(&pool).await.unwrap();
+        let markers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_exit_bookings").fetch_one(&pool).await.unwrap();
+        let shares: String = sqlx::query_scalar("SELECT shares FROM open_positions WHERE token_id = 'token'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!((trades, markers, shares.as_str()), (0, 0, "10"));
+        sqlx::query("DROP TRIGGER reject_exit_update").execute(&pool).await.unwrap();
+        assert!(book(&pool, dec!(4)).await.unwrap().inserted);
+    }
+
+    #[tokio::test]
+    async fn failed_trade_write_retains_position_and_full_close_is_idempotent() {
+        let pool = migrated_pool().await;
+        position(&pool).await;
+        sqlx::query("CREATE TRIGGER reject_trade BEFORE INSERT ON trades BEGIN SELECT RAISE(ABORT, 'trade write failed'); END")
+            .execute(&pool).await.unwrap();
+        assert!(book(&pool, dec!(10)).await.is_err());
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions").fetch_one(&pool).await.unwrap();
+        assert_eq!(rows, 1);
+        sqlx::query("DROP TRIGGER reject_trade").execute(&pool).await.unwrap();
+        assert_eq!(book(&pool, dec!(10)).await.unwrap().remaining, Decimal::ZERO);
+        assert!(!book(&pool, dec!(10)).await.unwrap().inserted);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions").fetch_one(&pool).await.unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn checked_trade_propagates_missing_table_failure() {
+        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        assert!(record_trade_db_checked(&pool, &TradeScope::shard_only("test"), Decimal::ZERO,
+            "Strategy", "Market", "YES", dec!(0.4), dec!(0.5), dec!(4), dec!(0.4), "exit", None)
+            .await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pending_entry_is_replaced_by_actual_fill_once() {
+        let pool = migrated_pool().await;
+        let scope = TradeScope::shard_only("test");
+        record_order_entry_checked(&pool, &scope, "buy-order", "squad", "Strategy", "token",
+            "Market", "YES", dec!(0.5), dec!(10), Decimal::ZERO, "pending").await.unwrap();
+        record_order_entry_checked(&pool, &scope, "buy-order", "squad", "Strategy", "token",
+            "Market", "YES", dec!(0.48), dec!(4), dec!(0.05), "confirmed").await.unwrap();
+        record_order_entry_checked(&pool, &scope, "buy-order", "squad", "Strategy", "token",
+            "Market", "YES", dec!(0.48), dec!(4), dec!(0.05), "confirmed").await.unwrap();
+        let row: (String, String, String, String) = sqlx::query_as("SELECT entry_price,shares,entry_fee,status FROM open_positions WHERE token_id = 'token'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(row, ("0.48".into(), "4".into(), "0.05".into(), "confirmed".into()));
+        let entries: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries").fetch_one(&pool).await.unwrap();
+        assert_eq!(entries, 1);
+        assert!(record_order_entry_checked(&pool, &scope, "another-order", "squad", "Strategy", "token",
+            "Market", "YES", dec!(0.48), dec!(2), Decimal::ZERO, "confirmed").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_entry_write_rolls_back_position_and_marker() {
+        let pool = migrated_pool().await;
+        sqlx::query("CREATE TRIGGER reject_entry BEFORE INSERT ON entries BEGIN SELECT RAISE(ABORT, 'entry write failed'); END")
+            .execute(&pool).await.unwrap();
+        assert!(record_order_entry_checked(&pool, &TradeScope::shard_only("test"), "buy-order", "squad",
+            "Strategy", "token", "Market", "YES", dec!(0.4), dec!(4), dec!(0.02), "confirmed").await.is_err());
+        let positions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions").fetch_one(&pool).await.unwrap();
+        let markers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_entry_bookings").fetch_one(&pool).await.unwrap();
+        assert_eq!((positions, markers), (0, 0));
+    }
+    #[tokio::test]
+    async fn cumulative_resting_fills_commit_only_new_shares_and_fees() {
+        let pool = migrated_pool().await;
+        position(&pool).await;
+        let scope = TradeScope::shard_only("test");
+        let first = record_cumulative_exit_trade_checked(&pool, &scope, "resting-order", Some("squad"),
+            "Strategy", "token", "Market", "YES", dec!(0.4), dec!(0.5), dec!(10),
+            dec!(4), dec!(0.2), dec!(0.04), "Resting sale").await.unwrap();
+        assert_eq!((first.shares, first.remaining, first.fees), (dec!(4), dec!(6), dec!(0.12)));
+        let second = record_cumulative_exit_trade_checked(&pool, &scope, "resting-order", Some("squad"),
+            "Strategy", "token", "Market", "YES", dec!(0.4), dec!(0.5), dec!(10),
+            dec!(6), dec!(0.2), dec!(0.06), "Resting sale").await.unwrap();
+        assert_eq!((second.shares, second.remaining, second.fees), (dec!(2), dec!(4), dec!(0.06)));
+        assert!(!record_cumulative_exit_trade_checked(&pool, &scope, "resting-order", Some("squad"),
+            "Strategy", "token", "Market", "YES", dec!(0.4), dec!(0.5), dec!(10),
+            dec!(6), dec!(0.2), dec!(0.06), "Resting sale").await.unwrap().inserted);
+        let trades: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades").fetch_one(&pool).await.unwrap();
+        assert_eq!(trades, 2);
+        let row: (String, String) = sqlx::query_as("SELECT shares,entry_fee FROM open_positions WHERE token_id = 'token'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!((row.0.parse::<Decimal>().unwrap(), row.1.parse::<Decimal>().unwrap()), (dec!(4), dec!(0.08)));
+    }
+
+    #[tokio::test]
+    async fn untracked_partial_orphan_gets_a_durable_owner_for_unsold_shares() {
+        let pool = migrated_pool().await;
+        let booked = book(&pool, dec!(4)).await.unwrap();
+        assert_eq!(booked.remaining, dec!(6));
+        let row: (String, String, String) = sqlx::query_as("SELECT shares,entry_fee,squadron_id FROM open_positions WHERE token_id = 'token'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!((row.0.parse::<Decimal>().unwrap(), row.1.parse::<Decimal>().unwrap()), (dec!(6), dec!(0.12)));
+        assert_eq!(row.2, "squad");
+    }
+
+    #[tokio::test]
+    async fn cumulative_entry_growth_survives_failed_write_and_database_restart() {
+        let path = std::env::temp_dir().join(format!("dradis-entry-booking-{}-{}.sqlite",
+            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&path).create_if_missing(true);
+        let pool = SqlitePoolOptions::new().max_connections(1).connect_with(options.clone()).await.unwrap();
+        init_schema(&pool).await.unwrap();
+        run_migrations(&pool).await;
+        let scope = TradeScope::shard_only("test");
+        record_order_entry_checked(&pool, &scope, "growing-buy", "squad", "Strategy", "token",
+            "Market", "YES", dec!(0.4), dec!(4), dec!(0.04), "confirmed").await.unwrap();
+        sqlx::query("CREATE TRIGGER reject_growth BEFORE INSERT ON entries BEGIN SELECT RAISE(ABORT, 'entry growth write failed'); END")
+            .execute(&pool).await.unwrap();
+        assert!(record_order_entry_checked(&pool, &scope, "growing-buy", "squad", "Strategy", "token",
+            "Market", "YES", dec!(0.4), dec!(6), dec!(0.06), "confirmed").await.is_err());
+        let owned: String = sqlx::query_scalar("SELECT shares FROM open_positions WHERE token_id = 'token'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(owned.parse::<Decimal>().unwrap(), dec!(4));
+        sqlx::query("DROP TRIGGER reject_growth").execute(&pool).await.unwrap();
+        pool.close().await;
+        let pool = SqlitePoolOptions::new().max_connections(1).connect_with(options).await.unwrap();
+        record_order_entry_checked(&pool, &scope, "growing-buy", "squad", "Strategy", "token",
+            "Market", "YES", dec!(0.4), dec!(6), dec!(0.06), "confirmed").await.unwrap();
+        record_order_entry_checked(&pool, &scope, "growing-buy", "squad", "Strategy", "token",
+            "Market", "YES", dec!(0.4), dec!(6), dec!(0.06), "confirmed").await.unwrap();
+        let row: (String, String) = sqlx::query_as("SELECT shares,entry_fee FROM open_positions WHERE token_id = 'token'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!((row.0.parse::<Decimal>().unwrap(), row.1.parse::<Decimal>().unwrap()), (dec!(6), dec!(0.06)));
+        let entries: Vec<String> = sqlx::query_scalar("SELECT shares FROM entries ORDER BY id")
+            .fetch_all(&pool).await.unwrap();
+        assert_eq!(entries.into_iter().map(|s| s.parse::<Decimal>().unwrap()).collect::<Vec<_>>(), vec![dec!(4), dec!(2)]);
+        pool.close().await;
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn entry_growth_adds_only_new_shares_after_an_intervening_exit() {
+        let pool = migrated_pool().await;
+        let scope = TradeScope::shard_only("test");
+        record_order_entry_checked(&pool, &scope, "growing-buy", "squad", "Strategy", "token",
+            "Market", "YES", dec!(0.4), dec!(4), dec!(0.04), "confirmed").await.unwrap();
+        record_exit_trade_checked(&pool, &scope, "partial-sell", Some("squad"), "Strategy", "token",
+            "Market", "YES", dec!(0.4), dec!(0.5), dec!(4), dec!(2), dec!(0.04), dec!(0.01), "exit")
+            .await.unwrap();
+        record_order_entry_checked(&pool, &scope, "growing-buy", "squad", "Strategy", "token",
+            "Market", "YES", dec!(0.4), dec!(6), dec!(0.06), "confirmed").await.unwrap();
+        let row: (String, String) = sqlx::query_as("SELECT shares,entry_fee FROM open_positions WHERE token_id = 'token'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!((row.0.parse::<Decimal>().unwrap(), row.1.parse::<Decimal>().unwrap()), (dec!(4), dec!(0.04)));
+        record_exit_trade_checked(&pool, &scope, "final-sell", Some("squad"), "Strategy", "token",
+            "Market", "YES", dec!(0.4), dec!(0.5), dec!(4), dec!(4), dec!(0.04), dec!(0.01), "exit")
+            .await.unwrap();
+        record_order_entry_checked(&pool, &scope, "growing-buy", "squad", "Strategy", "token",
+            "Market", "YES", dec!(0.4), dec!(6), dec!(0.06), "confirmed").await.unwrap();
+        let positions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions").fetch_one(&pool).await.unwrap();
+        assert_eq!(positions, 0, "replaying an old cumulative fill must not resurrect an exited holding");
+    }
+
+    #[tokio::test]
+    async fn exit_cost_basis_comes_from_its_exact_squadron_owner() {
+        let pool = migrated_pool().await;
+        let scope = TradeScope::shard_only("test");
+        for (squadron, price, shares) in [("A", dec!(0.4), dec!(10)), ("B", dec!(0.6), dec!(3))] {
+            record_open_position_with_status_checked(&pool, &scope, squadron, "Strategy", "token",
+                "Market", "YES", price, shares, false, "confirmed").await.unwrap();
+        }
+        let booked = record_exit_trade_checked(&pool, &scope, "sale-A", Some("A"), "Strategy", "token",
+            "Market", "YES", dec!(0.6), dec!(0.5), dec!(10), dec!(4), Decimal::ZERO,
+            Decimal::ZERO, "exit").await.unwrap();
+        assert_eq!(booked.pnl, dec!(0.4), "caller metadata from squadron B cannot change A's cost basis");
+        let price: String = sqlx::query_scalar("SELECT entry_price FROM trades WHERE strategy = 'Strategy'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(price.parse::<Decimal>().unwrap(), dec!(0.4));
+        let shares: String = sqlx::query_scalar("SELECT shares FROM open_positions WHERE squadron_id = 'B'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(shares.parse::<Decimal>().unwrap(), dec!(3));
+    }
+
+    #[tokio::test]
+    async fn anchor_partial_ledger_update_commits_with_the_exit_or_rolls_back() {
+        let pool = migrated_pool().await;
+        let scope = TradeScope::shard_only("test");
+        let strategy = crate::vipers::anchor_impl::STRATEGY_NAME;
+        record_open_position_with_status_checked(&pool, &scope, "squad", strategy, "token",
+            "Market", "YES", dec!(0.4), dec!(10), false, "confirmed").await.unwrap();
+        sqlx::query("UPDATE open_positions SET entry_fee = '0.2'").execute(&pool).await.unwrap();
+        assert!(anchor_shadow_open(&pool, "test", ANCHOR_LANE_ENTRY, "squad", "key", "condition",
+            "token", "Market", "YES", 0, 0.4, 10.0, 0.02, 0.0, 0.0, 0.0, 0.0,
+            0, 0.0, 0.0, 0.0, Some(false), None, None).await);
+        sqlx::query("CREATE TRIGGER reject_anchor_update BEFORE UPDATE ON anchor_shadow BEGIN SELECT RAISE(ABORT, 'Anchor write failed'); END")
+            .execute(&pool).await.unwrap();
+        assert!(record_exit_trade_checked(&pool, &scope, "anchor-sale", Some("squad"), strategy, "token",
+            "Market", "YES", dec!(0.4), dec!(0.5), dec!(10), dec!(4), dec!(0.2), dec!(0.05), "operator exit")
+            .await.is_err());
+        let trades: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades").fetch_one(&pool).await.unwrap();
+        let shares: String = sqlx::query_scalar("SELECT shares FROM open_positions").fetch_one(&pool).await.unwrap();
+        assert_eq!((trades, shares.as_str()), (0, "10"));
+        sqlx::query("DROP TRIGGER reject_anchor_update").execute(&pool).await.unwrap();
+        record_exit_trade_checked(&pool, &scope, "anchor-sale", Some("squad"), strategy, "token",
+            "Market", "YES", dec!(0.4), dec!(0.5), dec!(10), dec!(4), dec!(0.2), dec!(0.05), "operator exit")
+            .await.unwrap();
+        let row: (f64, f64, Option<String>) = sqlx::query_as("SELECT shares,entry_fee,closed_at FROM anchor_shadow")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(row, (6.0, 0.02, None));
+    }
+
 }

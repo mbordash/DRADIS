@@ -346,6 +346,7 @@ pub fn candidate_from_gamma_market(
     now: DateTime<Utc>,
     min_volume: f64,
 ) -> Option<GammaCandidate> {
+    if !crate::venues::intl::protocol::supported_gamma_ctf_market(m) { return None; }
     let null = serde_json::Value::Null;
     let name = m.get("question").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let event = m.get("event")

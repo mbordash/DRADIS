@@ -48,9 +48,8 @@ use tokio::time::{interval, Instant, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn, error, debug};
 
-use polymarket_client_sdk_v2::clob::Client as ClobClient;
-use polymarket_client_sdk_v2::auth::state::Authenticated;
-use polymarket_client_sdk_v2::auth::Normal;
+use crate::venues::intl::trading_client::TradingClient;
+use crate::venues::core::Execution;
 use polymarket_client_sdk_v2::clob::types::{Side};
 use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk_v2::clob::types::AssetType;
@@ -78,7 +77,7 @@ const LOOP_WATCHDOG_SECS: u64 = 180;
 /// Logs network round-trip time.  A 10 s timeout prevents the task from
 /// blocking the tokio runtime on a TCP-level stall.
 pub fn spawn_pulse_task(
-    trading_client: Arc<ClobClient<Authenticated<Normal>>>,
+    trading_client: Arc<TradingClient>,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -113,7 +112,7 @@ pub fn spawn_pulse_task(
 /// Uses the Polygon RPC provider for on-chain calls.  Generic over `P` (the
 /// alloy wallet provider) so it can be called from the generic `patrol<P>`.
 pub fn spawn_settlement_task<P>(
-    wallet_provider: P,
+    wallet_provider: Arc<crate::venues::intl::wallet_executor::WalletExecutor<P>>,
     safe_address: Address,
     eoa_address: Address,
     asset: String,
@@ -199,7 +198,7 @@ pub fn spawn_settlement_task<P>(
 /// wrong here: a transient API error would silently value a real position at
 /// zero and make the portfolio drop by its full size for a minute.
 async fn onchain_shares(
-    client: &Arc<ClobClient<Authenticated<Normal>>>,
+    client: &Arc<TradingClient>,
     token_id: &str,
 ) -> Option<Decimal> {
     let token_u = crate::venues::intl::u256_from_market_id(
@@ -313,7 +312,7 @@ fn shares_to_value(
 /// written back as zero shares.
 async fn calculate_positions_value(
     pool: &sqlx::SqlitePool,
-    client: &Arc<ClobClient<Authenticated<Normal>>>,
+    client: &Arc<TradingClient>,
 ) -> Decimal {
     // Fetch all open positions
     let positions = db::get_open_positions(pool).await;
@@ -511,7 +510,7 @@ async fn calculate_positions_value(
 pub fn spawn_status_task(
     live_collateral: Arc<Mutex<Decimal>>,
     total_pnl:       Arc<Mutex<Decimal>>,
-    trading_client:  Arc<ClobClient<Authenticated<Normal>>>,
+    trading_client:  Arc<TradingClient>,
     yes_price_rx:    watch::Receiver<PriceState>,
     no_price_rx:     watch::Receiver<PriceState>,
     // The window/daily books, when this squadron has that venue. A squadron
@@ -704,7 +703,7 @@ pub fn spawn_cleanup_task(
     // restores them to the squadron that opened them.
     squadron_id:          String,
     positions:            Arc<Mutex<crate::state::PositionMap>>,
-    trading_client:       Arc<ClobClient<Authenticated<Normal>>>,
+    trading_client:       Arc<TradingClient>,
     nonce_manager:        Arc<AtomicU64>,
     signer:               LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
     safe_address:         Address,
@@ -882,113 +881,50 @@ pub fn spawn_cleanup_task(
                                         paired_ask_ticked, orphan.original_entry, rehedge_cost,
                                     );
 
-                                    match place_limit_order(
+                                    match place_limit_order_filled(
                                         &trading_client, &nonce_manager, &signer,
-                                        safe_address, eoa_address,
-                                        vc, &paired_id, Side::Buy, orphan.shares,
-                                        buy_price, 0, crate::venues::core::TimeInForce::Fak, false, 0, &shared_http,
+                                        safe_address, eoa_address, vc, &paired_id, Side::Buy,
+                                        orphan.shares, buy_price, 0,
+                                        crate::venues::core::TimeInForce::Fak, false, 0, &shared_http,
                                     ).await {
-                                                        Ok(order_id) => {
-                                                            rehedged = true;
-                                                            info!(
-                                                                "✅ ORPHAN RE-HEDGE: FAK order placed {} — verifying fill...",
-                                                                order_id,
-                                                            );
-                                                            let tok_o = tg_token.clone();
-                                                            let cid_o = tg_chat_id.clone();
-                                                            let sh_o = orphan.shares;
-                                                            let cost_o = rehedge_cost;
-
-                                                            // Get market and side info
-                                                            let rh_market = if paired_id == hourly_yes_token || paired_id == hourly_no_token {
-                                                                hourly_market_name.clone()
-                                                            } else {
-                                                                maker_market_config.as_ref()
-                                                                    .map(|mkc| mkc.market_name.clone())
-                                                                    .unwrap_or_else(|| hourly_market_name.clone())
-                                                            };
-                                                            let rh_side = if paired_id == hourly_yes_token
-                                                                || maker_market_config.as_ref().map_or(false, |mkc| mkc.yes_token == paired_id)
-                                                            { "YES" } else { "NO" };
-
-                                                            let rh_squadron = squadron_id.clone();
-                                                            let rh_tid = paired_id.to_string();
-                                                            let rh_mkt = rh_market.clone();
-                                                            let rh_sd  = rh_side.to_string();
-                                                            let rh_ep  = paired_ask_ticked;
-                                                            let rh_sh  = orphan.shares;
-                                                            let rh_asset = asset.clone();
-                                                            let rh_tc = Arc::clone(&trading_client);
-                                                            // Needed so the async fill verifier can un-tombstone
-                                                            // the still-naked orphan leg if the re-hedge buy
-                                                            // doesn't actually fill on-chain (retry next cycle).
-                                                            let rh_tombstones = orphan_tombstones.clone();
-                                                            let rh_orphan_token = orphan.token_id.clone();
-
-                                                            // Write pending position immediately (Viper Launch)
-                                                            if let Some(pool) = db::pool_for(&rh_asset) {
-                                                                db::record_open_position_with_status(
-                                                                    &pool, &scope, &rh_squadron, "ArbitrageStrategy",
-                                                                    &rh_tid, &rh_mkt, &rh_sd,
-                                                                    rh_ep, rh_sh, false, "pending",
-                                                                ).await;
-                                                            }
-
-                                                            tokio::spawn(async move {
-                                                                // Wait 3s then verify fill on-chain
-                                                                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-                                                                let mut req = BalanceAllowanceRequest::default();
-                                                                req.asset_type = AssetType::Conditional;
-                                                                req.token_id = Some(crate::venues::intl::u256_from_market_id(&paired_id).unwrap_or_default());
-
-                                                                let balance_ok = match tokio::time::timeout(
-                                                                    std::time::Duration::from_secs(10),
-                                                                    rh_tc.balance_allowance(req)
-                                                                ).await {
-                                                                    Ok(Ok(resp)) => {
-                                                                        let balance = Decimal::from_str(&resp.balance.to_string())
-                                                                            .unwrap_or(dec!(0)) / dec!(1_000_000);
-                                                                        balance >= rh_sh * dec!(0.95) // Allow 5% tolerance
-                                                                    }
-                                                                    _ => false
-                                                                };
-
-                                                                if balance_ok {
-                                                                    info!("✅ ORPHAN RE-HEDGE: confirmed on-chain — arb completed");
-                                                                    let _ = send_notification(&tok_o, &cid_o, &format!(
-                                                                        "♻️ Orphan re-hedged: bought {:.0} missing shares @ ${:.4} \
-                                                                         (total arb cost ${:.4} → $1.00 payout at settle)",
-                                                                        sh_o, paired_ask_ticked, cost_o,
-                                                                    )).await;
-
-                                                                    // Update to confirmed (Mission In-Flight) + record entry
-                                                                    if let Some(pool) = db::pool_for(&rh_asset) {
-                                                                        db::confirm_position_status(&pool, "ArbitrageStrategy", &rh_tid).await;
-                                                                    }
-                                                                    metrics::record_entry(
-                                                                        &crate::state::TradeScope::crypto(
-                                                                            &rh_asset, crate::venues::intl::INTL_VENUE, &rh_asset),
-                                                                        "ArbitrageStrategy".to_string(),
-                                                                        rh_tid.clone(), rh_mkt.clone(), rh_sd.clone(),
-                                                                        rh_ep, rh_sh,
-                                                                    ).await;
-                                                                } else {
-                                                                    warn!("⚠️ ORPHAN RE-HEDGE: FAK order accepted but fill not confirmed on-chain — removing pending position");
-                                                                    if let Some(pool) = db::pool_for(&rh_asset) {
-                                                                        db::close_open_position(&pool, "ArbitrageStrategy", &rh_tid).await;
-                                                                    }
-                                                                    // Re-hedge buy never filled → the original leg is
-                                                                    // still naked. Un-tombstone it so the next cleanup
-                                                                    // cycle re-adopts and retries (re-hedge or flatten)
-                                                                    // instead of letting it ride to settlement.
-                                                                    rh_tombstones.lock().await.remove(&rh_orphan_token);
-                                                                }
-                                                            });
-                                                        }
-                                        Err(e) => warn!(
-                                            "⚠️ ORPHAN RE-HEDGE: FAK buy failed: {} — falling back to sell", e
-                                        ),
+                                        Ok((order_id, making, taking)) => {
+                                            if taking > Decimal::ZERO && making > Decimal::ZERO {
+                                                // An accepted buy suppresses the fallback sale even if
+                                                // persistence fails: the pair may now exist at the venue.
+                                                rehedged = true;
+                                                let price = making / taking;
+                                                let fee = crate::venues::intl::live_taker_fee_rate()
+                                                    * price * (Decimal::ONE - price) * taking;
+                                                let market = if paired_id == hourly_yes_token || paired_id == hourly_no_token {
+                                                    hourly_market_name.clone()
+                                                } else {
+                                                    maker_market_config.as_ref().map(|mkc| mkc.market_name.clone())
+                                                        .unwrap_or_else(|| hourly_market_name.clone())
+                                                };
+                                                let side = if paired_id == hourly_yes_token
+                                                    || maker_market_config.as_ref().map_or(false, |mkc| mkc.yes_token == paired_id)
+                                                { "YES" } else { "NO" };
+                                                let adoption = async {
+                                                    let pool = db::pool_for(&asset).ok_or_else(|| anyhow::anyhow!("re-hedge database unavailable"))?;
+                                                    let mut scope_r = scope.clone();
+                                                    scope_r.ghost = false;
+                                                    db::record_order_entry_checked(&pool, &scope_r, &order_id, &squadron_id,
+                                                        "ArbitrageStrategy", paired_id.as_str(), &market, side,
+                                                        price, taking, fee, "confirmed").await?;
+                                                    trading_client.acknowledge_placement(&order_id).await
+                                                }.await;
+                                                match adoption {
+                                                    Ok(()) => info!("ORPHAN RE-HEDGE: durably adopted order {} — {} shares @ {}", order_id, taking, price),
+                                                    Err(e) => warn!("ORPHAN RE-HEDGE order {} remains quarantined: {e}", order_id),
+                                                }
+                                            } else {
+                                                warn!("ORPHAN RE-HEDGE order {} matched no shares; no entry booked", order_id);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            rehedged = true;
+                                            warn!("ORPHAN RE-HEDGE failed with an unconfirmed outcome: {e}; retaining the original leg for recovery");
+                                        }
                                     }
                                 } else {
                                     warn!(
@@ -1046,25 +982,36 @@ pub fn spawn_cleanup_task(
                                         // sold 6 YES at $0.47 and the ledger never saw it.
                                         let st = orphan_sale(&orphan, making, taking, sell_price,
                                             crate::venues::intl::live_taker_fee_rate());
-                                        if st.filled >= config::MIN_ORDER_SHARES {
+                                        if st.filled > Decimal::ZERO {
                                             let side = if orphan.token_id == hourly_yes_token
                                                 || maker_market_config.as_ref().map_or(false, |mkc| mkc.yes_token == orphan.token_id)
                                             { "YES" } else { "NO" };
                                             info!("🧾 ORPHAN EXIT [{}]: {:.4} shares sold @ ${:.4} (entry ${:.4}) pnl=${:.4} (net of ${:.4} fees)",
                                                   orphan.strategy_name, st.filled, st.exit_price, orphan.original_entry, st.pnl, st.fees());
-                                            *total_pnl.lock().await += st.pnl;
-                                            // This path only runs live, whatever the cloned scope's
-                                            // ghost flag last read.
                                             let mut scope_o = scope.clone();
                                             scope_o.ghost = false;
-                                            metrics::record_trade(
-                                                &scope_o, st.fees(), orphan.strategy_name.clone(), orphan.market_name.clone(),
-                                                side.to_string(), orphan.original_entry, st.exit_price, st.filled, st.pnl,
-                                                "Orphan exit (bid FAK)".to_string(),
-                                            ).await;
+                                            match metrics::record_exit_trade_checked(
+                                                &scope_o, &order_id, Some(&squadron_id), orphan.strategy_name.clone(),
+                                                orphan.token_id.to_string(), orphan.market_name.clone(), side.to_string(),
+                                                orphan.original_entry, st.exit_price, orphan.shares, st.filled,
+                                                orphan.entry_fee, st.exit_fee, "Orphan exit (bid FAK)".to_string(),
+                                            ).await {
+                                                Ok(booked) => {
+                                                    if booked.inserted { *total_pnl.lock().await += booked.pnl; }
+                                                    if let Err(e) = trading_client.acknowledge_placement(&order_id).await {
+                                                        warn!("ORPHAN EXIT order {} was booked but remains quarantined: {e}", order_id);
+                                                        continue;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!("ORPHAN EXIT order {} was filled but not durably adopted: {e}", order_id);
+                                                    continue;
+                                                }
+                                            }
                                         } else {
                                             warn!("⚠️ ORPHAN EXIT [{}]: venue matched nothing on {:.4} shares at ${:.4} — no trade booked",
                                                   orphan.strategy_name, orphan.shares, sell_price);
+                                            continue;
                                         }
                                         let tok_o = tg_token.clone();
                                         let cid_o = tg_chat_id.clone();
@@ -1161,6 +1108,8 @@ pub fn spawn_lifecycle_task(
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(LIFECYCLE_SYNC_SECS));
         ticker.tick().await; // skip first tick — let the market settle
+        let mut pending_flattened = Vec::new();
+        let mut pending_confirmed = Vec::new();
         loop {
             tokio::select! {
                 biased;
@@ -1173,7 +1122,24 @@ pub fn spawn_lifecycle_task(
                             venue.as_ref(), &positions, &pool, &scope, &asset, &squadron_id, &live_legs,
                         ).await;
                     }
-                    let flattened = lifecycle.reconcile(venue.as_ref(), &positions).await;
+                    pending_flattened.extend(lifecycle.reconcile(venue.as_ref(), &positions).await);
+                    for leg in lifecycle.take_rehedged().await {
+                        let result = async {
+                            let pool = db::pool_for(&asset).ok_or_else(|| anyhow::anyhow!("re-hedge database unavailable"))?;
+                            let side = db::lookup_entry_side_db(&pool, leg.fill.market.as_str()).await
+                                .unwrap_or_else(|| "Buy".to_string());
+                            db::record_order_entry_checked(&pool,
+                                &crate::state::TradeScope::crypto(&asset, crate::venues::intl::INTL_VENUE, &asset),
+                                &leg.fill.order_id.to_string(), lifecycle.squadron_id(), &leg.strategy,
+                                leg.fill.market.as_str(), &leg.market_name, &side, leg.fill.price,
+                                leg.fill.filled, leg.fill.fee, "confirmed").await?;
+                            venue.acknowledge_order_adoption(&leg.fill.order_id).await
+                        }.await;
+                        if let Err(e) = result {
+                            warn!("Lifecycle re-hedge remains quarantined until durable adoption: {e}");
+                            lifecycle.retry_rehedged(leg).await;
+                        }
+                    }
                     // [B74] This venue tracks only paired legs, whose stale
                     // cancel clears the guard without reporting a release, and
                     // it has no fill feed; both lists are drained so they
@@ -1184,75 +1150,62 @@ pub fn spawn_lifecycle_task(
                             crate::helpers::db::close_pending_open_position_for(&p, lifecycle.squadron_id(), &q.strategy, q.market.as_str()).await;
                         }
                     }
-                    lifecycle.take_confirmed().await;
-                    for leg in flattened {
-                        // Bug #9 hardening: the in-memory position map's avg_entry can be
-                        // stale (e.g. adopted/topped-up fills). Cross-check against the DB
-                        // open_positions row — written at entry and chain-stamped — and
-                        // prefer it when the two diverge, logging the divergence so ghost
-                        // validation can quantify how often the map drifts.
+                    pending_confirmed.extend(lifecycle.take_confirmed().await);
+                    for confirmed in std::mem::take(&mut pending_confirmed) {
+                        let result = async {
+                            let pool = db::pool_for(&asset).ok_or_else(|| anyhow::anyhow!("fill database unavailable"))?;
+                            // The order's durable marker identifies the owner, and supplies
+                            // its cumulative fee even if the position has since been trimmed.
+                            let row: (String, String, String, String) = sqlx::query_as(
+                                "SELECT p.market,p.side,p.entry_price,e.entry_fee FROM open_positions p JOIN execution_entry_bookings e ON e.order_id = ? AND e.token_id = p.token_id AND e.strategy = p.strategy AND e.squadron_id = p.squadron_id WHERE p.token_id = ? AND p.strategy = ? AND p.squadron_id = ? AND p.ghost_mode = 0"
+                            ).bind(confirmed.order_id.to_string()).bind(confirmed.market.as_str())
+                                .bind(&confirmed.strategy).bind(lifecycle.squadron_id()).fetch_one(&pool).await?;
+                            let owner = venue.trading_client().tracked_orders(lifecycle.squadron_id()).await?
+                                .into_iter().find(|owner| owner.order_id == confirmed.order_id.to_string()
+                                    && owner.strategy == confirmed.strategy && owner.token_id == confirmed.market.as_str());
+                            let price = if let Some(owner) = &owner {
+                                (owner.initial_notional + (confirmed.filled - owner.initial_filled).max(Decimal::ZERO)
+                                    * owner.limit_price) / confirmed.filled
+                            } else if confirmed.price > Decimal::ZERO { confirmed.price } else { row.2.parse()? };
+                            let fee = owner.map(|owner| owner.entry_fee).unwrap_or(row.3.parse()?);
+                            db::record_order_entry_checked(&pool,
+                                &crate::state::TradeScope::crypto(&asset, crate::venues::intl::INTL_VENUE, &asset),
+                                &confirmed.order_id.to_string(), lifecycle.squadron_id(), &confirmed.strategy,
+                                confirmed.market.as_str(), &row.0, &row.1, price, confirmed.filled,
+                                fee, "confirmed").await?;
+                            venue.acknowledge_order_adoption(&confirmed.order_id).await
+                        }.await;
+                        if let Err(e) = result {
+                            warn!("Lifecycle fill order {} remains pending durable adoption: {e}", confirmed.order_id);
+                            pending_confirmed.push(confirmed);
+                        }
+                    }
+                    for leg in std::mem::take(&mut pending_flattened) {
                         let tid_str = leg.token_id.to_string();
-                        let avg_entry = match db::pool_for(&asset) {
-                            Some(p) => match db::lookup_open_position_strategy(&p, &tid_str).await {
-                                Some((db_entry, _)) if db_entry > dec!(0) => {
-                                    if db_entry != leg.avg_entry {
-                                        warn!(
-                                            " [{strategy}] flatten avg_entry divergence: position map ${map:.4} vs DB ${db:.4} — using DB",
-                                            strategy = leg.strategy, map = leg.avg_entry, db = db_entry,
-                                        );
-                                    }
-                                    db_entry
-                                }
-                                _ => leg.avg_entry,
-                            },
-                            None => leg.avg_entry,
-                        };
-                        let pnl = (leg.exit_price - avg_entry) * leg.shares;
-                        // Resolve the leg's real YES/NO outcome from the entries
-                        // table so the trade isn't mislabeled "Sell" (the bare order
-                        // direction). The venue-neutral lifecycle only knows token ids.
-                        let side = match db::pool_for(&asset) {
-                            Some(p) => db::lookup_entry_side_db(&p, &leg.token_id.to_string())
-                                .await
-                                .unwrap_or_else(|| "Sell".to_string()),
-                            None => "Sell".to_string(),
-                        };
-                        warn!(
-                            " [{strategy}] lifecycle flatten recorded: {market} entry={entry:.4} exit={exit:.4} shares={shares} pnl={pnl:.4}",
-                            strategy = leg.strategy,
-                            market   = leg.market_name,
-                            entry    = avg_entry,
-                            exit     = leg.exit_price,
-                            shares   = leg.shares,
-                        );
-                        let asset_c    = asset.clone();
-                        let strat      = leg.strategy.clone();
-                        let market     = leg.market_name.clone();
-                        let exit_price = leg.exit_price;
-                        let shares     = leg.shares;
-                        // Book synchronously (awaited, not a detached spawn): a container
-                        // restart mid-cleanup used to kill the fire-and-forget task before
-                        // the DB write flushed, leaving a flattened leg with no trade record
-                        // (the invisible half of the 2026-07-03 arb orphan). Awaiting here
-                        // guarantees the flatten is persisted before we move on.
-                        metrics::record_trade(
-                            &crate::state::TradeScope::crypto(
-                                &asset_c, crate::venues::intl::INTL_VENUE, &asset_c),
-                            Decimal::ZERO,
-                            strat,
-                            market,
-                            side,
-                            avg_entry,
-                            exit_price,
-                            shares,
-                            pnl,
-                            "LifecycleFlatten".to_string(),
-                        ).await;
-                        // Close the open_positions row now that the flatten is booked, so a
-                        // stale row can't linger until the next chain-sync purge and tempt
-                        // ChainReconcile into inventing a second exit for the same leg.
-                        if let Some(p) = db::pool_for(&asset) {
-                            db::close_open_position(&p, &leg.strategy, &tid_str).await;
+                        let result = async {
+                            let pool = db::pool_for(&asset).ok_or_else(|| anyhow::anyhow!("flatten database unavailable"))?;
+                            // The checked transaction resolves the exact row's cost basis;
+                            // this price is only a fallback for an untracked orphan.
+                            let avg_entry = leg.avg_entry;
+                            let side = db::lookup_entry_side_db(&pool, &tid_str).await
+                                .unwrap_or_else(|| "Sell".to_string());
+                            let booked = metrics::record_exit_trade_checked(
+                                &crate::state::TradeScope::crypto(&asset, crate::venues::intl::INTL_VENUE, &asset),
+                                &leg.order_id.to_string(), Some(lifecycle.squadron_id()),
+                                leg.strategy.clone(), tid_str.clone(), leg.market_name.clone(), side,
+                                avg_entry, leg.exit_price, leg.shares, leg.shares,
+                                Decimal::ZERO, leg.exit_fee, "LifecycleFlatten".to_string(),
+                            ).await?;
+                            // Retry an acknowledgment failure through the same order id;
+                            // its transaction marker prevents a second trade or P&L credit.
+                            venue.acknowledge_order_adoption(&leg.order_id).await?;
+                            warn!("[{}] lifecycle flatten durably recorded: {} shares={} retained={} pnl={}",
+                                leg.strategy, leg.market_name, booked.shares, booked.remaining, booked.pnl);
+                            Ok::<(), anyhow::Error>(())
+                        }.await;
+                        if let Err(e) = result {
+                            warn!("Lifecycle flatten order {} remains quarantined: {e}", leg.order_id);
+                            pending_flattened.push(leg);
                         }
                     }
                 }

@@ -29,7 +29,7 @@ use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk_v2::clob::types::AssetType;
 
 #[cfg(feature = "intl_clob")]
-use alloy::providers::ProviderBuilder;
+use alloy::providers::{Provider, ProviderBuilder};
 
 use chrono::Utc;
 use chrono_tz::US::Eastern;
@@ -39,8 +39,6 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 use std::env;
-#[cfg(feature = "intl_clob")]
-use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use tokio::sync::watch;
@@ -220,6 +218,73 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?
         .block_on(run())
+}
+
+#[cfg(feature = "intl_clob")]
+async fn intl_execution_blockers<P>(
+    venue: &IntlClobVenue,
+    executor: &dradis::venues::intl::wallet_executor::WalletExecutor<P>,
+    rpc_configured: bool,
+) -> Vec<String>
+where P: Provider + Clone + Send + Sync + 'static {
+    use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
+    use polymarket_client_sdk_v2::clob::types::AssetType;
+    alloy::sol! {
+        #[sol(rpc)]
+        interface IOutcomeApproval {
+            function isApprovedForAll(address account, address operator) external view returns (bool);
+        }
+    }
+    let mut blockers = Vec::new();
+    if dradis::config::GHOST_MODE { blockers.push("This build enforces Ghost mode".into()); }
+    if dradis::helpers::dynamic_config::read_only_mode() { blockers.push("Read-only diagnostics disable LIVE execution".into()); }
+    if !rpc_configured { blockers.push("Configure POLYGON_RPC_URL before LIVE execution".into()); }
+    if !blockers.is_empty() { return blockers; }
+    // Recovery is read-only and must run before unresolved intents are tested:
+    // a known completed effect may become verifiable after a restart.
+    match tokio::time::timeout(Duration::from_secs(15), executor.verify_ready()).await {
+        Ok(Ok(())) => {}
+        _ => {
+            blockers.extend(executor.live_blockers());
+            if blockers.is_empty() { blockers.push("Wallet deployment, signer authorization or relayer readiness could not be verified".into()); }
+            return blockers;
+        }
+    }
+    match venue.trading_client().unresolved_tokens().await {
+        Ok(tokens) if tokens.is_empty() => {}
+        Ok(tokens) => blockers.push(format!("{} token exposures await reconciliation after uncertain order submission", tokens.len())),
+        Err(_) => blockers.push("Order submission journal is unavailable".into()),
+    }
+    let mut request = BalanceAllowanceRequest::default();
+    request.asset_type = AssetType::Collateral;
+    request.signature_type = Some(venue.wallet().signature_type());
+    let response = match tokio::time::timeout(Duration::from_secs(10),
+        venue.trading_client().balance_allowance(request)).await {
+        Ok(Ok(response)) => response,
+        _ => { blockers.push("CLOB collateral allowances could not be verified".into()); return blockers; }
+    };
+    let ctf = alloy::primitives::address!("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045");
+    blockers.extend(dradis::venues::intl::wallet::collateral_approval_blockers(&response.allowances));
+    for (label, exchange) in dradis::venues::intl::wallet::ctf_trading_operators() {
+        let approved = tokio::time::timeout(Duration::from_secs(10),
+            IOutcomeApproval::new(ctf, executor.provider()).isApprovedForAll(venue.trading_address(), exchange).call()).await;
+        if !matches!(approved, Ok(Ok(true))) {
+            blockers.push(format!("Outcome-token approval is missing or unreadable for the {label} exchange"));
+        }
+    }
+    if venue.wallet().wallet_type == dradis::venues::intl::wallet::WalletType::Poly1271 {
+        for (label, adapter) in [
+            ("standard settlement", alloy::primitives::address!("0xAdA100Db00Ca00073811820692005400218FcE1f")),
+            ("negative-risk settlement", alloy::primitives::address!("0xadA2005600Dec949baf300f4C6120000bDB6eAab")),
+        ] {
+            let approved = tokio::time::timeout(Duration::from_secs(10),
+                IOutcomeApproval::new(ctf, executor.provider()).isApprovedForAll(venue.trading_address(), adapter).call()).await;
+            if !matches!(approved, Ok(Ok(true))) {
+                blockers.push(format!("Outcome-token approval is missing or unreadable for {label}"));
+            }
+        }
+    }
+    blockers
 }
 
 async fn run() -> Result<()> {
@@ -596,7 +661,11 @@ async fn run() -> Result<()> {
     // The intl session handles are attached below where that venue sets them up;
     // the other venues pass None and the loop reads session P&L from the
     // `pnl_history` snapshot each of their traders already records.
-    {
+    #[cfg(feature = "intl_clob")]
+    let wallet_observation_only = env::var("POLYMARKET_WALLET_TYPE")
+        .map(|mode| mode.trim() == "poly1271").unwrap_or(false);
+    // Explicit read-only diagnostics must not publish autonomous configuration changes.
+    if !dradis::helpers::dynamic_config::read_only_mode() {
         let advisor_cfg_rx = config_rx.clone();
         let advisor_cfg_tx = Arc::clone(&config_tx);
         let advisor_cag = cag.clone();
@@ -821,10 +890,10 @@ async fn run() -> Result<()> {
     // with a zero Safe address and park — the operator completes the Setup
     // view, which persists secrets.env and calls POST /api/setup/restart.
     let intl_creds_present = env::var("POLYMARKET_PRIVATE_KEY").map(|v| !v.is_empty()).unwrap_or(false)
-        && env::var("POLYGON_RPC_URL").map(|v| !v.is_empty()).unwrap_or(false);
+        && (wallet_observation_only || env::var("POLYGON_RPC_URL").map(|v| !v.is_empty()).unwrap_or(false));
     if !intl_creds_present {
         tracing::warn!(
-            "⚠️ Intl venue credentials missing (POLYMARKET_PRIVATE_KEY / POLYGON_RPC_URL) — \
+            "⚠️ Intl venue credentials missing (POLYMARKET_PRIVATE_KEY; Safe execution also requires POLYGON_RPC_URL) — \
              engine idle; complete the Control Tower Setup view, then restart."
         );
         tokio::spawn(dradis::api::server::run_api_server(
@@ -839,9 +908,6 @@ async fn run() -> Result<()> {
         std::future::pending::<()>().await;
         unreachable!();
     }
-    let polygon_rpc_url = env::var("POLYGON_RPC_URL")
-        .map_err(|_| anyhow::anyhow!("❌ POLYGON_RPC_URL not set in .env. Required for auto-settlement transactions. Use a paid RPC service like Helius (https://www.helius-rpc.com) or QuickNode. Example: POLYGON_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"))?;
-
     // ── Connect the compile-time-selected execution venue ────────────────────
     // For `intl_clob` this loads the EOA signer, authenticates the CLOB client,
     // derives the Safe (maker) address, and seeds the order nonce from the API —
@@ -875,20 +941,14 @@ async fn run() -> Result<()> {
     let safe_address   = venue.safe_address();
     let trading_client = Arc::clone(venue.trading_client());
     let nonce_manager  = Arc::clone(venue.nonce_manager());
-
-    let wallet_provider = ProviderBuilder::new()
-        .with_nonce_management(alloy::providers::fillers::SimpleNonceManager::default())  // Auto-refresh nonce from chain; prevents "nonce too low" on auto-settle
-        .wallet(signer.clone())
-        .connect(&polygon_rpc_url)
-        .await?;
-    // Host only: the RPC URL carries the provider API key (Alchemy and Infura in
-    // the path, Helius in the query), and this line is exactly what a customer
-    // pastes into a support ticket.
-    info!(
-        "✅ CTF auto-settlement client ready (rpc={})",
-        dradis::helpers::redact::redact_endpoint(&polygon_rpc_url),
-    );
-
+    cag.set_intl_venue(Arc::clone(&venue));
+    if venue.is_balance_only() {
+        config_tx.send_modify(|config| {
+            let mut next = config.as_ref().clone();
+            next.ghost_mode = true;
+            *config = Arc::new(next);
+        });
+    }
 
     // ── Spawn Control Tower API server ───────────────────────────────────────
     // Spawned here (after safe_address is derived) so it can be passed to
@@ -902,6 +962,38 @@ async fn run() -> Result<()> {
         cag.clone(),
     ));
 
+    // Configure a wallet-specific executor. Missing RPC/relayer prerequisites
+    // block LIVE while the authenticated wallet and simulation remain usable.
+    let rpc_configured = env::var("POLYGON_RPC_URL").map(|url| !url.trim().is_empty()).unwrap_or(false);
+    let polygon_rpc_url = env::var("POLYGON_RPC_URL")
+        .ok().filter(|url| !url.trim().is_empty())
+        .unwrap_or_else(|| "https://polygon-rpc.com".into());
+    let provider = ProviderBuilder::new()
+        .with_nonce_management(alloy::providers::fillers::SimpleNonceManager::default())
+        .wallet(signer.clone()).connect(&polygon_rpc_url).await
+        .map_err(|_| anyhow::anyhow!("Polygon provider initialization failed; check RPC configuration"))?;
+    let state_dir = std::path::PathBuf::from(env::var("DRADIS_DATA_DIR").unwrap_or_else(|_| "data".into()));
+    let wallet_provider = Arc::new(dradis::venues::intl::wallet_executor::WalletExecutor::new(
+        provider, signer.clone(), venue.wallet(), Arc::clone(&shared_http), state_dir).await?);
+    let weak_venue = Arc::downgrade(&venue);
+    let readiness_executor = Arc::clone(&wallet_provider);
+    venue.set_readiness_probe(Arc::new(move || {
+        let venue = weak_venue.upgrade();
+        let executor = Arc::clone(&readiness_executor);
+        Box::pin(async move {
+            match venue {
+                Some(venue) => intl_execution_blockers(venue.as_ref(), executor.as_ref(), rpc_configured).await,
+                None => vec!["Venue is not connected".into()],
+            }
+        })
+    }));
+    let blockers = venue.refresh_live_readiness().await;
+    if blockers.is_empty() {
+        info!("Wallet execution prerequisites verified; mode remains operator controlled");
+    } else {
+        warn!("LIVE unavailable: {}. Ghost simulation and balance reads remain available", blockers.join("; "));
+    }
+
     let initial_nonce = nonce_manager.load(AtomicOrdering::SeqCst);
     info!(" Order nonce ready (Maker/Safe): {}", initial_nonce);
 
@@ -911,13 +1003,14 @@ async fn run() -> Result<()> {
         info!(" Initializing portfolio balance (Attempt {}/3)...", i);
         let mut req = BalanceAllowanceRequest::default();
         req.asset_type = AssetType::Collateral;
+        req.signature_type = Some(venue.wallet().signature_type());
         match trading_client.balance_allowance(req).await {
             Ok(resp) => {
                 balance_ever_read = true;
-                startup_balance = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(1)) / dec!(1_000_000);
+                startup_balance = resp.balance / dec!(1_000_000);
                 if startup_balance > dec!(0) { break; }
             },
-            Err(e) => warn!("⚠️ Balance fetch failed: {:?}", e),
+            Err(e) => warn!("⚠️ {}", dradis::venues::intl::balance::sdk_error("startup collateral", e)),
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }

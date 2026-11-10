@@ -65,6 +65,8 @@ mod patrol_impl;
 /// traders own their own order lifecycles and do not route through `patrol()`.
 #[cfg(feature = "intl_clob")]
 pub use patrol_impl::{cancel_all_orders_unless_simulating, cancel_all_orders_with_retries};
+#[cfg(feature = "intl_clob")]
+pub(crate) use patrol_impl::fak_exit;
 
 /// Local order book built from the venue's `book` snapshots and `price_change`
 /// updates — B36. Venue-neutral core; `spawn_ws_task` feeds it.

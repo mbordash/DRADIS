@@ -26,6 +26,13 @@
 
 pub mod data_api;
 pub mod orders;
+pub mod balance;
+pub mod wallet;
+pub mod trading_client;
+pub mod order_journal;
+pub mod relayer;
+pub mod wallet_executor;
+pub mod protocol;
 
 /// Runtime venue identity persisted on every trade and entry row.
 ///
@@ -50,12 +57,13 @@ use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer;
 
 use polymarket_client_sdk_v2::clob::{Client as ClobClient, Config};
-use polymarket_client_sdk_v2::clob::types::{Side as ClobSide, SignatureType};
+use polymarket_client_sdk_v2::clob::types::Side as ClobSide;
 use polymarket_client_sdk_v2::clob::types::request::{BalanceAllowanceRequest, OrdersRequest};
 use polymarket_client_sdk_v2::clob::types::AssetType;
-use polymarket_client_sdk_v2::auth::state::Authenticated;
-use polymarket_client_sdk_v2::auth::Normal;
-use polymarket_client_sdk_v2::{POLYGON, PRIVATE_KEY_VAR, derive_safe_wallet};
+use polymarket_client_sdk_v2::{POLYGON, PRIVATE_KEY_VAR};
+use wallet::{WalletConfig, WalletType};
+use trading_client::TradingClient;
+use std::sync::RwLock;
 
 use tokio::sync::Mutex;
 
@@ -136,12 +144,8 @@ fn matched_shares(side: Side, making: Decimal, taking: Decimal) -> Decimal {
 /// flatten books nothing on a zero and keeps the leg for the next reconcile
 /// (`flatten_booking`); its re-hedge falls through to the flatten instead of
 /// guarding a leg that was never bought.
-fn reported_filled(matched: Decimal, requested: Decimal, tif: crate::venues::core::TimeInForce) -> Decimal {
-    use crate::venues::core::TimeInForce as T;
-    match tif {
-        T::Fak | T::Fok => matched,
-        T::Gtc | T::Gtd => if matched > Decimal::ZERO { matched } else { requested },
-    }
+fn reported_filled(matched: Decimal, _requested: Decimal, _tif: crate::venues::core::TimeInForce) -> Decimal {
+    matched
 }
 
 /// Polymarket's taker fee for a matched order, in USDC.
@@ -181,18 +185,50 @@ pub fn live_taker_fee_rate() -> Decimal {
         .unwrap_or(config::INTL_TAKER_FEE_RATE)
 }
 
+fn map_order_state(order: &polymarket_client_sdk_v2::clob::types::response::OpenOrderResponse)
+    -> crate::venues::core::OrderState {
+    use polymarket_client_sdk_v2::clob::types::OrderStatusType;
+    let resting = match &order.status {
+        OrderStatusType::Live => Some(true),
+        OrderStatusType::Matched | OrderStatusType::Canceled => Some(false),
+        _ => None,
+    };
+    crate::venues::core::OrderState { filled: Some(order.size_matched), resting }
+}
+
+fn map_open_order(order: polymarket_client_sdk_v2::clob::types::response::OpenOrderResponse) -> Result<OpenOrder> {
+    use polymarket_client_sdk_v2::clob::types::OrderType;
+    anyhow::ensure!(order.original_size > Decimal::ZERO && order.size_matched >= Decimal::ZERO
+        && order.size_matched <= order.original_size, "CLOB returned inconsistent order quantities");
+    let side = match order.side { ClobSide::Buy => Side::Buy, ClobSide::Sell => Side::Sell,
+        _ => anyhow::bail!("CLOB returned an unknown order side") };
+    let tif = match order.order_type {
+        OrderType::GTC => TimeInForce::Gtc, OrderType::GTD => TimeInForce::Gtd,
+        OrderType::FAK => TimeInForce::Fak, OrderType::FOK => TimeInForce::Fok,
+        _ => anyhow::bail!("CLOB returned an unknown order type"),
+    };
+    Ok(OpenOrder { order_id: OrderId(order.id), market: market_id_from_u256(order.asset_id),
+        side, price: order.price, original_qty: order.original_size, filled_qty: order.size_matched,
+        tif, pair_market: None })
+}
+
+type ReadinessProbe = dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send>> + Send + Sync;
+
 /// The international (self-custody) Polymarket CLOB venue.
 pub struct IntlClobVenue {
     /// Authenticated CLOB REST client used for all order/balance operations.
-    clob: Arc<ClobClient<Authenticated<Normal>>>,
+    clob: Arc<TradingClient>,
     /// EOA signing key for EIP-712 order signatures.
     signer: LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
     /// Session-scoped nonce manager (AtomicU64, retained for API compatibility).
     nonce: Arc<AtomicU64>,
     /// Shared HTTP client for nonce re-sync and order placement.
     http: Arc<reqwest::Client>,
-    /// Derived Gnosis Safe (maker) address.
-    safe_address: Address,
+    /// Immutable signer/funder/executor identity selected at connection time.
+    wallet: WalletConfig,
+    live_blockers: RwLock<Vec<String>>,
+    readiness_probe: RwLock<Option<Arc<ReadinessProbe>>>,
+    readiness_lock: Mutex<()>,
     /// EOA (signer) address.
     eoa_address: Address,
     /// Active token IDs the lifecycle engine should query for positions / open-orders.
@@ -204,45 +240,90 @@ pub struct IntlClobVenue {
 }
 
 impl IntlClobVenue {
-    /// Bootstrap the intl venue: load the private key, authenticate the CLOB
-    /// client, derive the Safe/EOA addresses, and initialize the nonce from the
-    /// Polymarket API.
+    /// Resolve the signer/funder identity and authenticate the CLOB client.
+    /// Poly1271 derives existing credentials for balance-only operation.
     ///
     /// Encapsulates the signer/nonce bootstrap that previously lived inline in
     /// `main.rs`. The Polygon settlement `Provider` is intentionally *not* owned
     /// here — it is a separate on-chain subsystem, generic over the patrol loop.
     pub async fn connect(http: Arc<reqwest::Client>) -> Result<Self> {
+        Self::connect_existing(http, false).await
+    }
+
+    /// Connect a diagnostic reader using only existing CLOB credentials.
+    /// This never attempts API-key creation, including for a legacy Safe.
+    pub async fn connect_read_only(http: Arc<reqwest::Client>) -> Result<Self> {
+        Self::connect_existing(http, true).await
+    }
+
+    async fn connect_existing(http: Arc<reqwest::Client>, existing_only: bool) -> Result<Self> {
         let private_key = std::env::var(PRIVATE_KEY_VAR)
             .context("POLYMARKET_PRIVATE_KEY not set")?;
 
-        let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
+        let signer = LocalSigner::from_str(private_key.trim())
+            .map_err(|_| anyhow::anyhow!("wallet.signer: invalid POLYMARKET_PRIVATE_KEY; check managed secrets override"))?
+            .with_chain_id(Some(POLYGON));
         let eoa_address = signer.address();
-        info!("Trading wallet (EOA) address: {}", eoa_address);
+        let wallet = WalletConfig::from_env(eoa_address).context("wallet.configuration")?;
+        info!(wallet_type = ?wallet.wallet_type, signer = %eoa_address, funder = %wallet.funder,
+            "CLOB wallet identity resolved");
 
-        let clob = Arc::new(
-            ClobClient::new(config::CLOB_API_BASE, Config::default())?
-                .authentication_builder(&signer)
-                .signature_type(SignatureType::GnosisSafe)
-                .authenticate()
-                .await?,
-        );
+        let client = ClobClient::new(config::CLOB_API_BASE, Config::default())
+            .map_err(|e| balance::sdk_error("clob.client", e))?;
+        // Existing Deposit Wallet accounts derive their credentials without
+        // creating new API keys during connection.
+        let credentials = if existing_only || wallet.wallet_type == WalletType::Poly1271 {
+            Some(tokio::time::timeout(std::time::Duration::from_secs(15),
+                client.derive_api_key(&signer, None)).await
+                .context("clob.derive_api_key: timeout (15s)")?
+                .map_err(|e| balance::sdk_error("clob.derive_api_key", e))?)
+        } else {
+            None
+        };
+        let mut auth = client.authentication_builder(&signer)
+            .funder(wallet.funder).signature_type(wallet.signature_type());
+        if let Some(credentials) = credentials {
+            auth = auth.credentials(credentials);
+        }
+        let raw_client = tokio::time::timeout(std::time::Duration::from_secs(15), auth.authenticate())
+            .await.context("clob.authenticate: timeout (15s)")?
+            .map_err(|e| balance::sdk_error("clob.authenticate", e))?;
+        let state_dir = std::path::PathBuf::from(std::env::var("DRADIS_DATA_DIR").unwrap_or_else(|_| "data".into()));
+        let clob = Arc::new(TradingClient::from_authenticated(raw_client, wallet, state_dir).await?);
+        info!(wallet_type = ?wallet.wallet_type, funder = %wallet.funder, "CLOB authenticated");
 
-        let safe_address = derive_safe_wallet(eoa_address, POLYGON)
-            .context("Safe derivation failed")?;
-        info!("Authenticated on Polymarket CLOB. Safe (Maker) address: {}", safe_address);
-
-        let initial_nonce = fetch_next_nonce(&http, safe_address).await.unwrap_or(0);
-        info!(" Initialized Nonce from API (Maker/Safe): {}", initial_nonce);
+        // V2 has no order nonce. Retain legacy bookkeeping only for Safe callers.
+        let initial_nonce = if wallet.wallet_type == WalletType::GnosisSafe {
+            fetch_next_nonce(&http, wallet.funder).await.unwrap_or(0)
+        } else { 0 };
         let nonce = Arc::new(AtomicU64::new(initial_nonce));
 
-        Ok(Self { clob, signer, nonce, http, safe_address, eoa_address,
+        Ok(Self { clob, signer, nonce, http, wallet, live_blockers: RwLock::new(vec!["Execution readiness checks have not completed".into()]), readiness_probe: RwLock::new(None), readiness_lock: Mutex::new(()), eoa_address,
                    active_tokens: Arc::new(Mutex::new(HashSet::new())) })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn test_connection(host: &str) -> Self {
+        use polymarket_client_sdk_v2::auth::Credentials;
+        let signer = LocalSigner::from_slice(&[1u8; 32]).unwrap().with_chain_id(Some(POLYGON));
+        let eoa_address = signer.address();
+        let wallet = WalletConfig::resolve(eoa_address, Some("poly1271"),
+            Some("0x1111111111111111111111111111111111111111")).unwrap();
+        let clob = ClobClient::new(host, Config::default()).unwrap()
+            .authentication_builder(&signer)
+            .credentials(Credentials::new(Default::default(), "c3ludGhldGlj".into(), "offline".into()))
+            .funder(wallet.funder).signature_type(wallet.signature_type()).authenticate().await.unwrap();
+        let clob = TradingClient::for_test(clob, wallet,
+            Arc::new(std::sync::atomic::AtomicBool::new(false))).await.unwrap();
+        Self { clob: Arc::new(clob), signer, nonce: Arc::new(AtomicU64::new(0)),
+            http: Arc::new(reqwest::Client::new()), wallet, live_blockers: RwLock::new(vec!["Synthetic fixture blocks execution".into()]), readiness_probe: RwLock::new(None), readiness_lock: Mutex::new(()), eoa_address,
+            active_tokens: Arc::new(Mutex::new(HashSet::new())) }
     }
 
     // ── Accessors (raw infra for call sites not yet on the Execution trait) ──
 
     /// Authenticated CLOB client (fee-rate / neg-risk / balance / cancel queries).
-    pub fn trading_client(&self) -> &Arc<ClobClient<Authenticated<Normal>>> {
+    pub fn trading_client(&self) -> &Arc<TradingClient> {
         &self.clob
     }
 
@@ -261,9 +342,46 @@ impl IntlClobVenue {
         &self.http
     }
 
-    /// Derived Gnosis Safe (maker) address.
+    pub fn wallet(&self) -> WalletConfig {
+        self.wallet
+    }
+
+    pub fn trading_address(&self) -> Address {
+        self.wallet.funder
+    }
+
+    pub fn is_balance_only(&self) -> bool {
+        self.wallet.wallet_type == WalletType::Poly1271 && !self.live_blockers().is_empty()
+    }
+
+    pub fn live_blockers(&self) -> Vec<String> {
+        self.live_blockers.read().expect("wallet readiness lock poisoned").clone()
+    }
+
+    pub fn set_readiness_probe(&self, probe: Arc<ReadinessProbe>) {
+        *self.readiness_probe.write().expect("wallet readiness probe lock poisoned") = Some(probe);
+    }
+
+    pub async fn refresh_live_readiness(&self) -> Vec<String> {
+        let _guard = self.readiness_lock.lock().await;
+        let probe = self.readiness_probe.read().expect("wallet readiness probe lock poisoned").clone();
+        if let Some(probe) = probe {
+            let blockers = tokio::time::timeout(std::time::Duration::from_secs(8), probe()).await
+                .unwrap_or_else(|_| vec!["Wallet readiness verification timed out".to_owned()]);
+            self.set_live_blockers(blockers);
+        }
+        self.live_blockers()
+    }
+
+    pub fn set_live_blockers(&self, blockers: Vec<String>) {
+        self.clob.set_execution_ready(blockers.is_empty());
+        *self.live_blockers.write().expect("wallet readiness lock poisoned") = blockers;
+    }
+
+    /// Compatibility accessor: the trading funder; use wallet().on_chain_safe()
+    /// when selecting an on-chain executor.
     pub fn safe_address(&self) -> Address {
-        self.safe_address
+        self.trading_address()
     }
 
     /// EOA (signer) address.
@@ -312,13 +430,14 @@ impl IntlClobVenue {
 #[async_trait]
 impl Execution for IntlClobVenue {
     async fn place_order(&self, intent: OrderIntent) -> Result<Fill> {
+        self.clob.require_mutation_allowed()?;
         let vc = Self::verifying_contract(intent.is_neg_risk);
 
         let (order_id, making_amount, taking_amount) = orders::place_limit_order_filled(
             &self.clob,
             &self.nonce,
             &self.signer,
-            self.safe_address,
+            self.trading_address(),
             self.eoa_address,
             vc,
             &intent.market,
@@ -374,13 +493,14 @@ impl Execution for IntlClobVenue {
     }
 
     async fn place_atomic(&self, legs: [OrderIntent; 2]) -> Result<[Fill; 2]> {
+        self.clob.require_mutation_allowed()?;
         let [a, b] = legs;
 
-        let (id_a, id_b) = orders::place_limit_orders_atomic(
+        let receipts = orders::place_limit_orders_atomic_filled(
             &self.clob,
             &self.nonce,
             &self.signer,
-            self.safe_address,
+            self.trading_address(),
             self.eoa_address,
             Self::verifying_contract(a.is_neg_risk),
             &a.market,
@@ -402,94 +522,86 @@ impl Execution for IntlClobVenue {
         )
         .await?;
 
-        Ok([
-            Fill { order_id: OrderId(id_a), market: a.market, filled: a.quantity, price: a.price, fee: Decimal::ZERO},
-            Fill { order_id: OrderId(id_b), market: b.market, filled: b.quantity, price: b.price, fee: Decimal::ZERO},
-        ])
+        let fill = |intent: OrderIntent, receipt: orders::OrderReceipt| {
+            let matched = matched_shares(intent.side, receipt.making_amount, receipt.taking_amount);
+            let price = if receipt.making_amount > Decimal::ZERO && receipt.taking_amount > Decimal::ZERO {
+                let price = match intent.side {
+                    Side::Sell => receipt.taking_amount / receipt.making_amount,
+                    Side::Buy => receipt.making_amount / receipt.taking_amount,
+                };
+                if price > Decimal::ZERO && price <= Decimal::ONE { price } else { intent.price }
+            } else { intent.price };
+            Fill { order_id: OrderId(receipt.order_id), market: intent.market, filled: matched,
+                price, fee: taker_fee(live_taker_fee_rate(), price, matched) }
+        };
+        let [receipt_a, receipt_b] = receipts;
+        Ok([fill(a, receipt_a), fill(b, receipt_b)])
+    }
+
+    async fn acknowledge_order_adoption(&self, id: &OrderId) -> Result<()> {
+        self.clob.acknowledge_placement(&id.0).await
     }
 
     async fn cancel(&self, id: OrderId) -> Result<()> {
-        let id_str = id.0.clone();
-        self.clob
-            .cancel_orders(&[id_str.as_str()])
-            .await
-            .map_err(|e| anyhow::anyhow!("intl cancel failed for {}: {e}", id.0))?;
+        let response = self.clob.cancel_orders(&[id.0.as_str()]).await?;
+        anyhow::ensure!(response.canceled.iter().any(|canceled| canceled == &id.0)
+            && !response.not_canceled.contains_key(&id.0), "CLOB did not confirm requested cancellation");
         Ok(())
     }
 
     async fn collateral(&self) -> Result<Decimal> {
-        let mut req = BalanceAllowanceRequest::default();
-        req.asset_type = AssetType::Collateral;
-        let resp = self.clob.balance_allowance(req).await
-            .map_err(|e| anyhow::anyhow!("balance_allowance failed: {e}"))?;
-        let raw = Decimal::from_str(&resp.balance.to_string()).unwrap_or(Decimal::ZERO);
-        Ok(raw / Decimal::from(1_000_000u32))
+        self.clob.collateral().await
     }
 
     async fn positions(&self) -> Result<Vec<Position>> {
         let tokens: Vec<MarketId> = self.active_tokens.lock().await.iter().cloned().collect();
         let mut result = Vec::with_capacity(tokens.len());
         for token in tokens {
-            let token_u256 = match u256_from_market_id(&token) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            let mut req = BalanceAllowanceRequest::default();
-            req.asset_type = AssetType::Conditional;
-            req.token_id = Some(token_u256);
-            match self.clob.balance_allowance(req).await {
-                Ok(resp) => {
-                    let bal = Decimal::from_str(&resp.balance.to_string())
-                        .unwrap_or(Decimal::ZERO)
-                        / dec!(1_000_000);
-                    if bal >= config::MIN_ORDER_SHARES {
-                        result.push(Position {
-                            market: token,
-                            shares: bal,
-                            avg_price: Decimal::ZERO, // cost basis tracked in PositionMap, not queried here
-                        });
-                    }
-                }
-                Err(_) => continue,
+            let mut request = BalanceAllowanceRequest::default();
+            request.asset_type = AssetType::Conditional;
+            request.token_id = Some(u256_from_market_id(&token)?);
+            request.signature_type = Some(self.wallet.signature_type());
+            let response = tokio::time::timeout(std::time::Duration::from_secs(10),
+                self.clob.balance_allowance(request)).await.context("CLOB positions timeout")?
+                .map_err(|error| balance::sdk_error("positions", error))?;
+            let shares = response.balance / dec!(1_000_000);
+            if shares > Decimal::ZERO {
+                result.push(Position { market: token, shares, avg_price: Decimal::ZERO });
             }
         }
         Ok(result)
     }
 
     async fn open_orders(&self) -> Result<Vec<OpenOrder>> {
-        // The CLOB `orders()` endpoint returns only resting/working orders for the
-        // given token. Every item returned is by definition still resting, so we
-        // map it with remaining_qty = 1 (> 0) to satisfy `is_resting() && remaining > 0`.
-        // The shared lifecycle uses this to extend the `resting_tokens` set — it does
-        // not need accurate qty/price from the venue response, only market identity.
-        let tokens: Vec<MarketId> = self.active_tokens.lock().await.iter().cloned().collect();
+        let request = OrdersRequest::default();
+        let mut cursor = None;
+        let mut seen = HashSet::new();
         let mut result = Vec::new();
-        for token in tokens {
-            let token_u256 = match u256_from_market_id(&token) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            let req = OrdersRequest::builder().asset_id(token_u256).build();
-            match self.clob.orders(&req, None).await {
-                Ok(page) => {
-                    for o in page.data {
-                        result.push(OpenOrder {
-                            order_id: OrderId(o.id),
-                            market: token.clone(),
-                            side: Side::Buy,           // intl lifecycle only tracks GTC buy bids
-                            price: Decimal::ZERO,      // not consumed by lifecycle reconcile
-                            original_qty: Decimal::ONE, // CLOB only lists resting orders → qty > 0
-                            filled_qty: Decimal::ZERO,
-                            tif: TimeInForce::Gtc,
-                            pair_market: None,          // pair linkage kept in TrackedLeg
-                        });
-                    }
-                }
-                Err(_) => continue,
+        for _ in 0..100 {
+            let page = tokio::time::timeout(std::time::Duration::from_secs(10),
+                self.clob.orders(&request, cursor.clone())).await.context("CLOB open orders timeout")?
+                .map_err(|error| balance::sdk_error("open_orders", error))?;
+            for order in page.data {
+                anyhow::ensure!(order.maker_address == self.wallet.funder,
+                    "CLOB returned an order belonging to a different trading funder");
+                result.push(map_open_order(order)?);
             }
+            if page.next_cursor.is_empty() || page.next_cursor == "LTE=" { return Ok(result); }
+            anyhow::ensure!(seen.insert(page.next_cursor.clone()), "CLOB order pagination repeated a cursor");
+            cursor = Some(page.next_cursor);
         }
-        Ok(result)
+        anyhow::bail!("CLOB order pagination exceeded the bounded page limit")
     }
+
+    async fn order_state(&self, id: &OrderId) -> Result<Option<crate::venues::core::OrderState>> {
+        let order = tokio::time::timeout(std::time::Duration::from_secs(10), self.clob.order(&id.0))
+            .await.context("CLOB order state timeout")?
+            .map_err(|error| balance::sdk_error("order_state", error))?;
+        anyhow::ensure!(order.maker_address == self.wallet.funder && order.id == id.0,
+            "CLOB order identity does not match the requested wallet/order");
+        Ok(Some(map_order_state(&order)))
+    }
+
     /// Best bid on `market`'s book.
     ///
     /// Lifted from the Trade Log's old intl-only quote helper
@@ -757,15 +869,14 @@ mod reported_fill_tests {
         assert_eq!(reported_filled(m, dec!(5.0684), TimeInForce::Fak), dec!(5.06));
     }
 
-    /// Nothing matched on a RESTING order: the requested size is kept, exactly
-    /// as before, so a GTC/GTD placement and callers' own fallbacks behave
-    /// unchanged.
+    /// An acknowledged resting order is not a fill. Its working size is tracked
+    /// separately until cumulative venue fills arrive.
     #[test]
-    fn an_unmatched_resting_order_keeps_the_requested_size() {
+    fn an_unmatched_resting_order_reports_zero_until_reconciled() {
         let m = matched_shares(Side::Buy, dec!(0), dec!(0));
         assert_eq!(m, dec!(0));
-        assert_eq!(reported_filled(m, dec!(5.0), TimeInForce::Gtc), dec!(5.0));
-        assert_eq!(reported_filled(m, dec!(5.0), TimeInForce::Gtd), dec!(5.0));
+        assert_eq!(reported_filled(m, dec!(5.0), TimeInForce::Gtc), dec!(0));
+        assert_eq!(reported_filled(m, dec!(5.0), TimeInForce::Gtd), dec!(0));
         assert_eq!(matched_shares(Side::Sell, dec!(5), dec!(0)), dec!(0), "half a pair is not a match");
     }
 
@@ -777,5 +888,70 @@ mod reported_fill_tests {
         let m = matched_shares(Side::Sell, dec!(0), dec!(0));
         assert_eq!(reported_filled(m, dec!(5.0), TimeInForce::Fak), dec!(0));
         assert_eq!(reported_filled(m, dec!(5.0), TimeInForce::Fok), dec!(0));
+    }
+}
+
+#[cfg(test)]
+mod order_read_tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use polymarket_client_sdk_v2::clob::types::{OrderStatusType, response::OpenOrderResponse};
+
+    fn order_value(id: &str) -> Value {
+        json!({"id":id,"status":"LIVE","owner":"00000000-0000-0000-0000-000000000000",
+            "maker_address":"0x1111111111111111111111111111111111111111",
+            "market":format!("0x{}", "11".repeat(32)),"asset_id":"42","side":"SELL",
+            "original_size":"10","size_matched":"3.25","price":"0.60","associate_trades":[],
+            "outcome":"Yes","created_at":0,"expiration":"1000000000","order_type":"GTD"})
+    }
+
+    #[test]
+    fn order_mapping_keeps_actual_side_size_fills_price_and_time_in_force() {
+        let order: OpenOrderResponse = serde_json::from_value(order_value("a")).unwrap();
+        let state = map_order_state(&order);
+        assert_eq!(state.filled, Some(dec!(3.25)));
+        assert_eq!(state.resting, Some(true));
+        let mapped = map_open_order(order).unwrap();
+        assert_eq!(mapped.side, Side::Sell);
+        assert_eq!(mapped.original_qty, dec!(10));
+        assert_eq!(mapped.filled_qty, dec!(3.25));
+        assert_eq!(mapped.remaining_qty(), dec!(6.75));
+        assert_eq!(mapped.price, dec!(0.60));
+        assert_eq!(mapped.tif, TimeInForce::Gtd);
+    }
+
+    #[test]
+    fn uncertain_order_status_is_not_a_terminal_order() {
+        let mut order: OpenOrderResponse = serde_json::from_value(order_value("a")).unwrap();
+        order.status = OrderStatusType::Unknown("not-understood".into());
+        assert_eq!(map_order_state(&order).resting, None);
+        order.status = OrderStatusType::Canceled;
+        assert_eq!(map_order_state(&order).resting, Some(false));
+        order.size_matched = dec!(11);
+        assert!(map_open_order(order).is_err());
+    }
+
+    #[tokio::test]
+    async fn open_orders_follow_pages_and_single_order_lookup_preserves_cumulative_fill() {
+        use axum::{routing::get, Router, Json, http::Uri};
+        use crate::venues::core::Execution;
+        let app = Router::new()
+            .route("/data/orders", get(|uri: Uri| async move {
+                let second = uri.query().unwrap_or_default().contains("cursor-two");
+                Json(json!({"data":[order_value(if second {"b"} else {"a"})],
+                    "next_cursor":if second {"LTE="} else {"cursor-two"}, "limit":1,"count":1}))
+            }))
+            .route("/data/order/a", get(|| async { Json(order_value("a")) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let venue = IntlClobVenue::test_connection(&host).await;
+        let orders = venue.open_orders().await.unwrap();
+        assert_eq!(orders.len(), 2);
+        assert_eq!(orders[1].order_id.0, "b");
+        let state = venue.order_state(&OrderId("a".into())).await.unwrap().unwrap();
+        assert_eq!(state.filled, Some(dec!(3.25)));
+        assert_eq!(state.resting, Some(true));
+        server.abort();
     }
 }

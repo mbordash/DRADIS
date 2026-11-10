@@ -27,40 +27,44 @@
 ///   3. `ticker.tick()`            — strategy evaluation
 
 use std::str::FromStr as _;
-use std::sync::Arc;
 use std::sync::atomic::Ordering as AtomicOrdering;
-
-use alloy::primitives::{U256, Address, address};
+use std::sync::Arc;
+use crate::squadron::game_over::{sports_game_over_due, sports_game_over_verdict, GameOver, SportsBook, SportsGameSignals,
+};
+use alloy::primitives::{address, Address, U256};
 use alloy::providers::Provider;
 use chrono::Utc;
-use crate::squadron::game_over::{sports_game_over_due, sports_game_over_verdict, GameOver, SportsBook, SportsGameSignals};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use tokio::time::{interval, Instant, Duration};
+use tokio::time::{interval, Duration, Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn, error, debug};
-
-use polymarket_client_sdk_v2::clob::types::{Side};
+use tracing::{debug, error, info, warn};
 use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk_v2::clob::types::AssetType;
 
-use crate::config;
-use crate::state::{Position, StrategySignal, MarketConfig, MarketSnapshot, LoneLegPolicy, lone_leg_policy};
-use crate::venues::core::MarketId;
-use crate::venues::intl::{market_id_from_u256, u256_from_market_id};
-use crate::orchestrator::{StrategyRegistry, StrategyContext};
-use crate::orchestrator::executor::{execute_strategies_concurrent, aggregate_and_resolve_signals};
-use crate::helpers::{
-    balance::*, orders::*,
-    notifications::{self, send_notification, tweet_trade}, metrics, db,
-};
-use crate::squadron::Squadron;
-use crate::state::TradeScope;
+use polymarket_client_sdk_v2::clob::types::Side;
+
 use super::context::PatrolContext;
 use super::patrol_tasks::{
-    spawn_pulse_task, spawn_settlement_task, spawn_cleanup_task,
-    spawn_status_task, spawn_watchdog_task, spawn_lifecycle_task,
+    spawn_cleanup_task, spawn_lifecycle_task, spawn_pulse_task, spawn_settlement_task,
+    spawn_status_task, spawn_watchdog_task,
 };
+use crate::config;
+use crate::helpers::{
+    balance::*,
+    db, metrics,
+    notifications::{self, send_notification, tweet_trade},
+    orders::*,
+};
+use crate::orchestrator::executor::{aggregate_and_resolve_signals, execute_strategies_concurrent};
+use crate::orchestrator::{StrategyContext, StrategyRegistry};
+use crate::squadron::Squadron;
+use crate::state::TradeScope;
+use crate::state::{
+    lone_leg_policy, LoneLegPolicy, MarketConfig, MarketSnapshot, Position, StrategySignal,
+};
+use crate::venues::core::MarketId;
+use crate::venues::intl::{market_id_from_u256, u256_from_market_id};
 use crate::venues::lifecycle::{LifecycleConfig, OrderLifecycle};
 
 /// [E95] The squadron's ultra-short (15-minute) market on Polymarket
@@ -111,7 +115,7 @@ fn publish_intl_ultra_markets(
 /// asks again at its next poll.
 async fn find_intl_ultra(
     http: Arc<reqwest::Client>,
-    client: Arc<polymarket_client_sdk_v2::clob::Client<polymarket_client_sdk_v2::auth::state::Authenticated<polymarket_client_sdk_v2::auth::Normal>>>,
+    client: Arc<crate::venues::intl::trading_client::TradingClient>,
     asset: String,
 ) -> Option<MarketConfig> {
     let c = crate::helpers::market::fetch_ultra_short_candidate(&http, &asset, Utc::now(), 60).await?;
@@ -247,6 +251,7 @@ fn quote_epoch_is_current(map: &QuoteEpochs, key: &PositionKey, epoch: u64) -> b
 /// shares, and book the exit at the exact resting price when it is lifted.
 #[derive(Debug, Clone)]
 struct MakerRestingExit {
+    order_id:Option<String>,
     /// Limit price of the resting ask — also the exact exit price when lifted,
     /// since a resting limit order cannot slip.
     price: Decimal,
@@ -327,8 +332,7 @@ impl Squadron {
     pub async fn patrol<P>(
         &mut self,
         cancel: CancellationToken,
-        ctx: &mut PatrolContext<P>,
-    ) where
+        ctx: &mut PatrolContext<P>) where
         P: Provider + Clone + Send + Sync + 'static,
     {
         // ── Preamble: pull ctx/self into local aliases ────────────────────────
@@ -609,7 +613,8 @@ impl Squadron {
         // One engine drives fill-confirm, stale-cancel, and naked-leg flatten
         // over the Execution trait surface. Runs alongside the existing bespoke
         // arb_pair_fill_monitor / sync_position_balance paths (additive for now).
-        let lifecycle = std::sync::Arc::new(OrderLifecycle::new(LifecycleConfig::intl(), self.id.clone()));
+        let lifecycle = std::sync::Arc::new(OrderLifecycle::new(LifecycleConfig::intl(), self.id.clone(),
+        ));
         spawn_lifecycle_task(
             std::sync::Arc::clone(&lifecycle),
             std::sync::Arc::clone(&ctx.session.venue),
@@ -700,7 +705,8 @@ impl Squadron {
             vec![]
         };
 
-        let maker_token_bids: Vec<(MarketId, Decimal)> = match (&maker_yes_price_rx, &maker_no_price_rx, &maker_market_config) {
+        let maker_token_bids: Vec<(MarketId, Decimal)> = match (&maker_yes_price_rx, &maker_no_price_rx, &maker_market_config,
+        ) {
             (Some(yes_rx), Some(no_rx), Some(mk)) => vec![
                 (mk.yes_token.clone(), yes_rx.borrow().0),
                 (mk.no_token.clone(),  no_rx.borrow().0),
@@ -711,7 +717,8 @@ impl Squadron {
         if hourly_yes_token != market_id_from_u256(U256::ZERO) {
             reconcile_orphaned_positions(
                 &squadron_id, &trading_client, &positions,
-                &[(hourly_yes_token.clone(), "YES"), (hourly_no_token.clone(), "NO")],
+                &[(hourly_yes_token.clone(), "YES"), (hourly_no_token.clone(), "NO"),
+                ],
                 &hourly_market_name, hourly_market_close_time, &hourly_token_bids, &adoption_order,
                 Some(&orphan_tombstones),
             ).await;
@@ -719,7 +726,8 @@ impl Squadron {
         if let Some(ref mk_config) = maker_market_config {
             reconcile_orphaned_positions(
                 &squadron_id, &trading_client, &positions,
-                &[(mk_config.yes_token.clone(), "YES(maker)"), (mk_config.no_token.clone(), "NO(maker)")],
+                &[(mk_config.yes_token.clone(), "YES(maker)"), (mk_config.no_token.clone(), "NO(maker)"),
+                ],
                 &mk_config.market_name, mk_config.market_close_time, &maker_token_bids, &adoption_order,
                 Some(&orphan_tombstones),
             ).await;
@@ -837,10 +845,15 @@ impl Squadron {
             let market_name_attached = match venue {
                 // [E95] A viper's role decides first; a script declares one.
                 _ if role == crate::orchestrator::strategy::MarketRole::UltraShort => String::new(),
-                _ if venue != "Window/Daily" && role == crate::orchestrator::strategy::MarketRole::Window => maker_market_config
+                _ if venue != "Window/Daily" && role == crate::orchestrator::strategy::MarketRole::Window =>
+                {
+                    maker_market_config
                     .as_ref()
                     .map(|m| m.market_name.clone())
-                    .unwrap_or_else(|| if single_market { hourly_market_name.clone() } else { String::new() }),
+                    .unwrap_or_else(|| {
+                            if single_market { hourly_market_name.clone() } else { String::new() }
+                        })
+                }
                 "Hourly" => hourly_market_name.clone(),
                 // On a single-market squadron the window/daily vipers run on the
                 // one market too (see `single_market_arb` in the tick), so name
@@ -848,7 +861,10 @@ impl Squadron {
                 "Window/Daily" => maker_market_config
                     .as_ref()
                     .map(|m| m.market_name.clone())
-                    .unwrap_or_else(|| if single_market { hourly_market_name.clone() } else { String::new() }),
+                    .unwrap_or_else(|| {
+                        if single_market { hourly_market_name.clone() } else { String::new()
+                        }
+                    }),
                 // A viper that prices from a raptor board rather than from the
                 // squadron's own market still patrols this squadron's market, so
                 // name it. "Unknown" read as a fault when it was a property of
@@ -907,6 +923,7 @@ impl Squadron {
 
         // ── Core tick loop: 3 arms ────────────────────────────────────────────
         let mut ticker = interval(config::main_ticker_interval());
+        let mut last_order_recovery = Instant::now() - Duration::from_secs(30);
         loop {
             tokio::select! {
                 biased;
@@ -1046,6 +1063,12 @@ impl Squadron {
                 }
                 // ── 3. Strategy evaluation tick ─────────────────────────────────
                 _ = ticker.tick() => {
+                    if last_order_recovery.elapsed()>=Duration::from_secs(30) {
+                        last_order_recovery=Instant::now();
+                        if let Err(error)=recover_known_clob_orders(&trading_client,&lifecycle,&positions,&squadron_id,&asset_lc).await {warn!("CLOB uncertain-order reconciliation deferred: {error}");}
+                        if let Err(error)=reconcile_tracked_buys(&trading_client,&lifecycle,&positions,&token_ownership,&scope,&squadron_id).await{warn!("Working entry reconciliation deferred: {error}");}
+                        if let Err(error)=reconcile_tracked_asks(&trading_client,&mut maker_resting_exits,&positions,&token_ownership,&total_pnl,&scope,&squadron_id).await{warn!("Working exit reconciliation deferred: {error}");}
+                    }
                     // Skip evaluation this tick if the market has changed — yield to arm 2.
                     if ctx.market_rx.has_changed().unwrap_or(false) { continue; }
 
@@ -1959,12 +1982,17 @@ impl Squadron {
                                 // only order that could have taken them.
                                 let resting_ask_price = resting_rec.as_ref().map(|r| r.price);
                                 if let Some(rest) = resting_rec {
+                                    if let Some(id)=rest.order_id.as_deref() {
+                                        if let Err(error)=trading_client.cancel_orders(&[id]).await{warn!("Protective ask cancellation unconfirmed: {error}");continue;}
+                                        if let Err(error)=reconcile_tracked_asks(&trading_client,&mut maker_resting_exits,&positions,&token_ownership,&total_pnl,&scope,&squadron_id).await{warn!("Protective ask fill booking failed: {error}");continue;}
+                                        if maker_resting_exits.contains_key(&pos_key){continue;}
+                                    }else{
                                     // Leaving the position: pull everything we have resting
                                     // on the token, the ask AND any residual entry bid. Only
                                     // the ASK's matched size is an exit fill, though — the
                                     // bid's is the entry, already in the position.
-                                    let cancel = cancel_resting_orders_for_token(
-                                        &trading_client, &tid_m, RestingSide::Both).await;
+                                    let cancel = match cancel_resting_orders_for_token(
+                                        &trading_client, &tid_m, RestingSide::Both).await {Ok(value)=>value,Err(error)=>{warn!("Resting order cancellation was not confirmed: {error}");continue;}};
                                     maker_resting_exits.remove(&pos_key);
 
                                     // How much do we still hold? A single balance read of
@@ -2069,7 +2097,8 @@ impl Squadron {
                                             }
                                         }
                                     }
-                                }
+
+                                    }}
 
                                 // ── Lone-leg exit: pull the partner's resting bid first ──────
                                 // A HoldAndManage pair (TimeDecay) exits a lone leg with
@@ -2086,8 +2115,11 @@ impl Squadron {
                                         let partner_key = PositionKey::new(sq_key.clone(), sn.clone(), partner.clone());
                                         let partner_pending = { let map = positions.lock().await; map.get(&partner_key).map(|p| p.fill_confirmed_at.is_none()).unwrap_or(false) };
                                         if partner_pending {
-                                            let pulled = cancel_resting_orders_for_token(&trading_client, &partner, RestingSide::Bids).await;
-                                            if pulled.any_found() {
+                                            let pulled = match cancel_resting_orders_for_token(&trading_client, &partner, RestingSide::Bids).await {Ok(value)=>value,Err(error)=>{warn!("Resting order cancellation was not confirmed: {error}");continue;}};
+                                            if let Err(error)=reconcile_tracked_buys(&trading_client,&lifecycle,&positions,&token_ownership,&scope,&squadron_id).await{warn!("Cancelled partner fill could not be reconciled: {error}");continue;}
+                                            if pulled.bid_matched>Decimal::ZERO {
+                                                if !retain_confirmed_partner_after_cancel(&mut*positions.lock().await,&partner_key){warn!("Cancelled partner reports a fill without durable ownership; retaining its guard");continue;}
+                                            } else if pulled.any_found() {
                                                 info!("🧹 EXIT [{}]: pulled the partner leg's resting bid on {} ahead of the lone-leg exit", sn, partner);
                                                 positions.lock().await.remove(&partner_key);
                                                 token_ownership.lock().await.remove(&partner);
@@ -2122,9 +2154,11 @@ impl Squadron {
                                 // Shares the venue matched on THIS order, from its synchronous
                                 // response. `None` only when placement returned Err.
                                 let mut exit_filled_shares: Option<Decimal> = None;
+                                let mut exit_order_id:Option<String>=None;
                                 if !ghosting {
                                     if let Err(e) = place_limit_order_filled(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, &tid, Side::Sell, shares, (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), target_yes_fee_bps as u16, params.order_type, params.post_only, 0, &shared_http).await
-                                        .map(|(_oid, making, taking)| {
+                                        .map(|(oid, making, taking)| {
+                                            exit_order_id=Some(oid);
                                             // SELL orientation: making = shares given, taking = USDC received.
                                             // Ratio is unit-invariant. Clamp to a valid binary price; anything
                                             // outside means an unexpected orientation → fall back below.
@@ -2410,13 +2444,12 @@ impl Squadron {
                                                 if aep_exit > params.price + dec!(0.01) {
                                                     warn!("⚠️ Stale mark [{}]: venue filled ${:.4} against a marked bid of ${:.4} (+${:.4}) — the book this exit was priced from was behind the venue", sn, aep_exit, params.price, aep_exit - params.price);
                                                 }
-                                                *total_pnl.lock().await += pnl_m;
-                                                metrics::record_trade(&scope, fees_m, sn.clone(), params.market_name.clone(), side_of(&tid).to_string(), re_m, aep_exit, rs_m, pnl_m, reason.clone()).await;
-                                                if let Some(pool) = db::pool_for(&asset_lc) {
-                                                    if remainder_m >= config::MIN_ORDER_SHARES {
-                                                        db::update_position_from_chain(&pool, tid_m.as_str(), remainder_m, re_m, None).await;
-                                                    } else {
-                                                        db::close_open_position(&pool, &sn, &tid_m.to_string()).await;
+                                                if let Some(order_id)=exit_order_id.as_deref() {
+                                                    let requested=rs_m+remainder_m;
+                                                    let full_entry_fee=if rs_m>Decimal::ZERO{entry_fee_m*requested/rs_m}else{Decimal::ZERO};
+                                                    match metrics::record_exit_trade_checked(&scope,order_id,Some(&squadron_id),sn.clone(),tid_m.to_string(),params.market_name.clone(),side_of(&tid).to_string(),re_m,aep_exit,requested,rs_m,full_entry_fee,exit_fee_m,reason.clone()).await {
+                                                        Ok(booking)=>{if booking.inserted{*total_pnl.lock().await+=booking.pnl;}if let Err(error)=trading_client.acknowledge_placement(order_id).await{warn!("Exit receipt remains quarantined: {error}");}},
+                                                        Err(error)=>{warn!("Exit bookkeeping failed; order remains quarantined: {error}");continue;}
                                                     }
                                                 }
                                                 // Report the booked slice back to the viper that asked
@@ -2461,6 +2494,7 @@ impl Squadron {
                                                 // wait left on this path, and it paces retries rather than
                                                 // blacking them out.
                                                 warn!("⚠️ EXIT [{}]: FAK matched nothing at ${:.4} — {:.4} shares retained, re-firing at the fresh bid", sn, params.price, remainder_m);
+                                                if let Some(id)=exit_order_id.as_deref(){let _=trading_client.acknowledge_placement(id).await;}
                                             }
 
                                             // The fill-oracle assumption, watched rather than trusted: one
@@ -2509,12 +2543,13 @@ impl Squadron {
                                             // releasing its token claim let FairValue buy the same token a minute
                                             // later, and the two positions' shares merged in every per-token sweep
                                             // that followed.
+                                            let mut paired_order_id=None;
                                             let (matched, venue_price) = if ghosting {
                                                 // In simulation the exit IS the fill, at the limit.
                                                 (Some(s), None)
                                             } else {
                                                 match place_limit_order_filled(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, other_vc, &other_tid, Side::Sell, s, other_limit, other_fee_bps, crate::venues::core::TimeInForce::Fak, false, 0, &shared_http).await {
-                                                    Ok((_oid, making, taking)) => fak_exit::sell_fill(making, taking),
+                                                    Ok((oid, making, taking)) => {paired_order_id=Some(oid);fak_exit::sell_fill(making, taking)},
                                                     Err(e) => {
                                                         warn!("⚠️ PAIRED EXIT [{}]: sell of the other leg ({:.4} shares @ ${:.4}) failed: \"{}\"", sn, s, other_limit, e.to_string().chars().take(120).collect::<String>());
                                                         (None, None)
@@ -2522,31 +2557,18 @@ impl Squadron {
                                                 }
                                             };
                                             let settled = { let mut map = positions.lock().await; fak_exit::settle_paired_leg(&mut map, &pk, matched, venue_price, other_limit, intl_taker_fee_rate) };
-                                            if let Some((p, st)) = settled {
-                                                if st.filled >= config::MIN_ORDER_SHARES {
-                                                    paired_pnl = st.pnl;
-                                                    paired_leg_booked = Some((st.pnl, st.fees()));
-                                                    *total_pnl.lock().await += st.pnl;
-                                                    let sn_pm = sn.clone(); let m_name = params.market_name.clone(); let sid = side_of(&other_tid).to_string(); let scope_pm = scope.clone();
-                                                    let (p_avg, fees, px, filled, pn) = (p.avg_entry, st.fees(), st.exit_price, st.filled, st.pnl);
-                                                    tokio::spawn(async move { metrics::record_trade(&scope_pm, fees, sn_pm, m_name, sid, p_avg, px, filled, pn, "Convergence/PairedExit".to_string()).await; });
+                                            if let Some((p,st))=settled {
+                                                if ghosting {
+                                                    if st.filled>Decimal::ZERO {paired_pnl=st.pnl;paired_leg_booked=Some((st.pnl,st.fees()));*total_pnl.lock().await+=st.pnl;metrics::record_trade(&scope,st.fees(),sn.clone(),params.market_name.clone(),side_of(&other_tid).to_string(),p.avg_entry,st.exit_price,st.filled,st.pnl,"Convergence/PairedExit".into()).await;}
+                                                } else if let Some(order_id)=paired_order_id.as_deref() {
+                                                    if st.filled>Decimal::ZERO {
+                                                        match metrics::record_exit_trade_checked(&scope,order_id,Some(&squadron_id),sn.clone(),other_tid.to_string(),params.market_name.clone(),side_of(&other_tid).to_string(),p.avg_entry,st.exit_price,p.shares,st.filled,p.entry_fee,st.exit_fee,"Convergence/PairedExit".into()).await {
+                                                            Ok(booking)=>{if booking.inserted{*total_pnl.lock().await+=booking.pnl;}paired_pnl=booking.pnl;paired_leg_booked=Some((booking.pnl,booking.fees));if let Err(error)=trading_client.acknowledge_placement(order_id).await{warn!("Paired exit remains quarantined: {error}");}},
+                                                            Err(error)=>warn!("Paired exit bookkeeping failed; receipt quarantined: {error}"),
+                                                        }
+                                                    }else{let _=trading_client.acknowledge_placement(order_id).await;}
                                                 }
-                                                let sn_cp = sn.clone(); let tid_cp = other_tid.to_string(); let asset_c = asset_lc.clone();
-                                                if st.remainder < config::MIN_ORDER_SHARES {
-                                                    // Release the paired token claim only when nothing is left to manage.
-                                                    token_ownership.lock().await.remove(&other_tid_m);
-                                                    tokio::spawn(async move { if let Some(pool) = db::pool_for(&asset_c) { db::close_open_position(&pool, &sn_cp, &tid_cp).await; } });
-                                                } else {
-                                                    // Unsold shares stay as the SAME position, unlinked from the leg
-                                                    // just sold, and keep the token claimed. TimeDecay only exits
-                                                    // whole pairs, so a lone leg is the orphan sweep's to flatten and
-                                                    // book (Arbitrage also has its own naked-leg exit).
-                                                    warn!("⚠️ PAIRED EXIT [{}]: venue sold {:.4} of {:.4} shares on the other leg — {:.4} retained and still claimed; the orphan sweep flattens them", sn, st.filled, p.shares, st.remainder);
-                                                    if st.filled >= config::MIN_ORDER_SHARES {
-                                                        let (rem, avg) = (st.remainder, p.avg_entry);
-                                                        tokio::spawn(async move { if let Some(pool) = db::pool_for(&asset_c) { db::update_position_from_chain(&pool, &tid_cp, rem, avg, None).await; } });
-                                                    }
-                                                }
+                                                if st.remainder<config::MIN_ORDER_SHARES {token_ownership.lock().await.remove(&other_tid_m);}
                                             }
                                         }
                                     }
@@ -2964,7 +2986,7 @@ impl Squadron {
                                             continue;
                                         }
 
-                                        match place_limit_orders_atomic(
+                                        match crate::venues::intl::orders::place_limit_orders_atomic_filled(
                                             &trading_client, &nonce_manager, &signer,
                                             safe_address, eoa_address,
                                             vc, &params.token_id, Side::Buy, params.shares, actual_entry_price, params.order_type.clone(), params.post_only, 0,
@@ -2972,7 +2994,32 @@ impl Squadron {
                                             &shared_http,
                                         ).await {
                                             Err(e) => {
-                                                warn!("⚠️ Arb batch entry FAILED [{}]: {} — no orders placed", sn, e);
+                                                if let Some(partial)=e.downcast_ref::<crate::venues::intl::orders::PartialBatchError>() {
+                                                    for (index, receipt) in partial.legs.iter().enumerate() {
+                                                        let (token,partner,market_name,price,tif)=if index==0 {(&params.token_id,&pp.token_id,&params.market_name,actual_entry_price,params.order_type)}else{(&pp.token_id,&params.token_id,&pp.market_name,actual_pair_entry_price,pp.order_type)};
+                                                        let key=PositionKey::new(sq_key.clone(),sn.clone(),token.clone());
+                                                        if let Some(receipt)=receipt {
+                                                            let matched=if receipt.making_amount>dec!(0)&&receipt.taking_amount>dec!(0){receipt.taking_amount}else{dec!(0)};
+                                                            let fill_price=if matched>dec!(0){receipt.making_amount/matched}else{price};
+                                                            let fee=crate::venues::intl::taker_fee(intl_taker_fee_rate,fill_price,matched);
+                                                            let size=if matched>dec!(0){matched}else{receipt.signed_quantity};
+                                                            if let Err(error)=track_buy_receipt(&trading_client,receipt,&squadron_id,&sn,token,market_name,side_of(token),price,fee,tif,Some(partner),target_market_close_time).await{warn!("Partial batch ownership persistence failed: {error}");continue;}
+                                                            positions.lock().await.insert(key.clone(),Position {shares:size,avg_entry:fill_price,opened_at:Utc::now(),close_time:target_market_close_time,market_name:market_name.clone(),pair_token_id:token.clone(),fill_confirmed_at:if matched>dec!(0){Some(Utc::now())}else{None},paired_leg_token_id:Some(partner.clone()),entry_fee:fee});
+                                                            token_ownership.lock().await.insert(token.clone(),sn.clone());
+                                                            patrol_venue.register_tokens(&[token.clone()]).await;
+                                                            lifecycle.track_with_size(&crate::venues::core::Fill {order_id:crate::venues::core::OrderId(receipt.order_id.clone()),market:token.clone(),filled:matched,price:fill_price,fee},receipt.signed_quantity,&sn,tif,Some(partner.clone())).await;
+                                                            if let Some(pool)=db::pool_for(&asset_lc) {
+                                                                if let Err(error)=db::record_order_entry_checked(&pool,&scope,&receipt.order_id,&squadron_id,&sn,&token.to_string(),market_name,side_of(token),fill_price,size,fee,if matched>Decimal::ZERO{"confirmed"}else{"pending"}).await {warn!("Partial leg adoption failed; receipt quarantined: {error}");continue;}
+                                                                let durable=sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM open_positions WHERE squadron_id=? AND strategy=? AND token_id=? AND ghost_mode=0").bind(&squadron_id).bind(&sn).bind(token.to_string()).fetch_one(&pool).await.unwrap_or(0)>0;
+                                                                if durable {if let Err(error)=trading_client.acknowledge_placement(&receipt.order_id).await{warn!("Accepted batch leg remains quarantined: {error}");}}
+                                                            }
+                                                        }else{positions.lock().await.remove(&key);token_ownership.lock().await.remove(token);}
+                                                    }
+                                                    pending_orders.lock().await.remove(&pos_key);
+                                                    warn!("Arb batch partially accepted: accepted legs retained for reconciliation");
+                                                    continue;
+                                                }
+                                                warn!("⚠️ Arb batch entry failed or is uncertain [{}]: {}", sn, e);
                                                 positions.lock().await.remove(&pos_key);
                                                 pending_orders.lock().await.remove(&pos_key);
                                                 // Release both token claims — order was never sent.
@@ -3000,7 +3047,15 @@ impl Squadron {
                                                 }
                                                 continue;
                                             }
-                                            Ok((leg_a_id, leg_b_id)) => {
+                                            Ok([receipt_a, receipt_b]) => {
+                                                let leg_a_id=receipt_a.order_id.clone();let leg_b_id=receipt_b.order_id.clone();
+                                                let actual_entry_price=if receipt_a.taking_amount>Decimal::ZERO{receipt_a.making_amount/receipt_a.taking_amount}else{actual_entry_price};
+                                                let actual_pair_entry_price=if receipt_b.taking_amount>Decimal::ZERO{receipt_b.making_amount/receipt_b.taking_amount}else{actual_pair_entry_price};
+                                                let fee_a=crate::venues::intl::taker_fee(intl_taker_fee_rate,actual_entry_price,receipt_a.taking_amount);
+                                                let fee_b=crate::venues::intl::taker_fee(intl_taker_fee_rate,actual_pair_entry_price,receipt_b.taking_amount);
+                                                if let Err(error)=track_buy_receipt(&trading_client,&receipt_a,&squadron_id,&sn,&params.token_id,&params.market_name,side_of(&params.token_id),actual_entry_price,fee_a,params.order_type,Some(&pp.token_id),target_market_close_time).await{warn!("Batch primary ownership persistence failed: {error}");continue;}
+                                                if let Err(error)=track_buy_receipt(&trading_client,&receipt_b,&squadron_id,&sn,&pp.token_id,&pp.market_name,side_of(&pp.token_id),actual_pair_entry_price,fee_b,pp.order_type,Some(&params.token_id),target_market_close_time).await{warn!("Batch partner ownership persistence failed: {error}");continue;}
+                                                if let Some(position)=positions.lock().await.get_mut(&pos_key){position.shares=if receipt_a.taking_amount>Decimal::ZERO{receipt_a.taking_amount}else{receipt_a.signed_quantity};position.avg_entry=actual_entry_price;position.entry_fee=fee_a;if receipt_a.taking_amount>Decimal::ZERO{position.fill_confirmed_at=Some(Utc::now());}}
                                                 let primary_wait_secs = if target_yes_token == hourly_yes_token { crate::helpers::balance::MAX_WAIT_SECS_HOURLY } else { crate::helpers::balance::MAX_WAIT_SECS_WINDOW };
                                                 // What a one-sided fill means for this pair. Under
                                                 // `HoldAndManage` (TimeDecay) each leg's sync task must
@@ -3019,10 +3074,10 @@ impl Squadron {
                                                 };
                                                 let cl_s = Arc::clone(&trading_client); let ps_s = Arc::clone(&positions); let pc_s = Arc::clone(&phantom_cooldowns); let to_s = Arc::clone(&token_ownership); let sn_s = sn.clone(); let tn_s = params.token_id.clone();
                                                 let db_sn_a = sn.clone(); let db_tid_a = params.token_id.to_string(); let db_mn_a = params.market_name.clone();
-                                                let db_side_a = side_of(&params.token_id); let db_ep_a = actual_entry_price; let db_sh_a = params.shares; let asset_a = asset_lc.clone(); let scope_a = scope.clone();
+                                                let db_side_a = side_of(&params.token_id); let db_ep_a = actual_entry_price; let db_sh_a = if receipt_a.taking_amount>Decimal::ZERO{receipt_a.taking_amount}else{receipt_a.signed_quantity}; let asset_a = asset_lc.clone(); let scope_a = scope.clone();
                                                 // Write pending position immediately (Viper Launch)
                                                 if let Some(pool) = db::pool_for(&asset_a) {
-                                                    db::record_open_position_with_status(&pool, &scope, &squadron_id, &sn, &db_tid_a, &db_mn_a, db_side_a, db_ep_a, db_sh_a, false, "pending").await;
+                                                    if let Err(error)=db::record_order_entry_checked(&pool,&scope,&receipt_a.order_id,&squadron_id,&sn,&db_tid_a,&db_mn_a,db_side_a,db_ep_a,db_sh_a,fee_a,if receipt_a.taking_amount>Decimal::ZERO{"confirmed"}else{"pending"}).await{warn!("Batch primary adoption failed; receipt quarantined: {error}");continue;}
                                                 }
                                                 let sq_bal = squadron_id.clone();
                                                 tokio::spawn(async move {
@@ -3050,7 +3105,7 @@ impl Squadron {
                                                 });
 
                                         let pp_close_time = target_market_close_time;
-                                        positions.lock().await.insert(PositionKey::new(sq_key.clone(), sn.clone(), pp_token_m.clone()), Position { shares: pp.shares, avg_entry: actual_pair_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp_token_m.clone(), fill_confirmed_at: None, paired_leg_token_id: Some(token_m.clone()), entry_fee: Decimal::ZERO });
+                                        positions.lock().await.insert(PositionKey::new(sq_key.clone(), sn.clone(), pp_token_m.clone()), Position { shares: if receipt_b.taking_amount>Decimal::ZERO{receipt_b.taking_amount}else{receipt_b.signed_quantity}, avg_entry: actual_pair_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp_token_m.clone(), fill_confirmed_at: if receipt_b.taking_amount>Decimal::ZERO{Some(Utc::now())}else{None}, paired_leg_token_id: Some(token_m.clone()), entry_fee: fee_b });
                                         // Claim paired token in registry.
                                         token_ownership.lock().await.insert(pp_token_m.clone(), sn.clone());
 
@@ -3064,10 +3119,10 @@ impl Squadron {
                                                 };
                                                 let sn_p = sn.clone(); let tn_p = pp.token_id.clone(); let ps_p = Arc::clone(&positions); let cl_p = Arc::clone(&trading_client); let pc_p = Arc::clone(&phantom_cooldowns); let to_p = Arc::clone(&token_ownership);
                                                 let db_sn_b = sn.clone(); let db_tid_b = pp.token_id.to_string(); let db_mn_b = pp.market_name.clone();
-                                                let db_side_b = side_of(&pp.token_id); let db_ep_b = actual_pair_entry_price; let db_sh_b = pp.shares; let asset_b = asset_lc.clone(); let scope_b = scope.clone();
+                                                let db_side_b = side_of(&pp.token_id); let db_ep_b = actual_pair_entry_price; let db_sh_b = if receipt_b.taking_amount>Decimal::ZERO{receipt_b.taking_amount}else{receipt_b.signed_quantity}; let asset_b = asset_lc.clone(); let scope_b = scope.clone();
                                                 // Write pending position immediately (Viper Launch)
                                                 if let Some(pool) = db::pool_for(&asset_b) {
-                                                    db::record_open_position_with_status(&pool, &scope, &squadron_id, &sn, &db_tid_b, &db_mn_b, db_side_b, db_ep_b, db_sh_b, false, "pending").await;
+                                                    if let Err(error)=db::record_order_entry_checked(&pool,&scope,&receipt_b.order_id,&squadron_id,&sn,&db_tid_b,&db_mn_b,db_side_b,db_ep_b,db_sh_b,fee_b,if receipt_b.taking_amount>Decimal::ZERO{"confirmed"}else{"pending"}).await{warn!("Batch partner adoption failed; receipt quarantined: {error}");continue;}
                                                 }
                                                 let sq_bal = squadron_id.clone();
                                                 tokio::spawn(async move {
@@ -3130,28 +3185,36 @@ impl Squadron {
                                                 patrol_venue.register_tokens(
                                                     &[params.token_id.clone(), pp.token_id.clone()]
                                                 ).await;
-                                                lifecycle.track(
+                                                lifecycle.track_with_size(
                                                     &crate::venues::core::Fill {
                                                         order_id: crate::venues::core::OrderId(leg_a_id),
                                                         market: params.token_id.clone(),
-                                                        filled: params.shares,
+                                                        filled: receipt_a.taking_amount,
                                                         price: actual_entry_price, fee: Decimal::ZERO
                                                     },
+                                                    receipt_a.signed_quantity,
                                                     &sn,
-                                                    crate::venues::core::TimeInForce::Gtc,
+                                                    params.order_type,
                                                     Some(pp.token_id.clone()),
                                                 ).await;
-                                                lifecycle.track(
+                                                lifecycle.track_with_size(
                                                     &crate::venues::core::Fill {
                                                         order_id: crate::venues::core::OrderId(leg_b_id),
                                                         market: pp.token_id.clone(),
-                                                        filled: pp.shares,
+                                                        filled: receipt_b.taking_amount,
                                                         price: actual_pair_entry_price, fee: Decimal::ZERO
                                                     },
+                                                    receipt_b.signed_quantity,
                                                     &sn,
-                                                    crate::venues::core::TimeInForce::Gtc,
+                                                    pp.order_type,
                                                     Some(params.token_id.clone()),
                                                 ).await;
+                                                if let Some(pool)=db::pool_for(&asset_lc) {
+                                                    for (id,token) in [(&receipt_a.order_id,&params.token_id),(&receipt_b.order_id,&pp.token_id)] {
+                                                        let durable=sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM open_positions WHERE squadron_id=? AND strategy=? AND token_id=? AND ghost_mode=0").bind(&squadron_id).bind(&sn).bind(token.to_string()).fetch_one(&pool).await.unwrap_or(0)>0;
+                                                        if durable {if let Err(error)=trading_client.acknowledge_placement(id).await{warn!("Batch adoption journal remains quarantined: {error}");}}
+                                                    }
+                                                }
                                             }
                                         }
                                     } else {
@@ -3169,7 +3232,8 @@ impl Squadron {
                                         //
                                         // Mirror of the exit-side fix above, and of the fix already
                                         // living in `IntlClobVenue::place_order`.
-                                        let (leg_a_order_id, entry_fill_price) = match place_limit_order_filled(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, &params.token_id, Side::Buy, params.shares, actual_entry_price, target_yes_fee_bps as u16, params.order_type, params.post_only, 0, &shared_http).await {
+                                        let mut entry_receipt=None;
+                                        let (leg_a_order_id, entry_fill_price) = match crate::venues::intl::orders::place_limit_order_receipt(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, &params.token_id, Side::Buy, params.shares, actual_entry_price, target_yes_fee_bps as u16, params.order_type, params.post_only, 0, &shared_http).await {
                                             Err(e) => {
                                                 warn!("⚠️ ENTRY order failed [{}]: {}", sn, e);
                                                 positions.lock().await.remove(&pos_key);
@@ -3212,7 +3276,9 @@ impl Squadron {
                                                 }
                                                 continue;
                                             }
-                                            Ok((id, making, taking)) => {
+                                            Ok(receipt) => {
+                                                let (id, making, taking)=(receipt.order_id.clone(),receipt.making_amount,receipt.taking_amount);
+                                                entry_receipt=Some(receipt);
                                                 // BUY orientation: making = USDC paid, taking = shares
                                                 // received. Ratio is unit-invariant. A post_only order
                                                 // rests and matches nothing now (making/taking = 0), so
@@ -3225,34 +3291,49 @@ impl Squadron {
                                                 (id, px.unwrap_or(params.price))
                                             }
                                         };
-                                        let _ = leg_a_order_id;
+                                        let Some(entry_receipt)=entry_receipt else {continue;};
+                                        let matched=if entry_receipt.making_amount>dec!(0)&&entry_receipt.taking_amount>dec!(0){entry_receipt.taking_amount}else{dec!(0)};
+                                        if matched<=dec!(0)&&matches!(params.order_type,crate::venues::core::TimeInForce::Fak|crate::venues::core::TimeInForce::Fok) {
+                                            positions.lock().await.remove(&pos_key);pending_orders.lock().await.remove(&pos_key);token_ownership.lock().await.remove(&token_m);
+                                            let _=trading_client.acknowledge_placement(&leg_a_order_id).await;continue;
+                                        }
+                                        let placed_size=entry_receipt.signed_quantity;
+                                        if let Err(error)=track_buy_receipt(&trading_client,&entry_receipt,&squadron_id,&sn,&params.token_id,&params.market_name,side_of(&params.token_id),entry_fill_price,crate::venues::intl::taker_fee(intl_taker_fee_rate,entry_fill_price,matched),params.order_type,pair_params.as_ref().map(|p|&p.token_id),target_market_close_time).await{warn!("Entry ownership persistence failed: {error}");continue;}
+                                        patrol_venue.register_tokens(&[params.token_id.clone()]).await;
+                                        lifecycle.track_with_size(&crate::venues::core::Fill {order_id:crate::venues::core::OrderId(leg_a_order_id.clone()),market:params.token_id.clone(),filled:matched,price:entry_fill_price,fee:crate::venues::intl::taker_fee(intl_taker_fee_rate,entry_fill_price,matched)},placed_size,&sn,params.order_type,pair_params.as_ref().map(|p|p.token_id.clone())).await;
                                         // The exchange charges its taker fee out of collateral and
                                         // reports it nowhere: making/taking come back as the matched
                                         // amounts BEFORE the fee, so booking that price alone leaves
                                         // the whole cost invisible to P&L. Carry it on the position
                                         // so the exit can net it out of the round trip.
                                         let entry_fee_paid = crate::venues::intl::taker_fee(
-                                            intl_taker_fee_rate, entry_fill_price, params.shares,
+                                            intl_taker_fee_rate, entry_fill_price, matched,
                                         );
                                         // Correct the provisional booking made before placement.
                                         if let Some(p) = positions.lock().await.get_mut(&pos_key) {
                                             p.avg_entry = entry_fill_price;
+                                            p.shares=if matched>dec!(0){matched}else{placed_size};
+                                            if matched>dec!(0){p.fill_confirmed_at=Some(Utc::now());}
                                             p.entry_fee = entry_fee_paid;
                                         }
                                         let cl_s = Arc::clone(&trading_client); let ps_s = Arc::clone(&positions); let pc_s = Arc::clone(&phantom_cooldowns); let to_s = Arc::clone(&token_ownership); let sn_s = sn.clone(); let tn_s = params.token_id.clone();
                                         let primary_wait_secs = if target_yes_token == hourly_yes_token { crate::helpers::balance::MAX_WAIT_SECS_HOURLY } else { crate::helpers::balance::MAX_WAIT_SECS_WINDOW };
                                         let db_sn_s = sn.clone(); let db_tid_s = params.token_id.to_string(); let db_mn_s = params.market_name.clone();
-                                        let db_side_s = side_of(&params.token_id); let db_ep_s = entry_fill_price; let db_sh_s = params.shares; let asset_s = asset_lc.clone(); let scope_s = scope.clone();
+                                        let db_side_s = side_of(&params.token_id); let db_ep_s = entry_fill_price; let db_sh_s = if matched>dec!(0){matched}else{placed_size}; let asset_s = asset_lc.clone(); let scope_s = scope.clone();
                                         let feat_snap_s = entry_snap.clone();
                                         // Write pending position immediately (Viper Launch)
                                         if let Some(pool) = db::pool_for(&asset_s) {
-                                            db::record_open_position_with_status(&pool, &scope, &squadron_id, &sn, &db_tid_s, &db_mn_s, db_side_s, db_ep_s, db_sh_s, false, "pending").await;
+                                            if let Err(error)=db::record_order_entry_checked(&pool,&scope,&leg_a_order_id,&squadron_id,&sn,&db_tid_s,&db_mn_s,db_side_s,db_ep_s,db_sh_s,entry_fee_paid,if matched>Decimal::ZERO{"confirmed"}else{"pending"}).await{warn!("Entry adoption failed; receipt quarantined: {error}");continue;}
                                             // Stamp what opening this leg cost. If the position
                                             // later leaves via settlement or an off-strategy
                                             // close, that booking happens in db.rs with no view
                                             // of the in-memory Position — this row is its only
                                             // source for the entry fee.
-                                            db::set_open_position_entry_fee(&pool, &db_tid_s, entry_fee_paid).await;
+
+                                        }
+                                        if let Some(pool)=db::pool_for(&asset_lc) {
+                                            let durable=sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM open_positions WHERE squadron_id=? AND strategy=? AND token_id=? AND ghost_mode=0").bind(&squadron_id).bind(&sn).bind(params.token_id.to_string()).fetch_one(&pool).await.unwrap_or(0)>0;
+                                            if durable {if let Err(error)=trading_client.acknowledge_placement(&leg_a_order_id).await{warn!("Entry journal remains quarantined: {error}");}}
                                         }
                                         let sq_bal = squadron_id.clone();
                                         tokio::spawn(async move {
@@ -3321,7 +3402,7 @@ impl Squadron {
                                             { pending_orders.lock().await.insert(pk.clone(), Instant::now() + Duration::from_secs(3)); }
                                             let _ = tokio::time::timeout(Duration::from_secs(10), crate::helpers::balance::quick_confirm_fill(&squadron_id, &trading_client, &sn, &p.token_id, &positions, &p.condition_id, p.order_type.clone())).await;
                                             let vc = if p.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
-                                            if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, &p.token_id, Side::Buy, p.shares, p.price, target_yes_fee_bps as u16, p.order_type, true, 0, &shared_http).await {
+                                            let quote_receipt=match crate::venues::intl::orders::place_limit_order_receipt(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, &p.token_id, Side::Buy, p.shares, p.price, target_yes_fee_bps as u16, p.order_type, true, 0, &shared_http).await {Err(e)=>{
                                                 positions.lock().await.remove(&pk);
                                                 // Release token claim — order placement failed.
                                                 token_ownership.lock().await.remove(&p_token_m);
@@ -3350,7 +3431,13 @@ impl Squadron {
                                                     }
                                                 }
                                                 continue;
-                                            }
+                                            },Ok(receipt)=>receipt};
+                                            let quote_matched=quote_receipt.taking_amount;
+                                            if let Err(error)=track_buy_receipt(&trading_client,&quote_receipt,&squadron_id,&sn,&p.token_id,&p.market_name,side_of(&p.token_id),p.price,Decimal::ZERO,p.order_type,None,target_market_close_time).await{warn!("Maker quote ownership persistence failed: {error}");continue;}
+                                            if let Some(position)=positions.lock().await.get_mut(&pk){position.shares=if quote_matched>Decimal::ZERO{quote_matched}else{quote_receipt.signed_quantity};if quote_matched>Decimal::ZERO{position.fill_confirmed_at=Some(Utc::now());}}
+                                            lifecycle.track_with_size(&crate::venues::core::Fill{order_id:crate::venues::core::OrderId(quote_receipt.order_id.clone()),market:p.token_id.clone(),filled:quote_matched,price:p.price,fee:Decimal::ZERO},quote_receipt.signed_quantity,&sn,p.order_type,None).await;
+                                            patrol_venue.register_tokens(&[p.token_id.clone()]).await;
+
                                             let cl_m = Arc::clone(&trading_client); let ps_m = Arc::clone(&positions); let pc_m = Arc::clone(&phantom_cooldowns); let to_m = Arc::clone(&token_ownership); let sn_m = sn.clone();
                                             let tid_em = p.token_id.to_string(); let mn_em = p.market_name.clone();
                                             let side_em = side_of(&p.token_id).to_string();
@@ -3361,7 +3448,8 @@ impl Squadron {
                                             let feat_snap_m = ctx.maker_snapshot.clone().unwrap_or_else(|| ctx.snapshot.clone());
                                             // Write pending position immediately (Viper Launch)
                                             if let Some(pool) = db::pool_for(&asset_em) {
-                                                db::record_open_position_with_status(&pool, &scope, &squadron_id, &sn, &tid_em, &mn_em, &side_em, ep_em, sh_em, false, "pending").await;
+                                                if let Err(error)=db::record_order_entry_checked(&pool,&scope,&quote_receipt.order_id,&squadron_id,&sn,&tid_em,&mn_em,&side_em,ep_em,if quote_matched>Decimal::ZERO{quote_matched}else{quote_receipt.signed_quantity},Decimal::ZERO,if quote_matched>Decimal::ZERO{"confirmed"}else{"pending"}).await{warn!("Maker quote adoption failed; receipt quarantined: {error}");continue;}
+                                                if let Err(error)=trading_client.acknowledge_placement(&quote_receipt.order_id).await{warn!("Maker quote receipt remains quarantined: {error}");continue;}
                                             }
                                             // Claim this quote's epoch. Anything that pulls or
                                             // replaces the quote bumps it, which is how the task
@@ -3434,8 +3522,8 @@ impl Squadron {
                                         // exit ask on this token belongs to the resting-exit
                                         // path, and its matched size is an exit, not a fill
                                         // to adopt.
-                                        let cancel = crate::helpers::balance::cancel_resting_orders_for_token(
-                                            &trading_client, &tok, crate::helpers::balance::RestingSide::Bids).await;
+                                        let cancel = match crate::helpers::balance::cancel_resting_orders_for_token(
+                                            &trading_client, &tok, crate::helpers::balance::RestingSide::Bids).await {Ok(value)=>value,Err(error)=>{warn!("Resting order cancellation was not confirmed: {error}");continue;}};
                                         let (order_found, m) = (cancel.bid_found, cancel.bid_matched);
                                         // ── Complete-fill guard ──────────────────────────
                                         // A quote that FULLY filled vanishes from the CLOB
@@ -3570,6 +3658,7 @@ impl Squadron {
                                         info!("👻 GHOST_MODE {} [{}]: {} | shares={:.2}, ask=${:.4} (simulated)",
                                               label, sn, params.market_name, live_shares, params.price);
                                         maker_resting_exits.insert(pk.clone(), MakerRestingExit {
+                                            order_id:None,
                                             price: params.price, shares: live_shares, avg_entry, entry_fee,
                                             market_name: params.market_name.clone(), last_poll: Instant::now(),
                                             short_reads: 0, max_short_read: dec!(0), booked: dec!(0),
@@ -3606,6 +3695,11 @@ impl Squadron {
                                     {
                                         continue;
                                     }
+                                    if let Some(id)=existing.order_id.clone() {
+                                        if let Err(error)=trading_client.cancel_orders(&[id.as_str()]).await{warn!("Ask reprice cancellation unconfirmed: {error}");continue;}
+                                        if let Err(error)=reconcile_tracked_asks(&trading_client,&mut maker_resting_exits,&positions,&token_ownership,&total_pnl,&scope,&squadron_id).await{warn!("Ask reprice fill booking failed: {error}");}
+                                        continue;
+                                    }
                                     // Repricing: pull the stale ask so the shares are free
                                     // to back the new one.
                                     let stale_price = existing.price;
@@ -3618,8 +3712,8 @@ impl Squadron {
                                     // lifecycle, not this one: it holds none of the shares,
                                     // and its matched size is the ENTRY fill — already in the
                                     // position, not something that left it.
-                                    let cancel = cancel_resting_orders_for_token(
-                                        &trading_client, &tok, RestingSide::Asks).await;
+                                    let cancel = match cancel_resting_orders_for_token(
+                                        &trading_client, &tok, RestingSide::Asks).await {Ok(value)=>value,Err(error)=>{warn!("Resting order cancellation was not confirmed: {error}");continue;}};
                                     // The record MUST go regardless of what the cancel
                                     // found: after this point no ask of ours rests, and
                                     // leaving the entry behind would make the next tick's
@@ -3705,14 +3799,27 @@ impl Squadron {
                                 }
 
                                 let vc = if params.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
-                                match place_limit_order(
+                                match crate::venues::intl::orders::place_limit_order_receipt(
                                     &trading_client, &nonce_manager, &signer,
                                     safe_address, eoa_address, vc, &tok, Side::Sell,
                                     live_shares, params.price, params.fee_bps,
                                     params.order_type, params.post_only, 0, &shared_http,
                                 ).await {
-                                    Ok(_order_id) => {
+                                    Ok(receipt) => {
+                                        let owner=crate::venues::intl::order_journal::TrackedOrder {
+                                            order_id:receipt.order_id.clone(),squadron:squadron_id.clone(),strategy:sn.clone(),token_id:tok.to_string(),side:Side::Sell as u8,side_label:side_of(&tok).to_string(),
+                                            quantity:live_shares,limit_price:params.price,entry_price:avg_entry,entry_fee,
+                                            exit_fee:if receipt.making_amount>Decimal::ZERO&&receipt.taking_amount>Decimal::ZERO{crate::venues::intl::taker_fee(intl_taker_fee_rate,receipt.taking_amount/receipt.making_amount,receipt.making_amount)}else{Decimal::ZERO},
+                                            market_name:params.market_name.clone(),pair_token:None,close_time:target_market_close_time,booked_cumulative:Decimal::ZERO,initial_filled:receipt.making_amount,initial_notional:receipt.taking_amount,
+                                        };
+                                        if let Err(error)=trading_client.track_order(&owner).await {warn!("Working exit ownership could not persist; receipt quarantined: {error}");continue;}
+                                        if let Some(pool)=db::pool_for(&asset_lc) {
+                                            if let Err(error)=db::record_open_position_with_status_checked(&pool,&scope,&squadron_id,&sn,tok.as_str(),&params.market_name,side_of(&tok),avg_entry,live_shares,false,"confirmed").await {warn!("Working exit position could not persist; receipt quarantined: {error}");continue;}
+                                        }else{continue;}
+                                        if let Err(error)=trading_client.acknowledge_placement(&receipt.order_id).await{warn!("Working exit receipt remains quarantined: {error}");continue;}
+
                                         maker_resting_exits.insert(pk.clone(), MakerRestingExit {
+                                            order_id:Some(receipt.order_id.clone()),
                                             price: params.price, shares: live_shares, avg_entry, entry_fee,
                                             market_name: params.market_name.clone(), last_poll: Instant::now(),
                                             short_reads: 0, max_short_read: dec!(0), booked: dec!(0),
@@ -3776,7 +3883,7 @@ impl Squadron {
                     if !maker_resting_exits.is_empty() && !ghosting {
                         let due: Vec<PositionKey> = maker_resting_exits
                             .iter()
-                            .filter(|(_, v)| v.last_poll.elapsed() >= Duration::from_secs(MAKER_RESTING_EXIT_POLL_SECS))
+                            .filter(|(_, v)| v.order_id.is_none() && v.last_poll.elapsed() >= Duration::from_secs(MAKER_RESTING_EXIT_POLL_SECS))
                             .map(|(k, _)| k.clone())
                             .collect();
 
@@ -3894,13 +4001,28 @@ impl Squadron {
         // Outside the tick, so there is no `ghosting` in scope — read the live
         // config directly rather than the build constant alone.
         if !maker_resting_exits.is_empty() && !crate::helpers::dynamic_config::ghosting_now() {
-            for (pk, rec) in maker_resting_exits.iter() {
-                let cancel = cancel_resting_orders_for_token(
-                    &trading_client, &pk.market, RestingSide::Both).await;
+            for (pk, rec) in maker_resting_exits.clone() {
+                if let Some(id)=rec.order_id.as_deref(){
+                    if let Err(error)=trading_client.cancel_orders(&[id]).await{warn!("Stand-down ask cancellation unconfirmed: {error}");continue;}
+                    if let Err(error)=reconcile_tracked_asks(&trading_client,&mut maker_resting_exits,&positions,&token_ownership,&total_pnl,&scope,&squadron_id).await{warn!("Stand-down ask booking failed: {error}");}
+                    continue;
+                }
+                let cancel = match cancel_resting_orders_for_token(
+                    &trading_client, &pk.market, RestingSide::Both,
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        warn!("Resting order cancellation was not confirmed: {error}");
+                        continue;
+                    }
+                };
                 // Only the ask's fill is an exit, and only the part the sweep
                 // has not already booked.
                 let mut matched = resting_exit::lift_since_booking(
-                    cancel.ask_found, cancel.ask_matched, rec.booked, rec.shares);
+                    cancel.ask_found, cancel.ask_matched, rec.booked, rec.shares,
+                );
                 // An ask that already vanished has no order left to report a
                 // matched size, so the wallet is the only witness to a lift. Read
                 // it with the same settlement-lag retries the stop path uses,
@@ -3910,7 +4032,8 @@ impl Squadron {
                     let mut held = onchain_balance_for_token(&trading_client, &pk.market).await;
                     for _ in 1..config::SETTLEMENT_LAG_RETRY_ATTEMPTS {
                         if rec.shares - held < config::MIN_ORDER_SHARES { break; }
-                        tokio::time::sleep(Duration::from_secs(config::SETTLEMENT_LAG_RETRY_DELAY_SECS)).await;
+                        tokio::time::sleep(Duration::from_secs(config::SETTLEMENT_LAG_RETRY_DELAY_SECS,
+                        )).await;
                         let again = onchain_balance_for_token(&trading_client, &pk.market).await;
                         if again > held { held = again; }
                     }
@@ -3920,10 +4043,11 @@ impl Squadron {
                     // Lifted during tear-down: book it here at the resting price
                     // rather than leaving a silent cash move for the reconciler.
                     // Net of the entry fee, as everywhere else a lift is booked.
-                    let (avg_entry, entry_fee) = positions.lock().await.get(pk)
+                    let (avg_entry, entry_fee) = positions.lock().await.get(&pk)
                         .map(|p| (p.avg_entry, p.entry_fee))
                         .unwrap_or((rec.avg_entry, rec.entry_fee));
-                    let bk = resting_exit::book_lift(rec.price, avg_entry, entry_fee, matched, rec.shares);
+                    let bk = resting_exit::book_lift(rec.price, avg_entry, entry_fee, matched, rec.shares,
+                    );
                     let pnl = bk.pnl;
                     *total_pnl.lock().await += pnl;
                     let side_label = if maker_market_config.as_ref().is_some_and(|m| m.yes_token == pk.market)
@@ -3935,7 +4059,7 @@ impl Squadron {
                         avg_entry, rec.price, matched, pnl,
                         format!("{}: lifted @ ${:.4} during stand-down", resting_exit::label(&pk.strategy), rec.price),
                     ).await;
-                    positions.lock().await.remove(pk);
+                    positions.lock().await.remove(&pk);
                     token_ownership.lock().await.remove(&pk.market);
                     if let Some(pool) = db::pool_for(&asset_lc) {
                         db::close_open_position(&pool, &pk.strategy, pk.market.as_str()).await;
@@ -3979,12 +4103,413 @@ impl Squadron {
 /// placing API key, so the operator can see which are the engine's own), and
 /// `true` is returned: a deliberate skip is not a cancel failure, and the
 /// callers' error arms describe failures.
+fn retain_confirmed_partner_after_cancel(
+    map: &mut crate::state::PositionMap,
+    key: &PositionKey,
+) -> bool {
+    let Some(position) = map.get_mut(key) else {
+        return false;
+    };
+    if position.fill_confirmed_at.is_none() {
+        return false;
+    }
+    position.paired_leg_token_id = None;
+    true
+}
+
+#[cfg(test)]
+mod cancelled_partner_tests {
+    use super::*;
+    #[test]
+    fn a_partly_filled_cancelled_partner_keeps_its_exact_holding() {
+        let token=MarketId::new("7");let key=PositionKey::new("synthetic-squadron","synthetic-strategy",token.clone());
+        let mut positions=crate::state::PositionMap::new();
+        positions.insert(key.clone(),Position{shares:dec!(2.5),avg_entry:dec!(0.4),opened_at:Utc::now(),close_time:None,market_name:"Synthetic market".into(),pair_token_id:token,fill_confirmed_at:Some(Utc::now()),paired_leg_token_id:Some(MarketId::new("1")),entry_fee:dec!(0.01)});
+        assert!(retain_confirmed_partner_after_cancel(&mut positions,&key));
+        assert_eq!(positions[&key].shares,dec!(2.5));assert_eq!(positions[&key].entry_fee,dec!(0.01));assert!(positions[&key].paired_leg_token_id.is_none());
+        positions.get_mut(&key).unwrap().fill_confirmed_at=None;
+        assert!(!retain_confirmed_partner_after_cancel(&mut positions,&key));assert!(positions.contains_key(&key));
+    }
+}
+
+async fn track_buy_receipt(
+    client: &crate::venues::intl::trading_client::TradingClient,
+    receipt: &crate::venues::intl::orders::OrderReceipt,
+    squadron: &str,
+    strategy: &str,
+    token: &MarketId,
+    market: &str,
+    side_label: &str,
+    price: Decimal,
+    fee: Decimal,
+    tif: crate::venues::core::TimeInForce,
+    pair: Option<&MarketId>,
+    close_time: Option<chrono::DateTime<Utc>>,
+) -> anyhow::Result<()> {
+    if !matches!(
+        tif,
+        crate::venues::core::TimeInForce::Gtc | crate::venues::core::TimeInForce::Gtd
+    ) {
+        return Ok(());
+    }
+    client
+        .track_order(&crate::venues::intl::order_journal::TrackedOrder {
+            order_id: receipt.order_id.clone(),
+            squadron: squadron.into(),
+            strategy: strategy.into(),
+            token_id: token.to_string(),
+            side: Side::Buy as u8,
+            side_label: side_label.into(),
+            quantity: receipt.signed_quantity,
+            limit_price: price,
+            entry_price: if receipt.taking_amount > Decimal::ZERO {
+                receipt.making_amount / receipt.taking_amount
+            } else {
+                price
+            },
+            entry_fee: fee,
+            exit_fee: Decimal::ZERO,
+            market_name: market.into(),
+            pair_token: pair.map(ToString::to_string),
+            close_time,
+            booked_cumulative: receipt.taking_amount,
+            initial_filled: receipt.taking_amount,
+            initial_notional: receipt.making_amount,
+        })
+        .await
+}
+
+async fn reconcile_tracked_buys(
+    client: &crate::venues::intl::trading_client::TradingClient,
+    lifecycle: &OrderLifecycle,
+    positions: &Arc<tokio::sync::Mutex<crate::state::PositionMap>>,
+    ownership: &Arc<tokio::sync::Mutex<std::collections::HashMap<MarketId, String>>>,
+    scope: &TradeScope,
+    squadron: &str,
+) -> anyhow::Result<()> {
+    use crate::venues::core::{Fill, OrderId, TimeInForce};
+    use polymarket_client_sdk_v2::clob::types::OrderStatusType;
+    let pool = db::pool_for(&scope.shard)
+        .ok_or_else(|| anyhow::anyhow!("working entry database is unavailable"))?;
+    let mut live_scope = scope.clone();
+    live_scope.ghost = false;
+    for mut owner in client.tracked_orders(squadron).await? {
+        if owner.side != Side::Buy as u8 {
+            continue;
+        }
+        let order = client.order(&owner.order_id).await?;
+        anyhow::ensure!(
+            order.id == owner.order_id
+                && order.maker_address == client.wallet().funder
+                && order.asset_id.to_string() == owner.token_id
+                && order.side == Side::Buy,
+            "working entry order identity changed"
+        );
+        let terminal = match order.status {
+            OrderStatusType::Live | OrderStatusType::Delayed | OrderStatusType::Unmatched => false,
+            OrderStatusType::Matched | OrderStatusType::Canceled => true,
+            _ => continue,
+        };
+        let token = MarketId::new(owner.token_id.clone());
+        let key = PositionKey::new(squadron, owner.strategy.clone(), token.clone());
+        let matched = order.size_matched;
+        let price = if matched > Decimal::ZERO {
+            (owner.initial_notional
+                + (matched - owner.initial_filled).max(Decimal::ZERO) * owner.limit_price)
+                / matched
+        } else {
+            owner.limit_price
+        };
+        if matched > Decimal::ZERO {
+            db::record_order_entry_checked(
+                &pool,
+                &live_scope,
+                &owner.order_id,
+                squadron,
+                &owner.strategy,
+                &owner.token_id,
+                &owner.market_name,
+                &owner.side_label,
+                price,
+                matched,
+                owner.entry_fee,
+                "confirmed",
+            )
+            .await?;
+        } else if terminal {
+            db::close_pending_open_position_for(&pool, squadron, &owner.strategy, &owner.token_id)
+                .await;
+            let remaining:i64=sqlx::query_scalar("SELECT COUNT(*) FROM open_positions WHERE squadron_id=? AND strategy=? AND token_id=? AND ghost_mode=0 AND status='pending'").bind(squadron).bind(&owner.strategy).bind(&owner.token_id).fetch_one(&pool).await?;
+            anyhow::ensure!(
+                remaining == 0,
+                "unfilled working entry could not be durably released"
+            );
+            positions.lock().await.remove(&key);
+            ownership.lock().await.remove(&token);
+        } else {
+            db::record_order_entry_checked(
+                &pool,
+                &live_scope,
+                &owner.order_id,
+                squadron,
+                &owner.strategy,
+                &owner.token_id,
+                &owner.market_name,
+                &owner.side_label,
+                price,
+                owner.quantity,
+                Decimal::ZERO,
+                "pending",
+            )
+            .await?;
+        }
+        if matched > Decimal::ZERO || !terminal {
+            let row:Option<(String,Option<String>,String)>=sqlx::query_as("SELECT shares,entry_fee,entry_price FROM open_positions WHERE squadron_id=? AND strategy=? AND token_id=? AND ghost_mode=0")
+                .bind(squadron).bind(&owner.strategy).bind(&owner.token_id).fetch_optional(&pool).await?;
+            let Some((durable_shares, durable_fee, durable_price)) = row else {
+                if terminal {
+                    lifecycle
+                        .finish_recovered_order(&OrderId(owner.order_id.clone()))
+                        .await;
+                    client.finish_tracked_order(&owner.order_id).await?;
+                }
+                continue;
+            };
+            let quantity = Decimal::from_str(&durable_shares)?;
+            let price = Decimal::from_str(&durable_price)?;
+            let fee = durable_fee
+                .as_deref()
+                .map(Decimal::from_str)
+                .transpose()?
+                .unwrap_or(Decimal::ZERO);
+            let mut map = positions.lock().await;
+            if let Some(position) = map.get_mut(&key) {
+                position.shares = quantity;
+                position.avg_entry = price;
+                if matched > Decimal::ZERO {
+                    position.fill_confirmed_at = Some(Utc::now());
+                    position.entry_fee = fee;
+                }
+            } else {
+                map.insert(
+                    key.clone(),
+                    Position {
+                        shares: quantity,
+                        avg_entry: price,
+                        opened_at: Utc::now(),
+                        close_time: owner.close_time,
+                        market_name: owner.market_name.clone(),
+                        pair_token_id: token.clone(),
+                        fill_confirmed_at: if matched > Decimal::ZERO {
+                            Some(Utc::now())
+                        } else {
+                            None
+                        },
+                        paired_leg_token_id: owner
+                            .pair_token
+                            .as_ref()
+                            .map(|value| MarketId::new(value.clone())),
+                        entry_fee: fee,
+                    },
+                );
+            }
+            drop(map);
+            ownership
+                .lock()
+                .await
+                .insert(token.clone(), owner.strategy.clone());
+            lifecycle
+                .track_with_size(
+                    &Fill {
+                        order_id: OrderId(owner.order_id.clone()),
+                        market: token.clone(),
+                        filled: matched,
+                        price,
+                        fee: owner.entry_fee,
+                    },
+                    owner.quantity,
+                    &owner.strategy,
+                    if matches!(
+                        order.order_type,
+                        polymarket_client_sdk_v2::clob::types::OrderType::GTD
+                    ) {
+                        TimeInForce::Gtd
+                    } else {
+                        TimeInForce::Gtc
+                    },
+                    owner
+                        .pair_token
+                        .as_ref()
+                        .map(|value| MarketId::new(value.clone())),
+                )
+                .await;
+        }
+        owner.booked_cumulative = matched;
+        client.track_order(&owner).await?;
+        client.acknowledge_placement(&owner.order_id).await?;
+        if terminal {
+            lifecycle
+                .finish_recovered_order(&OrderId(owner.order_id.clone()))
+                .await;
+            client.finish_tracked_order(&owner.order_id).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn reconcile_tracked_asks(
+    client: &crate::venues::intl::trading_client::TradingClient,
+    asks: &mut std::collections::HashMap<PositionKey, MakerRestingExit>,
+    positions: &Arc<tokio::sync::Mutex<crate::state::PositionMap>>,
+    ownership: &Arc<tokio::sync::Mutex<std::collections::HashMap<MarketId, String>>>,
+    pnl: &Arc<tokio::sync::Mutex<Decimal>>,
+    scope: &TradeScope,
+    squadron: &str,
+) -> anyhow::Result<()> {
+    use polymarket_client_sdk_v2::clob::types::OrderStatusType;
+    let pool = db::pool_for(&scope.shard)
+        .ok_or_else(|| anyhow::anyhow!("working exit database is unavailable"))?;
+    let mut live_scope = scope.clone();
+    live_scope.ghost = false;
+    for mut owner in client.tracked_orders(squadron).await? {
+        if owner.side != Side::Sell as u8 {
+            continue;
+        }
+        let order = client.order(&owner.order_id).await?;
+        anyhow::ensure!(
+            order.id == owner.order_id
+                && order.maker_address == client.wallet().funder
+                && order.asset_id.to_string() == owner.token_id
+                && order.side == Side::Sell,
+            "working exit order identity changed"
+        );
+        let terminal = match order.status {
+            OrderStatusType::Live | OrderStatusType::Delayed | OrderStatusType::Unmatched => false,
+            OrderStatusType::Matched | OrderStatusType::Canceled => true,
+            _ => continue,
+        };
+        let token = MarketId::new(owner.token_id.clone());
+        let key = PositionKey::new(squadron, owner.strategy.clone(), token.clone());
+        let rows:Vec<(String,Option<String>)>=sqlx::query_as("SELECT shares,entry_fee FROM open_positions WHERE squadron_id=? AND strategy=? AND token_id=? AND ghost_mode=0")
+            .bind(squadron).bind(&owner.strategy).bind(&owner.token_id).fetch_all(&pool).await?;
+        anyhow::ensure!(
+            rows.len() <= 1,
+            "working exit has ambiguous position ownership"
+        );
+        let mut remaining = rows
+            .first()
+            .map(|row| Decimal::from_str(&row.0))
+            .transpose()?
+            .unwrap_or(Decimal::ZERO);
+        let mut remaining_fee = rows
+            .first()
+            .and_then(|row| row.1.as_deref())
+            .map(Decimal::from_str)
+            .transpose()?
+            .unwrap_or(Decimal::ZERO);
+        if order.size_matched > Decimal::ZERO {
+            let booking = metrics::record_cumulative_exit_trade_checked(
+                &live_scope,
+                &owner.order_id,
+                Some(squadron),
+                owner.strategy.clone(),
+                owner.token_id.clone(),
+                owner.market_name.clone(),
+                owner.side_label.clone(),
+                owner.entry_price,
+                owner.limit_price,
+                owner.quantity,
+                order.size_matched,
+                owner.entry_fee,
+                owner.exit_fee,
+                resting_exit::ledger_reason(&owner.strategy, owner.limit_price, owner.entry_price),
+            )
+            .await?;
+            if booking.inserted {
+                *pnl.lock().await += booking.pnl;
+                remaining = booking.remaining;
+                remaining_fee = booking.remaining_entry_fee;
+            }
+            owner.booked_cumulative = order.size_matched;
+            // Progress JSON follows the SQLite booking transaction; replaying a
+            // stale JSON snapshot is harmless because SQLite owns deduplication.
+            client.track_order(&owner).await?;
+        }
+        if remaining > Decimal::ZERO {
+            let mut map = positions.lock().await;
+            if let Some(position) = map.get_mut(&key) {
+                position.shares = remaining;
+                position.entry_fee = remaining_fee;
+            } else {
+                map.insert(
+                    key.clone(),
+                    Position {
+                        shares: remaining,
+                        avg_entry: owner.entry_price,
+                        opened_at: Utc::now(),
+                        close_time: owner.close_time,
+                        market_name: owner.market_name.clone(),
+                        pair_token_id: token.clone(),
+                        fill_confirmed_at: Some(Utc::now()),
+                        paired_leg_token_id: owner
+                            .pair_token
+                            .as_ref()
+                            .map(|token| MarketId::new(token.clone())),
+                        entry_fee: remaining_fee,
+                    },
+                );
+            }
+            ownership
+                .lock()
+                .await
+                .insert(token.clone(), owner.strategy.clone());
+        } else if terminal {
+            positions.lock().await.remove(&key);
+            ownership.lock().await.remove(&token);
+        }
+        if !rows.is_empty() || order.size_matched > Decimal::ZERO || terminal {
+            client.acknowledge_placement(&owner.order_id).await?;
+        }
+        if terminal {
+            client.finish_tracked_order(&owner.order_id).await?;
+            asks.remove(&key);
+        } else {
+            asks.insert(
+                key,
+                MakerRestingExit {
+                    order_id: Some(owner.order_id),
+                    price: owner.limit_price,
+                    shares: remaining,
+                    avg_entry: owner.entry_price,
+                    entry_fee: remaining_fee,
+                    market_name: owner.market_name,
+                    last_poll: Instant::now(),
+                    short_reads: 0,
+                    max_short_read: Decimal::ZERO,
+                    booked: owner.booked_cumulative,
+                    vanished_at: None,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn recover_known_clob_orders(
+    client: &crate::venues::intl::trading_client::TradingClient,
+    _lifecycle: &OrderLifecycle,
+    _positions: &Arc<tokio::sync::Mutex<crate::state::PositionMap>>,
+    _squadron: &str,
+    _asset: &str,
+) -> anyhow::Result<()> {
+    // A known-id query may establish acceptance, but cannot assign a strategy.
+    // Only the explicit durable owner paths below can book and acknowledge it.
+    let _ = client.recover_uncertain().await?;
+    Ok(())
+}
+
 pub async fn cancel_all_orders_unless_simulating(
-    trading_client: &polymarket_client_sdk_v2::clob::Client<
-        polymarket_client_sdk_v2::auth::state::Authenticated<
-            polymarket_client_sdk_v2::auth::Normal,
-        >,
-    >,
+    trading_client: &crate::venues::intl::trading_client::TradingClient,
 ) -> bool {
     if crate::helpers::dynamic_config::ghosting_now() {
         crate::helpers::balance::report_resting_orders_while_simulating(trading_client).await;
@@ -3994,18 +4519,13 @@ pub async fn cancel_all_orders_unless_simulating(
 }
 
 pub async fn cancel_all_orders_with_retries(
-    trading_client: &polymarket_client_sdk_v2::clob::Client<
-        polymarket_client_sdk_v2::auth::state::Authenticated<
-            polymarket_client_sdk_v2::auth::Normal,
-        >,
-    >,
+    trading_client: &crate::venues::intl::trading_client::TradingClient,
 ) -> bool {
     for i in 0..MAX_CANCEL_RETRIES {
         let delay = BASE_CANCEL_RETRY_DELAY_MS * (1 << i);
         match tokio::time::timeout(
             Duration::from_secs(8),
-            trading_client.cancel_all_orders(),
-        ).await {
+            trading_client.cancel_all_orders()).await {
             Ok(Ok(_)) => {
                 info!("✅ Successfully cancelled all orders after {} retries.", i);
                 return true;
@@ -4523,7 +5043,8 @@ mod trade_accounting_tests {
         PositionKey::new(
             "btc-hourly",
             "MakerStrategy",
-            MarketId::new("98160110645972743141257069093476801874133411306802274299633963514874310415390"),
+            MarketId::new("98160110645972743141257069093476801874133411306802274299633963514874310415390",
+            ),
         )
     }
 
@@ -4566,7 +5087,9 @@ mod trade_accounting_tests {
     fn epochs_do_not_leak_across_tokens() {
         let mut epochs = QuoteEpochs::new();
         let yes = key();
-        let no = PositionKey::new("btc-hourly", "MakerStrategy", MarketId::new("85421064502935751366375640444050801090202872554536397578825264135513707159160"));
+        let no = PositionKey::new("btc-hourly", "MakerStrategy", MarketId::new("85421064502935751366375640444050801090202872554536397578825264135513707159160",
+            ),
+        );
 
         let watch_yes = bump_quote_epoch(&mut epochs, &yes);
         let watch_no  = bump_quote_epoch(&mut epochs, &no);
@@ -4693,8 +5216,8 @@ mod context_borrow_tests {
 /// reprice, by a stop, or at stand-down. Kept free of I/O so the shapes from
 /// the 2026-09-03 incident are pinned by tests.
 pub(crate) mod resting_exit {
-    use rust_decimal::Decimal;
     use crate::config;
+    use rust_decimal::Decimal;
 
     /// Shares the venue says left THIS ask that the ledger has not seen yet.
     ///
@@ -4706,7 +5229,8 @@ pub(crate) mod resting_exit {
     /// venue figure at all — a fully lifted order vanishes from the list, and
     /// so does an externally cancelled one — so this reports zero rather than
     /// guess; the caller's chain read decides.
-    pub fn lift_since_booking(found: bool, ask_matched: Decimal, booked: Decimal, live: Decimal) -> Decimal {
+    pub fn lift_since_booking(found: bool, ask_matched: Decimal, booked: Decimal, live: Decimal,
+    ) -> Decimal {
         if !found { return Decimal::ZERO; }
         (ask_matched - booked).max(Decimal::ZERO).min(live.max(Decimal::ZERO))
     }
@@ -4772,7 +5296,8 @@ pub(crate) mod resting_exit {
     /// read the shares still held. A failed balance read returns 0, which the
     /// sweep counts as short, so it can never be the reading that permits a
     /// re-post; a slow endpoint just extends the wait.
-    pub fn vanished_ask_may_repost(since_vanished: std::time::Duration, held_seen_since: bool) -> bool {
+    pub fn vanished_ask_may_repost(since_vanished: std::time::Duration, held_seen_since: bool,
+    ) -> bool {
         since_vanished.as_secs() >= super::MAKER_RESTING_EXIT_VANISHED_GRACE_SECS && held_seen_since
     }
 
@@ -4996,7 +5521,8 @@ pub(crate) mod resting_exit {
             assert_eq!(reprice_outcome(false, lifted), RepriceOutcome::AwaitSweep,
                 "the record is kept, exactly as a reprice keeps it");
             // Retry: chain caught up; the kept record's price books the lift.
-            let lifted = lift_at_pull(prior, dec!(0.0028), lift_since_booking(false, dec!(0), dec!(0), prior));
+            let lifted = lift_at_pull(prior, dec!(0.0028), lift_since_booking(false, dec!(0), dec!(0), prior),
+            );
             assert_eq!(lifted, dec!(7.140058));
             assert_eq!(reprice_outcome(false, lifted), RepriceOutcome::BookLift);
             let bk = book_lift(dec!(0.59), dec!(0.4899), dec!(0.12495), lifted, prior);
@@ -5060,7 +5586,8 @@ pub(crate) mod resting_exit {
             assert_eq!(bk.entry_fee_booked, dec!(0.1568));
             assert_eq!(bk.entry_fee_left, dec!(0.1568));
             assert_eq!(bk.pnl, dec!(0.56) - dec!(0.1568));
-            let rest = book_lift(dec!(0.24), dec!(0.20), bk.entry_fee_left, dec!(14), dec!(14));
+            let rest = book_lift(dec!(0.24), dec!(0.20), bk.entry_fee_left, dec!(14), dec!(14),
+            );
             assert_eq!(bk.entry_fee_booked + rest.entry_fee_booked, dec!(0.3136));
             assert_eq!(rest.entry_fee_left, dec!(0));
         }
@@ -5082,7 +5609,8 @@ pub(crate) mod resting_exit {
         /// snapshot reads each from the field that owns it.
         #[test]
         fn each_strategy_is_gated_by_its_own_knob() {
-            let only = |maker, fairvalue, momentum, convergence| Knobs { maker, fairvalue, momentum, convergence, gboost: false };
+            let only = |maker, fairvalue, momentum, convergence| Knobs { maker, fairvalue, momentum, convergence, gboost: false,
+            };
             assert!(only(true, false, false, false).enabled_for("MakerStrategy"));
             assert!(!only(false, true, true, true).enabled_for("MakerStrategy"));
             assert!(only(false, true, false, false).enabled_for("FairValueStrategy"));
@@ -5091,7 +5619,8 @@ pub(crate) mod resting_exit {
             assert!(!only(true, true, false, true).enabled_for("MomentumStrategy"));
             assert!(only(false, false, false, true).enabled_for("ConvergenceStrategy"));
             assert!(!only(true, true, true, false).enabled_for("ConvergenceStrategy"));
-            let gboost_only = Knobs { maker: false, fairvalue: false, momentum: false, convergence: false, gboost: true };
+            let gboost_only = Knobs { maker: false, fairvalue: false, momentum: false, convergence: false, gboost: true,
+            };
             assert!(gboost_only.enabled_for("GboostStrategy"), "GBoost answers to its own knob, not the Maker's");
             assert!(!Knobs { gboost: false, ..gboost_only }.enabled_for("GboostStrategy"));
 
@@ -5141,9 +5670,9 @@ pub(crate) mod resting_exit {
 /// exit of a position that is already losing on a moving book — is pinned by
 /// tests against the real fills rather than exercised only on real money.
 pub mod fak_exit {
+    use crate::state::{Position, PositionKey, PositionMap};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use crate::state::{Position, PositionKey, PositionMap};
 
     /// What one FAK actually did.
     #[derive(Debug, Clone, PartialEq)]
@@ -5247,7 +5776,8 @@ pub mod fak_exit {
         if let Some((px, pnl)) = attribute_to_resting_ask(resting_ask, market_open, entry, entry_fee, shares) {
             return Some((px, pnl, UnverifiedExitSource::RestingAsk));
         }
-        super::reconcile_unverified_exit(baseline, now_collateral, shares, entry, observed_bid, max_dev)
+        super::reconcile_unverified_exit(baseline, now_collateral, shares, entry, observed_bid, max_dev,
+        )
             .map(|(px, pnl)| (px, pnl, UnverifiedExitSource::Collateral))
     }
 
@@ -5294,7 +5824,8 @@ pub mod fak_exit {
         fee_rate: Decimal,
     ) -> Option<(Position, Settlement)> {
         let p = map.remove(key)?;
-        let st = settle(p.shares, matched, venue_price, limit, p.avg_entry, p.entry_fee, fee_rate);
+        let st = settle(p.shares, matched, venue_price, limit, p.avg_entry, p.entry_fee, fee_rate,
+        );
         if st.remainder >= crate::config::MIN_ORDER_SHARES {
             let mut kept = retain_remainder(&p, st.remainder, st.entry_fee_left);
             kept.paired_leg_token_id = None;
@@ -5306,8 +5837,8 @@ pub mod fak_exit {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use chrono::{Duration, Utc};
         use crate::venues::core::MarketId;
+        use chrono::{Duration, Utc};
 
         const RATE: Decimal = dec!(0.07);
 
@@ -5317,7 +5848,8 @@ pub mod fak_exit {
         /// balance polling while the bid fell to $0.19.
         #[test]
         fn a_fak_the_venue_matched_nothing_on_retains_everything_and_books_nothing() {
-            let st = settle(dec!(24), Some(dec!(0)), None, dec!(0.24), dec!(0.30), dec!(0), RATE);
+            let st = settle(dec!(24), Some(dec!(0)), None, dec!(0.24), dec!(0.30), dec!(0), RATE,
+            );
             assert_eq!(st.filled, dec!(0));
             assert_eq!(st.remainder, dec!(24));
             assert_eq!(st.pnl, dec!(0));
@@ -5330,7 +5862,8 @@ pub mod fak_exit {
         #[test]
         fn a_fully_matched_fak_books_the_venues_price_fee_and_pnl() {
             let taking = dec!(0.19) * dec!(32);
-            let st = settle(dec!(32), Some(dec!(32)), Some(taking / dec!(32)), dec!(0.20), dec!(0.30), dec!(0), RATE);
+            let st = settle(dec!(32), Some(dec!(32)), Some(taking / dec!(32)), dec!(0.20), dec!(0.30), dec!(0), RATE,
+            );
             assert_eq!(st.filled, dec!(32));
             assert_eq!(st.remainder, dec!(0));
             assert!((st.exit_fee - dec!(0.3447)).abs() < dec!(0.0001), "fee {}", st.exit_fee);
@@ -5342,7 +5875,8 @@ pub mod fak_exit {
         /// eventual second exit still nets the whole round trip.
         #[test]
         fn a_partial_match_prorates_the_entry_fee_and_keeps_the_rest_with_the_remainder() {
-            let st = settle(dec!(32), Some(dec!(8)), Some(dec!(0.24)), dec!(0.24), dec!(0.30), dec!(0.64), RATE);
+            let st = settle(dec!(32), Some(dec!(8)), Some(dec!(0.24)), dec!(0.24), dec!(0.30), dec!(0.64), RATE,
+            );
             assert_eq!(st.filled, dec!(8));
             assert_eq!(st.remainder, dec!(24));
             assert_eq!(st.entry_fee_booked, dec!(0.16));
@@ -5359,7 +5893,8 @@ pub mod fak_exit {
             assert_eq!(st.remainder, dec!(32));
             assert_eq!(st.pnl, dec!(0));
             // And an over-report cannot make us book more than we asked for.
-            let over = settle(dec!(32), Some(dec!(40)), None, dec!(0.24), dec!(0.30), dec!(0), RATE);
+            let over = settle(dec!(32), Some(dec!(40)), None, dec!(0.24), dec!(0.30), dec!(0), RATE,
+            );
             assert_eq!(over.filled, dec!(32));
         }
 
@@ -5439,7 +5974,8 @@ pub mod fak_exit {
             assert_eq!(kept.paired_leg_token_id, Some(MarketId::new("pair")));
         }
 
-        fn paired_leg(shares: Decimal, entry: Decimal, entry_fee: Decimal) -> (PositionMap, PositionKey) {
+        fn paired_leg(shares: Decimal, entry: Decimal, entry_fee: Decimal,
+        ) -> (PositionMap, PositionKey) {
             let key = PositionKey::new("btc-open", "TimeDecayStrategy", MarketId::new("no"));
             let opened = Utc::now() - Duration::minutes(4);
             let p = Position {
@@ -5611,5 +6147,48 @@ mod live_strike_tests {
         // None rather than matching the sentinel's empty id.
         let (_tx2, rx2) = watch::channel(state("", Some(dec!(1))));
         assert_eq!(live_hourly_strike(&rx2, "", None), None);
+    }
+}
+
+#[cfg(test)]
+mod durable_order_restore_tests {
+    use super::*;
+    use crate::venues::intl::{order_journal::{JournalOrder,TrackedOrder},trading_client::tests::{client,server}};
+    use std::sync::atomic::AtomicBool;
+
+    #[tokio::test]
+    async fn known_buy_and_sell_orders_restore_their_owner_and_book_cumulative_fills_once()->anyhow::Result<()> {
+        for side in ["BUY","SELL"] {
+            let suffix=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+            let shard=format!("synthetic-order-{}-{suffix}",side.to_lowercase());
+            let path=std::env::temp_dir().join(format!("{shard}.sqlite"));
+            db::init_shard(&shard,path.to_str().unwrap(),crate::venues::intl::INTL_VENUE).await?;
+            let mut scope=TradeScope::crypto(&shard,crate::venues::intl::INTL_VENUE,&shard);scope.ghost=false;
+            let body=serde_json::json!({"id":"synthetic-order","status":"LIVE","owner":"00000000-0000-0000-0000-000000000000","maker_address":"0x1111111111111111111111111111111111111111","market":format!("0x{}","0".repeat(64)),"asset_id":"7","side":side,"original_size":"10","size_matched":"4","price":if side=="BUY"{"0.4"}else{"0.6"},"outcome":"YES","created_at":1,"expiration":"0","order_type":"GTC"});
+            let (host,_calls,task)=server(body,200).await?;
+            let (trading,_signer)=client(&host,Arc::new(AtomicBool::new(false))).await?;
+            let buy=side=="BUY";let order_side=if buy{Side::Buy}else{Side::Sell};
+            let receipt=JournalOrder{order_hash:"synthetic-hash".into(),order_id:Some("synthetic-order".into()),funder:trading.wallet().funder.to_string(),token_id:"7".into(),side:order_side as u8,signed_quantity:dec!(10),maker_amount:"4000000".into(),taker_amount:"10000000".into()};
+            trading.seed_accepted_for_test(&receipt).await?;
+            let owner=TrackedOrder{order_id:"synthetic-order".into(),squadron:"synthetic-squadron".into(),strategy:"synthetic-strategy".into(),token_id:"7".into(),side:order_side as u8,side_label:"YES".into(),quantity:dec!(10),limit_price:if buy{dec!(0.4)}else{dec!(0.6)},entry_price:dec!(0.4),entry_fee:Decimal::ZERO,exit_fee:Decimal::ZERO,market_name:"Synthetic market".into(),pair_token:None,close_time:None,booked_cumulative:Decimal::ZERO,initial_filled:Decimal::ZERO,initial_notional:Decimal::ZERO};
+            trading.track_order(&owner).await?;
+            let pool=db::pool_for(&shard).unwrap();
+            if buy {db::record_order_entry_checked(&pool,&scope,"synthetic-order","synthetic-squadron","synthetic-strategy","7","Synthetic market","YES",dec!(0.4),dec!(10),Decimal::ZERO,"pending").await?;}
+            else {db::record_open_position_with_status_checked(&pool,&scope,"synthetic-squadron","synthetic-strategy","7","Synthetic market","YES",dec!(0.4),dec!(10),false,"confirmed").await?;}
+            let positions=Arc::new(tokio::sync::Mutex::new(crate::state::PositionMap::new()));let ownership=Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));let pnl=Arc::new(tokio::sync::Mutex::new(Decimal::ZERO));let lifecycle=OrderLifecycle::new(LifecycleConfig::intl(),"synthetic-squadron");let mut asks=std::collections::HashMap::new();
+            for _ in 0..2 {
+                if buy {reconcile_tracked_buys(&trading,&lifecycle,&positions,&ownership,&scope,"synthetic-squadron").await?;}
+                else {reconcile_tracked_asks(&trading,&mut asks,&positions,&ownership,&pnl,&scope,"synthetic-squadron").await?;}
+            }
+            let key=PositionKey::new("synthetic-squadron","synthetic-strategy",MarketId::new("7"));
+            assert_eq!(positions.lock().await[&key].shares,if buy{dec!(4)}else{dec!(6)});
+            assert_eq!(*pnl.lock().await,if buy{Decimal::ZERO}else{dec!(0.8)});
+            positions.lock().await.clear();asks.clear();
+            if buy{reconcile_tracked_buys(&trading,&lifecycle,&positions,&ownership,&scope,"synthetic-squadron").await?;}else{reconcile_tracked_asks(&trading,&mut asks,&positions,&ownership,&pnl,&scope,"synthetic-squadron").await?;}
+            assert_eq!(positions.lock().await[&key].shares,if buy{dec!(4)}else{dec!(6)});
+            assert_eq!(*pnl.lock().await,if buy{Decimal::ZERO}else{dec!(0.8)});
+            assert!(trading.unresolved_tokens().await?.is_empty());task.abort();
+        }
+        Ok(())
     }
 }

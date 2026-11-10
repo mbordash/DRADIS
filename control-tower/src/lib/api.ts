@@ -65,6 +65,50 @@ export async function getConfig(): Promise<DynamicConfig> {
   return res.json();
 }
 
+export interface VenueCapabilities {
+  wallet_type: 'gnosis_safe' | 'poly1271' | null;
+  signature_type: number | null;
+  trading_address: string | null;
+  supports_simulation: boolean;
+  execution_ready: boolean;
+  settlement_ready: boolean;
+  blockers: string[];
+  ghost_mode: boolean;
+}
+
+/** Fail closed when an older or incompatible engine cannot report readiness. */
+export async function getVenueCapabilities(): Promise<VenueCapabilities> {
+  const res = await fetch(`${BASE}/api/venue/capabilities`, {
+    cache: 'no-store',
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) throw new Error(`GET /api/venue/capabilities → ${res.status}`);
+  const value: unknown = await res.json();
+  if (!value || typeof value !== 'object') throw new Error('Invalid venue capabilities response');
+  const fields = value as Record<string, unknown>;
+  if (
+    !(fields.wallet_type === 'gnosis_safe' || fields.wallet_type === 'poly1271' || fields.wallet_type === null)
+    || !(fields.signature_type === null || typeof fields.signature_type === 'number')
+    || !(fields.trading_address === null || typeof fields.trading_address === 'string')
+    || typeof fields.supports_simulation !== 'boolean'
+    || typeof fields.execution_ready !== 'boolean'
+    || typeof fields.settlement_ready !== 'boolean'
+    || typeof fields.ghost_mode !== 'boolean'
+    || !Array.isArray(fields.blockers)
+    || !fields.blockers.every((reason: unknown) => typeof reason === 'string')
+  ) throw new Error('Invalid venue capabilities response');
+  return {
+    wallet_type: fields.wallet_type,
+    signature_type: fields.signature_type,
+    trading_address: fields.trading_address,
+    supports_simulation: fields.supports_simulation,
+    execution_ready: fields.execution_ready,
+    settlement_ready: fields.settlement_ready,
+    blockers: fields.blockers,
+    ghost_mode: fields.ghost_mode,
+  };
+}
+
 /** Editable-config field schema — drives the dynamic Advanced modal. */
 /** GET /api/autoscale [E91]. */
 export async function getAutoscale(): Promise<import('./types').AutoscaleStatus> {
