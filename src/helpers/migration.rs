@@ -401,6 +401,71 @@ fn walk_files(root: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
     Ok(())
 }
 
+/// [B102] Move a file or folder into place, across filesystems too.
+///
+/// The restore stages under `logs/migration/` and moves each unit to where the
+/// engine reads it. On the AMI `data/` and `logs/` are separate bind mounts, and
+/// Linux refuses a rename between two mount points even on one disk (EXDEV,
+/// "Cross-device link (os error 18)"). Database units never crossed (logs to
+/// logs), but scripted vipers (`data/vipers/`, in backups since 1.7.0) always
+/// did, so every restore of a backup holding one failed part-way on the AMI.
+///
+/// A plain rename when it works. On EXDEV: copy to a hidden sibling of the
+/// target (same filesystem as the target), sync it, rename that into place,
+/// then remove the source. A crash in between leaves the source intact and at
+/// worst a stray `.restore-tmp` copy, never a half-written target.
+fn move_path(from: &Path, to: &Path) -> io::Result<()> {
+    move_path_with(from, to, &|a: &Path, b: &Path| fs::rename(a, b))
+}
+
+fn move_path_with(from: &Path, to: &Path, rename: &dyn Fn(&Path, &Path) -> io::Result<()>) -> io::Result<()> {
+    match rename(from, to) {
+        Err(e) if is_cross_device(&e) => {
+            let name = to.file_name().ok_or_else(|| io::Error::other("a move target has no file name"))?;
+            let tmp = to.with_file_name(format!(".{}.restore-tmp", name.to_string_lossy()));
+            remove_tree(&tmp)?;
+            copy_tree(from, &tmp)?;
+            rename(&tmp, to)?;
+            remove_tree(from)
+        }
+        other => other,
+    }
+}
+
+/// EXDEV is 18 on Linux and macOS.
+fn is_cross_device(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::CrossesDevices || e.raw_os_error() == Some(18)
+}
+
+/// Copy a regular file (synced) or a folder of them. Anything else (a link,
+/// a device) is refused: an archive's staging holds only files and folders.
+fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(from)?;
+    if meta.is_dir() {
+        fs::create_dir_all(to)?;
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else if meta.is_file() {
+        fs::copy(from, to)?;
+        fs::File::open(to)?.sync_all()
+    } else {
+        Err(io::Error::other(format!("{} is neither a file nor a folder", from.display())))
+    }
+}
+
+/// Remove a file or folder; nothing there is fine.
+fn remove_tree(p: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(p) {
+        Ok(m) if m.is_dir() => fs::remove_dir_all(p),
+        Ok(_) => fs::remove_file(p),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 fn rel(base: &Path, p: &Path) -> String {
     p.strip_prefix(base).unwrap_or(p).to_string_lossy().replace('\\', "/")
 }
@@ -933,13 +998,13 @@ pub fn apply_pending_restore(
                     if let Some(parent) = to.parent() {
                         fs::create_dir_all(parent)?;
                     }
-                    fs::rename(&d, &to).with_context(|| format!("moving {} aside", d.display()))?;
+                    move_path(&d, &to).with_context(|| format!("moving {} aside", d.display()))?;
                 }
             }
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::rename(staging.join(unit), &target).with_context(|| format!("restoring {unit}"))?;
+            move_path(&staging.join(unit), &target).with_context(|| format!("restoring {unit}"))?;
         }
         let bundle: serde_json::Value = read_json(&staging.join("bundle.json")).unwrap_or(serde_json::Value::Null);
         let secrets_merged = if bundle.is_object() { merge_secrets(&bundle)? } else { 0 };
@@ -1005,7 +1070,87 @@ mod tests {
     /// macOS reports time in microseconds, and tests running in parallel that
     /// started inside one microsecond were handed the same directory and built
     /// their backups over each other.
-    fn temp_dir(name: &str) -> PathBuf {
+/// [B102] A rename that refuses to cross the top-level folder under `root`,
+    /// the way Linux refuses one between the AMI's `data/` and `logs/` mounts.
+    fn mount_aware_rename(root: PathBuf) -> impl Fn(&Path, &Path) -> io::Result<()> {
+        move |a: &Path, b: &Path| {
+            let top = |p: &Path| p.strip_prefix(&root).ok().and_then(|r| r.components().next()).map(|c| c.as_os_str().to_owned());
+            if top(a) != top(b) {
+                return Err(io::Error::from_raw_os_error(18));
+            }
+            fs::rename(a, b)
+        }
+    }
+
+    #[test]
+    fn a_move_across_mounts_copies_and_removes_the_source() {
+        let root = temp_dir("exdev-file");
+        fs::create_dir_all(root.join("logs/migration/staging/data/vipers")).unwrap();
+        fs::create_dir_all(root.join("data/vipers")).unwrap();
+        let from = root.join("logs/migration/staging/data/vipers/last.json");
+        fs::write(&from, b"{\"name\":\"last\"}").unwrap();
+        let to = root.join("data/vipers/last.json");
+        let rename = mount_aware_rename(root.clone());
+        assert_eq!(rename(&from, &to).unwrap_err().raw_os_error(), Some(18), "the fake mount refuses a plain rename");
+        move_path_with(&from, &to, &rename).unwrap();
+        assert_eq!(fs::read(&to).unwrap(), b"{\"name\":\"last\"}");
+        assert!(!from.exists(), "the staged copy is gone");
+        assert!(!root.join("data/vipers/.last.json.restore-tmp").exists(), "no temporary copy left");
+    }
+
+    #[test]
+    fn a_folder_moves_across_mounts_whole() {
+        let root = temp_dir("exdev-dir");
+        let from = root.join("logs/unit");
+        fs::create_dir_all(from.join("sub")).unwrap();
+        fs::write(from.join("a"), b"1").unwrap();
+        fs::write(from.join("sub/b"), b"2").unwrap();
+        fs::create_dir_all(root.join("data")).unwrap();
+        let to = root.join("data/unit");
+        move_path_with(&from, &to, &mount_aware_rename(root.clone())).unwrap();
+        assert_eq!(fs::read(to.join("a")).unwrap(), b"1");
+        assert_eq!(fs::read(to.join("sub/b")).unwrap(), b"2");
+        assert!(!from.exists());
+    }
+
+    #[test]
+    fn a_stale_temporary_copy_from_a_crash_is_replaced() {
+        let root = temp_dir("exdev-stale");
+        fs::create_dir_all(root.join("logs")).unwrap();
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::write(root.join("logs/x.rhai"), b"new").unwrap();
+        fs::write(root.join("data/.x.rhai.restore-tmp"), b"half").unwrap();
+        move_path_with(&root.join("logs/x.rhai"), &root.join("data/x.rhai"), &mount_aware_rename(root.clone())).unwrap();
+        assert_eq!(fs::read(root.join("data/x.rhai")).unwrap(), b"new");
+    }
+
+/// [B102] The real thing: run in a Linux container with two separate mounts,
+    /// `DRADIS_EXDEV_LOGS` and `DRADIS_EXDEV_DATA` (as the AMI mounts `logs/`
+    /// and `data/`). Ignored by default; it needs that setup.
+    #[test]
+    #[ignore]
+    fn a_move_between_real_mounts_works() {
+        let (Ok(logs), Ok(data)) = (std::env::var("DRADIS_EXDEV_LOGS"), std::env::var("DRADIS_EXDEV_DATA")) else {
+            panic!("set DRADIS_EXDEV_LOGS and DRADIS_EXDEV_DATA to folders on two mounts");
+        };
+        let from = Path::new(&logs).join("last.json");
+        let to = Path::new(&data).join("last.json");
+        fs::write(&from, b"viper").unwrap();
+        let _ = fs::remove_file(&to);
+        assert_eq!(fs::rename(&from, &to).unwrap_err().raw_os_error(), Some(18), "the two folders must be on different mounts");
+        move_path(&from, &to).unwrap();
+        assert_eq!(fs::read(&to).unwrap(), b"viper");
+        assert!(!from.exists());
+    }
+
+    #[test]
+    fn other_rename_errors_are_not_retried_as_copies() {
+        let root = temp_dir("exdev-other");
+        let err = move_path_with(&root.join("missing"), &root.join("there"), &|a: &Path, b: &Path| fs::rename(a, b)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+        fn temp_dir(name: &str) -> PathBuf {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("dradis-migration-{name}-{}-{n}", std::process::id()));
