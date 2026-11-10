@@ -4,11 +4,17 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
-## 1.7.2 (unreleased)
+## 1.8.0 (2026-11-09)
 
+- Community vipers: share script vipers between DRADIS instances. On the Build a Viper page, Export saves a viper (its script, parameters and readme) as a single file, and Import a viper file shows you the readme, parameters and source before anything is saved. The new Community card browses the registry at dradis.live/vipers: every version there is signed by the registry, and DRADIS checks that signature before it shows or imports anything. Imported vipers always arrive switched off and on paper, are labeled Imported (or Imported, edited once you change them), and are offered newer versions with a diff. A version the registry withdraws shows its reason. Community content is MIT licensed, not investment advice and not reviewed for profitability. To contribute one, open a pull request on github.com/mbordash/dradis-contrib.
 - Ultra-short market (new, off by default): each crypto squadron can also fly the venue's 15-minute market on its underlying, beside its hourly and window markets, replacing it at every 15-minute close. Switch it on in Setup (Deployment, Ultra-short Market). Only vipers that declare it trade it: today, script vipers whose market is set to Ultra-short on the Build a Viper page. Every built-in viper keeps its own market. The squadron page shows the 15-minute market beside the others. Kalshi first; on a venue or underlying with no 15-minute market the squadron leaves it empty, and those vipers say so on their cards.
 - Build a Viper: a script chooses which of its squadron's markets it trades (hourly, window/daily or ultra-short). Its ctx describes that market, and its exits follow each position's own market.
 - Up or Down markets whose title gives a time range ("10:15PM-10:30PM ET") are read as that length: a 15-minute or four-hour window is no longer taken for an hour. The Markets page's model strike for a four-hour window now starts at the window's open.
+- Build a Viper: a live script buying at an ask quoted between cents (Kalshi quotes $0.972) was refused as below the ask; its limit is now the ask rounded up to the next cent, and a sale at a bid between cents is rounded down instead of refused.
+- Build a Viper: a script can no longer call sleep(), which paused every script viper until the engine restarted itself. Scripts that call it are refused.
+- Build a Viper: saving a viper or resetting its memory confirms with a notice on the page, and the Late Favorite template is no longer offered (it now lives in the community registry, where it can be imported).
+- A settled position no longer stays in a squadron's memory until its session ends, where it kept counting against that viper's exposure cap. Every squadron now sees every settlement the sweep books.
+- LLM advisor: each squadron's briefing covers only its own market class (and coin), instead of the whole instance's trades with a note to ignore the rest.
 
 ## 1.7.1 (2026-11-07)
 
