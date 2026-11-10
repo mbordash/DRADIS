@@ -147,16 +147,18 @@ pub const INTL_TAKER_FEE_RATE: Decimal = dec!(0.07);
 
 /// Polymarket US taker fee coefficient Θ: `fee = Θ · p · (1 − p) · shares` on
 /// every fill that crosses the spread, on entry and exit alike. Makers pay
-/// nothing and are PAID a rebate of 0.0125 on the same formula, per fill, at the
-/// time of the fill (docs.polymarket.us/fees, effective exchange-wide 2026-07-01).
-/// Venue fact, identical across profiles. The gateway publishes the coefficient
-/// on every market record (`feeCoefficient`, 0.06 on every market checked
-/// 2026-09-09 across sports, crypto and politics); this is the venue-wide figure
-/// the price-dependent fee arithmetic reads, and the per-market figure is
-/// carried on `MarketConfig::{yes,no}_fee_bps` as its per-share ceiling.
-/// DRADIS carried this as ZERO until 2026-09-09, which switched off every
-/// fee-aware gate on the venue.
-pub const US_TAKER_FEE_RATE: Decimal = dec!(0.06);
+/// nothing (a maker rebate starts at $10M of 30-day maker volume).
+///
+/// Since 2026-11-06 13:00 ET Θ is set per ACCOUNT by its taker volume over
+/// the preceding 30 completed ET days (docs.polymarket.us/fees): 0.095 below
+/// $10k, 0.085 to $50k, 0.075 to $250k, 0.0695 above (and 0.0695 for a new
+/// account's first 7 days). The gateway's per-market `feeCoefficient` is the
+/// Tier 1 figure (0.095 on every market, checked 2026-11-09), not what a given
+/// account pays. This default is Tier 1, the safe assumption: an operator on a
+/// cheaper tier sets `us_taker_fee_rate` in Setup. Venue fact, identical
+/// across profiles. Was 0.06 (the July 2026 flat rate) until 1.8.0; ZERO until
+/// 2026-09-09, which switched off every fee-aware gate on the venue.
+pub const US_TAKER_FEE_RATE: Decimal = dec!(0.095);
 pub const EARLY_EXIT_COMBINED_BID_THRESHOLD: Decimal = dec!(0.995);
 
 
@@ -1073,7 +1075,7 @@ pub const HELM_FEE_MAX_RATIO: Decimal = dec!(0.40);
 /// allowed. `round_trip_fee_pct` is `2 × rate × (1 − p)`, so the binding cases
 /// are cheap longshots: at the 0.07 intl rate a taker round trip is 11.9% of
 /// notional at $0.15 against 1.5% at $0.89. At 0.05 a targetless TAKER entry
-/// below about $0.64 is refused ($0.58 on US at 0.06), and the answer is to name
+/// below about $0.64 is refused (about $0.74 on Polymarket US Tier 1), and the answer is to name
 /// a take-profit or hold to settlement rather than to raise this. A resting
 /// entry is charged one leg, not two, so its boundary is near $0.29.
 pub const HELM_FEE_MAX_NOTIONAL_PCT: Decimal = dec!(0.05);

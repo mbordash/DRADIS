@@ -39,8 +39,9 @@ use rust_decimal_macros::dec;
 /// entry range, and silently so — the trade closes "at target" and still loses
 /// money. Callers should floor their target against this.
 ///
-/// Polymarket US charges the same quadratic schedule at 0.06 (`us_taker_fee_rate`),
-/// so the floor binds there too. It was carried as zero until 2026-09-09, which
+/// Polymarket US charges the same quadratic schedule at the account's own tier
+/// (`us_taker_fee_rate`, 0.0695 to 0.095 since 2026-11-06), so the floor binds
+/// there too. It was carried as zero until 2026-09-09, which
 /// made every floor and gate built on this function inert on that venue.
 pub fn round_trip_fee_pct(entry_price: Decimal) -> Decimal {
     if entry_price <= Decimal::ZERO || entry_price >= Decimal::ONE { return Decimal::ZERO; }
@@ -138,11 +139,12 @@ pub fn taker_fee_ceiling_bps(rate: Decimal) -> u32 {
 /// agree rather than a third number appearing. That fallback overstates the fee
 /// on a market the venue does not charge for, which only makes the Arbitrage
 /// early exit less eager and settlement the preferred close; it never
-/// understates it. Defaulting to zero was the defect this replaces, on both the
-/// Polymarket International event-market path (Gamma's `feeSchedule`) and the
-/// Polymarket US path (the gateway's `feeCoefficient`), and a zero the venue did
-/// not actually publish must not come back through a renamed field or a
-/// dropped one.
+/// understates it. Defaulting to zero was the defect this replaces on the
+/// Polymarket International event-market path (Gamma's `feeSchedule`), and a
+/// zero the venue did not actually publish must not come back through a
+/// renamed field or a dropped one. Polymarket US used this too until its
+/// per-account tiers (2026-11-06); it now caps the published figure at the
+/// account's own rate (`venues::us::trader::us_market_fee`).
 ///
 /// Returns the ceiling (see [`taker_fee_ceiling_bps`]) and `true` when the
 /// market's own schedule supplied it.
@@ -227,11 +229,12 @@ pub fn taker_fee_rate() -> Decimal { crate::venues::intl::live_taker_fee_rate() 
 #[cfg(feature = "kalshi")]
 pub fn taker_fee_rate() -> Decimal { dec!(0.07) }
 
-/// Polymarket US publishes the same quadratic schedule with Θ = 0.06 (taker) and
-/// a −0.0125 maker rebate, per fill (docs.polymarket.us/fees). The gateway sends
-/// the coefficient on every market record as `feeCoefficient`; this is the
-/// venue-wide figure, read from the `us_taker_fee_rate` knob, and the trader
-/// warns when a market publishes a different one.
+/// Polymarket US charges the same quadratic schedule, per fill
+/// (docs.polymarket.us/fees). Since 2026-11-06 the taker Θ is set per account by
+/// 30-day taker volume (0.095 / 0.085 / 0.075 / 0.0695); the gateway's
+/// per-market `feeCoefficient` is the Tier 1 figure. This is the operator's own
+/// rate, read from the `us_taker_fee_rate` knob (default Tier 1), and the
+/// trader prices each market at the lower of the two.
 ///
 /// Returned ZERO until 2026-09-09 on the belief that the venue charged no taker
 /// fee, which switched off every fee-aware gate and floor on that build.
@@ -418,11 +421,14 @@ pub fn sports_maker_fee_rate() -> Decimal { Decimal::ZERO }
 #[cfg(feature = "kalshi")]
 pub fn sports_maker_fee_rate() -> Decimal { dec!(0.0175) }
 
-/// Polymarket US pays the maker a rebate AT TRADE rather than charging one
-/// (docs.polymarket.us/fees: 0.06 taker, -0.0125 maker), which makes it the
-/// friendliest venue for a resting-bid strategy.
+/// Polymarket US neither charges nor pays a maker below $10M of 30-day maker
+/// volume. Its maker rebate (-0.0035 to -0.0104) is tiered from there
+/// (docs.polymarket.us/fees, 2026-11-06); before that every maker was paid
+/// -0.0125, which DRADIS assumed until 1.8.0. Zero, the Tier 1 figure, is what
+/// an operator of this engine pays: a gate counting a rebate the account never
+/// receives would price resting bids too generously.
 #[cfg(feature = "us_retail")]
-pub fn sports_maker_fee_rate() -> Decimal { dec!(-0.0125) }
+pub fn sports_maker_fee_rate() -> Decimal { Decimal::ZERO }
 
 /// Cancel every resting order the VENUE reports, before trading begins.
 ///
@@ -585,9 +591,9 @@ mod fee_ceiling_tests {
         assert_eq!(taker_fee_ceiling_bps(dec!(-0.05)), 0);
     }
 
-    /// Polymarket US publishes 0.06 on every market (`feeCoefficient`, checked
-    /// live 2026-09-09): a 150 bps ceiling, 1.5¢ a share at mid — the "$1.50
-    /// per 100-lot at $0.50" on docs.polymarket.us/fees. A market that
+    /// Polymarket US publishes its Tier 1 rate, 0.095, on every market
+    /// (`feeCoefficient`, checked live 2026-11-09): a 237 bps ceiling. Before
+    /// 2026-11-06 it was 0.06, a 150 bps ceiling. A market that
     /// publishes nothing takes the venue-wide rate and says so; a published
     /// zero is a free market and stays zero rather than being "corrected".
     #[test]

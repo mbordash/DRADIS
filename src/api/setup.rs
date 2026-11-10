@@ -1913,6 +1913,10 @@ mod tests {
                 // not a risk posture: applying a profile never adds or drops the
                 // ultra-short market.
                 "ultra_short_market_enabled",
+                // Polymarket US's taker rate is the operator's fee tier, set by
+                // their own 30-day volume since 2026-11-06: an account fact, so
+                // applying a profile never resets it.
+                "us_taker_fee_rate",
             ];
             // `autoscale_` [E91]: the capital auto-scaler is the operator's sizing
             // policy across every profile, so applying a profile never arms,

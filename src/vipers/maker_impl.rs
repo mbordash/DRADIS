@@ -112,7 +112,7 @@ fn side_reject_reason(
         //
         // `round_trip_fee_pct` is a fraction of notional; multiplying by the
         // price puts it in the same units as the spread. Binds on every venue —
-        // Polymarket US charges 0.06 and was wrongly carried as free until
+        // Polymarket US charges a taker fee and was wrongly carried as free until
         // 2026-09-09, which let this branch quote into spreads under the fee.
         // ONE taker leg at THIS MARKET's rate, not two at the venue-wide one.
         //
@@ -2142,7 +2142,7 @@ mod spread_gate_wording_tests {
         let floor = fee_floor(dec!(0.50));
         assert!(floor > Decimal::ZERO, "every shipped venue charges a taker fee; floor was {floor}");
         #[cfg(feature = "us_retail")]
-        assert_eq!(floor, dec!(0.015), "Polymarket US: 0.06 × 0.50 × 0.50, one leg");
+        assert_eq!(floor, dec!(0.02375), "Polymarket US Tier 1: 0.095 × 0.50 × 0.50, one leg");
         #[cfg(feature = "intl_clob")]
         assert_eq!(floor, dec!(0.0175), "Polymarket International crypto: 0.07 × 0.50 × 0.50, one leg");
     }
@@ -2627,7 +2627,10 @@ mod charged_fee_rate_tests {
     fn a_one_cent_btc_book_is_not_unquotable_at_any_min_spread() {
         let bid = dec!(0.12);
         let floor = crate::venues::taker_leg_fee_pct_at(bid, charged_fee_rate(1000)) * bid;
-        assert!(floor < dec!(0.01), "the true floor {floor} is under a 1c spread");
+        // Under a cent at 0.07; Polymarket US Tier 1 (0.095) sits just above,
+        // at 1.003c, which is still a quotable two-cent book, not "any".
+        let one_cent_or_tier_one = if crate::venues::taker_fee_rate() <= dec!(0.07) { dec!(0.01) } else { dec!(0.0101) };
+        assert!(floor < one_cent_or_tier_one, "the true floor {floor} is under a 1c spread");
         let naive = crate::venues::taker_leg_fee_pct_at(bid, dec!(0.40)) * bid;
         assert!((naive - dec!(0.0422)).abs() < dec!(0.0001), "the logged figure was the naive one: {naive}");
     }

@@ -1886,8 +1886,11 @@ mod tests {
         // reading passes can be fee-dominated once the exit is counted.
         let mut tight = c.clone();
         tight.take_profit_price = Some(dec!(0.52)); // ~24% target
-        let one_leg = fee_verdict_on(&tight, &b, TakeProfitLeg::Resting, dec!(0.20), dec!(0.05));
-        let two_legs = fee_verdict_on(&tight, &b, TakeProfitLeg::Taker, dec!(0.20), dec!(0.05));
+        // Both fee shares scale with the venue's rate, so the cap does too: 0.20
+        // at the 0.07 venues, proportionally more on Polymarket US Tier 1.
+        let cap = dec!(0.20) * crate::venues::taker_fee_rate() / dec!(0.07);
+        let one_leg = fee_verdict_on(&tight, &b, TakeProfitLeg::Resting, cap, dec!(0.05));
+        let two_legs = fee_verdict_on(&tight, &b, TakeProfitLeg::Taker, cap, dec!(0.05));
         assert!(one_leg.refusal.is_none(), "{}", one_leg.text);
         assert!(two_legs.refusal.is_some(), "the same target must refuse once the exit is charged: {}", two_legs.text);
     }

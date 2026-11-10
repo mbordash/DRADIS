@@ -100,8 +100,9 @@ pub struct UsMarket {
     pub volume_str: Option<String>,
     /// The market's taker fee coefficient Θ (`feeCoefficient`): the venue
     /// charges `Θ · shares · p · (1 − p)` on every fill that crosses the
-    /// spread. 0.06 on every market checked 2026-09-09 (sports, crypto,
-    /// politics; open and resolved), matching the published schedule.
+    /// spread. 0.06 on every market checked 2026-09-09; 0.095, the Tier 1
+    /// rate, on every market since the 2026-11-06 volume tiers. An upper
+    /// bound: an account pays its own tier (`us_taker_fee_rate`).
     ///
     /// `None` when the gateway sent nothing readable — deliberately NOT zero,
     /// which is a real value meaning a free market. The trader falls back to

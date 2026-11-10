@@ -7,10 +7,10 @@
 //! ## The venue that suits this design best
 //!
 //! Of the three venues, this is where a resting bid has the most going for it:
-//! Polymarket US pays the maker a **rebate at trade** (−0.0125 against a 0.06 taker
-//! coefficient), so Bookline's break-even sits around −0.81 points against −0.69 on
-//! Polymarket International and only −0.56 on a two-cent Kalshi book. The maker
-//! leg is not merely free here, it earns.
+//! a maker pays nothing on Polymarket US. Until 2026-11-06 it was also paid a
+//! rebate at trade (−0.0125); since then the rebate starts at $10M of 30-day
+//! maker volume, so for an operator of this engine the maker leg is free, not
+//! paid (`venues::sports_maker_fee_rate`).
 //!
 //! ## Why the market records make this easier than Kalshi
 //!

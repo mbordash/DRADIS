@@ -421,8 +421,8 @@ pub(crate) fn parse_gamma_fee_rate(market: &serde_json::Value) -> Option<Decimal
 /// [`crate::venues::taker_fee_ceiling_bps`]) and `true` when the market's own
 /// schedule supplied it.
 pub(crate) fn event_market_fee_bps(published: Option<Decimal>, venue_wide_rate: Decimal) -> (u32, bool) {
-    // Shared with the Polymarket US trader, which resolves the gateway's
-    // per-market `feeCoefficient` the same way.
+    // Polymarket US no longer shares this: its published figure is a Tier 1
+    // upper bound, capped at the account's rate (`us_market_fee`).
     crate::venues::published_or_venue_fee_bps(published, venue_wide_rate)
 }
 

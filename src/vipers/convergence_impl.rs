@@ -66,8 +66,8 @@
 ///     [`crate::vipers::fee_dominated_entry`] Momentum uses. At the shipped
 ///     targets this refuses the whole $0.35–$0.65 band on a fee venue, on every
 ///     profile — the honest reading of the arithmetic, reported to the Control
-///     Tower as such. Polymarket US charges 0.06 rather than 0.07 and the band
-///     is refused there too (4.2% of notional at $0.65 against a 7–10% target).
+///     Tower as such. Polymarket US charges 0.0695 to 0.095 by tier and the
+///     band is refused there too.
 ///   * **`convergence_tp_fee_margin_mult`** floors the take-profit at a
 ///     multiple of the fee the exit will pay, so a ConvergenceTP can never book
 ///     a loss under a reason string that says profit.
@@ -936,6 +936,23 @@ mod tests {
         assert!(dc.convergence_max_fee_to_target_ratio < dec!(0.5), "the fee must stay a minority of the plan");
         assert!(dc.convergence_min_entry_price < dc.convergence_max_entry_price, "the band must not be empty");
 
+        // The band is derived for 0.07 (below). A venue charging more
+        // (Polymarket US Tier 1, 0.095 since 2026-11-06) refuses the bottom of
+        // it at the gate, which is the safe direction: the refused prices must
+        // be a prefix of the band, and the top must stay admitted.
+        if crate::venues::taker_fee_rate() > dec!(0.07) {
+            let mut admitted_seen = false;
+            let mut ask = dc.convergence_min_entry_price;
+            while ask <= dc.convergence_max_entry_price {
+                let refused = crate::vipers::fee_dominated_entry(
+                    ask, dc.convergence_target_profit_pct, dc.convergence_max_fee_to_target_ratio).is_some();
+                assert!(!(admitted_seen && refused), "${ask}: a refusal above an admitted price");
+                admitted_seen |= !refused;
+                ask += dec!(0.01);
+            }
+            assert!(admitted_seen, "the gate refuses the whole band");
+            return;
+        }
         let mut ask = dc.convergence_min_entry_price;
         while ask <= dc.convergence_max_entry_price {
             let verdict = crate::vipers::fee_dominated_entry(

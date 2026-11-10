@@ -5315,7 +5315,11 @@ mod event_sigma_tests {
             let (_, no) = Fv::conservative_side_fairs_ev(spot, strike, sigma, 4.2e-5, t, mult).unwrap();
             Fv::side_edge(Decimal::from_f64(no).unwrap(), dec!(0.73))
         };
-        assert!(edge_at(1.0) >= req, "today's pricing took this trade: edge {}", edge_at(1.0));
+        // A Kalshi trade at its 0.07 rate; a dearer venue (Polymarket US Tier 1)
+        // already refuses it unscaled.
+        if crate::venues::taker_fee_rate() <= dec!(0.07) {
+            assert!(edge_at(1.0) >= req, "today's pricing took this trade: edge {}", edge_at(1.0));
+        }
         assert!(edge_at(1.5) < req, "the event multiplier must refuse it: edge {}", edge_at(1.5));
         assert!(edge_at(1.5) < Decimal::ZERO, "and not narrowly: the edge is gone entirely");
     }

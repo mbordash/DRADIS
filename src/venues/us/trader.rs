@@ -1253,10 +1253,10 @@ async fn trade_one_market(
     // Venue-neutral market config (now carrying the real close time, so the
     // shared phase classifier can drive wind-down / rotation) + position map.
     //
-    // The fee is the market's own published coefficient, as the per-share
-    // ceiling the flat `fee_bps` unit carries (150 bps for 0.06). It was
-    // hard-coded to zero until 2026-09-09 on the belief that this venue charged
-    // no taker fee; it charges 0.06 on every fill that crosses.
+    // The fee is the lower of the market's published coefficient and the
+    // account's tier (`market_fee_bps`), as the per-share ceiling the flat
+    // `fee_bps` unit carries (238 bps for 0.095). It was hard-coded to zero
+    // until 2026-09-09 on the belief that this venue charged no taker fee.
     let fee_bps = market_fee_bps(&pair);
     let market_cfg = MarketConfig {
         yes_token: pair.long.clone(),
@@ -2856,31 +2856,45 @@ async fn record_entry(
 /// verifiable cost basis and we log loudly rather than invent P&L.
 /// The per-share fee ceiling, in basis points, a market's `MarketConfig` carries.
 ///
-/// The market's own published coefficient when the gateway sent one (0.06 → 150
-/// bps), else the venue-wide `us_taker_fee_rate` — the same resolution the
-/// event-market deploy path uses on Polymarket International. Both cases are
-/// logged, and a market whose published figure differs from the venue-wide knob
-/// gets a warning, because the price-dependent floors and gates read the knob
-/// and would be pricing that market against the wrong schedule.
+/// The LOWER of the market's published coefficient and the operator's own
+/// `us_taker_fee_rate`. Since 2026-11-06 Polymarket US sets the taker rate per
+/// account by 30-day taker volume (0.095 / 0.085 / 0.075 / 0.0695), and the
+/// gateway's `feeCoefficient` is the Tier 1 figure (0.095 on every market,
+/// 2026-11-09), so it is an upper bound, not what this account pays: the knob
+/// is. A market publishing LESS than the knob (a promotion, a free market at
+/// zero) is charged at its own figure. A market publishing nothing takes the
+/// knob and says so.
 fn market_fee_bps(pair: &super::markets::UsMarketPair) -> u32 {
-    let venue_wide = crate::venues::taker_fee_rate();
-    let (bps, from_market) = crate::venues::published_or_venue_fee_bps(pair.fee_coefficient, venue_wide);
+    let account = crate::venues::taker_fee_rate();
+    let (rate, bps) = us_market_fee(pair.fee_coefficient, account);
     match pair.fee_coefficient {
-        Some(rate) if rate != venue_wide => warn!(
-            "⚠️ \"{}\" publishes taker fee coefficient {rate} but us_taker_fee_rate is {venue_wide} — \
-             fee floors and gates on this market are priced against the knob, not the market. \
-             Set us_taker_fee_rate in the Control Tower if the venue's schedule has changed.",
+        Some(published) if published < account => warn!(
+            "⚠️ \"{}\" publishes taker fee coefficient {published}, below your us_taker_fee_rate {account}; \
+             this market's fee floors and gates use {published} (ceiling {bps} bps)",
             pair.question,
         ),
-        Some(rate) => info!("🧾 \"{}\" taker fee coefficient {rate} (ceiling {bps} bps), from the market record",
-            pair.question),
+        Some(published) => info!(
+            "🧾 \"{}\" taker fee {rate} (your tier; the market publishes {published}), ceiling {bps} bps",
+            pair.question,
+        ),
         None => warn!(
-            "⚠️ \"{}\" published no taker fee coefficient — assuming the venue-wide {venue_wide} \
-             (ceiling {bps} bps, from_market={from_market})",
+            "⚠️ \"{}\" published no taker fee coefficient — using your us_taker_fee_rate {account} \
+             (ceiling {bps} bps)",
             pair.question,
         ),
     }
     bps
+}
+
+/// The rate a Polymarket US market is priced at, and its per-share ceiling in
+/// bps: the published coefficient capped at the account's own tier. Pure, for
+/// the tests.
+fn us_market_fee(published: Option<Decimal>, account: Decimal) -> (Decimal, u32) {
+    let rate = match published {
+        Some(p) => p.min(account),
+        None => account,
+    };
+    (rate, crate::venues::taker_fee_ceiling_bps(rate))
 }
 
 /// Book a completed round trip to the tradelog, net of both legs' taker fees.
@@ -3475,5 +3489,33 @@ async fn release_swept_positions(positions: &Arc<Mutex<PositionMap>>) {
     let dead = db::release_swept_from_map(&mut *positions.lock().await);
     for k in dead {
         info!("🧾 Released {}'s in-memory position on {} — the settlement sweep booked and closed the row", k.strategy, k.market);
+    }
+}
+
+#[cfg(test)]
+mod tiered_fee_tests {
+    use super::us_market_fee;
+    use rust_decimal_macros::dec;
+
+    /// [GitHub #13] Since 2026-11-06 the gateway publishes the Tier 1 rate
+    /// (0.095) on every market while the account pays its own tier. A market
+    /// is priced at the lower of the two; one publishing nothing takes the
+    /// account's rate; a published zero stays a free market.
+    #[test]
+    fn a_market_is_priced_at_the_lower_of_its_published_rate_and_the_account_tier() {
+        assert_eq!(us_market_fee(Some(dec!(0.095)), dec!(0.075)), (dec!(0.075), 188));
+        assert_eq!(us_market_fee(Some(dec!(0.095)), dec!(0.095)), (dec!(0.095), 238));
+        assert_eq!(us_market_fee(Some(dec!(0.06)), dec!(0.095)), (dec!(0.06), 150), "a cheaper market keeps its own figure");
+        assert_eq!(us_market_fee(None, dec!(0.085)), (dec!(0.085), 212), "212.5 rounds to even");
+        assert_eq!(us_market_fee(Some(dec!(0)), dec!(0.095)), (dec!(0), 0));
+    }
+
+    /// The tier table, the build default and the knob's floor are one fact.
+    #[test]
+    fn the_tier_table_agrees_with_the_default_and_the_floor() {
+        let tiers = crate::venues::us::TAKER_FEE_TIERS;
+        assert_eq!(tiers[0], crate::config::US_TAKER_FEE_RATE, "the default is Tier 1");
+        assert_eq!(tiers[3], crate::helpers::dynamic_config::US_TAKER_FEE_LOWEST_TIER);
+        assert!(tiers.windows(2).all(|w| w[0] > w[1]), "cheaper with volume");
     }
 }

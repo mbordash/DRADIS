@@ -2328,6 +2328,75 @@ pub fn apply_build_caps(cfg: &mut DynamicConfig) -> Vec<CeilingClamp> {
     clamped
 }
 
+/// The cheapest Polymarket US taker tier (Tier 4, and a new account's first 7
+/// days). Since 2026-11-06 no account pays less, so a stored
+/// `us_taker_fee_rate` below it, other than zero, is a retired schedule: the
+/// 0.06 flat rate every instance before 1.8.0 was seeded with. Zero is left
+/// alone, as an operator's explicit "no fee".
+pub const US_TAKER_FEE_LOWEST_TIER: Decimal = rust_decimal_macros::dec!(0.0695);
+
+/// Raise a retired `us_taker_fee_rate` to the build's default (the Tier 1
+/// rate). Below the cheapest tier every fee gate and floor on Polymarket US
+/// would let through entries that lose to their fees; the default overstates
+/// the fee for an operator on a cheaper tier, which only makes those gates
+/// stricter until the operator sets their own tier in Setup.
+///
+/// Returns the stored value it replaced. The knob is read only on Polymarket
+/// US, but the row is the same on every build, so the floor is too: a bundle
+/// restored onto a US instance must not carry 0.06 in.
+pub fn apply_fee_floors(cfg: &mut DynamicConfig) -> Option<Decimal> {
+    let stored = cfg.us_taker_fee_rate;
+    if stored > Decimal::ZERO && stored < US_TAKER_FEE_LOWEST_TIER {
+        cfg.us_taker_fee_rate = config::US_TAKER_FEE_RATE;
+        return Some(stored);
+    }
+    None
+}
+
+/// Log a raised fee rate once per scope for the life of the process, for the
+/// reason [`warn_ceiling_clamps`] gives.
+fn warn_fee_floor(scope: &str, raised: Option<Decimal>) {
+    let Some(stored) = raised else { return };
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    if !seen.lock().map(|mut s| s.insert(scope.to_string())).unwrap_or(true) {
+        return;
+    }
+    // Only a Polymarket US build reads the knob or shows it in Setup; elsewhere
+    // the raise is bookkeeping (a bundle may later be restored onto US).
+    if crate::venues::venue_name() != "us_retail" {
+        info!("⚙️  {scope}: stored us_taker_fee_rate {stored} raised to {} (Polymarket US tiers, unused on this venue)",
+              config::US_TAKER_FEE_RATE);
+        return;
+    }
+    {
+        warn!(
+            "⚙️  {scope}: stored us_taker_fee_rate {stored} is below every Polymarket US taker tier \
+             (0.0695 to 0.095 since 2026-11-06); running at {} (Tier 1). Set your own tier in Setup.",
+            config::US_TAKER_FEE_RATE,
+        );
+    }
+}
+
+/// Refuse a patch that sets `us_taker_fee_rate` below the cheapest tier
+/// (other than zero), which the next load would raise again.
+fn refuse_fee_floor_violations(patch: &serde_json::Value) -> Result<()> {
+    let Some(v) = patch.as_object().and_then(|o| o.get("us_taker_fee_rate")) else { return Ok(()) };
+    let rate: Option<Decimal> = match v {
+        serde_json::Value::String(s) => s.parse().ok(),
+        serde_json::Value::Number(n) => n.to_string().parse().ok(),
+        _ => None,
+    };
+    match rate {
+        Some(r) if r > Decimal::ZERO && r < US_TAKER_FEE_LOWEST_TIER => anyhow::bail!(
+            "refused: us_taker_fee_rate {r} is below every Polymarket US taker tier. Since 2026-11-06 the \
+             rate is 0.095 below $10,000 of 30-day taker volume, 0.085 to $50,000, 0.075 to $250,000 and \
+             0.0695 above (docs.polymarket.us/fees)."
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// A capped field found above its build ceiling: on load (clamped) or in a
 /// patch (refused).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2453,6 +2522,14 @@ impl DynamicConfig {
                         // Shared with the LLM proposal validator so the two cannot
                         // disagree about what is reachable — see `apply_build_caps`.
                         warn_ceiling_clamps("global config", &apply_build_caps(&mut cfg));
+                        let fee_raised = apply_fee_floors(&mut cfg);
+                        warn_fee_floor("global config", fee_raised);
+                        // Persisted once, at startup (not on the 30 s squadron
+                        // reads): the row, its exports and config_history then
+                        // say 0.095 instead of repeating the raise forever.
+                        if fee_raised.is_some() && record_session_snapshot {
+                            cfg.save_as("fee_floor").await;
+                        }
 
                         info!("⚙️  DynamicConfig loaded from SQLite (safety floors applied)");
 
@@ -2488,6 +2565,7 @@ impl DynamicConfig {
                 let primary = pool.connect_options().get_filename().to_path_buf();
                 if let Some((mut cfg, source, kept)) = seed_from_siblings(&primary).await {
                     warn_ceiling_clamps("seeded config", &apply_build_caps(&mut cfg));
+                    warn_fee_floor("seeded config", apply_fee_floors(&mut cfg));
                     warn!(
                         "⚙️  No DynamicConfig in {} — seeded from {} (the newest sibling shard). \
                          Instance-level keys left at the compiled defaults: {:?}. Review Setup before trading.",
@@ -2513,7 +2591,7 @@ impl DynamicConfig {
     async fn save_as(&self, changed_by: &str) {
         // A save by anyone but the loader means the operator (or the advisor)
         // has looked at the config: the "seeded" notice has done its job.
-        if !matches!(changed_by, "startup_dynamic" | "seeded_from_shard")
+        if !matches!(changed_by, "startup_dynamic" | "seeded_from_shard" | "fee_floor")
             && matches!(config_origin(), ConfigOrigin::Seeded { .. })
         {
             set_config_origin(ConfigOrigin::Shard);
@@ -2560,6 +2638,7 @@ impl DynamicConfig {
         let mut value = serde_json::to_value(current.as_ref())?;
         let patch: serde_json::Value = serde_json::from_str(patch_json)?;
         refuse_ceiling_violations(&patch)?;
+        refuse_fee_floor_violations(&patch)?;
 
         // Merge: patch fields overwrite current fields; unknown keys are ignored.
         if let (Some(obj), Some(patch_obj)) = (value.as_object_mut(), patch.as_object()) {
@@ -2617,6 +2696,10 @@ impl DynamicConfig {
                     Ok(mut cfg) => {
                         // Same build caps as the global config — see `apply_build_caps`.
                         warn_ceiling_clamps(&format!("squadron {squadron_id}"), &apply_build_caps(&mut cfg));
+                        // The knob is Global-scope (Polymarket US reads the global
+                        // row), so the global load reports the raise; a squadron
+                        // row's copy is corrected quietly.
+                        apply_fee_floors(&mut cfg);
 
                         // Instance-level fields follow the global row, always.
                         // A squadron row that disagrees is never honored — see
@@ -2759,6 +2842,7 @@ impl DynamicConfig {
         let mut value = serde_json::to_value(current.as_ref())?;
         let patch: serde_json::Value = serde_json::from_str(patch_json)?;
         refuse_ceiling_violations(&patch)?;
+        refuse_fee_floor_violations(&patch)?;
 
         if let (Some(obj), Some(patch_obj)) = (value.as_object_mut(), patch.as_object()) {
             merge_patch_into(obj, patch_obj);
@@ -3194,6 +3278,10 @@ mod build_cap_tests {
             assert!(clamps.is_empty(), "profile '{name}' is lowered by the build caps: {clamps:?}");
             let refused = ceiling_violations(values);
             assert!(refused.is_empty(), "profile '{name}' would be refused by PATCH: {refused:?}");
+            // The US fee tier is the operator's account fact: a profile must
+            // not carry it, or applying one would reset the operator's tier.
+            assert!(values.get("us_taker_fee_rate").is_none(), "profile '{name}' sets the account's US fee tier");
+            assert!(refuse_fee_floor_violations(values).is_ok());
         }
         // The two live stops this test exists for, by name and value.
         let balanced = &profiles["balanced"]["values"];
@@ -3583,3 +3671,43 @@ mod seeding_tests {
     }
 }
 
+
+#[cfg(test)]
+mod fee_floor_tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    /// [GitHub #13] Every instance before 1.8.0 was seeded with 0.06, below
+    /// every Polymarket US tier since 2026-11-06. A stored 0.06 loads as the
+    /// Tier 1 default; a real tier, the default itself and an explicit zero are
+    /// left alone.
+    #[test]
+    fn a_retired_us_fee_rate_is_raised_to_tier_one_on_load() {
+        let mut cfg = DynamicConfig { us_taker_fee_rate: dec!(0.06), ..DynamicConfig::default() };
+        assert_eq!(apply_fee_floors(&mut cfg), Some(dec!(0.06)));
+        assert_eq!(cfg.us_taker_fee_rate, config::US_TAKER_FEE_RATE);
+        for kept in [dec!(0.0695), dec!(0.075), dec!(0.085), dec!(0.095), dec!(0)] {
+            let mut cfg = DynamicConfig { us_taker_fee_rate: kept, ..DynamicConfig::default() };
+            assert_eq!(apply_fee_floors(&mut cfg), None, "{kept}");
+            assert_eq!(cfg.us_taker_fee_rate, kept);
+        }
+        assert_eq!(DynamicConfig::default().us_taker_fee_rate, dec!(0.095));
+    }
+
+    /// A patch below the cheapest tier is refused by name, as a string or a
+    /// number; a tier, zero and a patch without the key pass.
+    #[test]
+    fn a_patch_below_every_us_tier_is_refused() {
+        for bad in [serde_json::json!({"us_taker_fee_rate": "0.06"}), serde_json::json!({"us_taker_fee_rate": 0.05})] {
+            let e = refuse_fee_floor_violations(&bad).unwrap_err().to_string();
+            assert!(e.contains("us_taker_fee_rate") && e.contains("0.0695"), "{e}");
+        }
+        for ok in [
+            serde_json::json!({"us_taker_fee_rate": "0.075"}),
+            serde_json::json!({"us_taker_fee_rate": "0"}),
+            serde_json::json!({"momentum_stop_loss_pct": "0.05"}),
+        ] {
+            assert!(refuse_fee_floor_violations(&ok).is_ok(), "{ok}");
+        }
+    }
+}

@@ -76,11 +76,11 @@ pub struct UsMarketPair {
     pub close_time: Option<DateTime<Utc>>,
     /// Cumulative USD trading volume — used to rank and rotate to the hottest market.
     pub volume: f64,
-    /// The market's published taker fee coefficient Θ (`feeCoefficient`, 0.06
-    /// on every market checked 2026-09-09), or `None` when the gateway sent
-    /// none. Becomes `MarketConfig::{yes,no}_fee_bps` as the per-share ceiling
-    /// `Θ/4`; the trader falls back to the venue-wide `us_taker_fee_rate` for
-    /// `None` and warns. Never defaulted to zero: zero means a free market.
+    /// The market's published taker fee coefficient Θ (`feeCoefficient`, the
+    /// Tier 1 rate 0.095 since 2026-11-06), or `None` when the gateway sent
+    /// none. The trader prices the market at the lower of this and the
+    /// account's `us_taker_fee_rate`, as the per-share ceiling `Θ/4` on
+    /// `MarketConfig::{yes,no}_fee_bps`, and uses the knob alone for `None`. Never defaulted to zero: zero means a free market.
     pub fee_coefficient: Option<Decimal>,
 }
 

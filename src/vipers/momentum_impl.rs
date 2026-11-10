@@ -902,7 +902,7 @@ impl Strategy for MomentumStrategyImpl {
         // loss. With no fee the same trade nets −$0.27; it booked −$0.59.
         //
         // Per side, because the two asks differ. Binds on every venue: all three
-        // charge the quadratic taker fee (Polymarket US at 0.06).
+        // charge the quadratic taker fee (Polymarket US at the account's tier).
         let fee_reason_bull = crate::vipers::fee_dominated_entry(
             yes_ask, base_take_profit(yes_ask, dc.momentum_target_profit_pct), dc.momentum_max_fee_to_target_ratio);
         let fee_reason_bear = crate::vipers::fee_dominated_entry(
@@ -1997,10 +1997,16 @@ mod tests {
     #[test]
     fn the_fee_share_gate_passes_the_observed_plan() {
         // 2 × 0.07 × (1 − 0.65) = 0.049; the gate reads the venue rate, so only the
-        // shape is pinned here (the number is 0.049 on the 7% venues, 0.042 on Polymarket US).
+        // shape is pinned here (the number is 0.049 on the 7% venues, 0.0665 on Polymarket US Tier 1).
         let fee = crate::venues::round_trip_fee_pct(OBSERVED_ENTRY);
+        let verdict = crate::vipers::fee_dominated_entry(OBSERVED_ENTRY, dec!(0.15), dec!(0.40));
+        if crate::venues::taker_fee_rate() > dec!(0.07) {
+            // Polymarket US Tier 1: 2 × 0.095 × 0.35 = 6.65%, 44% of the plan, refused.
+            assert!(fee / dec!(0.15) > dec!(0.40) && verdict.is_some());
+            return;
+        }
         assert!(fee / dec!(0.15) < dec!(0.40));
-        assert!(crate::vipers::fee_dominated_entry(OBSERVED_ENTRY, dec!(0.15), dec!(0.40)).is_none());
+        assert!(verdict.is_none());
     }
 
     /// Above the flat-target floor the geometry is far worse than the card
@@ -2160,6 +2166,13 @@ mod tests {
         let fee = crossing_branch_inert(dec!(0.45), dec!(0.43), dec!(0.15), dec!(0.40))
             .expect("6.6%+ round trip is over 40% of a 15% target at every price up to $0.45");
         assert!(fee.starts_with("fee-dominated at every price 0.43–0.45"), "{fee}");
+        if crate::venues::taker_fee_rate() > dec!(0.07) {
+            // Polymarket US Tier 1 (0.095): the balanced crossing band is
+            // fee-dominated throughout, and the check says so by name.
+            let dead = crossing_branch_inert(dec!(0.62), dec!(0.58), dec!(0.15), dec!(0.40));
+            assert!(dead.as_deref().is_some_and(|d| d.starts_with("fee-dominated")), "{dead:?}");
+            return;
+        }
         assert_eq!(crossing_branch_inert(dec!(0.62), dec!(0.58), dec!(0.15), dec!(0.40)), None, "balanced: 0.58–0.62 is live");
         assert_eq!(crossing_branch_inert(dec!(0.75), dec!(0.43), dec!(0.20), dec!(0.40)), None, "aggressive: live");
         // A cap above the flat-target floor is judged at the best price of BOTH
@@ -2174,6 +2187,8 @@ mod tests {
     /// and a second, high interval appears.
     #[test]
     fn effective_entry_band_stops_at_the_flat_target_floor() {
+        // Pinned at the 0.07 venues; Polymarket US Tier 1 refuses most of it.
+        if crate::venues::taker_fee_rate() > dec!(0.07) { return; }
         let band = effective_entry_band(dec!(0.58), dec!(0.78), dec!(0.15), dec!(0.40));
         assert_eq!(band, vec![(dec!(0.58), dec!(0.69))]);
         assert_eq!(format_band(&band), "0.58–0.69");
@@ -2291,11 +2306,11 @@ mod tests {
     /// shipped 0.40 cap that entry is refused on the 0.07 venues (Polymarket
     /// International, Kalshi), and the refusal names the knob that owns it.
     ///
-    /// The verdict follows the venue's rate, not the venue's name: on Polymarket
-    /// US the schedule is 0.06, the same trade is 5.64% of notional — 38% of the
-    /// plan — and it passes the 0.40 cap by two points. That is the arithmetic,
-    /// pinned here so the gate is never mistaken for a venue switch. (Until the
-    /// fix of 2026-09-09 that build carried a zero rate and this gate was inert.)
+    /// The verdict follows the venue's rate, not the venue's name. At
+    /// Polymarket US's old flat 0.06 the same trade was 38% of the plan and
+    /// passed; at its Tier 1 rate since 2026-11-06 (0.095) it is 59% and is
+    /// refused. (Until the fix of 2026-09-09 that build carried a zero rate and
+    /// this gate was inert.)
     #[test]
     fn the_2026_09_09_entry_is_refused_where_the_fee_dominates_the_plan() {
         let fee = crate::venues::round_trip_fee_pct(dec!(0.53));
@@ -2315,11 +2330,9 @@ mod tests {
         if rate >= dec!(0.07) {
             assert!(verdict.is_some(), "at {rate} the 2026-09-09 entry is refused");
         }
-        if rate == dec!(0.06) {
-            assert!(verdict.is_none(), "at 0.06 the same entry is 38% of the plan and passes");
-        }
-        // A cap that admits the fee lets the trade through on every venue.
-        assert_eq!(crate::vipers::fee_dominated_entry(dec!(0.53), dec!(0.15), dec!(0.50)), None);
+        // A cap that admits the fee lets the trade through on every venue
+        // (59.5% of the plan at Polymarket US Tier 1, the dearest).
+        assert_eq!(crate::vipers::fee_dominated_entry(dec!(0.53), dec!(0.15), dec!(0.60)), None);
     }
 
     /// The gate is a share-of-plan test, so it follows the fee curve: the same
@@ -2798,6 +2811,16 @@ mod tests {
         hold_yes(&c, dec!(0.63), dec!(7.94), 30, true).await;
         let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
         assert!(matches!(sig, StrategySignal::MakerRestingExit { .. }), "a running move must not decay, got {sig:?}");
+
+        // The rest replays BTC at 0.07. At Polymarket US Tier 1 (0.095) a +6.3%
+        // gain does not clear both legs, so the ask keeps working there.
+        if crate::venues::taker_fee_rate() > dec!(0.07) {
+            let c = ctx(book(dec!(0.67), dec!(0.69)), plan());
+            hold_yes(&c, dec!(0.63), dec!(7.94), 30, true).await;
+            let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+            assert!(matches!(sig, StrategySignal::MakerRestingExit { .. }), "the fees are not cleared, got {sig:?}");
+            return;
+        }
 
         // Faded (velocity 0) and +6.3% at the bid: net of the exit fee that
         // clears the entry-leg fee with room, so the gain is banked.

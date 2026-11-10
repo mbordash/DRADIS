@@ -229,15 +229,16 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
          the ceiling an order authorizes, not what is charged. Only change this if Polymarket's schedule \
          changes; setting it wrong silently skews every recorded trade.").range(0.0, 0.5).step(0.005)
         .venues(VENUE_INTL));
-    v.push(F::new("Global", None, "us_taker_fee_rate", "Polymarket US Taker Fee Rate", "pct", true,
-        "Polymarket US only. The venue's taker fee coefficient: fee = rate × price × (1 − price) × shares on \
-         every fill that crosses the spread, entry and exit alike; a resting post-only order pays nothing and \
-         is paid a 0.0125 rebate on the same formula. Every fee floor and fee gate on this venue reads this \
-         figure, and recorded P&L is net of it. 0.06 is the published schedule (docs.polymarket.us/fees, \
-         effective July 2026) and the feeCoefficient the gateway sends on every market; DRADIS logs a warning \
-         at deploy if a market publishes a different one. DRADIS carried this as zero before 2026-09-09, \
-         which silently switched off every fee gate on the venue — setting it to zero does that again.")
-        .range(0.0, 0.5).step(0.005).venues(VENUE_US));
+    v.push(F::new("Global", None, "us_taker_fee_rate", "Polymarket US Taker Fee Tier", "pct", true,
+        "Polymarket US only. Your account's taker fee coefficient: fee = rate × price × (1 − price) × shares on \
+         every fill that crosses the spread, entry and exit alike; a resting post-only order pays nothing. \
+         Since 2026-11-06 Polymarket US sets it per account by your taker volume over the last 30 days \
+         (docs.polymarket.us/fees): 0.095 below $10,000, 0.085 to $50,000, 0.075 to $250,000, 0.0695 above, \
+         and 0.0695 for a new account's first 7 days. The default, 0.095, is the top rate: set yours to your \
+         current tier. Every fee floor and fee gate on this venue reads this figure, recorded P&L is net of it, \
+         and each market is priced at the lower of this and the rate the market publishes. Values between 0 \
+         and 0.0695 match no tier and are refused; 0 switches off every fee gate on the venue.")
+        .range(0.0, 0.5).step(0.0005).venues(VENUE_US));
     v.push(F::new("Global", None, "book_apply_price_changes", "Apply Price Changes", "bool", false,
         "Polymarket International only. Keep the order book current between trades by folding the \
          venue's price_change messages (order placements and cancellations) into the book. Off, the \

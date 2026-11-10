@@ -71,14 +71,24 @@ const DEFAULT_MIN_VOLUME: f64 = 5_000.0;
 /// are the ones still open; stale listings are resolved events awaiting settlement.
 const MARKET_START_LOOKBACK_DAYS: i64 = 7;
 
+/// Polymarket US taker fee tiers since 2026-11-06 13:00 ET, by the account's
+/// taker volume over the preceding 30 completed ET days: below $10,000,
+/// to $50,000, to $250,000, and above (docs.polymarket.us/fees). The first is
+/// `config::US_TAKER_FEE_RATE`; the last is
+/// `dynamic_config::US_TAKER_FEE_LOWEST_TIER`, the knob's floor.
+pub const TAKER_FEE_TIERS: [Decimal; 4] = [
+    rust_decimal_macros::dec!(0.095), rust_decimal_macros::dec!(0.085),
+    rust_decimal_macros::dec!(0.075), rust_decimal_macros::dec!(0.0695),
+];
+
 /// The live Polymarket US taker fee coefficient, falling back to the compile-time
 /// default before the config channel is published (venue bootstrap) or if it has
 /// gone away. `venues::taker_fee_rate()` on this build.
 ///
-/// Venue-wide by design: the gateway publishes a per-market `feeCoefficient`
-/// and the trader carries that on `MarketConfig::{yes,no}_fee_bps`, but the
-/// price-dependent fee floors and gates have no market in scope and read this.
-/// The trader warns at deploy if a market's published figure differs from it.
+/// The operator's own tier: the gateway publishes a per-market
+/// `feeCoefficient` (the Tier 1 rate), and the trader carries the lower of the
+/// two on `MarketConfig::{yes,no}_fee_bps`; the price-dependent fee floors and
+/// gates have no market in scope and read this.
 pub fn live_taker_fee_rate() -> Decimal {
     crate::helpers::dynamic_config::global_config_tx()
         .map(|tx| tx.borrow().us_taker_fee_rate)
@@ -95,6 +105,11 @@ pub fn live_taker_fee_rate() -> Decimal {
 /// is a maker fill too. Booked here so the fee reaches recorded P&L the way it
 /// does on Kalshi and Polymarket International, rather than vanishing into the
 /// balance; this venue booked zero on every fill until 2026-09-09.
+///
+/// Booked at the account's rate (`us_taker_fee_rate`), not the market's
+/// `fee_bps`: a market publishing less than the account's tier (none does
+/// today; the gateway publishes Tier 1 on every market) is gated at its own
+/// figure but booked at the tier, which overstates that fill's fee.
 fn taker_fee_for(intent: &OrderIntent, filled: Decimal) -> Decimal {
     if intent.post_only || filled <= Decimal::ZERO {
         return Decimal::ZERO;
@@ -1284,11 +1299,13 @@ mod tests {
             post_only,
             expiration_secs: 0,
             is_neg_risk: false,
-            fee_bps: 150,
+            fee_bps: 238,
         };
-        assert_eq!(taker_fee_for(&intent(dec!(0.50), false), dec!(100)), dec!(1.50));
-        assert_eq!(taker_fee_for(&intent(dec!(0.10), false), dec!(1000)), dec!(5.40));
-        assert_eq!(taker_fee_for(&intent(dec!(0.65), false), dec!(1000)), dec!(13.65));
+        // At the default rate, Tier 1 (0.095): Θ · p · (1 − p) per share.
+        assert_eq!(crate::config::US_TAKER_FEE_RATE, dec!(0.095));
+        assert_eq!(taker_fee_for(&intent(dec!(0.50), false), dec!(100)), dec!(2.375));
+        assert_eq!(taker_fee_for(&intent(dec!(0.10), false), dec!(1000)), dec!(8.55));
+        assert_eq!(taker_fee_for(&intent(dec!(0.65), false), dec!(1000)), dec!(21.6125));
         // A post-only order never crosses: no fee (it is paid a rebate instead).
         assert_eq!(taker_fee_for(&intent(dec!(0.50), true), dec!(100)), Decimal::ZERO);
         // Nothing filled, nothing charged — a rested GTC pays on its later
@@ -1405,9 +1422,10 @@ mod tests {
 //
 // Parses a page of the public gateway listing through DRADIS's OWN market
 // record (the one discovery uses, not the SDK's) and asserts every market
-// carries a readable coefficient equal to the venue-wide default. If the venue
-// changes its schedule this fails, which is the signal to move
-// `US_TAKER_FEE_RATE` and the `us_taker_fee_rate` knob.
+// carries a readable coefficient that is one of the taker tiers
+// (`TAKER_FEE_TIERS`). Since 2026-11-06 the gateway publishes the Tier 1 rate,
+// which is the default. If the venue changes its schedule this fails, which is
+// the signal to move the tiers, `US_TAKER_FEE_RATE` and the knob's help text.
 #[cfg(test)]
 mod fee_coefficient_live_smoke {
     #[tokio::test]
@@ -1421,9 +1439,10 @@ mod fee_coefficient_live_smoke {
         assert!(!parsed.markets.is_empty(), "the gateway returned no markets");
         let pairs = super::markets::pair_markets(parsed.markets.clone());
         for m in &parsed.markets {
-            assert_eq!(
-                m.fee_coefficient, Some(crate::config::US_TAKER_FEE_RATE),
-                "{}: gateway coefficient {:?} differs from the venue-wide default", m.slug, m.fee_coefficient,
+            assert!(
+                m.fee_coefficient.is_some_and(|c| super::TAKER_FEE_TIERS.contains(&c)),
+                "{}: gateway coefficient {:?} is not one of the taker tiers {:?}",
+                m.slug, m.fee_coefficient, super::TAKER_FEE_TIERS,
             );
         }
         eprintln!("{} markets, {} paired, every coefficient {:?}",

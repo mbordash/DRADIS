@@ -106,8 +106,11 @@ def const_values(path: Path) -> dict[str, object]:
 # parameters are operational too: what an operator is trying against the whole
 # board is not risk appetite. Every `bookline_board_*` field is excluded, the
 # same rule `embedded_profiles_match_config_schema` enforces on the output.
+# Polymarket US's taker rate is the operator's own fee tier (by their 30-day
+# volume since 2026-11-06), an account fact rather than risk appetite: applying
+# a profile must not reset it.
 NON_PROFILE_FIELDS = {
-    "ghost_mode", "collateral_sweep_enabled",
+    "ghost_mode", "collateral_sweep_enabled", "us_taker_fee_rate",
     "sports_ledger_enabled", "sports_ledger_leagues", "sports_ledger_snapshot_offsets_mins",
     "sports_ledger_credit_reserve", "sports_ledger_quota_reset_day",
 }
