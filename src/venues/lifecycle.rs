@@ -344,8 +344,13 @@ impl OrderLifecycle {
     /// before leaving a market: a resting bid is cancelled by the rotation
     /// itself and must not pin the squadron to the market forever [B74]. A
     /// paired leg (an arbitrage or Time Decay entry) is a holding even before
-    /// the reconciler confirms it, as it always was.
+    /// the reconciler confirms it, as it always was. [B103] An open script
+    /// paper position counts too, as a simulated position already does: its
+    /// exits are evaluated only against the markets the squadron watches.
     pub async fn holds_anything(&self, positions: &Arc<Mutex<PositionMap>>) -> bool {
+        if crate::vipers::scripted::paper::holds_open(&self.squadron_id, Utc::now()) {
+            return true;
+        }
         let unconfirmed: Vec<(String, MarketId)> = {
             let map = positions.lock().await;
             let mut quotes = Vec::new();
@@ -2014,5 +2019,26 @@ mod resting_quote_tests {
         assert!(lc.resting_for("TimeDecayStrategy", &MarketId::new(LEG)).await, "a refused cancel means it filled: the reconciler settles it");
         assert!(lc.take_released().await.is_empty());
     }
-}
 
+    /// [B103] A script's open paper position holds the squadron to its market,
+    /// as a simulated position does; past the market's close it does not.
+    #[tokio::test]
+    async fn an_open_script_paper_position_is_a_holding() {
+        let lc = OrderLifecycle::new(LifecycleConfig::us(), "b103-lifecycle");
+        let map: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(PositionMap::default()));
+        assert!(!lc.holds_anything(&map).await);
+        let now = Utc::now();
+        crate::vipers::scripted::paper::cache_add("b103-lifecycle", "my_momentum", crate::vipers::scripted::paper::PaperRow {
+            id: 88, script: "my_momentum".into(), squadron_id: "b103-lifecycle".into(),
+            condition_id: "KXBTCD-26NOV1018-T73799.99".into(), token_id: "KXBTCD-26NOV1018-T73799.99#no".into(),
+            market: "Bitcoin price on Nov 10, 2026? $73,800 or above".into(), side: "NO".into(),
+            opened_at: now, close_time: Some(now + chrono::Duration::minutes(58)),
+            entry_price: dec!(0.55), shares: dec!(5), entry_fee: dec!(0.0866), take_profit: Some(dec!(0.65)),
+            entry_reason: String::new(), script_hash: "1826995d".into(), closed_at: None, exit_price: None,
+            exit_fee: None, exit_reason: None, close_hash: None, pnl: None,
+        });
+        assert!(lc.holds_anything(&map).await, "a paper position keeps the squadron on its market");
+        crate::vipers::scripted::paper::cache_remove("b103-lifecycle", "my_momentum", 88);
+        assert!(!lc.holds_anything(&map).await);
+    }
+}

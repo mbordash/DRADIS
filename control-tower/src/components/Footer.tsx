@@ -109,7 +109,17 @@ export default function Footer() {
       <div>
         DRADIS Trading Automation Control Tower{' '}
         <span className="text-gray-600">So say we all.</span>{' '}
-        <EngineVersion />
+        <EngineVersion />{' '}
+        <span className="text-gray-700">·</span>{' '}
+        {/* Install, upgrade and FAQ: the Control Tower had no way back to them. */}
+        <a
+          href="https://dradis.live/docs"
+          target="_blank"
+          rel="noreferrer"
+          className="text-gray-500 hover:text-indigo-300 hover:underline underline-offset-4"
+        >
+          Documentation ↗
+        </a>
       </div>
     </footer>
   );

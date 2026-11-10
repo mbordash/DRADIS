@@ -232,6 +232,22 @@ pub fn cached_all(script: &str) -> Vec<PaperRow> {
     lock().iter().filter(|((_, s), _)| s == script).flat_map(|(_, b)| b.rows.clone()).collect()
 }
 
+/// [B103] Does any script hold an open paper position on this squadron whose
+/// market has not closed yet? The rotation asks before leaving a market: a
+/// paper row is only managed (take-profit, stop, script exit) while its market
+/// is one the squadron watches, so moving away mid-hour left it to ride to
+/// settlement, unmanaged and scored as if the script had held it.
+///
+/// A row past its close no longer needs the book (it settles from the
+/// venue's resolution), so it does not hold the squadron. Read from the cache,
+/// which each script's exit pass loads on its first tick.
+pub fn holds_open(squadron: &str, now: DateTime<Utc>) -> bool {
+    lock().iter()
+        .filter(|((sq, _), _)| sq == squadron)
+        .flat_map(|(_, b)| b.rows.iter())
+        .any(|r| r.closed_at.is_none() && r.close_time.unwrap_or(r.opened_at + chrono::Duration::hours(24)) > now)
+}
+
 /// The open rows of one squadron as last loaded, without touching the database
 /// (for the dry run, which is synchronous).
 pub fn cached_for(squadron: &str, script: &str) -> Vec<PaperRow> {
@@ -304,4 +320,44 @@ pub fn forget_resolution(token: &str) {
 #[cfg(test)]
 pub fn set_resolution_for_test(token: &str, px: Decimal) {
     probes().lock().unwrap_or_else(|x| x.into_inner()).1.insert(token.to_string(), px);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    fn row(id: i64, squadron: &str, close_in_secs: Option<i64>, now: DateTime<Utc>) -> PaperRow {
+        PaperRow {
+            id, script: "holdtest".into(), squadron_id: squadron.into(),
+            condition_id: "KX-T1".into(), token_id: "KX-T1#no".into(), market: "m".into(), side: "NO".into(),
+            opened_at: now - chrono::Duration::minutes(5),
+            close_time: close_in_secs.map(|s| now + chrono::Duration::seconds(s)),
+            entry_price: dec!(0.55), shares: dec!(5), entry_fee: dec!(0.08), take_profit: Some(dec!(0.65)),
+            entry_reason: String::new(), script_hash: "h".into(), closed_at: None, exit_price: None,
+            exit_fee: None, exit_reason: None, close_hash: None, pnl: None,
+        }
+    }
+
+    /// [B103] Squadron names unique to this test: the cache is process-wide.
+    #[test]
+    fn an_open_paper_row_holds_its_squadron_until_its_market_closes() {
+        let now = Utc::now();
+        assert!(!holds_open("b103-a", now), "nothing cached, nothing held");
+        cache_add("b103-a", "holdtest", row(1, "b103-a", Some(3600), now));
+        assert!(holds_open("b103-a", now), "an open row on a live market holds the squadron");
+        assert!(!holds_open("b103-b", now), "only its own squadron");
+        assert!(!holds_open("b103-a", now + chrono::Duration::seconds(3601)), "past the close it settles from the venue and frees the squadron");
+        cache_remove("b103-a", "holdtest", 1);
+        assert!(!holds_open("b103-a", now), "a closed row holds nothing");
+    }
+
+    #[test]
+    fn a_row_without_a_close_time_holds_for_a_day_at_most() {
+        let now = Utc::now();
+        cache_add("b103-c", "holdtest", row(2, "b103-c", None, now));
+        assert!(holds_open("b103-c", now));
+        assert!(!holds_open("b103-c", now + chrono::Duration::hours(24)));
+        cache_remove("b103-c", "holdtest", 2);
+    }
 }
