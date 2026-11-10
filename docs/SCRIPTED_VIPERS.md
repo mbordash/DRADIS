@@ -305,6 +305,37 @@ The instance backup carries `data/vipers/*.rhai` and `*.json`, and a restore
 puts them back before the engine loads them. Their settings (switches, cap,
 parameter values) are part of the config and travel with it.
 
+## Sharing: export, import and the community registry
+
+- **Export.** The Export button saves the viper as a bundle file
+  (`<name>.dradis-viper.json`): manifest, source and a content digest. Use it
+  to move a viper between your own instances or to send one in a support
+  ticket.
+- **Import a file.** "Import a viper file…" reads a bundle in the browser and
+  hands it to the engine, which checks the digest, the script API level and
+  the save checks. You review the readme (shown as plain text), parameters,
+  full source and, when the name is taken, a diff against your viper. You then
+  import it under a free name or replace yours.
+- **Community.** "Browse community vipers" fetches the registry index from
+  dradis.live (only when you click it; the engine never polls). Review fetches
+  that version, and Import goes through the same review as a file. Registry
+  versions are signed. The review shows **signed · dradis.live** and the
+  verified publisher, and the engine refuses a bundle whose signature does not
+  check out, however it arrived. Withdrawn versions are refused from the
+  registry and flagged on the copies you installed. An installed copy shows
+  "Update to x.y.z" when a newer version is published.
+
+Every import arrives **switched off on every squadron and on paper**. A
+replacement keeps the viper's on/off switches, goes back to paper and clears
+its memory, and is refused while the viper holds a position. The card shows
+where an imported viper came from: **Imported** while it is unchanged,
+**Imported, edited** once you change it.
+
+To publish a viper of your own, open a pull request to
+[dradis-contrib](https://github.com/mbordash/dradis-contrib) (see its
+CONTRIBUTING.md). After review and merge, a maintainer publishes it to the
+registry.
+
 ## API
 
 Everything the page does goes through the engine's REST API, behind the API
@@ -320,6 +351,11 @@ key like every other config write:
 | DELETE | `/api/vipers/scripts/{name}` | Delete (refused while holding a real position) |
 | POST | `/api/vipers/scripts/{name}/dry-run` | `{ squadron, source?, manifest? }` |
 | POST | `/api/vipers/scripts/{name}/reset-state` | Clear the viper's memory |
+| GET | `/api/vipers/scripts/{name}/export` | The viper as a bundle file |
+| POST | `/api/vipers/import/check` | `{ bundle, name? }` → what an import would do (changes nothing) |
+| POST | `/api/vipers/import` | `{ bundle, name?, replace? }` → import (off, on paper) |
+| GET | `/api/vipers/registry` | The community registry index, signature checked, with what is installed here |
+| GET | `/api/vipers/registry/{publisher}/{name}/{version}` | One published version, signature and index checked (400 invalid, 404 unlisted, 410 withdrawn) |
 
 Switches and parameter values are config, set with
 `PATCH /api/config { "custom_vipers": { "<name>": { "enabled": …, "live": …, "max_exposure_usdc": …, "params": { … } } } }`.

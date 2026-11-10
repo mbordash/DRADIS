@@ -77,6 +77,10 @@ export function CommunityCard({ disabled, onReview }: {
         Vipers published on <span className="text-gray-400">dradis.live</span>, signed by the registry. You review each one before
         anything is saved, and it arrives off and on paper. Community content: not investment advice.
       </p>
+      <p className="text-[10px] font-mono text-gray-500">
+        Built one worth sharing? Export it and open a pull request on{' '}
+        <a href="https://github.com/mbordash/dradis-contrib/blob/main/CONTRIBUTING.md" target="_blank" rel="noreferrer" className="text-sky-400 hover:underline">dradis-contrib</a>.
+      </p>
       {!listing && (
         <button className={btnPlain} disabled={disabled || loading !== null} onClick={browse}>
           {loading === 'index' ? 'Loading…' : 'Browse community vipers'}

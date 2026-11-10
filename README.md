@@ -485,6 +485,8 @@ The **Build a Viper** page in Control Tower lets you write a strategy as a short
 
 Scripts live on the data volume and travel in the instance backup. **Status: new**, covered by unit and end-to-end engine tests. Run your own on paper first. Guide: [SCRIPTED_VIPERS.md](docs/SCRIPTED_VIPERS.md).
 
+**Sharing vipers.** Any script viper exports as a bundle file that another DRADIS can import. The **Community** card on the same page browses the community registry at [dradis.live/vipers](https://dradis.live/vipers). Every version there is signed with a key kept offline, and the engine checks that signature before it shows or imports anything. Whichever way a viper arrives, you review its readme, parameters and full source (with a diff when it replaces one of yours), and it lands **switched off and on paper**. Community vipers are contributed by pull request to [dradis-contrib](https://github.com/mbordash/dradis-contrib) (MIT licensed), checked by CI and reviewed before they are published. They are not investment advice and are not reviewed for profitability.
+
 Building from source and want a compiled Rust Viper instead: [CUSTOM_STRATEGY.md](docs/CUSTOM_STRATEGY.md).
 
 ---
@@ -1139,3 +1141,8 @@ Contributor License Agreement — see [CONTRIBUTING.md](docs/CONTRIBUTING.md).
 Pull requests are welcome. Contributors are asked to sign the
 [Contributor License Agreement](docs/CLA.md) once; the CLA bot will prompt
 automatically on your first pull request.
+
+To share a strategy rather than change the engine, contribute a script viper
+to [dradis-contrib](https://github.com/mbordash/dradis-contrib) instead: no
+CLA, MIT licensed, and once merged it is published to the community registry
+for every DRADIS operator to import.
