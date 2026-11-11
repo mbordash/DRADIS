@@ -4,6 +4,14 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
+## 1.8.2 (2026-11-11)
+
+- Daily drawdown limit: you can now set it. Setup, Engine, Daily Drawdown Limit sets the most the day may lose, in dollars, before every viper stops opening real-money positions until midnight ET. It was fixed by the risk profile ($3 or 0.75% of starting collateral on the conservative profile the AMI ships), and because it counts every viper together, two small losses in one viper could stop all the others for the rest of the day. 0, the default, keeps the profile's limit, so nothing changes until you set it. It takes effect without a restart, applying a risk profile never changes it, and the LLM advisor can never change it at any autonomy level. On Kalshi and Polymarket US the day's loss is the whole account's; on Polymarket International each coin counts its own.
+- Daily drawdown limit: a restart no longer forgets the day. The day's loss was counted from the engine's start, so a restart (an upgrade, a crash recovery) cleared a limit that had been reached and gave the rest of the day a fresh allowance. On a live instance the engine now also counts what was realized since midnight ET before the restart.
+- Build a Viper: a paper position could be left unmanaged when a Kalshi or Polymarket US crypto squadron switched to a different market in the middle of an hour (for example to a busier strike). Its take-profit and stop were no longer watched, and it was held to settlement. The squadron now keeps its market while a script viper holds an open paper position there, as it already did for real positions.
+- Changing an instance-wide setting in Setup no longer logs a "config disagreed with the global row" warning for every squadron.
+- The Control Tower footer links to the documentation at dradis.live/docs.
+
 ## 1.8.1 (2026-11-10)
 
 - Restore: restoring a backup on a Marketplace instance failed with "Cross-device link (os error 18)" when the backup held a Build a Viper script (any backup made on 1.7.0 or later from an instance with a script viper). The restore stopped before changing anything. It now moves those files correctly: upload the same backup again and it restores, vipers included.

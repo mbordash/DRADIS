@@ -2733,6 +2733,16 @@ impl DynamicConfig {
     /// If none exists, returns a fresh copy of compile-time defaults (does NOT persist yet).
     /// Caller is responsible for persisting via save_for_squadron() if needed.
     pub async fn load_for_squadron(squadron_id: &str) -> Arc<Self> {
+        Self::load_for_squadron_reporting(squadron_id, true).await
+    }
+
+    /// `load_for_squadron`, saying whether a row that disagrees with the global
+    /// row on an instance-level key is reported. A patch reads the row only to
+    /// rewrite it: the read heals it (the persisted result agrees with the
+    /// global row), so warning there turned every Setup change of such a key
+    /// into a "disagreed" warning per squadron, a fault report for a normal save
+    /// (2026-11-11, B105). The periodic reloads still report.
+    async fn load_for_squadron_reporting(squadron_id: &str, report_divergence: bool) -> Arc<Self> {
         if read_only_mode() {
             info!("⚙️  READ-ONLY demo mode — squadron {} using compile-time defaults", squadron_id);
             return Arc::new(DynamicConfig::default());
@@ -2768,7 +2778,9 @@ impl DynamicConfig {
                             None => Self::load_or_default().await,
                         };
                         let corrected = reconcile_global_semantics(&mut cfg, &global);
-                        warn_global_divergence(squadron_id, &corrected);
+                        if report_divergence {
+                            warn_global_divergence(squadron_id, &corrected);
+                        }
 
                         info!("⚙️  Squadron config loaded from DB: {}", squadron_id);
                         return Arc::new(cfg);
@@ -2885,7 +2897,7 @@ impl DynamicConfig {
         static PATCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         let _guard = PATCH_LOCK.lock().await;
 
-        let current = Self::load_for_squadron(squadron_id).await;
+        let current = Self::load_for_squadron_reporting(squadron_id, false).await;
         let mut value = serde_json::to_value(current.as_ref())?;
         let patch: serde_json::Value = serde_json::from_str(patch_json)?;
         refuse_ceiling_violations(&patch)?;

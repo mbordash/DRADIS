@@ -186,6 +186,8 @@ const COMPILED_VENUE: &str = {
 };
 
 fn main() -> Result<()> {
+    // [B105] The daily drawdown carry reads trades booked before this instant.
+    dradis::vipers::mark_process_start();
     // `--build-venue` prints the compiled venue and exits.
     //
     // All three venue builds write the same target/release/dradis, so a binary

@@ -254,6 +254,15 @@ pub fn venue_name() -> &'static str { "us_retail" }
 #[cfg(feature = "kalshi")]
 pub fn venue_name() -> &'static str { "kalshi" }
 
+/// [B105] Is a squadron's live session P&L the whole account's? On Kalshi and
+/// Polymarket US it is portfolio value against the starting value, one account
+/// whatever the squadron; on Polymarket International each coin runs its own
+/// session. The daily drawdown carry reads the trade databases to match.
+#[cfg(feature = "intl_clob")]
+pub const SESSION_PNL_ACCOUNT_WIDE: bool = false;
+#[cfg(any(feature = "us_retail", feature = "kalshi"))]
+pub const SESSION_PNL_ACCOUNT_WIDE: bool = true;
+
 /// The venue label this build's trades are filed under, and the one a trained
 /// model's `venue` stamp is compared against (`gboost_planb::venue_blocks_live`).
 #[cfg(feature = "intl_clob")]

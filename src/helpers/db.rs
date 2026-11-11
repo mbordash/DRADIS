@@ -1296,6 +1296,22 @@ pub async fn sports_ledger_kick_off(pool: &SqlitePool, condition_id: &str) -> Op
     s.as_deref().and_then(crate::raptors::sports_ledger::parse_time)
 }
 
+/// [B105] Realized P&L of the trades booked in `[from, to)`, real-money rows
+/// (`ghost = false`) or simulated ones (`ghost = true`). Summed in `Decimal`
+/// from the stored strings so cents do not drift through a float. `None` on a
+/// read error, so the caller can tell "no loss" from "could not tell".
+pub async fn realized_pnl_between(pool: &SqlitePool, from: DateTime<Utc>, to: DateTime<Utc>, ghost: bool) -> Option<Decimal> {
+    let rows: Vec<Option<String>> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT CAST(pnl AS TEXT) FROM trades WHERE ts >= ? AND ts < ? AND COALESCE(ghost, 0) = ?")
+        .bind(from.to_rfc3339())
+        .bind(to.to_rfc3339())
+        .bind(ghost as i32)
+        .fetch_all(pool).await
+        .map_err(|e| error!("❌ DB realized P&L read failed: {}", e))
+        .ok()?;
+    Some(rows.iter().flatten().filter_map(|s| s.trim().parse::<Decimal>().ok()).sum())
+}
+
 /// The venue's own resolution for a token, as the sports ledger recorded it.
 ///
 /// Settlement is the plan for every Bookline position, so this is the primary exit

@@ -160,12 +160,127 @@ fn day_pnl_in(
     session_pnl - a.anchor
 }
 
-/// Session P&L since midnight ET for this squadron's scope [B90].
+/// Session P&L since midnight ET for this squadron's scope [B90], plus, on the
+/// day the process started, what that scope realized earlier the same day
+/// before the start [B105].
 pub fn day_pnl(ctx: &crate::orchestrator::strategy::StrategyContext) -> Decimal {
     let today = chrono::Utc::now().with_timezone(&chrono_tz::US::Eastern).date_naive();
-    let first_day = *FIRST_DAY.get_or_init(|| today);
-    let mut anchors = DAY_ANCHORS.lock().unwrap_or_else(|e| e.into_inner());
-    day_pnl_in(&mut anchors, first_day, &ctx.crypto_filter.to_lowercase(), ctx.session_pnl, today)
+    // The day the process started, not the day of the first tick: a start at
+    // 23:59 ET whose first tick lands after midnight must not carry the whole
+    // previous day into the new one [B105].
+    let first_day = *FIRST_DAY.get_or_init(|| PROCESS_START.get()
+        .map(|t| t.with_timezone(&chrono_tz::US::Eastern).date_naive())
+        .unwrap_or(today));
+    let scope = ctx.crypto_filter.to_lowercase();
+    let since_start = {
+        let mut anchors = DAY_ANCHORS.lock().unwrap_or_else(|e| e.into_inner());
+        day_pnl_in(&mut anchors, first_day, &scope, ctx.session_pnl, today)
+    };
+    if today == first_day { since_start + day_carry(&scope) } else { since_start }
+}
+
+/// [B105] The day's loss survives a restart.
+///
+/// Session P&L starts at zero with the process, so until 1.8.2 a restart
+/// forgot the day: on 2026-11-11 a deploy at 07:55 ET cleared a guard tripped
+/// at 04:02 ET by $3.54 of losses. The first time a scope is evaluated, this
+/// reads what was realized between midnight ET and the process start and
+/// counts it toward the day, matching the guard's scope: the coin's own trade
+/// database on Polymarket International, where each coin has its own session,
+/// and every trade database on Kalshi and Polymarket US (one per wing on US),
+/// where session P&L is the account's (`venues::SESSION_PNL_ACCOUNT_WIDE`).
+///
+/// Live instances only, real-money rows only. A simulating instance's session
+/// P&L counts only some of its simulated rows (shadow lanes and several ghost
+/// settlements are booked without reaching it), so carrying every ghost row
+/// would make a restarted simulation stricter than one left running.
+///
+/// Not covered: a settlement the venue paid while the engine was down is
+/// booked after the start, so it is in neither the carry nor (already in the
+/// starting value) the session P&L.
+///
+/// Loaded in the background: until the read lands (milliseconds after the
+/// first tick) the carry is 0, the pre-1.8.2 behavior. A failed read keeps 0
+/// and says so.
+static DAY_CARRY: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Option<Decimal>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// When this process started, for the end of the carry window. Pinned early in
+/// `main` by `mark_process_start`; first use otherwise (tests).
+static PROCESS_START: std::sync::OnceLock<chrono::DateTime<chrono::Utc>> = std::sync::OnceLock::new();
+
+/// Record the process start time. Call once, before any squadron ticks.
+pub fn mark_process_start() {
+    let _ = PROCESS_START.get_or_init(chrono::Utc::now);
+}
+
+fn day_carry(scope: &str) -> Decimal {
+    let mut carry = DAY_CARRY.lock().unwrap_or_else(|e| e.into_inner());
+    match carry.get(scope) {
+        Some(v) => v.unwrap_or(Decimal::ZERO),
+        None => {
+            // Only from inside the runtime; a test context has none and keeps 0.
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                carry.insert(scope.to_string(), None);
+                rt.spawn(load_day_carry(scope.to_string()));
+            }
+            Decimal::ZERO
+        }
+    }
+}
+
+/// Midnight ET of the day `at` falls on, in UTC.
+fn et_midnight_before(at: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    use chrono::TimeZone;
+    let day = at.with_timezone(&chrono_tz::US::Eastern).date_naive();
+    chrono_tz::US::Eastern
+        .from_local_datetime(&day.and_hms_opt(0, 0, 0).expect("midnight exists"))
+        .earliest()
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .unwrap_or(at)
+}
+
+async fn load_day_carry(scope: String) {
+    let start = *PROCESS_START.get_or_init(chrono::Utc::now);
+    let midnight = et_midnight_before(start);
+    if crate::helpers::dynamic_config::ghosting_now() {
+        DAY_CARRY.lock().unwrap_or_else(|e| e.into_inner()).insert(scope, Some(Decimal::ZERO));
+        return;
+    }
+    // Pools for a venue can come up after its first tick (the US pool inits
+    // after venue connect): wait briefly rather than read nothing.
+    let mut pool = None;
+    for _ in 0..40 {
+        pool = crate::helpers::db::pool_for(&scope);
+        if pool.is_some() { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    let pools = match pool {
+        Some(_) if crate::venues::SESSION_PNL_ACCOUNT_WIDE => crate::helpers::db::all_pools(),
+        Some(p) => vec![p],
+        None => Vec::new(),
+    };
+    let mut read = if pools.is_empty() { None } else { Some(Decimal::ZERO) };
+    for p in &pools {
+        read = match (read, crate::helpers::db::realized_pnl_between(p, midnight, start, false).await) {
+            (Some(acc), Some(v)) => Some(acc + v),
+            _ => None,
+        };
+    }
+    let value = match read {
+        Some(v) => {
+            if !v.is_zero() {
+                info!("🛡️ Daily drawdown [{}]: counting ${:.2} realized since 00:00 ET before this start toward today's limit",
+                      scope, v);
+            }
+            v
+        }
+        None => {
+            tracing::warn!("⚠️ Daily drawdown [{}]: could not read today's earlier trades; the day counts from this start", scope);
+            Decimal::ZERO
+        }
+    };
+    DAY_CARRY.lock().unwrap_or_else(|e| e.into_inner()).insert(scope, Some(value));
 }
 
 /// The day's loss has reached the limit, without the reject log line.
@@ -184,6 +299,17 @@ mod day_drawdown_tests {
     use chrono::NaiveDate;
 
     fn d(n: u32) -> NaiveDate { NaiveDate::from_ymd_opt(2026, 11, n).unwrap() }
+
+    #[test]
+    fn the_carry_window_starts_at_midnight_eastern() {
+        use chrono::TimeZone;
+        // 07:55 EST = 12:55 UTC on 2026-11-11; midnight EST = 05:00 UTC.
+        let at = chrono::Utc.with_ymd_and_hms(2026, 11, 11, 12, 55, 0).unwrap();
+        assert_eq!(et_midnight_before(at), chrono::Utc.with_ymd_and_hms(2026, 11, 11, 5, 0, 0).unwrap());
+        // 23:30 EDT on 2026-07-01 = 03:30 UTC on the 2nd; midnight EDT = 04:00 UTC on the 1st.
+        let summer = chrono::Utc.with_ymd_and_hms(2026, 7, 2, 3, 30, 0).unwrap();
+        assert_eq!(et_midnight_before(summer), chrono::Utc.with_ymd_and_hms(2026, 7, 1, 4, 0, 0).unwrap());
+    }
 
     #[test]
     fn the_operator_limit_replaces_the_profile_limit_and_zero_keeps_it() {
