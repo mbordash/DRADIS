@@ -585,6 +585,11 @@ mod tests {
             let to = match flipped {
                 serde_json::Value::Bool(b) => serde_json::json!(!b),
                 serde_json::Value::Number(n) => serde_json::json!(n.as_u64().expect("an unsigned count") + 1),
+                // A Decimal serializes as a string.
+                serde_json::Value::String(s) => {
+                    let d: rust_decimal::Decimal = s.parse().unwrap_or_else(|e| panic!("{key}: {s}: {e}"));
+                    serde_json::json!((d + rust_decimal::Decimal::from(7)).to_string())
+                }
                 other => panic!("{key} is {other:?} — extend this test for a field of a new type"),
             };
             let b = propose(key, to);

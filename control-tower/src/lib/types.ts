@@ -137,6 +137,7 @@ export interface DynamicConfig {
   deploy_max_days_to_close:      number;
   auto_deploy_politics:          boolean;
   squadron_retire_linger_secs?:  number;
+  max_daily_drawdown_usdc?:      string;
   auto_deploy_sports:            boolean;
   event_market_retire_grace_secs: number;
   sports_game_over_after_secs?: number;

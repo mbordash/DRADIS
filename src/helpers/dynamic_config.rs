@@ -117,6 +117,18 @@ pub fn ultra_short_market_enabled() -> bool {
     global_config_tx().map(|tx| tx.borrow().ultra_short_market_enabled).unwrap_or(false)
 }
 
+/// Operator's daily drawdown limit in dollars, when one is set (> 0).
+///
+/// Instance-wide like the switches above: on Kalshi and Polymarket US the day's
+/// P&L the guard measures is account-wide, so a per-squadron limit would let one
+/// squadron's row decide for every other. `None` (unset, or the channel not up
+/// yet) keeps the profile's compiled limit.
+pub fn max_daily_drawdown_override() -> Option<Decimal> {
+    global_config_tx()
+        .map(|tx| tx.borrow().max_daily_drawdown_usdc)
+        .filter(|v| *v > Decimal::ZERO)
+}
+
 /// How long an engine-retired squadron stays listed before the CAG reaps it.
 /// Read outside any tick (the registry reaps when listed), so it comes off the
 /// global watch; the compile-time default applies until the channel is up.
@@ -839,6 +851,12 @@ pub struct DynamicConfig {
     /// the vipers that declare it. Off by default: no selection, no book feed.
     #[serde(default)]
     pub ultra_short_market_enabled:    bool,
+    /// Daily drawdown limit in dollars: every viper's real-money entries stop
+    /// once the day's realized loss (since 00:00 ET) reaches it. 0 keeps the
+    /// built-in profile limit (`config::max_session_drawdown`). Instance-wide:
+    /// read off the global watch by `daily_drawdown_limit`.
+    #[serde(default)]
+    pub max_daily_drawdown_usdc:       Decimal,
     /// Keep a sports squadron running without waiting for an operator deploy.
     #[serde(default = "default_auto_deploy_sports")]
     pub auto_deploy_sports:            bool,
@@ -1691,6 +1709,7 @@ impl Default for DynamicConfig {
             auto_deploy_politics:          config::AUTO_DEPLOY_POLITICS,
             squadron_retire_linger_secs:   config::SQUADRON_RETIRE_LINGER_SECS,
             ultra_short_market_enabled:    false,
+            max_daily_drawdown_usdc:       Decimal::ZERO,
             auto_deploy_sports:            config::AUTO_DEPLOY_SPORTS,
             kalshi_sports_game_series:     config::KALSHI_SPORTS_GAME_SERIES.to_string(),
             event_market_retire_grace_secs: config::EVENT_MARKET_RETIRE_GRACE_SECS,
@@ -2098,6 +2117,10 @@ pub const GLOBAL_SEMANTICS_KEYS: &[&str] = &[
     "helm_enabled",
     "helm_live_enabled",
     "helm_max_open_intents",
+    // [B104] The guard reads the global watch only, so a squadron row (a
+    // squadron PATCH, an approved advisor proposal) setting it would be saved,
+    // shown and ignored.
+    "max_daily_drawdown_usdc",
 ];
 
 /// Force `cfg`'s instance-level fields to agree with `global`.
@@ -2133,6 +2156,11 @@ pub fn reconcile_global_semantics(
     if cfg.helm_max_open_intents != global.helm_max_open_intents {
         cfg.helm_max_open_intents = global.helm_max_open_intents;
         corrected.push("helm_max_open_intents");
+    }
+    // [B104] One daily loss limit per instance, set in Setup.
+    if cfg.max_daily_drawdown_usdc != global.max_daily_drawdown_usdc {
+        cfg.max_daily_drawdown_usdc = global.max_daily_drawdown_usdc;
+        corrected.push("max_daily_drawdown_usdc");
     }
     // [E86] A scripted viper's Live switch and the operator's cap describe the
     // instance, like Helm's: the Build a Viper page sets them on the global row,
@@ -2375,6 +2403,24 @@ fn warn_fee_floor(scope: &str, raised: Option<Decimal>) {
              (0.0695 to 0.095 since 2026-11-06); running at {} (Tier 1). Set your own tier in Setup.",
             config::US_TAKER_FEE_RATE,
         );
+    }
+}
+
+/// [B104] Refuse a negative daily drawdown limit. The guard would ignore it
+/// (only a value above 0 replaces the profile limit) while Setup showed it.
+fn refuse_negative_drawdown_limit(patch: &serde_json::Value) -> Result<()> {
+    let Some(v) = patch.as_object().and_then(|o| o.get("max_daily_drawdown_usdc")) else { return Ok(()) };
+    let limit: Option<Decimal> = match v {
+        serde_json::Value::String(s) => s.parse().ok(),
+        serde_json::Value::Number(n) => n.to_string().parse().ok(),
+        _ => None,
+    };
+    match limit {
+        Some(l) if l < Decimal::ZERO => anyhow::bail!(
+            "refused: max_daily_drawdown_usdc {l} is negative. Set the most the day may lose in dollars, \
+             or 0 to keep the risk profile's built-in limit."
+        ),
+        _ => Ok(()),
     }
 }
 
@@ -2639,6 +2685,7 @@ impl DynamicConfig {
         let patch: serde_json::Value = serde_json::from_str(patch_json)?;
         refuse_ceiling_violations(&patch)?;
         refuse_fee_floor_violations(&patch)?;
+        refuse_negative_drawdown_limit(&patch)?;
 
         // Merge: patch fields overwrite current fields; unknown keys are ignored.
         if let (Some(obj), Some(patch_obj)) = (value.as_object_mut(), patch.as_object()) {
@@ -2843,6 +2890,7 @@ impl DynamicConfig {
         let patch: serde_json::Value = serde_json::from_str(patch_json)?;
         refuse_ceiling_violations(&patch)?;
         refuse_fee_floor_violations(&patch)?;
+        refuse_negative_drawdown_limit(&patch)?;
 
         if let (Some(obj), Some(patch_obj)) = (value.as_object_mut(), patch.as_object()) {
             merge_patch_into(obj, patch_obj);
@@ -3083,6 +3131,23 @@ mod tests {
     }
 
     #[test]
+    fn the_daily_drawdown_limit_is_instance_level_and_never_negative() {
+        assert!(GLOBAL_SEMANTICS_KEYS.contains(&"max_daily_drawdown_usdc"));
+        let mut row = DynamicConfig::default();
+        row.max_daily_drawdown_usdc = rust_decimal_macros::dec!(50);
+        let mut global = DynamicConfig::default();
+        global.max_daily_drawdown_usdc = rust_decimal_macros::dec!(15);
+        assert!(reconcile_global_semantics(&mut row, &global).contains(&"max_daily_drawdown_usdc"));
+        assert_eq!(row.max_daily_drawdown_usdc, rust_decimal_macros::dec!(15));
+        for bad in [serde_json::json!({"max_daily_drawdown_usdc": "-5"}), serde_json::json!({"max_daily_drawdown_usdc": -0.5})] {
+            assert!(refuse_negative_drawdown_limit(&bad).unwrap_err().to_string().contains("negative"), "{bad}");
+        }
+        for ok in [serde_json::json!({"max_daily_drawdown_usdc": "0"}), serde_json::json!({"max_daily_drawdown_usdc": 15}), serde_json::json!({"ghost_mode": true})] {
+            assert!(refuse_negative_drawdown_limit(&ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
     fn a_config_row_predating_the_newest_knobs_still_loads() {
         let mut legacy = serde_json::to_value(DynamicConfig::default()).unwrap();
         let obj = legacy.as_object_mut().unwrap();
@@ -3133,6 +3198,7 @@ mod tests {
             "helm_critique_timeout_secs", "helm_calibration_min_resolved",
             "squadron_retire_linger_secs",
             "ultra_short_market_enabled",
+            "max_daily_drawdown_usdc",
             "bookline_max_open_markets",
             "bookline_resting_tp_edge",
             "bookline_board_lane_enabled",
@@ -3381,6 +3447,11 @@ mod global_semantics_tests {
                 serde_json::Value::Number(n) => {
                     let bumped = n.as_u64().expect("an unsigned count") + 1;
                     value[*key] = serde_json::Value::from(bumped);
+                }
+                // A Decimal serializes as a string: move it to a different amount.
+                serde_json::Value::String(s) => {
+                    let d: Decimal = s.parse().unwrap_or_else(|e| panic!("{key}: {s}: {e}"));
+                    value[*key] = serde_json::Value::String((d + dec!(7)).to_string());
                 }
                 other => panic!(
                     "{key} is {other:?}, which this test cannot flip — extend the test \

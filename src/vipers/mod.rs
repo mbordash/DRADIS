@@ -88,10 +88,26 @@ pub fn gate_log_permitted(strategy: &str, asset: &str, key: &str, interval_secs:
     true
 }
 
+/// The daily drawdown limit in dollars: the operator's Setup value when set,
+/// otherwise the profile's compiled limit.
+///
+/// The compiled limit alone ($3 or 0.75% of collateral on the conservative
+/// profile the AMI ships) could not be changed at all: on 2026-11-11 two Anchor
+/// losses ($4.01) tripped it at 04:02 ET and held the closing sniper, whose
+/// single loss is ~$10 by design, out of the market until midnight.
+pub fn daily_drawdown_limit(starting_collateral: Decimal) -> Decimal {
+    drawdown_limit_with(crate::helpers::dynamic_config::max_daily_drawdown_override(), starting_collateral)
+}
+
+fn drawdown_limit_with(operator: Option<Decimal>, starting_collateral: Decimal) -> Decimal {
+    operator.filter(|v| *v > Decimal::ZERO)
+        .unwrap_or_else(|| config::max_session_drawdown(starting_collateral))
+}
+
 /// Shared risk utility: is `pnl` a loss at or past the drawdown limit?
 /// Strategies call `drawdown_limit_hit(ctx)`, which passes the day's P&L.
 pub fn is_drawdown_limit_hit(pnl: Decimal, starting_collateral: Decimal) -> bool {
-    let max_dd = config::max_session_drawdown(starting_collateral);
+    let max_dd = daily_drawdown_limit(starting_collateral);
     if pnl <= -max_dd {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let last = LAST_DRAWDOWN_REJECT_LOG.load(Ordering::Relaxed);
@@ -154,7 +170,7 @@ pub fn day_pnl(ctx: &crate::orchestrator::strategy::StrategyContext) -> Decimal 
 
 /// The day's loss has reached the limit, without the reject log line.
 pub fn drawdown_breached(ctx: &crate::orchestrator::strategy::StrategyContext) -> bool {
-    day_pnl(ctx) <= -config::max_session_drawdown(ctx.starting_collateral)
+    day_pnl(ctx) <= -daily_drawdown_limit(ctx.starting_collateral)
 }
 
 /// The entry guard every viper checks: the day's loss has reached the limit.
@@ -168,6 +184,16 @@ mod day_drawdown_tests {
     use chrono::NaiveDate;
 
     fn d(n: u32) -> NaiveDate { NaiveDate::from_ymd_opt(2026, 11, n).unwrap() }
+
+    #[test]
+    fn the_operator_limit_replaces_the_profile_limit_and_zero_keeps_it() {
+        let profile = config::max_session_drawdown(dec!(300));
+        assert_eq!(drawdown_limit_with(None, dec!(300)), profile);
+        assert_eq!(drawdown_limit_with(Some(Decimal::ZERO), dec!(300)), profile);
+        assert_eq!(drawdown_limit_with(Some(dec!(25)), dec!(300)), dec!(25));
+        // Lower than the profile is honored too: it is the operator's tolerance.
+        assert_eq!(drawdown_limit_with(Some(dec!(1)), dec!(300)), dec!(1));
+    }
 
     #[test]
     fn a_loss_trips_the_day_and_clears_at_midnight_et() {

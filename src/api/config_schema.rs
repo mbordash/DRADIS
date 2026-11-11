@@ -239,6 +239,18 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
          and each market is priced at the lower of this and the rate the market publishes. Values between 0 \
          and 0.0695 match no tier and are refused; 0 switches off every fee gate on the venue.")
         .range(0.0, 0.5).step(0.0005).venues(VENUE_US));
+    v.push(F::new("Global", None, "max_daily_drawdown_usdc", "Daily Drawdown Limit", "usd", false,
+        "Stop every viper's real-money entries for the rest of the day once the day's realized loss \
+         reaches this many dollars. The day runs from midnight ET and the limit clears then; exits, \
+         settlements and paper vipers are never stopped. It counts every viper together, so a few \
+         small losses in one can stop all the others: set it above the largest single loss any live \
+         viper can take, plus room for an ordinary bad run. On Kalshi and Polymarket US the day's loss \
+         is the whole account's; on Polymarket International each coin (BTC, ETH, SOL) counts its own \
+         loss against the full limit. 0 keeps the risk profile's built-in limit \
+         (conservative, which the AMI ships: $3 or 0.75% of starting collateral, whichever is larger; \
+         balanced: $4 or 1%; aggressive: $15 or 6%). Instance-wide: every squadron reads this value. \
+         Takes effect on the next tick, no restart.")
+        .range(0.0, 1_000_000.0).step(1.0).unit("USDC"));
     v.push(F::new("Global", None, "book_apply_price_changes", "Apply Price Changes", "bool", false,
         "Polymarket International only. Keep the order book current between trades by folding the \
          venue's price_change messages (order placements and cancellations) into the book. Off, the \
@@ -1860,7 +1872,7 @@ mod tests {
     }
 
     /// On Kalshi the Engine card (the Global group less Ghost Mode, which the
-    /// header owns) has nothing left and so is not drawn; on International all
+    /// header owns) holds only the venue-neutral settings; on International all
     /// of its settings stay.
     #[test]
     fn kalshi_shows_no_polymarket_engine_settings() {
@@ -1869,8 +1881,9 @@ mod tests {
                 .filter(|f| f.group == "Global" && f.key != "ghost_mode")
                 .map(|f| f.key).collect()
         };
-        assert!(engine("kalshi").is_empty(), "{:?}", engine("kalshi"));
-        assert_eq!(engine("us_retail"), vec!["us_taker_fee_rate"]);
+        assert_eq!(engine("kalshi"), vec!["max_daily_drawdown_usdc"]);
+        assert_eq!(engine("us_retail"), vec!["us_taker_fee_rate", "max_daily_drawdown_usdc"]);
+        assert!(engine("intl_clob").contains(&"max_daily_drawdown_usdc"));
         assert!(engine("intl_clob").contains(&"collateral_sweep_enabled"));
         assert!(!engine("intl_clob").contains(&"us_taker_fee_rate"));
         // Kalshi's own setting appears there and nowhere else.

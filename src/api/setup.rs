@@ -1944,6 +1944,10 @@ mod tests {
                 // their own 30-day volume since 2026-11-06: an account fact, so
                 // applying a profile never resets it.
                 "us_taker_fee_rate",
+                // The daily drawdown limit is the operator's own loss tolerance
+                // for the account; applying a profile never moves it (0 keeps
+                // the profile's compiled limit anyway).
+                "max_daily_drawdown_usdc",
             ];
             // `autoscale_` [E91]: the capital auto-scaler is the operator's sizing
             // policy across every profile, so applying a profile never arms,

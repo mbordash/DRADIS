@@ -822,7 +822,7 @@ LLM_OUTCOME_HORIZON_SECS=7200    # when applied changes get outcome-scored
 ## ️ Safety Systems
 
 - **Circuit breaker**: Pauses all trading after 3 consecutive execution failures.
-- **Daily drawdown limit**: every viper, Anchor included since 1.6.0, stops opening positions once the day's loss reaches the profile's limit (conservative: the larger of 0.75% of the starting balance and $3). The day is counted from midnight ET and clears at the next midnight; until 1.6.0 it counted from engine start and held until a restart. Exits are never blocked.
+- **Daily drawdown limit**: every viper, Anchor included since 1.6.0, stops opening positions once the day's loss reaches the limit: the Daily Drawdown Limit set in Setup (Engine) since 1.8.2, or when that is 0, the profile's limit (conservative: the larger of 0.75% of the starting balance and $3). The day is counted from midnight ET and clears at the next midnight; until 1.6.0 it counted from engine start and held until a restart. Exits are never blocked.
 - **TOCTOU-safe entry**: Atomic lock scope prevents duplicate orders.
 - **Orphaned pair detection**: Arbiter waits 5s after first-leg confirm before acting on a missing second leg. TimeDecay GTC bids are given the full theta window (up to 30 min) before a resting order is declared orphaned, on every venue since 1.6.0 (Kalshi and Polymarket US canceled the partner after 60 s before).
 - **Capital Auto-Scaler limits**: when enabled, a scaled-up entry is bounded by a per-order dollar cap and the viper's own runtime Max Exposure, and never grows while the drawdown breaker is tripped (see [Capital Auto-Scaler](#capital-auto-scaler)).

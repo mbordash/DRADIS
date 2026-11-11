@@ -104,9 +104,12 @@ pub fn is_money_field(key: &str) -> bool {
 }
 
 /// Mode flips (paper ↔ live) are an operator decision at every tier, and so
-/// is the collateral sweep: it moves the operator's funds on-chain.
+/// is the collateral sweep: it moves the operator's funds on-chain. So is the
+/// daily drawdown limit: it is the guard over every other change the advisor
+/// makes, and the circuit breaker that demotes the advisor cannot be the only
+/// thing standing between it and raising its own ceiling.
 pub fn is_mode_field(key: &str) -> bool {
-    key == "ghost_mode" || key == "collateral_sweep_enabled"
+    key == "ghost_mode" || key == "collateral_sweep_enabled" || key == "max_daily_drawdown_usdc"
 }
 
 /// Per-change policy verdict.
@@ -122,7 +125,7 @@ pub enum Verdict {
 /// `tier` must already account for kill switch / breaker demotion.
 pub fn evaluate_change(tier: i64, c: &ValidatedChange, knobs: &PolicyKnobs) -> Verdict {
     if is_mode_field(&c.key) {
-        return Verdict::Hold("mode flips require human approval at every tier".into());
+        return Verdict::Hold("mode flips and the daily drawdown limit require human approval at every tier".into());
     }
     match tier {
         3 => Verdict::Apply,
