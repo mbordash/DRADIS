@@ -486,6 +486,13 @@ export default function ViperCard({ viper, config, onPatch, market, status, mark
                 ))}
               </div>
             )}
+            {status?.last_buy_refused && (
+              <div className="text-[11px] font-mono leading-snug text-amber-300"
+                   title="A buy the viper decided on, refused by an engine check after the decision">
+                <span>buy refused {fmtAgo(status.last_buy_refused_secs_ago ?? null)}: </span>
+                <span>{status.last_buy_refused}</span>
+              </div>
+            )}
             <div className="text-[11px] font-mono leading-snug" title={status?.last_signal_at ?? undefined}>
               <span className="text-gray-600">last signal: </span>
               <span className="text-gray-500">

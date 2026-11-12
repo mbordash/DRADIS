@@ -340,6 +340,20 @@ function SettingsPanel({ name, manifest, cfg, instanceGhost, paperCount, paperPn
   const manifestCap = Number(manifest.max_exposure_usdc);
   const effectiveCap = cfg.max_exposure_usdc != null && cfg.max_exposure_usdc !== ''
     ? Math.min(Number(cfg.max_exposure_usdc), manifestCap) : manifestCap;
+  // [B107] What the values being typed would cap at, and a warning when a full
+  // order at the script's own price ceiling cannot fit. Only for scripts that
+  // name their size `contracts` or `shares` and their ceiling `max_ask` or
+  // `max_price` (the templates do); the engine's refusal covers the rest.
+  const typedCap = cap !== '' && Number(cap) > 0 ? Math.min(Number(cap), manifestCap) : manifestCap;
+  const sizeKey = ['contracts', 'shares'].find((k) => manifest.params?.[k]);
+  const ceilKey = ['max_ask', 'max_price'].find((k) => manifest.params?.[k]);
+  const fullOrder = sizeKey && ceilKey ? Number(values[sizeKey]) * Number(values[ceilKey]) : NaN;
+  const sizeWarning = Number.isFinite(fullOrder) && fullOrder >= typedCap
+    ? `${values[sizeKey!]} ${sizeKey} at ${ceilKey} ${values[ceilKey!]} is $${fullOrder.toFixed(2)} before fees, at or over the cap in force ($${typedCap}); fees come on top. Such a buy will be refused. Raise ${cap !== '' && Number(cap) < manifestCap ? 'your cap' : "Max exposure in the editor above (the script's own cap)"}, or lower ${sizeKey}.`
+    : null;
+  const capNote = cfg.max_exposure_usdc != null && cfg.max_exposure_usdc !== '' && Number(cfg.max_exposure_usdc) > manifestCap
+    ? `Your saved cap $${num(cfg.max_exposure_usdc)} is above the script's own cap $${manifestCap}, so $${manifestCap} applies.`
+    : null;
 
   const patch = async (entry: CustomViperConfig, done: string) => {
     setBusy(true); setError(null);
@@ -390,6 +404,7 @@ function SettingsPanel({ name, manifest, cfg, instanceGhost, paperCount, paperPn
         : `${manifest.display_name} is live: it sends real orders from the next tick.`);
   };
 
+  const capChanged = cap !== num(cfg.max_exposure_usdc);
   const saveValues = async () => {
     // Checked here because the engine quietly falls back to the default for a
     // value it cannot use, and the operator would never know.
@@ -407,12 +422,19 @@ function SettingsPanel({ name, manifest, cfg, instanceGhost, paperCount, paperPn
       params[k] = n;
     }
     if (cap !== '' && (!Number.isFinite(Number(cap)) || Number(cap) <= 0)) bad.push(`your cap '${cap}' must be a number above 0, or blank`);
+    // [B107] The engine enforces the lower cap, so one above the manifest's
+    // does nothing; it refuses the save, and this says why before it does.
+    // Only a cap the operator changed is checked and sent: a stored cap left
+    // above a manifest that was lowered later must not block saving a param.
+    else if (capChanged && cap !== '' && Number(cap) > manifestCap) bad.push(`your cap $${cap} is above the script's own cap $${manifestCap}, and the lower of the two applies. Raise Max exposure in the editor above first, or set $${manifestCap} or less`);
     if (bad.length) {
       setError(bad.join('\n'));
       toast.error(`Not saved: ${bad.length} value${bad.length === 1 ? '' : 's'} out of range. See the list at the top of Settings.`);
       return;
     }
-    await patch({ params, max_exposure_usdc: cap === '' ? null : cap }, `Saved ${manifest.display_name}'s values. They apply from the next tick.`);
+    const entry: CustomViperConfig = { params };
+    if (capChanged) entry.max_exposure_usdc = cap === '' ? null : cap;
+    await patch(entry, `Saved ${manifest.display_name}'s values. They apply from the next tick.`);
   };
 
   return (
@@ -452,9 +474,15 @@ function SettingsPanel({ name, manifest, cfg, instanceGhost, paperCount, paperPn
           <div>
             <label className={labelCls}>Your cap (USD; blank: the manifest&apos;s ${num(manifest.max_exposure_usdc)})</label>
             <input className={inputCls} value={cap} onChange={(e) => setCap(e.target.value)} placeholder={num(manifest.max_exposure_usdc)} />
-            <p className="text-[10px] font-mono text-gray-600 mt-1">The lower of the two applies.</p>
+            <p className="text-[10px] font-mono text-gray-600 mt-1">The lower of the two applies: now ${typedCap}.</p>
           </div>
         </div>
+        {(capNote || sizeWarning) && (
+          <div className="rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] font-mono text-amber-200 space-y-1">
+            {capNote && <p>{capNote}</p>}
+            {sizeWarning && <p>{sizeWarning}</p>}
+          </div>
+        )}
         {Object.keys(manifest.params ?? {}).length > 0 && (
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             {Object.entries(manifest.params).map(([k, p]) => (

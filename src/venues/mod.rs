@@ -382,6 +382,17 @@ pub fn sports_catalog() -> std::sync::Arc<dyn crate::raptors::sports_ledger::Spo
     ))
 }
 
+/// [B106] Whether a taker order may be priced at a tenth of a cent near the
+/// extremes (above $0.90, below $0.10). Kalshi's crypto markets quote a
+/// `tapered_deci_cent` ladder there and its order path sends four decimals.
+/// Polymarket International's order path rounds every price to a whole cent
+/// (`intl/orders.rs`), and Polymarket US is treated as cents until a market
+/// record says otherwise, so a 0.995 limit would go out as $1.00 or $0.99.
+#[cfg(feature = "kalshi")]
+pub const SUB_CENT_TAKER_PRICES: bool = true;
+#[cfg(not(feature = "kalshi"))]
+pub const SUB_CENT_TAKER_PRICES: bool = false;
+
 /// The price grid the venue's sports game markets quote on.
 ///
 /// Distinct from `helpers::price`'s hard-coded cent grid, which is the crypto

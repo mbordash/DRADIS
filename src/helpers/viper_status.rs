@@ -100,6 +100,14 @@ struct ViperStatus {
     /// the moment: GBoost reports which model is serving and what its training
     /// pipeline is doing. Survives signals; only the viper replaces it.
     detail: Option<String>,
+    /// [B107] The last time a buy the viper had decided on was refused by a
+    /// check after its decision (exposure cap, collateral, order sanity), with
+    /// the reason. Pinned apart from the ledger: such a refusal fires only on
+    /// the few ticks a buy is ready, so it never ranks among the top kinds, and
+    /// the decision itself never reaches `last_signal_at`. On 2026-11-11 an
+    /// exposure cap refused every closing-sniper buy for 15 hours while the
+    /// card showed only "held for 119s of 120s".
+    last_buy_refused: Option<(DateTime<Utc>, String)>,
     /// Refusal ledger: how many ticks each named gate has vetoed this viper,
     /// keyed by the reason with its live numbers normalized out.
     ///
@@ -125,6 +133,7 @@ impl ViperStatus {
             last_reason_at: None,
             last_signal_at: None,
             detail: None,
+            last_buy_refused: None,
             refusals: HashMap::new(),
             refusal_window_started_at: now,
         }
@@ -245,9 +254,11 @@ pub fn record_eval(asset: &str, strategy: &str, outcome: EvalOutcome) {
     entry.last_outcome = outcome;
     if outcome == EvalOutcome::Signal {
         entry.last_signal_at = Some(now);
-        // A fresh signal supersedes any stale veto reason.
+        // A fresh signal supersedes any stale veto reason, and a buy that went
+        // through resolves an earlier refused one.
         entry.last_reason = None;
         entry.last_reason_at = None;
+        entry.last_buy_refused = None;
     }
 }
 
@@ -297,6 +308,20 @@ pub fn report_reason(asset: &str, strategy: &str, reason: &str) {
     entry.last_reason = Some(reason.to_string());
     entry.last_reason_at = Some(now);
     entry.bump_refusal(reason);
+}
+
+/// [B107] Report that a buy the viper decided on was refused by a check after
+/// the decision. Counts like [`report_reason`], and is also pinned on the row
+/// (`last_buy_refused`) so it stays visible whatever the ledger's ranking.
+pub fn report_buy_refused(asset: &str, strategy: &str, reason: &str) {
+    report_reason(asset, strategy, reason);
+    let mut map = match registry().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(entry) = map.get_mut(&key(asset, strategy)) {
+        entry.last_buy_refused = Some((Utc::now(), reason.to_string()));
+    }
 }
 
 /// Set (or clear) the viper's standing detail line. See `ViperStatus::detail`.
@@ -361,6 +386,10 @@ pub struct ViperStatusView {
     pub last_signal_secs_ago: Option<i64>,
     /// The viper's standing context line, when it keeps one (see `report_detail`).
     pub detail: Option<String>,
+    /// [B107] The last buy the viper decided on that a later check refused,
+    /// whatever its rank in the ledger.
+    pub last_buy_refused: Option<String>,
+    pub last_buy_refused_secs_ago: Option<i64>,
     /// The refusal ledger, most frequent first, capped at
     /// `VIEW_REFUSAL_KINDS` entries.
     pub refusals: Vec<RefusalTally>,
@@ -473,6 +502,8 @@ pub fn snapshot(asset_filter: Option<&str>) -> Vec<ViperStatusView> {
         last_signal_at: st.last_signal_at.map(|t| t.to_rfc3339()),
         last_signal_secs_ago: st.last_signal_at.map(|t| (now - t).num_seconds()),
         detail: st.detail.clone(),
+        last_buy_refused: st.last_buy_refused.as_ref().map(|(_, r)| r.clone()),
+        last_buy_refused_secs_ago: st.last_buy_refused.as_ref().map(|(t, _)| (now - *t).num_seconds()),
         refusals: tallies(st, false, VIEW_REFUSAL_KINDS),
     }).collect();
     rows.sort_by(|a, b| (a.asset.as_str(), a.strategy.as_str()).cmp(&(b.asset.as_str(), b.strategy.as_str())));
@@ -498,6 +529,23 @@ mod tests {
         let eth = snapshot(Some("eth"));
         let eth_row = eth.iter().find(|r| r.strategy == "TestStrategyA").unwrap();
         assert_eq!(eth_row.last_outcome, EvalOutcome::Signal);
+    }
+
+    #[test]
+    fn a_refused_buy_stays_pinned_whatever_its_rank() {
+        for _ in 0..50 {
+            for r in ["a", "b", "c", "d", "e", "f"] { report_reason("btc", "TestStrategyPin", &format!("gate {r}")); }
+        }
+        report_buy_refused("btc", "TestStrategyPin", "exposure cap: $0.00 open + $10.78 for this order is over $10.00");
+        report_reason("btc", "TestStrategyPin", "gate a");
+        let row = snapshot(Some("btc")).into_iter().find(|r| r.strategy == "TestStrategyPin").unwrap();
+        assert!(row.refusals.iter().all(|t| !t.reason.starts_with("exposure cap")), "outranked in the ledger");
+        assert_eq!(row.last_buy_refused.as_deref(), Some("exposure cap: $0.00 open + $10.78 for this order is over $10.00"));
+        assert!(row.last_buy_refused_secs_ago.is_some_and(|s| s >= 0));
+        assert_eq!(row.last_reason.as_deref(), Some("gate a"));
+        record_eval("btc", "TestStrategyPin", EvalOutcome::Signal);
+        let row = snapshot(Some("btc")).into_iter().find(|r| r.strategy == "TestStrategyPin").unwrap();
+        assert!(row.last_buy_refused.is_none(), "a buy that went through clears the pin");
     }
 
     #[test]

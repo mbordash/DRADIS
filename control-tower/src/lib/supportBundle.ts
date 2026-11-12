@@ -74,11 +74,12 @@ function renderVipers(rows: ViperStatusRow[]): string {
     const reason = r.last_reason ? `\n    holding: ${r.last_reason} (${fmtAgo(r.last_reason_secs_ago)})` : '';
     const signal = r.last_signal_at ? `\n    last signal: ${r.last_signal_at} (${fmtAgo(r.last_signal_secs_ago)})` : '';
     const detail = r.detail ? `\n    detail: ${r.detail}` : '';
+    const buyRefused = r.last_buy_refused ? `\n    buy refused: ${r.last_buy_refused} (${fmtAgo(r.last_buy_refused_secs_ago ?? null)})` : '';
     const refusals = r.refusals.length
       ? '\n    refused: ' + r.refusals.map(t => `${t.count}x ${t.reason}`).join('; ')
         + '\n    latest:  ' + r.refusals.map(t => t.last_detail).filter(Boolean).join(' | ')
       : '';
-    return head + reason + signal + detail + refusals;
+    return head + reason + signal + buyRefused + detail + refusals;
   }).join('\n');
 }
 

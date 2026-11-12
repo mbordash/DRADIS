@@ -50,9 +50,14 @@ export default function ScriptViperCard({ row, config, onPatch }: {
         <span className={`text-[9px] font-mono uppercase border rounded px-1 ${modeCls}`}>{mode}</span>
       </div>
       {row.detail && <div className="text-[11px] font-mono text-gray-300">{row.detail}</div>}
-      {row.last_reason && (
+      {row.last_reason && row.last_reason !== row.last_buy_refused && (
         <div className={`text-[11px] font-mono ${bad || row.last_reason.startsWith('script error') ? 'text-red-300' : 'text-gray-400'}`}>
           {row.last_reason}
+        </div>
+      )}
+      {row.last_buy_refused && (
+        <div className="text-[11px] font-mono text-amber-300" title="A buy the script decided on, refused by an engine check after the decision">
+          buy refused {fmtAgo(row.last_buy_refused_secs_ago ?? null)}: {row.last_buy_refused}
         </div>
       )}
       <div className="flex items-center justify-between pt-1">

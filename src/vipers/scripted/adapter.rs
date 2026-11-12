@@ -130,9 +130,22 @@ pub fn check_buy(
     // 0.97 is below the NO ask 0.9720"): its limit is the ask rounded up to
     // the next tick, still inside `MAX_SLIPPAGE`, and the venue fills at the
     // price offered.
-    if price_r < ask && price >= ask {
+    // A price from 0.995 to just under $1 rounds to $1 on the cent grid; it is
+    // a buy at the ask like any other, so it takes the same path. A price of
+    // $1 or more is refused below.
+    if price >= ask && price < Decimal::ONE && (price_r < ask || price_r >= Decimal::ONE) {
         let tick = rust_decimal_macros::dec!(0.01);
         price_r = (ask / tick).ceil() * tick;
+        // [B106] Above $0.99 the next whole cent is $1, which no venue takes.
+        // Where the order path prices at a tenth of a cent near the extremes
+        // (Kalshi's tapered deci-cent ladder), the limit is the script's price
+        // at a tenth of a cent, never below the ask it buys at. Elsewhere the
+        // refusal below stands: the order would go out at a whole cent.
+        if price_r >= Decimal::ONE && crate::venues::SUB_CENT_TAKER_PRICES {
+            let milli = rust_decimal_macros::dec!(0.001);
+            price_r = (price.min(Decimal::ONE - milli) / milli).floor() * milli;
+            price_r = price_r.max(ask);
+        }
     }
     if price_r <= Decimal::ZERO || price_r >= Decimal::ONE {
         return Err(format!("buy price {price} is not inside (0, 1)"));
@@ -289,11 +302,30 @@ async fn db_exposure(strategy: &str) -> Decimal {
 
 /// One warning per script per minute, so a broken script does not flood the log.
 fn warn_throttled(script: &str, msg: &str) {
+    if throttle_ok(script, 60) { warn!("📜 Script viper '{script}': {msg}"); }
+}
+
+/// Whether a throttled warning under `key` may print now (at most once per
+/// `secs`).
+fn throttle_ok(key: &str, secs: u64) -> bool {
     static LAST: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> = std::sync::OnceLock::new();
     let mut m = LAST.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
-    if m.get(script).is_none_or(|t| t.elapsed().as_secs() >= 60) {
-        m.insert(script.to_string(), std::time::Instant::now());
-        warn!("📜 Script viper '{script}': {msg}");
+    if m.get(key).is_none_or(|t| t.elapsed().as_secs() >= secs) {
+        m.insert(key.to_string(), std::time::Instant::now());
+        true
+    } else {
+        false
+    }
+}
+
+/// [B107] For an exposure-cap refusal, which cap is in force and where to
+/// raise it: the lower of the manifest's and the operator's applies.
+fn cap_hint(reason: &str, live: &Live) -> String {
+    if !reason.starts_with("exposure cap") { return String::new(); }
+    let manifest = live.script.manifest.max_exposure_usdc;
+    match live.cfg.max_exposure_usdc {
+        Some(own) if own < manifest => format!(" (cap in force: your ${own}, below the manifest's ${manifest}; raise it in the viper's settings)"),
+        _ => format!(" (cap in force: the manifest's ${manifest}; raise Max exposure in Build a Viper)"),
     }
 }
 
@@ -499,7 +531,22 @@ impl ScriptedStrategy {
         );
         let b = match checked {
             Ok(b) => b,
-            Err(r) => { self.reason(ctx, &r); return StrategySignal::NoSignal; }
+            // Already holding this market is the one-position rule doing its
+            // job (a script that buys and holds asks again every tick), not a
+            // buy lost.
+            Err(r) if r.starts_with("already holds") => { self.reason(ctx, &r); return StrategySignal::NoSignal; }
+            Err(r) => {
+                // [B107] The script decided to buy and a check refused it. That
+                // is pinned on the card and logged, because it fires only on
+                // the few ticks a buy is ready and would otherwise sit under
+                // the ledger's top kinds while `last_signal_at` stays empty.
+                viper_status::report_buy_refused(&ctx.crypto_filter, &self.name, &r);
+                if throttle_ok(&format!("{}#buy-refused", self.script), 300) {
+                    warn!("📜 [{}] {} buy refused on {}: {r}{}", self.name, side.as_str().to_uppercase(),
+                          ctx.market.market_name, cap_hint(&r, &live));
+                }
+                return StrategySignal::NoSignal;
+            }
         };
         let why = why.unwrap_or_else(|| "script entry".into());
         let label = side.as_str().to_uppercase();
@@ -1075,6 +1122,27 @@ mod tests {
             "a price under the ask is still refused");
         assert_eq!(check_sell(dec!(0.975), dec!(0.975)), Ok(dec!(0.97)));
         assert_eq!(check_sell(dec!(0.42), dec!(0.42)), Ok(dec!(0.42)));
+    }
+
+    /// [B106] An ask of 0.991-0.999 used to round up to $1 and be refused as
+    /// "not inside (0, 1)". Where the venue's order path prices at a tenth of
+    /// a cent (Kalshi), the limit is the script's price at that precision;
+    /// elsewhere the refusal stands, because the order would go out at a cent.
+    #[test]
+    fn an_ask_above_99_cents_buys_only_where_tenths_of_a_cent_are_priced() {
+        let buy = |price, ask| check_buy(Side::Yes, price, dec!(11), None, ask, dec!(100), false,
+            dec!(0), dec!(20), None, Some(dec!(100)), true, dec!(1));
+        if crate::venues::SUB_CENT_TAKER_PRICES {
+            assert_eq!(buy(dec!(0.995), dec!(0.995)).unwrap().price, dec!(0.995));
+            assert_eq!(buy(dec!(0.9987), dec!(0.991)).unwrap().price, dec!(0.998), "the script's price, floored to a tenth of a cent");
+            assert_eq!(buy(dec!(0.9999), dec!(0.999)).unwrap().price, dec!(0.999), "never $1");
+            assert!(buy(dec!(1), dec!(0.999)).unwrap_err().contains("not inside (0, 1)"), "a script asking $1 is still refused");
+            assert!(buy(dec!(0.99), dec!(0.991)).unwrap_err().contains("below the YES ask"), "a price under the ask is still refused");
+            assert_eq!(buy(dec!(0.972), dec!(0.972)).unwrap().price, dec!(0.98), "below 0.99 the cent rule is unchanged");
+        } else {
+            assert!(buy(dec!(0.995), dec!(0.995)).unwrap_err().contains("not inside (0, 1)"));
+            assert_eq!(buy(dec!(0.995), dec!(0.99)).unwrap().price, dec!(0.99), "0.995 against a 0.99 ask buys at the ask's cent");
+        }
     }
 
     #[test]

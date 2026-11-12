@@ -512,7 +512,8 @@ pub struct CustomViperConfig {
     #[serde(default)]
     pub live: bool,
     /// The operator's cap, if lower than the manifest's. The adapter enforces
-    /// the smaller of the two.
+    /// the smaller of the two; a patch setting it above the manifest's is
+    /// refused (B107).
     #[serde(default)]
     pub max_exposure_usdc: Option<Decimal>,
     /// Parameter overrides, checked against the manifest each time they are read.
@@ -2424,6 +2425,40 @@ fn refuse_negative_drawdown_limit(patch: &serde_json::Value) -> Result<()> {
     }
 }
 
+/// [B107] Refuse a patch that gives a scripted viper an exposure cap above its
+/// manifest's. The adapter enforces the smaller of the two, so such a cap was
+/// accepted and silently did nothing: on 2026-11-11 a squadron cap of $11
+/// over a manifest cap of $10 refused every 11-contract buy for 15 hours. Only
+/// the caps the patch names are checked, against the manifest as loaded now; a
+/// script that is not loaded (removed, or a test) passes.
+fn refuse_cap_above_manifest(patch: &serde_json::Value) -> Result<()> {
+    let manifest_cap = |name: &str| crate::vipers::scripted::store::get(name).map(|s| s.manifest.max_exposure_usdc);
+    refuse_cap_above(patch, manifest_cap)
+}
+
+fn refuse_cap_above(patch: &serde_json::Value, manifest_cap: impl Fn(&str) -> Option<Decimal>) -> Result<()> {
+    let Some(vipers) = patch.as_object().and_then(|o| o.get("custom_vipers")).and_then(|v| v.as_object()) else {
+        return Ok(());
+    };
+    for (name, entry) in vipers {
+        let cap: Option<Decimal> = match entry.get("max_exposure_usdc") {
+            Some(serde_json::Value::String(s)) => s.trim().parse().ok(),
+            Some(serde_json::Value::Number(n)) => n.to_string().parse().ok(),
+            _ => None,
+        };
+        if let (Some(cap), Some(ceiling)) = (cap, manifest_cap(name)) {
+            if cap > ceiling {
+                anyhow::bail!(
+                    "refused: {name}'s cap ${cap} is above the script's own cap ${ceiling}, and the lower of \
+                     the two applies. Raise Max exposure in the script's manifest (Build a Viper) to at least \
+                     ${cap} first, or set a cap of ${ceiling} or less here."
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Refuse a patch that sets `us_taker_fee_rate` below the cheapest tier
 /// (other than zero), which the next load would raise again.
 fn refuse_fee_floor_violations(patch: &serde_json::Value) -> Result<()> {
@@ -2686,6 +2721,7 @@ impl DynamicConfig {
         refuse_ceiling_violations(&patch)?;
         refuse_fee_floor_violations(&patch)?;
         refuse_negative_drawdown_limit(&patch)?;
+        refuse_cap_above_manifest(&patch)?;
 
         // Merge: patch fields overwrite current fields; unknown keys are ignored.
         if let (Some(obj), Some(patch_obj)) = (value.as_object_mut(), patch.as_object()) {
@@ -2903,6 +2939,7 @@ impl DynamicConfig {
         refuse_ceiling_violations(&patch)?;
         refuse_fee_floor_violations(&patch)?;
         refuse_negative_drawdown_limit(&patch)?;
+        refuse_cap_above_manifest(&patch)?;
 
         if let (Some(obj), Some(patch_obj)) = (value.as_object_mut(), patch.as_object()) {
             merge_patch_into(obj, patch_obj);
@@ -3156,6 +3193,25 @@ mod tests {
         }
         for ok in [serde_json::json!({"max_daily_drawdown_usdc": "0"}), serde_json::json!({"max_daily_drawdown_usdc": 15}), serde_json::json!({"ghost_mode": true})] {
             assert!(refuse_negative_drawdown_limit(&ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn a_script_cap_above_its_manifest_is_refused() {
+        let ceiling = |name: &str| (name == "sniper").then(|| rust_decimal_macros::dec!(10));
+        let over = serde_json::json!({"custom_vipers": {"sniper": {"max_exposure_usdc": "11"}}});
+        let msg = refuse_cap_above(&over, ceiling).unwrap_err().to_string();
+        assert!(msg.contains("$11") && msg.contains("$10") && msg.contains("Build a Viper"), "{msg}");
+        assert!(refuse_cap_above(&serde_json::json!({"custom_vipers": {"sniper": {"max_exposure_usdc": 10.5}}}), ceiling).is_err());
+        for ok in [
+            serde_json::json!({"custom_vipers": {"sniper": {"max_exposure_usdc": "10"}}}),
+            serde_json::json!({"custom_vipers": {"sniper": {"max_exposure_usdc": null}}}),
+            serde_json::json!({"custom_vipers": {"sniper": {"live": true, "params": {"contracts": 11}}}}),
+            serde_json::json!({"custom_vipers": {"sniper": null}}),
+            serde_json::json!({"custom_vipers": {"not_loaded": {"max_exposure_usdc": "500"}}}),
+            serde_json::json!({"ghost_mode": true}),
+        ] {
+            assert!(refuse_cap_above(&ok, ceiling).is_ok(), "{ok}");
         }
     }
 

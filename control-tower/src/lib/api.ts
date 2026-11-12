@@ -178,6 +178,11 @@ export interface ViperStatusRow {
    *  what its in-engine training pipeline is doing (backfill progress, training,
    *  the last cycle's decision). Null for vipers that keep none. */
   detail: string | null;
+  /** [B107] The last buy the viper decided on that a later engine check
+   *  refused (exposure cap, collateral, order sanity), pinned whatever its
+   *  rank in the ledger. Absent on engines before 1.8.2. */
+  last_buy_refused?: string | null;
+  last_buy_refused_secs_ago?: number | null;
   /** Refusal ledger: how many ticks each named gate vetoed this viper since
    *  startup, most frequent first (top 5). `reason` has live numbers folded
    *  to `#`; `last_detail` is the latest verbatim line. This is the same
