@@ -1070,7 +1070,13 @@ pub struct FoldStats {
 pub fn rule_stats(rows: &[&TrainingRow], p: &[f64], plan: &Plan) -> RuleStats {
     let mut order: Vec<usize> = (0..rows.len()).filter(|&i| {
         let r = rows[i];
+        // [B108] The live rule never enters a side whose ask is below the scored
+        // mid, so neither does the rule the gate measures. An approximation of
+        // live: a recorded Kalshi/US row's ask is the next sample plus half a cent,
+        // so this trips on a drop over half a cent where live trips on one over
+        // the real half-spread, the conservative side.
         p[i] >= plan.break_even(r.ask) + plan.margin
+            && !crate::vipers::gboost_planb::ask_below_scored_mid(r.ask, r.features[MID_COLUMN])
     }).collect();
     order.sort_by_key(|&i| (rows[i].w + 60 * rows[i].k, rows[i].w, rows[i].side));
     let mut seen: HashSet<(i64, usize)> = HashSet::new();
@@ -3636,6 +3642,24 @@ mod tests {
         assert!((s.mean_ret - 0.1).abs() < 1e-12, "minute 5's return and side 1's, not minute 10's: {}", s.mean_ret);
         assert!((s.win - 0.5).abs() < 1e-12);
         assert!(s.ci_lo <= s.mean_ret && s.mean_ret <= s.ci_hi);
+    }
+
+    /// [B108] The gate's rule skips a row whose ask is below its scored mid, as
+    /// the live rule does, and takes the next qualifying minute instead.
+    #[test]
+    fn the_rule_skips_a_minute_whose_ask_is_below_its_mid() {
+        let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.43, hi: 0.75, fee: 0.07, margin: 0.10, first_minute: 5, last_minute: 45, hold: false };
+        let mk = |k, mid: f64, ret| {
+            let mut features = [0.0; N_FEATURES];
+            features[MID_COLUMN] = mid;
+            TrainingRow { w: 0, k, side: 0, ask: 0.5, features, y: ret > 0.0, ret, exit: ExitKind::Tp, exit_t: 0, elig: true }
+        };
+        let rows = vec![mk(5, 0.58, -0.4), mk(6, 0.49, 0.2)];
+        let refs: Vec<&TrainingRow> = rows.iter().collect();
+        let need = break_even(0.5, 0.2, 0.11, 0.07, 0.90) + 0.10;
+        let s = rule_stats(&refs, &[need + 0.01, need + 0.01], &plan);
+        assert_eq!(s.trades, 1);
+        assert!((s.mean_ret - 0.2).abs() < 1e-12, "minute 6, not the stale-mid minute 5: {}", s.mean_ret);
     }
 
     /// A labeled trade is bought at the first price the market showed at or after the

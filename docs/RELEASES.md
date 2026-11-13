@@ -4,6 +4,10 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
+## 1.8.3 (unreleased)
+
+- GBoost: no longer enters on a stale price. It compared the market's price from the last minute's sample, up to 3 minutes old, with the live ask, so whenever the price had just fallen the old price looked like an edge and it bought the side that had just gotten cheaper. A side whose ask is below the price it was scored against is now refused for that minute (the card says "ask below the minute's market price"), the nightly trainer's check uses the same rule, and simulated trades taken before this fix no longer count toward a model's shadow record. Expect GBoost to enter rarely until a model shows real skill over the market price.
+
 ## 1.8.2 (2026-11-11)
 
 - Daily drawdown limit: you can now set it. Setup, Engine, Daily Drawdown Limit sets the most the day may lose, in dollars, before every viper stops opening real-money positions until midnight ET. It was fixed by the risk profile ($3 or 0.75% of starting collateral on the conservative profile the AMI ships), and because it counts every viper together, two small losses in one viper could stop all the others for the rest of the day. 0, the default, keeps the profile's limit, so nothing changes until you set it. It takes effect without a restart, applying a risk profile never changes it, and the LLM advisor can never change it at any autonomy level. On Kalshi and Polymarket US the day's loss is the whole account's; on Polymarket International each coin counts its own.

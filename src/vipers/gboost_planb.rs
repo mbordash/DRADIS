@@ -470,7 +470,7 @@ pub fn live_stake(rec: &ShadowStats, full: Decimal, probation: Decimal) -> (Deci
 /// The closed shadow rows the CONFIGURED entry rule would have taken, as
 /// `(window_start, ret)` for `shadow_stats`.
 ///
-/// A row is `(window_start, ret, entry ask, calibrated p)`. The record is
+/// A row is `(window_start, ret, entry ask, calibrated p, scored mid)`. The record is
 /// evidence about the rule that would trade, so it is re-scored against that
 /// rule on every read rather than against the rule that opened the row: when
 /// the rule changes (the 2026-09-29 `break_even` correction, or an operator
@@ -478,10 +478,20 @@ pub fn live_stake(rec: &ShadowStats, full: Decimal, probation: Decimal) -> (Deci
 /// counting, and rows it would still take keep counting, because the model and
 /// the outcome are unchanged and only the selection differed. Nothing is
 /// deleted, and no row is added: a row the old rule refused was never opened.
-pub fn rows_under_rule(rows: &[(i64, f64, f64, f64)], plan: &crate::vipers::gboost_planb_train::Plan) -> Vec<(i64, f64)> {
+/// [B108] A row whose ask was below its scored mid is refused like any other;
+/// a row with no stored mid (written before [B108]) is refused too, since the
+/// rule that took it could not tell, and with the production shrink nearly all
+/// of them were taken on that gap.
+pub fn rows_under_rule(rows: &[crate::helpers::db::ShadowReturnRow], plan: &crate::vipers::gboost_planb_train::Plan) -> Vec<(i64, f64)> {
     rows.iter()
-        .filter(|(_, _, ask, p)| decide_side(*ask, *p, plan.fee, plan.tp, plan.sl, plan.tp_ceiling, plan.margin, plan.lo, plan.hi, plan.hold).qualifies)
-        .map(|(w, ret, _, _)| (*w, *ret))
+        .filter(|(_, _, ask, p, mid)| {
+            let Some(mid) = mid else { return false };
+            refuse_stale_mid(
+                decide_side(*ask, *p, plan.fee, plan.tp, plan.sl, plan.tp_ceiling, plan.margin, plan.lo, plan.hi, plan.hold),
+                *ask, *mid,
+            ).qualifies
+        })
+        .map(|(w, ret, _, _, _)| (*w, *ret))
         .collect()
 }
 
@@ -751,6 +761,40 @@ pub fn decide_side(ask: f64, p: f64, fee_rate: f64, tp: f64, sl: f64, ceiling: f
         SideDecision { qualifies: true, break_even: be, required, reason: "clears break-even plus margin" }
     } else {
         SideDecision { qualifies: false, break_even: be, required, reason: "below break-even plus margin" }
+    }
+}
+
+/// [B108] Whether a side's ask sits below the market mid its features were built
+/// from. A real book's ask is never below its own mid, so this means the mid is
+/// older than the ask: the market fell between the minute's price sample and the
+/// ask. Live, the mid is a history sample up to `MID_STALE_SECS` before the
+/// minute (on Kalshi and Polymarket US the instance's own `(bid + ask) / 2`
+/// samples) and the ask is the book now; in the training rows the ask is a
+/// taker print up to `ENTRY_PRINT_SECS` after the minute or the next sample (up
+/// to `ENTRY_LATEST_SECS`) plus half a spread. If Polymarket International's
+/// price history is a last-trade price rather than a book mid, a consistent
+/// wide book could also show an ask below it; the guard then refuses, which is
+/// the conservative side. Under `ResidualMid` the probability IS that mid
+/// plus a small deviation, so the gap reads as edge: on production 2026-10-15 to
+/// 11-13 the shadow lane's 206 entries claimed ~9 points over the ask on average
+/// and realized below it (−18% a trade), buying whichever side had just dropped.
+/// Such a side is not scored for entry, live or in the trainer's rule.
+pub fn ask_below_scored_mid(ask: f64, mid: f64) -> bool {
+    // The epsilon keeps an ask equal to the mid (a locked book, or a training
+    // sample exactly half a spread below) kept whatever the float rounding.
+    mid.is_finite() && ask < mid - 1e-9
+}
+
+/// The refusal reason [`refuse_stale_mid`] gives; also the card's idle reason
+/// when it is why no side qualified.
+pub const STALE_MID_REASON: &str = "ask below the minute's market price: the market moved since, not an edge";
+
+/// `decision` refused when the ask is below the scored mid ([`ask_below_scored_mid`]).
+pub fn refuse_stale_mid(decision: SideDecision, ask: f64, mid: f64) -> SideDecision {
+    if decision.qualifies && ask_below_scored_mid(ask, mid) {
+        SideDecision { qualifies: false, reason: STALE_MID_REASON, ..decision }
+    } else {
+        decision
     }
 }
 
@@ -2191,12 +2235,12 @@ impl Strategy for GboostPlanBStrategy {
         };
         let preds = model.predict(&features);
         let decisions: Vec<SideDecision> = (0..2)
-            .map(|side| decide_side(
+            .map(|side| refuse_stale_mid(decide_side(
                 ask[side], preds[side].1, f(crate::venues::taker_fee_rate()), f(dc.gboost_planb_take_profit_pct),
                 f(dc.gboost_planb_stop_loss_pct), f(dc.gboost_planb_tp_ceiling), f(dc.gboost_planb_margin),
                 f(dc.gboost_planb_min_ask), f(dc.gboost_planb_max_ask),
                 ExitPosture::from_i64(dc.gboost_planb_exit_posture) == ExitPosture::Settlement,
-            ))
+            ), ask[side], features[side][MID_COLUMN]))
             .collect();
         let label = ["YES", "NO"];
         info!(
@@ -2214,7 +2258,11 @@ impl Strategy for GboostPlanBStrategy {
                 .max_by(|&a, &b| (preds[a].1 - decisions[a].required).total_cmp(&(preds[b].1 - decisions[b].required)))
         };
         let Some(side) = best else {
-            idle("no side clears break-even plus margin");
+            idle(if decisions.iter().any(|d| d.reason == STALE_MID_REASON) {
+                STALE_MID_REASON
+            } else {
+                "no side clears break-even plus margin"
+            });
             return Ok(StrategySignal::NoSignal);
         };
 
@@ -2325,6 +2373,7 @@ impl Strategy for GboostPlanBStrategy {
                 &pool, &asset, &model.version, &cid, token_id.as_str(),
                 &market.market_name, label[side], w, ask[side], f(shares),
                 tp_price, stop_price, entry_fee, preds[side].1, decisions[side].break_even,
+                features[side][MID_COLUMN],
             ).await;
             if opened {
                 // Marked attempted exactly as a confirmed live fill is, so the
@@ -2870,6 +2919,36 @@ mod tests {
         assert_eq!(calibrate(1.0, 1.0, 0.0), 1.0 - 1e-4);
     }
 
+    /// [B108] An ask below the mid the features were built from is a stale mid,
+    /// not edge: the production 2026-11-13 07:25:30 minute (ask 0.81, mid 0.885,
+    /// p 0.885) qualified on that gap alone and is refused now.
+    #[test]
+    fn an_ask_below_the_scored_mid_never_qualifies() {
+        let d = decide_side(0.81, 0.885, 0.07, 0.20, 0.11, 0.90, 0.05, 0.25, 0.90, true);
+        assert!(d.qualifies, "the arithmetic alone clears it: {d:?}");
+        let r = refuse_stale_mid(d, 0.81, 0.885);
+        assert!(!r.qualifies);
+        assert_eq!(r.required, d.required, "the bar is still reported");
+        assert!(r.reason.contains("market moved"), "{}", r.reason);
+        // An ask at or above the mid is untouched, and a refusal stays a refusal.
+        assert_eq!(refuse_stale_mid(d, 0.81, 0.80), d);
+        assert_eq!(refuse_stale_mid(d, 0.81, 0.81), d);
+        let below = decide_side(0.81, 0.82, 0.07, 0.20, 0.11, 0.90, 0.05, 0.25, 0.90, true);
+        assert_eq!(refuse_stale_mid(below, 0.81, 0.885), below);
+        // No mid to compare with is not a stale one.
+        assert!(!ask_below_scored_mid(0.81, f64::NAN));
+        // The NO leg is judged on its own mid: the features' NO row carries the
+        // NO mid in MID_COLUMN, which is what the serving call passes.
+        let bars: Vec<Bar> = (0..75).map(|i| Bar { open_s: 3600 + 60 * i, open: 100.0, high: 100.0, low: 100.0, close: 100.0 }).collect();
+        let f = build_features(&DecisionInputs {
+            strike: None, w: 3600 + 30 * 60, t: 3600 + 61 * 60, bars: &bars, mid_now: [Some(0.30), Some(0.72)],
+            mid_m1: [None; 2], mid_m5: [None; 2], ask: [0.31, 0.65], funding: Some(0.0), oi_d5: None, oi_d30: None, tlsr: None, tlsr15: None,
+        }).unwrap();
+        assert_eq!((f[0][MID_COLUMN], f[1][MID_COLUMN]), (0.30, 0.72));
+        assert!(!ask_below_scored_mid(f[0][2], f[0][MID_COLUMN]), "YES ask 0.31 over its 0.30 mid");
+        assert!(ask_below_scored_mid(f[1][2], f[1][MID_COLUMN]), "NO ask 0.65 under its 0.72 mid");
+    }
+
     #[test]
     fn a_side_qualifies_only_inside_the_band_and_above_break_even_plus_margin() {
         let d = |ask: f64, p: f64| decide_side(ask, p, 0.07, 0.20, 0.11, 0.90, 0.10, 0.43, 0.75, false);
@@ -3127,10 +3206,10 @@ mod shadow_promotion_tests {
         use crate::vipers::gboost_planb_train::{EntryRule, Plan};
         let plan = Plan { entry: EntryRule::FirstAfter, tp: 0.20, sl: 0.11, tp_ceiling: 0.90, lo: 0.25, hi: 0.90, fee: 0.07, margin: 0.05, first_minute: 5, last_minute: 45, hold: false };
         let rows = vec![
-            (0, 0.14, 0.50, 0.60),      // $0.50 at p 0.60: below the knee, qualifies under both rules
-            (3600, -0.15, 0.79, 0.55),  // $0.79 at p 0.55: the old rule took it at need 0.49; the corrected rule needs 0.61
-            (7200, 0.13, 0.79, 0.65),   // $0.79 at p 0.65: qualifies under both
-            (10800, -0.16, 0.90, 0.70), // $0.90: no target under the ceiling, refused
+            (0, 0.14, 0.50, 0.60, Some(0.0)),      // $0.50 at p 0.60: below the knee, qualifies under both rules
+            (3600, -0.15, 0.79, 0.55, Some(0.0)),  // $0.79 at p 0.55: the old rule took it at need 0.49; the corrected rule needs 0.61
+            (7200, 0.13, 0.79, 0.65, Some(0.0)),   // $0.79 at p 0.65: qualifies under both
+            (10800, -0.16, 0.90, 0.70, Some(0.0)), // $0.90: no target under the ceiling, refused
         ];
         let kept = rows_under_rule(&rows, &plan);
         assert_eq!(kept, vec![(0, 0.14), (7200, 0.13)]);
@@ -3142,6 +3221,11 @@ mod shadow_promotion_tests {
         let strict = Plan { margin: 0.20, ..plan };
         assert_eq!(rows_under_rule(&rows, &strict), vec![]);
         assert_eq!(rows_under_rule(&[], &plan), vec![]);
+        // [B108] The same qualifying row is refused when its ask was below the
+        // scored mid, and when no mid was stored (a row written before [B108]).
+        assert_eq!(rows_under_rule(&[(0, 0.14, 0.50, 0.60, Some(0.56))], &plan), vec![]);
+        assert_eq!(rows_under_rule(&[(0, 0.14, 0.50, 0.60, None)], &plan), vec![]);
+        assert_eq!(rows_under_rule(&[(0, 0.14, 0.50, 0.60, Some(0.50))], &plan), vec![(0, 0.14)], "an ask equal to the mid is kept");
     }
 
     /// The plan's exit rule, which the shadow record is only evidence about if
@@ -3324,7 +3408,7 @@ mod shadow_promotion_tests {
 
         let opened = db::gboost_shadow_open(
             &p, "btc", V, "cond-1", "tok-yes", "Bitcoin Up or Down - September 23, 12PM ET",
-            "YES", 1_758_600_000, 0.60, 6.0, 0.72, 0.51, 0.0168, 0.71, 0.55,
+            "YES", 1_758_600_000, 0.60, 6.0, 0.72, 0.51, 0.0168, 0.71, 0.55, 0.595,
         ).await;
         assert!(opened, "the shadow ledger must accept an entry, or the lane records nothing");
         assert!(db::gboost_shadow_holds(&p, "btc", "cond-1").await,
@@ -3360,6 +3444,7 @@ mod shadow_promotion_tests {
         assert_eq!(rows[0].0, 1_758_600_000, "the hourly window is carried for the market bootstrap");
         assert!((rows[0].1 - ret).abs() < 1e-12);
         assert!((rows[0].2 - 0.60).abs() < 1e-12, "the ask rides along so the row can be re-scored");
+        assert_eq!(rows[0].4, Some(0.595), "and so does the scored mid ([B108])");
 
         let rec = shadow_stats(&rows.iter().map(|r| (r.0, r.1)).collect::<Vec<_>>());
         assert_eq!(rec.trades, 1);

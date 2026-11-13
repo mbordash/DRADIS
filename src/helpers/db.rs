@@ -1617,23 +1617,26 @@ pub struct ShadowTrade {
     pub entry_fee: f64,
 }
 
+/// One closed shadow row for the record: `(window_start, ret, entry_price, p, mid)`.
+pub type ShadowReturnRow = (i64, f64, f64, f64, Option<f64>);
+
 /// Open a simulated position. Returns false if the write failed, in which case
 /// the caller must not treat the entry as taken.
 #[allow(clippy::too_many_arguments)]
 pub async fn gboost_shadow_open(
     pool: &SqlitePool, asset: &str, model_version: &str, condition_id: &str, token_id: &str,
     market: &str, side: &str, window_start: i64, entry_price: f64, shares: f64,
-    tp_price: f64, stop_price: f64, entry_fee: f64, p: f64, break_even: f64,
+    tp_price: f64, stop_price: f64, entry_fee: f64, p: f64, break_even: f64, mid: f64,
 ) -> bool {
     match sqlx::query(
         "INSERT INTO gboost_shadow_trades
             (asset, model_version, condition_id, token_id, market, side, window_start, opened_at,
-             entry_price, shares, tp_price, stop_price, entry_fee, p, break_even)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+             entry_price, shares, tp_price, stop_price, entry_fee, p, break_even, mid)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(asset).bind(model_version).bind(condition_id).bind(token_id).bind(market).bind(side)
         .bind(window_start).bind(Utc::now().to_rfc3339())
         .bind(entry_price).bind(shares).bind(tp_price).bind(stop_price).bind(entry_fee)
-        .bind(p).bind(break_even)
+        .bind(p).bind(break_even).bind(mid)
         .execute(pool).await
     {
         Ok(_) => true,
@@ -1720,12 +1723,13 @@ pub async fn gboost_shadow_close(pool: &SqlitePool, id: i64, exit_price: f64, re
 /// worth of evidence, not two, and resampling rows instead of markets would
 /// understate the interval exactly where the record is thinnest.
 ///
-/// Each row is `(window_start, ret, entry_price, p)`. The ask and the calibrated
-/// probability ride along so the viper can re-score the row against the entry
-/// rule in force when it reads the record (`rows_under_rule`).
-pub async fn gboost_shadow_returns(pool: &SqlitePool, asset: &str, model_version: &str) -> Vec<(i64, f64, f64, f64)> {
+/// Each row is `(window_start, ret, entry_price, p, mid)`. The ask, the calibrated
+/// probability and the scored mid ride along so the viper can re-score the row
+/// against the entry rule in force when it reads the record (`rows_under_rule`);
+/// `mid` is `None` on rows written before [B108].
+pub async fn gboost_shadow_returns(pool: &SqlitePool, asset: &str, model_version: &str) -> Vec<ShadowReturnRow> {
     sqlx::query_as(
-        "SELECT window_start, ret, entry_price, p FROM gboost_shadow_trades
+        "SELECT window_start, ret, entry_price, p, mid FROM gboost_shadow_trades
           WHERE asset = ? AND model_version = ? AND closed_at IS NOT NULL AND ret IS NOT NULL
           ORDER BY id")
         .bind(asset).bind(model_version)
@@ -2041,9 +2045,14 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) {
             closed_at     TEXT,
             exit_price    REAL,
             exit_reason   TEXT,
-            ret           REAL
+            ret           REAL,
+            mid           REAL
         )"
     ).execute(pool).await;
+    // [B108] The scored mid, so the record can drop an entry whose ask was below
+    // it. Nullable and added in place: rows written before it carry NULL and no
+    // longer count (they were taken under the stale-mid artifact).
+    let _ = sqlx::query("ALTER TABLE gboost_shadow_trades ADD COLUMN mid REAL").execute(pool).await;
     let _ = sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_gboost_shadow_model
              ON gboost_shadow_trades(asset, model_version, closed_at)"
