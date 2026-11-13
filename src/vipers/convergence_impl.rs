@@ -205,6 +205,11 @@ impl Strategy for ConvergenceStrategyImpl {
             idle("daily drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }
+        // [B96] Oracle-relative thresholds are all 0 with no price.
+        if crate::vipers::oracle_unknown(ctx) {
+            idle(crate::vipers::ORACLE_UNKNOWN_REASON);
+            return Ok(StrategySignal::NoSignal);
+        }
         // BTC-only: institutional_pulse has no ETH/SOL analog.
         if !Self::is_btc(ctx) {
             idle("BTC-only strategy (no ETF tide for this asset)");
@@ -717,7 +722,9 @@ impl Strategy for ConvergenceStrategyImpl {
                 // Signal-decay / reversal exit (discretionary — suppressed during
                 // soft-exit cooldown): the conviction that opened the position has
                 // flipped against it, or coherence has collapsed.
+                // [B96] Not while the price is unknown: Tide has no iNAV then.
                 if !soft_exit_cooldown_active
+                    && !crate::vipers::oracle_unknown(ctx)
                     && secs_held >= config::CONVERGENCE_MIN_HOLD_SECS {
                     let half_thr = dc.convergence_pulse_threshold / dec!(2);
                     let pulse_reversed = if is_yes { pulse <= -half_thr } else { pulse >= half_thr };

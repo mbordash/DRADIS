@@ -693,13 +693,37 @@ async fn get_assets() -> Response {
     Json(db::available_assets()).into_response()
 }
 
+/// [B109] `?squadron=<id>` on `/api/config`, which used to be ignored: a
+/// read returned the GLOBAL row as if it were that squadron's (production
+/// 2026-11-13: Anchor read as off on btc-open while its own row had it on),
+/// and a PATCH wrote the global row. A blank value counts as absent.
+#[derive(Deserialize, Default)]
+struct ConfigSquadronQuery {
+    #[serde(default)]
+    squadron: Option<String>,
+}
+
+fn squadron_param(v: &Option<String>) -> Option<String> {
+    v.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_string)
+}
+
 /// GET /api/config
 ///
 /// Returns the full DynamicConfig as a flat JSON object.
 /// Field names match the struct fields (snake_case).
-async fn get_config(State(s): State<ApiState>) -> Response {
+/// With `?squadron=<id>` it is the same as `GET /api/squadrons/{id}/config`.
+async fn get_config(State(s): State<ApiState>, Query(q): Query<ConfigSquadronQuery>) -> Response {
+    let global = s.config_rx.borrow().clone();
+    config_response(global, q).await
+}
+
+/// The body of `GET /api/config`, apart from the state it reads.
+async fn config_response(global: Arc<DynamicConfig>, q: ConfigSquadronQuery) -> Response {
+    if let Some(id) = squadron_param(&q.squadron) {
+        return get_squadron_config(Path(id)).await;
+    }
     debug!("Received GET /api/config request");
-    let cfg = s.config_rx.borrow().clone();
+    let cfg = global;
     match serde_json::to_value(cfg.as_ref()) {
         Ok(val) => {
             debug!("Successfully processed GET /api/config");
@@ -758,6 +782,10 @@ enum PatchScope {
 struct PatchConfigQuery {
     #[serde(default)]
     scope: PatchScope,
+    /// [B109] With a squadron the patch goes to that squadron's row only,
+    /// as `PATCH /api/squadrons/{id}/config`; `scope` does not apply.
+    #[serde(default)]
+    squadron: Option<String>,
 }
 
 /// Apply a config patch to the global row, broadcast it, and (with `fan_out`)
@@ -825,6 +853,9 @@ async fn patch_config(
     Query(q): Query<PatchConfigQuery>,
     body: String,
 ) -> Response {
+    if let Some(id) = squadron_param(&q.squadron) {
+        return patch_squadron_config(Path(id), body).await;
+    }
     info!("📥 Received PATCH /api/config (global) with body: {}", body);
     match apply_global_patch(&s, &body, q.scope == PatchScope::GlobalAndDeployed).await {
         Ok(new_cfg) => {
@@ -3377,6 +3408,37 @@ mod patch_scope_tests {
     fn an_omitted_scope_defaults_to_reaching_deployed_squadrons() {
         let q: PatchConfigQuery = serde_json::from_str("{}").expect("empty query deserializes");
         assert_eq!(q.scope, PatchScope::GlobalAndDeployed);
+    }
+
+    /// [B109] `?squadron=` is read off the real query string on both the
+    /// GET and the PATCH, and a blank value is no squadron (the global row).
+    #[test]
+    fn the_squadron_param_is_read_and_a_blank_one_is_global() {
+        use axum::extract::Query;
+        let uri = |q: &str| format!("http://x/api/config?{q}").parse::<axum::http::Uri>().unwrap();
+        let g: Query<ConfigSquadronQuery> = Query::try_from_uri(&uri("squadron=btc-open")).unwrap();
+        assert_eq!(squadron_param(&g.squadron).as_deref(), Some("btc-open"));
+        let p: Query<PatchConfigQuery> = Query::try_from_uri(&uri("squadron=btc-open&scope=global_only")).unwrap();
+        assert_eq!(squadron_param(&p.squadron).as_deref(), Some("btc-open"));
+        for q in ["", "squadron=", "squadron=%20", "scope=global_only"] {
+            let p: Query<PatchConfigQuery> = Query::try_from_uri(&uri(q)).unwrap();
+            assert_eq!(squadron_param(&p.squadron), None, "{q:?}");
+            let g: Query<ConfigSquadronQuery> = Query::try_from_uri(&uri(q)).unwrap();
+            assert_eq!(squadron_param(&g.squadron), None, "{q:?}");
+        }
+    }
+
+    /// [B109] The handler itself, not just the parse: a squadron that has no
+    /// row is never answered with the global row (404, or 500 with no
+    /// database), and no squadron still is.
+    #[tokio::test]
+    async fn a_squadron_read_never_returns_the_global_row() {
+        if crate::helpers::dynamic_config::read_only_mode() { return; }
+        let global = Arc::new(DynamicConfig::default());
+        let r = config_response(Arc::clone(&global), ConfigSquadronQuery { squadron: Some("b109-no-such-squadron".into()) }).await;
+        assert_ne!(r.status(), StatusCode::OK, "an unknown squadron was answered with the global row");
+        let r = config_response(global, ConfigSquadronQuery { squadron: Some(" ".into()) }).await;
+        assert_eq!(r.status(), StatusCode::OK);
     }
 
     /// The escape hatch still exists for a caller that means "seed only".

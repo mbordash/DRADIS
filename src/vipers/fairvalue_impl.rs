@@ -1424,7 +1424,8 @@ impl FairValueStrategyImpl {
         event_mult: f64,
     ) -> Option<f64> {
         let strike = market.strike_price?.to_f64()?;
-        let spot = snapshot.oracle_price.to_f64()?;
+        // [B96] An oracle of 0 is no price, not a spot below every strike.
+        let spot = snapshot.oracle_price.to_f64().filter(|s| *s > 0.0)?;
         let secs_left = market
             .market_close_time
             .map(|ct| (ct - Utc::now()).num_seconds())?;

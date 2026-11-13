@@ -450,7 +450,7 @@ impl Strategy for TimeDecayStrategyImpl {
                     (no_pos.expect("lone NO leg is present"), market.no_token.clone(), snap.no_bid, market.no_fee_bps as u16, "NO")
                 };
                 let (max_fast_vel, _) = TimeDecayStrategy::iv_thresholds(snap.oracle_price, dc.time_decay_max_fast_velocity_pct, dc.time_decay_max_slow_drift_pct);
-                let iv_elevated = snap.velocity.abs() > max_fast_vel;
+                let iv_elevated = snap.oracle_price > dec!(0) && snap.velocity.abs() > max_fast_vel; // [B96] no price, no IV read
                 let held_secs = (Utc::now() - leg.fill_effective_at(ghost).unwrap_or(leg.opened_at)).num_seconds();
                 let decision = lone_leg_decision(
                     leg.avg_entry, bid, dc.time_decay_lone_leg_stop_pct, iv_elevated,
@@ -497,7 +497,7 @@ impl Strategy for TimeDecayStrategyImpl {
 
             // ── Dynamic stop: tighten when vol is elevated ────────────────────
             let (max_fast_vel, _) = TimeDecayStrategy::iv_thresholds(ctx.snapshot.oracle_price, dc.time_decay_max_fast_velocity_pct, dc.time_decay_max_slow_drift_pct);
-            let iv_elevated = snap.velocity.abs() > max_fast_vel;
+            let iv_elevated = snap.oracle_price > dec!(0) && snap.velocity.abs() > max_fast_vel; // [B96] no price, no IV read
             let effective_stop_pct = if iv_elevated {
                 let tight = dc.time_decay_stop_loss_pct * dc.time_decay_iv_stop_tighten_multiplier;
                 tracing::debug!("⚡ TimeDecay IV elevated (|vel|={:.2}): stop tightened to {:.1}%", snap.velocity, tight * dec!(100));

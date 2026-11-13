@@ -623,6 +623,11 @@ impl Strategy for MomentumStrategyImpl {
             idle("daily drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }
+        // [B96] Oracle-relative thresholds are all 0 with no price.
+        if crate::vipers::oracle_unknown(ctx) {
+            idle(crate::vipers::ORACLE_UNKNOWN_REASON);
+            return Ok(StrategySignal::NoSignal);
+        }
 
         // ── Effective band and crossing-branch state ─────────────────────────
         // What the fee gate actually admits inside the configured band, and
@@ -1577,7 +1582,10 @@ impl Strategy for MomentumStrategyImpl {
             let is_yes = tok == ctx.market.yes_token;
             let net_profit_margin = taker_exit_net_margin(avg_entry, bid);
             let decay_floor = crate::venues::entry_only_fee_pct(avg_entry) * dc.momentum_decay_fee_margin_mult;
-            let faded = if is_yes { velocity < decay_min } else { velocity > -decay_min };
+            // [B96] With no price the velocity and its threshold are both 0
+            // (or, for one tick, a stale velocity beside a 0 threshold): no read.
+            let faded = ctx.snapshot.oracle_price > dec!(0)
+                && if is_yes { velocity < decay_min } else { velocity > -decay_min };
             if faded && net_profit_margin > decay_floor {
                 let reason = format!(
                     "MomentumDecay: bid=${:.4}, profit={:.2}%, net={:.2}% vs floor {:.2}%, v5={:.2} vs fade {:.2}",

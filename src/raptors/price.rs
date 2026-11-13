@@ -334,6 +334,50 @@ pub fn publish_level(
     }
 }
 
+/// [B96] Send the documented "not connected" values on every channel the
+/// raptor owns: level 0 and every rate 0, together (see [`publish_level`]).
+pub fn publish_not_connected(
+    oracle_tx: &watch::Sender<Decimal>,
+    velocity_tx: &watch::Sender<(Decimal, Decimal, Decimal)>,
+    drift_tx: &watch::Sender<(Decimal, Decimal, Decimal)>,
+) {
+    let _ = oracle_tx.send(Decimal::ZERO);
+    let _ = velocity_tx.send((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
+    let _ = drift_tx.send((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
+}
+
+/// [B96] The health map's side of "not connected": the Telemetry page and
+/// `/api/status` read these, so they clear with the channels.
+fn mark_health_not_connected(
+    raptor_health_tx: &watch::Sender<HashMap<String, AssetRaptorHealth>>,
+    asset: &str,
+) {
+    raptor_health_tx.send_modify(|map| {
+        let h = map.entry(asset.to_string()).or_default();
+        h.price_connected = false;
+        h.oracle_price = Decimal::ZERO;
+        h.velocity_5s = Decimal::ZERO;
+        h.velocity_1s = Decimal::ZERO;
+        h.acceleration = Decimal::ZERO;
+        h.drift_60m = Decimal::ZERO;
+        h.drift_10m = Decimal::ZERO;
+    });
+}
+
+/// [B96] Seconds with no price tick after which the level and rates are
+/// published as "not connected" while the socket is still given time to
+/// recover. Binance's `@ticker` stream prints about once a second and
+/// routinely skips one; ten seconds is a feed that has stopped.
+pub const PRICE_TICK_STALE_SECS: u64 = 10;
+
+/// [B96] Whether a connection is still too young to publish from: for the
+/// first `MOMENTUM_WINDOW_SECS` after a (re)connect the 5 s velocity spans
+/// only part of its window and the 1 s velocity has no anchor, so the rates
+/// would read a calm market whatever happened during the outage.
+pub fn connection_warming(connected_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(connected_at) < Duration::from_secs(config::MOMENTUM_WINDOW_SECS)
+}
+
 /// How often a withheld USD level is written to the log.
 const BASIS_GAP_LOG_SECS: u64 = 60;
 
@@ -530,6 +574,10 @@ pub async fn run_price_raptor(
             // updates — would otherwise be invisible forever.  If 60s elapse with
             // no real price tick we force a reconnect regardless of ping activity.
             let mut last_price_tick = Instant::now();
+            // [B96] When this connection opened; see `connection_warming`.
+            let connected_at = Instant::now();
+            // [B96] "Not connected" already published for the current silence.
+            let mut stale_published = false;
 
             'ws: loop {
                 // Staleness guard: independent of WS keepalive pings.
@@ -537,8 +585,19 @@ pub async fn run_price_raptor(
                     warn!("⚠️ Price Raptor: no price tick in 60s (zombie WS — pings alive but ticker silent) — reconnecting");
                     break 'ws;
                 }
+                // [B96] A feed silent for `PRICE_TICK_STALE_SECS` stops reading
+                // as live at once; the reconnect limits below are unchanged.
+                if !stale_published && last_price_tick.elapsed() >= Duration::from_secs(PRICE_TICK_STALE_SECS) {
+                    warn!("⚠️ Price Raptor [{}]: no price tick in {}s — oracle and rates read 0 (not connected) until ticks resume",
+                        crypto_filter.to_uppercase(), PRICE_TICK_STALE_SECS);
+                    publish_not_connected(&oracle_tx, &velocity_tx, &drift_tx);
+                    mark_health_not_connected(&raptor_health_tx, &crypto_filter);
+                    stale_published = true;
+                }
 
-                match tokio_timeout(Duration::from_secs(30), ws_stream.next()).await {
+                // A short wait so the stale check above runs on time; the 30 s
+                // silent-stall reconnect is measured from the last tick.
+                match tokio_timeout(Duration::from_secs(5), ws_stream.next()).await {
                     Ok(Some(Ok(msg))) => {
                         if let Message::Text(text) = msg {
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -546,15 +605,19 @@ pub async fn run_price_raptor(
                                     if let Ok(price) = Decimal::from_str(price_str) {
                                         let now = Instant::now();
                                         last_price_tick = now; // reset staleness clock
+                                        stale_published = false;
+                                        // [B96] Nothing is published from a connection
+                                        // younger than the 5 s velocity window.
+                                        let warming = connection_warming(connected_at, now);
                                         // The LEVEL goes out in the venue's settlement currency;
                                         // every rate below stays on the raw series (see the
                                         // module doc). `dec!(0)` is the documented "not
                                         // connected" value: a dollar level with no fresh
                                         // conversion factor is unknown, not the USDT price.
-                                        let level = publish_level(
+                                        let level = if warming { None } else { publish_level(
                                             denomination, price, *basis_rx.borrow(), now, Duration::from_secs(BASIS_MAX_AGE_SECS),
-                                        );
-                                        if level.is_none()
+                                        ) };
+                                        if level.is_none() && !warming
                                             && now.duration_since(last_basis_gap_log).as_secs() >= BASIS_GAP_LOG_SECS
                                         {
                                             last_basis_gap_log = now;
@@ -750,8 +813,10 @@ pub async fn run_price_raptor(
                     Ok(None) | Ok(Some(Err(_))) => break 'ws,
                     // 30s elapsed with no message — silent stall; force reconnect.
                     Err(_) => {
-                        warn!("⚠️ Price Raptor: no tick in 30s — reconnecting");
-                        break 'ws;
+                        if last_price_tick.elapsed() >= Duration::from_secs(30) {
+                            warn!("⚠️ Price Raptor: no tick in 30s — reconnecting");
+                            break 'ws;
+                        }
                     }
                 }
             }
@@ -763,12 +828,13 @@ pub async fn run_price_raptor(
         if !connected {
             ws_url_idx = (ws_url_idx + 1) % ws_urls.len();
         }
-        // Mark price raptor as offline while reconnecting.
-        raptor_health_tx.send_modify(|map| {
-            map.entry(crypto_filter.clone()).or_default().price_connected = false;
-        });
+        // [B96] Publish "not connected" (level 0, every rate 0) while
+        // reconnecting. Before, a drop or a silent feed left the last print
+        // and the last 5 s velocity on the channels, and every viper read
+        // them as live for as long as the outage lasted.
+        publish_not_connected(&oracle_tx, &velocity_tx, &drift_tx);
+        mark_health_not_connected(&raptor_health_tx, &crypto_filter);
         prev_velocity = dec!(0);
-        price_history_10m.clear();
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
@@ -979,6 +1045,29 @@ mod live_binance_tests {
 #[cfg(test)]
 mod usd_mark_tests {
     use super::*;
+
+    /// [B96] A new connection publishes nothing for the 5 s velocity window.
+    #[test]
+    fn a_new_connection_warms_for_the_velocity_window() {
+        let t0 = Instant::now();
+        let w = Duration::from_secs(config::MOMENTUM_WINDOW_SECS);
+        assert!(connection_warming(t0, t0));
+        assert!(connection_warming(t0, t0 + w - Duration::from_millis(1)));
+        assert!(!connection_warming(t0, t0 + w));
+    }
+
+    /// [B96] A disconnect clears the level and every rate together; before,
+    /// the last print stayed on the channels and read as live.
+    #[test]
+    fn a_disconnect_publishes_not_connected_on_every_channel() {
+        let (o_tx, o_rx) = watch::channel(dec!(81000));
+        let (v_tx, v_rx) = watch::channel((dec!(12), dec!(4), dec!(1)));
+        let (d_tx, d_rx) = watch::channel((dec!(150), dec!(40), dec!(0.3)));
+        publish_not_connected(&o_tx, &v_tx, &d_tx);
+        assert_eq!(*o_rx.borrow(), Decimal::ZERO);
+        assert_eq!(*v_rx.borrow(), (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
+        assert_eq!(*d_rx.borrow(), (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
+    }
 
     /// 2026-10-18, 12:48 ET: Binance BTC/USDT 81,083.53 while USDC/USDT printed
     /// 1.0013. The dollar level is below the $80,999.99 strike that the USDT

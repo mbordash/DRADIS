@@ -102,6 +102,11 @@ impl Strategy for BasisStrategyImpl {
             idle("daily drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }
+        // [B96] Oracle-relative thresholds are all 0 with no price.
+        if crate::vipers::oracle_unknown(ctx) {
+            idle(crate::vipers::ORACLE_UNKNOWN_REASON);
+            return Ok(StrategySignal::NoSignal);
+        }
 
         // ── Venue Selection: Prefer Window/Maker venue for Basis ─────────────
         let (market, snap) = if let (Some(mk_mkt), Some(mk_snap)) = (&ctx.maker_market, &ctx.maker_snapshot) {

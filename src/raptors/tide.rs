@@ -247,6 +247,18 @@ pub async fn run_tide_raptor(
         let market_open = is_us_market_open(chrono::Utc::now());
         let oracle = *oracle_rx.borrow();
 
+        // [B96] No oracle, no synthetic iNAV: every ETF would be skipped and
+        // the snapshot would read pulse 0 and coherence 0, which Convergence
+        // takes as "coherence collapsed" and exits on. Hold the last snapshot
+        // instead (as of the price feed's drop) and report Tide disconnected;
+        // the next compute after the price returns publishes fresh values.
+        if market_open && oracle <= dec!(0) {
+            raptor_health_tx.send_modify(|map| {
+                map.entry("btc".to_string()).or_default().tide_connected = false;
+            });
+            continue;
+        }
+
         // Per-ETF premium bps for the snapshot, plus weighted aggregation accums.
         let mut per_etf_bps: HashMap<&'static str, Decimal> = HashMap::new();
         let mut weighted_z_sum = dec!(0);

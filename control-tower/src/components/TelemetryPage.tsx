@@ -43,6 +43,8 @@ interface Row {
   t: number;
   time: string;
   oracle: number;
+  // The chart's oracle line: a gap while the price feed reports no price (0).
+  oracleLine: number | null;
   v5: number;
   v1: number;
   accel: number;
@@ -103,6 +105,7 @@ function toRow(s: TelemetrySample): Row {
     t: Number(s.t),
     time: fmtClock(Number(s.t)),
     oracle: num(s.oracle_price),
+    oracleLine: num(s.oracle_price) > 0 ? num(s.oracle_price) : null,
     v5: num(s.velocity_5s),
     v1: num(s.velocity_1s),
     accel: num(s.acceleration),
@@ -310,7 +313,7 @@ function Scrubber({
         <ResponsiveContainer width="100%" height="100%">
           <LineChart data={data} margin={{ top: 4, right: 12, bottom: 0, left: 0 }}>
             <YAxis hide domain={['auto', 'auto']} />
-            <Line type="monotone" dataKey="oracle" stroke="#10b981" strokeWidth={1.2} dot={false} isAnimationActive={false} />
+            <Line type="monotone" dataKey="oracleLine" stroke="#10b981" strokeWidth={1.2} dot={false} isAnimationActive={false} />
             <Brush
               dataKey="time"
               height={22}
@@ -929,7 +932,7 @@ export default function TelemetryPage({ availableAssets, venue }: { availableAss
           title="Oracle Price"
           subtitle="Binance Spot WS — current mark"
           data={viewRows}
-          series={[{ key: 'oracle', label: 'price', color: '#10b981' }]}
+          series={[{ key: 'oracleLine', label: 'price', color: '#10b981' }]}
           fmtY={v => `$${Math.round(v).toLocaleString('en-US')}`}
         />
         <SignalChart

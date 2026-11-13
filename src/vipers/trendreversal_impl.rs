@@ -138,6 +138,11 @@ impl Strategy for TrendReversalStrategyImpl {
             idle("daily drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }
+        // [B96] Oracle-relative thresholds are all 0 with no price.
+        if crate::vipers::oracle_unknown(ctx) {
+            idle(crate::vipers::ORACLE_UNKNOWN_REASON);
+            return Ok(StrategySignal::NoSignal);
+        }
 
         // ── Venue selection: prefer Window/Daily ─────────────────────────────
         // TrendCapture needs a longer expiry for multi-minute drift trades.
@@ -860,7 +865,10 @@ impl Strategy for TrendReversalStrategyImpl {
                 // Trend-reversal exit — trend-FOLLOWING only. In fade (TrendReversal)
                 // mode the entry already fades the drift, so a drift flip is the
                 // thesis playing OUT, not a reason to bail; rely on TP/SL/catastrophic.
+                // [B96] With no price the drift and its threshold both read 0
+                // and `0 <= -0` would call a reversal; TP/SL keep running.
                 if !dc.trendreversal_mode
+                    && !crate::vipers::oracle_unknown(ctx)
                     && !soft_exit_cooldown_active
                     && secs_held >= config::TRENDCAPTURE_MIN_HOLD_BEFORE_REVERSAL_SECS {
                     let is_yes = token_id == &market.yes_token;

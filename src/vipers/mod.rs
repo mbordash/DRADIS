@@ -288,6 +288,21 @@ pub fn drawdown_breached(ctx: &crate::orchestrator::strategy::StrategyContext) -
     day_pnl(ctx) <= -daily_drawdown_limit(ctx.starting_collateral)
 }
 
+/// [B96] The idle reason for an entry refused because the price is unknown.
+pub const ORACLE_UNKNOWN_REASON: &str = "no oracle price (price feed not connected)";
+
+/// [B96] The squadron has a price feed but no price: the raptor publishes a
+/// level of 0, with every rate 0, while it has none to give (disconnected,
+/// a silent feed, or a dollar venue's conversion factor gone stale). Every
+/// oracle-relative threshold is then 0, and a comparison like
+/// `drift_10m <= -thr` passes on a flat zero, so a viper that reads the
+/// oracle refuses entries while this holds. Exits keep running on the mark.
+/// A squadron with no price feed at all (sports, politics) always reads 0
+/// and is not affected.
+pub fn oracle_unknown(ctx: &crate::orchestrator::strategy::StrategyContext) -> bool {
+    ctx.has_price_feed && ctx.snapshot.oracle_price <= Decimal::ZERO
+}
+
 /// The entry guard every viper checks: the day's loss has reached the limit.
 pub fn drawdown_limit_hit(ctx: &crate::orchestrator::strategy::StrategyContext) -> bool {
     is_drawdown_limit_hit(day_pnl(ctx), ctx.starting_collateral)
@@ -683,6 +698,50 @@ mod venue_resolution_tests {
                 id == m.yes_token || id == m.no_token,
                 "{t} resolved to a venue that does not quote it",
             );
+        }
+    }
+
+    /// [B96] An oracle of 0 is "no price" only on a squadron with a feed.
+    #[test]
+    fn an_oracle_of_zero_is_unknown_only_with_a_price_feed() {
+        let mut c = ctx(None);
+        assert!(!oracle_unknown(&c));
+        c.snapshot.oracle_price = dec!(0);
+        assert!(oracle_unknown(&c));
+        c.has_price_feed = false;
+        assert!(!oracle_unknown(&c), "sports and politics squadrons always read 0");
+    }
+
+    /// [B96] With no price every oracle-relative threshold is 0. Each viper
+    /// that scales its gates by the oracle refuses the entry and says why,
+    /// rather than reading a flat zero drift as a signal.
+    #[tokio::test]
+    async fn the_oracle_relative_vipers_refuse_entries_with_no_price() {
+        use crate::orchestrator::strategy::Strategy;
+        use crate::state::StrategySignal;
+        let mut dc = DynamicConfig::default();
+        dc.enable_trendcapture = true;
+        dc.enable_convergence = true;
+        dc.enable_basis = true;
+        dc.enable_momentum = true;
+        let strategies: Vec<Box<dyn Strategy>> = vec![
+            Box::new(crate::vipers::trendreversal_impl::TrendReversalStrategyImpl::new()),
+            Box::new(crate::vipers::convergence_impl::ConvergenceStrategyImpl::new()),
+            Box::new(crate::vipers::basis_impl::BasisStrategyImpl::new()),
+            Box::new(crate::vipers::momentum_impl::MomentumStrategyImpl::new()),
+        ];
+        for s in strategies {
+            let mut c = ctx(None);
+            c.crypto_filter = "b96".to_string();
+            c.snapshot.oracle_price = dec!(0);
+            c.dynamic_config = Arc::new(dc.clone());
+            let sig = s.evaluate_entry(&c).await.expect("evaluates");
+            assert!(matches!(sig, StrategySignal::NoSignal), "{} entered with no price", s.name());
+            let reason = crate::helpers::viper_status::snapshot(Some("b96")).into_iter()
+                .find(|v| v.strategy == s.name())
+                .and_then(|v| v.last_reason)
+                .unwrap_or_default();
+            assert!(reason.contains("no oracle price"), "{}: reason was {reason:?}", s.name());
         }
     }
 
