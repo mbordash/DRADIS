@@ -104,6 +104,7 @@ docs/spikes/helm-design.md
 docs/spikes/scripted-viper-spike.md
 docs/spikes/ultra-short-market-spike.md
 docs/spikes/community-vipers-spike.md
+docs/spikes/multi-underlying-kalshi-design.md
 
 # Private keys
 *.pem

@@ -49,9 +49,11 @@ Details: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 **This is experimental software. You will probably lose money. Start in GHOST mode and tune.**
 
-- **Risk**: Momentum trades are directional and can get whiplashed. Arbitrage spreads are thin. None of this is guaranteed profit.
-- **US Citizens**: Polymarket is rolling out US access under CFTC regulation via a waitlist.
-- **Competition**: Polymarket is full of well-funded, low-latency bots. This project is a learning exercise, not an edge.
+- **Risk**: Directional vipers (Momentum, TrendReversal) can get whiplashed, arbitrage spreads are thin, and high-probability entries near the close win small and lose large. Nothing here is guaranteed profit, and past results, including any shown on dradis.live, do not predict future ones.
+- **Start small**: Run in GHOST mode first, then go live with the smallest size the venue allows. Set a daily drawdown limit in Setup before you do.
+- **Where you can trade**: Kalshi and Polymarket US are CFTC-regulated and serve US residents; Polymarket International does not. Which venues you may use depends on where you live. Check each venue's terms before you connect an account.
+- **Competition**: Every venue DRADIS supports has well-funded, low-latency traders on the other side. Treat DRADIS as a tool for running and measuring your own strategies, not as an edge in itself.
+- **Not advice**: Nothing in this project, its strategies or the community vipers is investment advice.
 
 ## Quick start
 
