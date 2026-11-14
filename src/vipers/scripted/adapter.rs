@@ -283,23 +283,37 @@ async fn tp_prune(pool: Option<&sqlx::SqlitePool>, sq: &str, script: &str, held:
 /// fee estimated at the taker rate. Read at most every two seconds per
 /// strategy: the entry tick runs every 50 ms.
 async fn db_exposure(strategy: &str) -> Decimal {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (std::time::Instant, Decimal)>>> = std::sync::OnceLock::new();
+    db_exposure_landed(strategy).await.0
+}
+
+/// [`db_exposure`] with the (squadron, token) of every row it counted, so a
+/// reservation whose position has landed stops counting twice [E102b].
+async fn db_exposure_landed(strategy: &str) -> (Decimal, Landed) {
+    type Entry = (std::time::Instant, Decimal, Landed);
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Entry>>> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    if let Some((at, v)) = cache.lock().unwrap_or_else(|p| p.into_inner()).get(strategy) {
-        if at.elapsed().as_secs() < 2 { return *v; }
+    if let Some((at, v, l)) = cache.lock().unwrap_or_else(|p| p.into_inner()).get(strategy) {
+        if at.elapsed().as_secs() < 2 { return (*v, l.clone()); }
     }
     let mut total = Decimal::ZERO;
+    let mut landed = Landed::new();
     for pool in crate::helpers::db::all_pools() {
-        let rows: Vec<(String, String)> = sqlx::query_as("SELECT entry_price, shares FROM open_positions WHERE strategy = ?")
+        let rows: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT entry_price, shares, squadron_id, token_id FROM open_positions WHERE strategy = ?")
             .bind(strategy).fetch_all(&pool).await.unwrap_or_default();
-        for (p, n) in rows {
+        for (p, n, sq, tok) in rows {
+            landed.insert((sq.unwrap_or_default(), tok));
             let (Ok(p), Ok(n)) = (p.parse::<Decimal>(), n.parse::<Decimal>()) else { continue };
             total += p * n + crate::venues::taker_fee_per_share(p) * n;
         }
     }
-    cache.lock().unwrap_or_else(|p| p.into_inner()).insert(strategy.to_string(), (std::time::Instant::now(), total));
-    total
+    cache.lock().unwrap_or_else(|p| p.into_inner()).insert(strategy.to_string(), (std::time::Instant::now(), total, landed.clone()));
+    (total, landed)
 }
+
+/// (squadron, token) pairs this viper already holds in the ledger or a loop's
+/// position map.
+pub type Landed = std::collections::HashSet<(String, String)>;
 
 /// [E102b] [`db_exposure`] for one squadron.
 async fn db_exposure_here(strategy: &str, squadron: &str) -> Decimal {
@@ -322,12 +336,14 @@ async fn db_exposure_here(strategy: &str, squadron: &str) -> Decimal {
     total
 }
 
-/// [E102b] How long an entry's reserved cost counts against the cap: long
-/// enough for its fill to land in `open_positions` and pass the 2 s exposure
-/// cache, short enough that a refused or unfilled order frees it quickly.
-pub const RESERVATION_SECS: u64 = 6;
+/// [E102b] How long a live entry's reserved cost counts against the cap if
+/// nothing releases it: past a slow fill and the 2 s exposure cache. It stops
+/// counting earlier once its position is in the ledger or a position map, and
+/// a venue loop releases it when it drops or fails to fill the entry.
+pub const RESERVATION_SECS: u64 = 15;
 
-type Reservations = Vec<(String, String, Decimal, std::time::Instant)>;
+/// One live entry in flight: (script, squadron, token) -> (cost, when).
+type Reservations = HashMap<(String, String, String), (Decimal, std::time::Instant)>;
 
 fn reservations() -> &'static std::sync::Mutex<Reservations> {
     static R: std::sync::OnceLock<std::sync::Mutex<Reservations>> = std::sync::OnceLock::new();
@@ -335,7 +351,7 @@ fn reservations() -> &'static std::sync::Mutex<Reservations> {
 }
 
 /// Pure rule behind [`reserve_entry`]: `reserved` and `reserved_here` are the
-/// live reservations of this script, in total and on this squadron.
+/// other live reservations of this script, in total and on this squadron.
 pub fn entry_fits(
     exposure: Decimal, exposure_here: Decimal, reserved: Decimal, reserved_here: Decimal, cost: Decimal,
     max_exposure: Decimal, max_here: Option<Decimal>,
@@ -348,26 +364,47 @@ pub fn entry_fits(
     if let Some(cap) = max_here {
         if exposure_here + reserved_here + cost > cap {
             return Err(format!(
-                "squadron cap: ${exposure_here:.2} open here + ${reserved_here:.2} in flight + ${cost:.2} for this order is over this squadron's ${cap:.2}"
+                "squadron cap: ${exposure_here:.2} open here + ${reserved_here:.2} in flight + ${cost:.2} for this order is over this squadron's ${cap:.2} (Cap here on this squadron's script card)"
             ));
         }
     }
     Ok(())
 }
 
-/// Check the caps with every live reservation counted, and reserve `cost` if
-/// the entry fits, atomically, so two squadrons cannot both pass on one tick.
+/// Check the caps with every other live reservation counted, and reserve (or
+/// refresh) this entry's own, atomically: two squadrons cannot both pass on one
+/// tick. Keyed by (script, squadron, token), so a script re-asking each tick
+/// refreshes its reservation instead of stacking it or blocking itself, and a
+/// reservation whose position has `landed` no longer counts.
+#[allow(clippy::too_many_arguments)]
 pub fn reserve_entry(
-    script: &str, squadron: &str, exposure: Decimal, exposure_here: Decimal, cost: Decimal,
+    script: &str, squadron: &str, token: &str, landed: &Landed,
+    exposure: Decimal, exposure_here: Decimal, cost: Decimal,
     max_exposure: Decimal, max_here: Option<Decimal>,
 ) -> Result<(), String> {
     let mut r = reservations().lock().unwrap_or_else(|p| p.into_inner());
-    r.retain(|(_, _, _, at)| at.elapsed().as_secs() < RESERVATION_SECS);
-    let reserved: Decimal = r.iter().filter(|(s, _, _, _)| s == script).map(|(_, _, c, _)| *c).sum();
-    let reserved_here: Decimal = r.iter().filter(|(s, q, _, _)| s == script && q == squadron).map(|(_, _, c, _)| *c).sum();
+    r.retain(|_, (_, at)| at.elapsed().as_secs() < RESERVATION_SECS);
+    let me = (script.to_string(), squadron.to_string(), token.to_string());
+    let others = r.iter().filter(|((s, q, t), _)| {
+        s == script && (q.as_str(), t.as_str()) != (squadron, token) && !landed.contains(&(q.clone(), t.clone()))
+    });
+    let (mut reserved, mut reserved_here) = (Decimal::ZERO, Decimal::ZERO);
+    for ((_, q, _), (c, _)) in others {
+        reserved += *c;
+        if q == squadron { reserved_here += *c; }
+    }
     entry_fits(exposure, exposure_here, reserved, reserved_here, cost, max_exposure, max_here)?;
-    r.push((script.to_string(), squadron.to_string(), cost, std::time::Instant::now()));
+    r.insert(me, (cost, std::time::Instant::now()));
     Ok(())
+}
+
+/// [E102b] Free a script entry's reservation: the venue loop dropped it or it
+/// filled nothing. `strategy` is the strategy name (`Script:<name>`); anything
+/// else is ignored, so a loop can call this for every dropped entry.
+pub fn release_reservation(strategy: &str, squadron: &str, token: &str) {
+    let Some(script) = strategy.strip_prefix(super::store::NAME_PREFIX) else { return };
+    let mut r = reservations().lock().unwrap_or_else(|p| p.into_inner());
+    r.remove(&(script.to_string(), squadron.to_string(), token.to_string()));
 }
 
 /// One warning per script per minute, so a broken script does not flood the log.
@@ -469,13 +506,13 @@ impl ScriptedStrategy {
 
     /// This viper's open cost basis, fees included, across every squadron, and
     /// the side it holds on this squadron's market, if any.
-    async fn holdings(&self, ctx: &StrategyContext, paper_mode: bool) -> Option<(Decimal, Decimal, Option<Side>)> {
+    async fn holdings(&self, ctx: &StrategyContext, paper_mode: bool) -> Option<(Decimal, Decimal, Option<Side>, Landed)> {
         if paper_mode {
             let pool = crate::helpers::db::pool_for(&Self::asset(ctx))?;
             let here = paper::cached_open(&pool, &ctx.squadron_id, &self.script).await;
             let exposure = paper::cached_all(&self.script).iter().map(PaperRow::cost).sum();
             let exposure_here = here.iter().map(PaperRow::cost).sum();
-            Some((exposure, exposure_here, here.iter().find_map(|r| Self::side_of(ctx, &r.token_id))))
+            Some((exposure, exposure_here, here.iter().find_map(|r| Self::side_of(ctx, &r.token_id)), Landed::new()))
         } else {
             // Each market loop (Kalshi, US) and each asset (intl) has its own
             // position map, so the map alone would let the cap multiply by the
@@ -483,12 +520,20 @@ impl ScriptedStrategy {
             // larger of the two counts an entry still in flight as well.
             let here = self.order_positions(ctx, true).await;
             let in_map: Decimal = here.iter().map(|(_, p)| p.avg_entry * p.shares + p.entry_fee).sum();
-            let exposure = in_map.max(db_exposure(&self.name).await);
+            let (db_total, mut landed) = db_exposure_landed(&self.name).await;
+            let exposure = in_map.max(db_total);
+            // Everything a position map already holds has landed too.
+            {
+                let map = ctx.positions.lock().await;
+                for k in map.keys().filter(|k| k.strategy == self.name) {
+                    landed.insert((k.squadron.clone(), k.market.as_str().to_string()));
+                }
+            }
             let mine = self.order_positions(ctx, false).await;
             let here_in_map: Decimal = mine.iter().map(|(_, p)| p.avg_entry * p.shares + p.entry_fee).sum();
             let exposure_here = here_in_map.max(db_exposure_here(&self.name, &ctx.squadron_id).await);
             let held = mine.iter().find_map(|(t, _)| Self::side_of(ctx, t.as_str()));
-            Some((exposure, exposure_here, held))
+            Some((exposure, exposure_here, held, landed))
         }
     }
 
@@ -567,7 +612,7 @@ impl ScriptedStrategy {
         }
         let asset = Self::asset(ctx);
         let pool = crate::helpers::db::pool_for(&asset);
-        let Some((exposure, exposure_here, held)) = self.holdings(ctx, paper).await else {
+        let Some((exposure, exposure_here, held, landed)) = self.holdings(ctx, paper).await else {
             self.reason(ctx, "no database for the paper ledger");
             return StrategySignal::NoSignal;
         };
@@ -626,12 +671,20 @@ impl ScriptedStrategy {
         // order's cost taken before it is sent: positions land in the ledger
         // after their fill, so without it two squadrons entering on the same
         // tick would each pass the instance cap against the same open amount.
+        // Paper rows are visible the moment they are written and race nothing
+        // real, so paper checks the squadron share without reserving.
         let cost = b.price * b.shares + b.fee;
-        if let Err(r) = reserve_entry(&self.script, &ctx.squadron_id, exposure, exposure_here, cost,
-                                      live.max_exposure, live.cfg.max_exposure_here_usdc) {
+        let fits = if paper {
+            entry_fits(exposure, exposure_here, Decimal::ZERO, Decimal::ZERO, cost, live.max_exposure, live.cfg.max_exposure_here_usdc)
+        } else {
+            reserve_entry(&self.script, &ctx.squadron_id, token.as_str(), &landed, exposure, exposure_here, cost,
+                          live.max_exposure, live.cfg.max_exposure_here_usdc)
+        };
+        if let Err(r) = fits {
             viper_status::report_buy_refused(&ctx.crypto_filter, &self.name, &r);
             if throttle_ok(&format!("{}#buy-refused", self.script), 300) {
-                warn!("📜 [{}] {} buy refused on {}: {r}", self.name, side.as_str().to_uppercase(), ctx.market.market_name);
+                warn!("📜 [{}] {} buy refused on {}: {r}{}", self.name, side.as_str().to_uppercase(),
+                      ctx.market.market_name, cap_hint(&r, &live));
             }
             return StrategySignal::NoSignal;
         }
@@ -702,7 +755,7 @@ impl ScriptedStrategy {
     async fn exit(&self, ctx: &StrategyContext, full: &StrategyContext) -> StrategySignal {
         let Some(live) = self.settings(ctx) else { return StrategySignal::NoSignal };
         let paper_mode = live.mode == Mode::Paper;
-        let exposure = self.holdings(ctx, paper_mode).await.map_or(Decimal::ZERO, |(e, _, _)| e);
+        let exposure = self.holdings(ctx, paper_mode).await.map_or(Decimal::ZERO, |(e, _, _, _)| e);
         self.paper_exits(ctx, full, &live, &self.context_as(ctx, &live, exposure, true)).await;
         let ghost = config::GHOST_MODE || ctx.dynamic_config.ghost_mode;
         self.order_exits(ctx, full, &live, &self.context_as(ctx, &live, exposure, ghost), ghost).await
@@ -971,16 +1024,29 @@ mod tests {
     }
 
     /// [E102b] Two squadrons on the same tick: the second sees the first's
-    /// reservation and is refused, though neither position has landed yet.
+    /// reservation and is refused, though neither position has landed yet; a
+    /// script re-asking refreshes its own instead of stacking it; a landed
+    /// position stops its reservation counting; a release frees it.
     #[test]
-    fn e102b_two_squadrons_on_one_tick_cannot_both_pass_the_cap() {
+    fn e102b_reservations_are_atomic_refreshed_landed_aware_and_releasable() {
         use rust_decimal_macros::dec;
         let script = "e102b-race-test";
-        assert!(reserve_entry(script, "btc-open", dec!(0), dec!(0), dec!(9.9), dec!(15), None).is_ok());
-        let e = reserve_entry(script, "eth-open", dec!(0), dec!(0), dec!(9.9), dec!(15), None).unwrap_err();
+        let none = Landed::new();
+        assert!(reserve_entry(script, "btc-open", "BTC#yes", &none, dec!(0), dec!(0), dec!(9.9), dec!(15), None).is_ok());
+        let e = reserve_entry(script, "eth-open", "ETH#yes", &none, dec!(0), dec!(0), dec!(9.9), dec!(15), None).unwrap_err();
         assert!(e.contains("in flight"), "{e}");
-        assert!(reserve_entry(script, "sol-open", dec!(0), dec!(0), dec!(5), dec!(15), None).is_ok(), "what still fits is reserved");
-        reservations().lock().unwrap().retain(|(s, _, _, _)| s != script);
+        // The same squadron and token asking again is its own retry, not a second order.
+        assert!(reserve_entry(script, "btc-open", "BTC#yes", &none, dec!(0), dec!(0), dec!(9.9), dec!(15), None).is_ok());
+        // Once btc-open's position is in the ledger, its reservation stops counting
+        // (the ledger figure carries it now).
+        let landed: Landed = [("btc-open".to_string(), "BTC#yes".to_string())].into_iter().collect();
+        assert!(reserve_entry(script, "eth-open", "ETH#yes", &landed, dec!(0), dec!(0), dec!(5), dec!(15), None).is_ok());
+        // Released (dropped or unfilled): SOL fits again.
+        release_reservation(&format!("{}{script}", super::super::store::NAME_PREFIX), "eth-open", "ETH#yes");
+        release_reservation(&format!("{}{script}", super::super::store::NAME_PREFIX), "btc-open", "BTC#yes");
+        assert!(reserve_entry(script, "sol-open", "SOL#no", &none, dec!(0), dec!(0), dec!(9.9), dec!(15), None).is_ok());
+        release_reservation("NotAScript", "sol-open", "SOL#no");
+        reservations().lock().unwrap().retain(|(s, _, _), _| s != script);
     }
 
     /// [E102a] Paper here narrows a live script to paper on one squadron.

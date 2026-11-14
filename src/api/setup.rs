@@ -139,6 +139,11 @@ const MANAGED_KEYS: &[(&str, &str, &str, &str, &str)] = &[
     // every six hours for new versions and withdrawals of imported vipers. On
     // unless set to false; read at each check, so no restart is needed.
     ("COMMUNITY_UPDATE_CHECK",   "Check the community registry for viper updates (on unless turned off)", "shared", "integration", "bool"),
+    // [E102] Not a credential: the crypto underlyings the rotation flies, one
+    // squadron each (`btc,eth,sol`; the first is the primary one). Read at
+    // startup, so a change asks for a restart. Squadrons for new underlyings
+    // start held: nothing opens there until the operator arms them.
+    ("ROTATION_UNDERLYINGS",     "Crypto underlyings to fly (btc, eth, sol; the first is your main one)", "shared", "integration", "text"),
 ];
 
 /// Managed keys the engine reads from the process environment each time it
@@ -1951,6 +1956,7 @@ mod tests {
                 // [E102a] Whether a squadron is held is the operator's per-squadron
                 // decision; a profile must never arm or hold anything.
                 "squadron_held",
+                "held_reviewed",
             ];
             // `autoscale_` [E91]: the capital auto-scaler is the operator's sizing
             // policy across every profile, so applying a profile never arms,

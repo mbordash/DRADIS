@@ -1297,6 +1297,10 @@ async fn get_pnl_span() -> Response {
 #[derive(Serialize)]
 struct StatusResponse {
     strategy_markets: HashMap<String, String>,
+    /// [E102] Seconds since each rotation loop last ticked (`kalshi:btc`,
+    /// `intl:eth`, ...). The process watchdog counts any loop's tick, so a
+    /// single stuck loop shows only here and in the stall warning.
+    rotation_loops: std::collections::BTreeMap<String, u64>,
     /// Whether the LLM Advisor is switched on (env override or compile default).
     llm_advisor_enabled: bool,
     /// What the advisor is doing now: disabled, misconfigured, waiting, ok,
@@ -1373,6 +1377,7 @@ async fn get_status(State(s): State<ApiState>) -> Response {
     debug!("Successfully retrieved status");
     Json(StatusResponse {
         strategy_markets: markets,
+        rotation_loops: crate::helpers::rotation::loop_ages(),
         llm_advisor_enabled: crate::helpers::llm_advisor::advisor_enabled_setting(),
         llm_advisor: crate::helpers::llm_advisor::advisor_health(),
         session_started_at, raptors, dark_market_feeds,

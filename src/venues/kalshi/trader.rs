@@ -745,6 +745,33 @@ enum MarketOutcome {
 /// Run the Kalshi trading loop until `cancel` fires: select the hottest
 /// tradeable crypto market across the configured series, trade it until close,
 /// rotate.
+/// [E102] The rotation plan: one (underlying, series) per rotation loop.
+///
+/// With `ROTATION_UNDERLYINGS` set, each underlying flies the configured series
+/// that belong to it (`KALSHI_SERIES` grouped by `detect_underlying`), or its
+/// default 15-minute and daily series when none are configured. Without it,
+/// the pre-E102 rule stands: one loop for the first configured series'
+/// underlying ([B84]). Returns the plan and the series no loop flies.
+fn rotation_plan(underlyings: Option<Vec<String>>, series: Vec<String>) -> (Vec<(String, Vec<String>)>, Vec<String>) {
+    let Some(us) = underlyings else {
+        let (u, kept, ignored) = rotation_series(series);
+        return (u.map(|u| vec![(u.to_string(), kept)]).unwrap_or_default(), ignored);
+    };
+    let mut plan = Vec::new();
+    for u in &us {
+        let mine: Vec<String> = series.iter().filter(|s| detect_underlying(s) == Some(u.as_str())).cloned().collect();
+        let mine = if mine.is_empty() {
+            let up = u.to_ascii_uppercase();
+            vec![format!("KX{up}15M"), format!("KX{up}D")]
+        } else { mine };
+        plan.push((u.clone(), mine));
+    }
+    let ignored = series.into_iter()
+        .filter(|s| !detect_underlying(s).is_some_and(|d| us.iter().any(|u| u == d)))
+        .collect();
+    (plan, ignored)
+}
+
 pub async fn run_kalshi_trader(
     venue: Arc<KalshiVenue>,
     cag: Cag,
@@ -759,14 +786,16 @@ pub async fn run_kalshi_trader(
     cancel: CancellationToken,
 ) {
     let filter = std::env::var(ENV_MARKET_FILTER).ok().filter(|s| !s.is_empty());
-    let (underlying, series, ignored) = rotation_series(configured_series());
-    // [E102a] The rotation's underlying is the instance's primary one.
-    if let Some(u) = underlying { crate::helpers::dynamic_config::set_primary_underlying(u); }
-    info!("🏛️ Kalshi trader starting — underlying={underlying:?} series={series:?} filter={filter:?}");
+    let (plan, ignored) = rotation_plan(crate::helpers::rotation::configured_underlyings(), configured_series());
+    // [E102a] The first underlying is the instance's primary one: squadrons for
+    // the others start held when first created. Set once, here, never per loop.
+    if let Some((u, _)) = plan.first() { crate::helpers::dynamic_config::set_primary_underlying(u); }
+    info!("🏛️ Kalshi trader starting — rotation {plan:?} filter={filter:?}");
     if !ignored.is_empty() {
         warn!(
-            "⚠️ Kalshi rotation flies one underlying ({underlying:?}, the first configured series'); \
-             ignoring {ignored:?} from {ENV_SERIES}. Deploy another underlying as its own squadron."
+            "⚠️ Kalshi rotation ignores {ignored:?} from {ENV_SERIES}: no configured underlying flies them. \
+             Set {} to fly several underlyings, each as its own squadron.",
+            crate::helpers::rotation::ENV_ROTATION_UNDERLYINGS,
         );
     }
 
@@ -796,7 +825,7 @@ pub async fn run_kalshi_trader(
     // Venue-lifetime private fill feed (event-precise fill confirmation).
     venue.start_fill_feed(cancel.clone());
 
-    // Drain the deployment queue alongside the rotation loop. Operator-deployed
+    // Drain the deployment queue alongside the rotation loops. Operator-deployed
     // markets run concurrently with the venue's own selection — they are a
     // different market class on a different cadence, not a replacement for it.
     tokio::spawn(crate::venues::deployment::run_deployment_processor(
@@ -812,6 +841,62 @@ pub async fn run_kalshi_trader(
         cancel.clone(),
     ));
 
+    // [E102] One rotation loop per underlying, each its own squadron
+    // (`btc-open`, `eth-open`, ...). Each has its own heartbeat so a stuck loop
+    // shows in `/api/status`; the newest one feeds the process watchdog.
+    crate::helpers::rotation::spawn_heartbeat_forwarder(Arc::clone(&process_heartbeat_secs), cancel.clone());
+    if plan.is_empty() {
+        // No crypto series configured: nothing to rotate. Operator deployments
+        // still run, so wait for shutdown rather than return to the park path.
+        warn!("⚠️ Kalshi rotation has no crypto underlying to fly; only operator deployments will trade");
+        cancel.cancelled().await;
+        return;
+    }
+    let mut loops = tokio::task::JoinSet::new();
+    for (underlying, series) in plan {
+        let name = format!("kalshi:{underlying}");
+        let hb = crate::helpers::rotation::register_loop(&name);
+        let (venue, cag, raptor_health_tx, markets_tx, tennis_rx, cancel, filter) = (
+            Arc::clone(&venue), cag.clone(), Arc::clone(&raptor_health_tx), Arc::clone(&markets_tx),
+            tennis_rx.clone(), cancel.clone(), filter.clone(),
+        );
+        loops.spawn(async move {
+            run_rotation_loop(venue, cag, raptor_health_tx, markets_tx, hb, tennis_rx, cancel, underlying, series, filter).await;
+            name
+        });
+    }
+    // A loop returns only when cancelled. Any other end (a panic, a return)
+    // leaves its squadron's positions unmanaged while the others keep the
+    // process alive, so it ends the process and the supervisor restarts it,
+    // as a panic in the single inline loop always did.
+    while let Some(r) = loops.join_next().await {
+        if cancel.is_cancelled() {
+            continue;
+        }
+        match r {
+            Ok(name) => error!("❌ Kalshi rotation loop {name} returned while the engine runs; exiting so the supervisor restarts it"),
+            Err(e) => error!("❌ Kalshi rotation loop ended abnormally: {e}; exiting so the supervisor restarts it"),
+        }
+        std::process::exit(1);
+    }
+}
+
+/// [E102] One underlying's rotation: select its hottest market, trade it until
+/// it closes or a hotter one appears, repeat. Never leaves its underlying.
+#[allow(clippy::too_many_arguments)]
+async fn run_rotation_loop(
+    venue: Arc<KalshiVenue>,
+    cag: Cag,
+    raptor_health_tx: Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
+    markets_tx: Arc<watch::Sender<HashMap<String, String>>>,
+    process_heartbeat_secs: Arc<AtomicU64>,
+    tennis_rx: watch::Receiver<TennisSnapshot>,
+    cancel: CancellationToken,
+    underlying: String,
+    series: Vec<String>,
+    filter: Option<String>,
+) {
+    info!("🔁 Kalshi rotation loop for {underlying} flying {series:?}");
     // The squadron the rotation loop currently owns, so the next rotation can
     // retire it when it lands on a different underlying.
     let mut last_rotation_squadron: Option<String> = None;
@@ -828,6 +913,8 @@ pub async fn run_kalshi_trader(
         // A retired instance selects no market: its replacement owns the
         // account (helpers::migration).
         if crate::helpers::migration::is_retired() {
+            // [E102] Idling on purpose: keep this loop's heartbeat fresh.
+            crate::helpers::rotation::touch(&process_heartbeat_secs);
             tokio::select! {
                 _ = cancel.cancelled() => return,
                 _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
@@ -865,11 +952,11 @@ pub async fn run_kalshi_trader(
         match outcome {
             MarketOutcome::Cancelled => return,
             MarketOutcome::BetterMarketFound => {
-                info!("🔀 Kalshi rotation — hotter market found, switching");
+                info!("🔀 Kalshi rotation [{underlying}] — hotter market found, switching");
             }
             MarketOutcome::Closed => {
                 closed_rank = Some(wanted_after_close);
-                info!("🔁 Kalshi market closed — rotating to next market");
+                info!("🔁 Kalshi market closed [{underlying}] — rotating to next market");
                 if wait_or_cancel(&cancel, 10).await {
                     return;
                 }
@@ -1528,9 +1615,12 @@ async fn trade_one_market(
     db::alias_pool(status_scope, asset);
     // [E102a] A rotation squadron for an underlying other than the instance's
     // primary one starts held the first time its row is created.
-    let held = deployed_as.is_none() && mandate == MarketMandate::Rotating
-        && crate::helpers::dynamic_config::starts_held(pair.underlying, true).await;
-    seed_squadron_config(&squadron_id, viper_budgets, held).await;
+    let rotating = deployed_as.is_none() && mandate == MarketMandate::Rotating;
+    let held = rotating && crate::helpers::dynamic_config::starts_held(pair.underlying, true).await;
+    // [E102 review] An existing row for a non-primary underlying (an `eth-open`
+    // left by a pre-1.5.8 rotation hop, with its vipers on) is held once.
+    let hold_existing = rotating && crate::helpers::dynamic_config::holds_existing_row(pair.underlying, true);
+    seed_squadron_config(&squadron_id, viper_budgets, held, hold_existing).await;
     let market_class = squadron.classify_and_link().await;
     // Carried into every tick's StrategyContext: the class is what a viper
     // asks to know what kind of market it is looking at.
@@ -2359,12 +2449,14 @@ async fn trade_one_market(
             // Inside the RTB window we manage what we hold but take on nothing
             // new: cancels and exits still flow, entries and quotes do not.
             if winding_down && signal.opens_exposure() {
+                release_entry_reservations(&squadron_id, &strategy_name, &signal);
                 continue;
             }
             // [E102a] A held squadron opens nothing until it is armed from its
             // card; exits and cancels still flow.
             if dyn_cfg.squadron_held && signal.opens_exposure() {
                 crate::helpers::viper_status::report_reason(&status_scope.to_uppercase(), &strategy_name, crate::helpers::viper_status::SQUADRON_HELD);
+                release_entry_reservations(&squadron_id, &strategy_name, &signal);
                 continue;
             }
             // [E95] The ultra-short market's own last minute, or a slot kept
@@ -2374,17 +2466,29 @@ async fn trade_one_market(
                 if let Some(u) = &ultra {
                     let ending = !ultra_wanted || u.cfg.phase(Utc::now(), MARKET_RTB_WINDOW_SECS) != MarketPhase::Open;
                     if ending && signal.tokens_opened().iter().any(|t| t == &u.pair.long || t == &u.pair.short) {
+                        release_entry_reservations(&squadron_id, &strategy_name, &signal);
                         continue;
                     }
                 }
             }
             if dispatch_signal(&squadron_id, venue.as_ref(), &pool, &scope, &positions, &lifecycle, &strategy_name, status_scope, &signal, starting).await {
                 acted = true;
+            } else if signal.opens_exposure() {
+                release_entry_reservations(&squadron_id, &strategy_name, &signal);
             }
         }
         if acted {
             cooldown_until = Instant::now() + Duration::from_secs(ACTION_COOLDOWN_SECS);
         }
+    }
+}
+
+/// [E102b] Free a script entry's cap reservation when the loop drops the
+/// entry or it fills nothing, so it neither blocks the script's own retry nor
+/// holds the cap against other squadrons until it expires.
+fn release_entry_reservations(squadron_id: &str, strategy_name: &str, signal: &StrategySignal) {
+    for t in signal.tokens_opened() {
+        crate::vipers::scripted::adapter::release_reservation(strategy_name, squadron_id, t.as_str());
     }
 }
 
@@ -3576,7 +3680,8 @@ async fn sync_dashboard(
     // figure; no total is returned, so the loop keeps the session P&L it had
     // rather than reporting a phantom drop equal to the unpriced positions, and
     // no P&L snapshot is written from a total we could not compute.
-    let positions = match venue.positions().await {
+    // [E102] Shared across squadron loops syncing within a second or two.
+    let positions = match venue.positions_shared().await {
         Ok(p) => p,
         Err(e) => {
             warn!("Kalshi dashboard sync: positions query failed — skipping reconcile/purge this pass: {e}");
@@ -3884,6 +3989,10 @@ fn register_kalshi_squadron(
     let display_name = match (squadron_name, deployed_as) {
         (Some(n), _) if !n.trim().is_empty() => n.trim().to_string(),
         (_, Some(class)) => format!("Kalshi {} Squadron", title_case(class)),
+        // [E102] Named for its underlying: several rotation squadrons can fly
+        // at once, and three cards reading "Kalshi Crypto Squadron" told the
+        // operator nothing.
+        (_, None) if pair.is_crypto() => format!("Kalshi {} Squadron", pair.underlying.to_ascii_uppercase()),
         (_, None) => "Kalshi Crypto Squadron".to_string(),
     };
     let squadron = Squadron::new_named(
@@ -3915,7 +4024,7 @@ fn register_kalshi_squadron(
 /// squadron id that already has config still honors the numbers just entered,
 /// which is what the deploy dialog implies and what Polymarket International
 /// has always done.
-async fn seed_squadron_config(squadron_id: &str, budgets: &std::collections::HashMap<String, f64>, held: bool) {
+async fn seed_squadron_config(squadron_id: &str, budgets: &std::collections::HashMap<String, f64>, held: bool, hold_existing: bool) {
     if let Some(pool) = db::pool() {
         if db::squadron_config_get(pool, squadron_id).await.is_none() {
             if held {
@@ -3923,6 +4032,8 @@ async fn seed_squadron_config(squadron_id: &str, budgets: &std::collections::Has
             } else {
                 DynamicConfig::init_for_squadron(squadron_id).await;
             }
+        } else if hold_existing {
+            DynamicConfig::hold_existing_once(squadron_id).await;
         }
     }
     if budgets.is_empty() {
@@ -4003,6 +4114,18 @@ mod tests {
     fn non_crypto_series_rejected() {
         assert!(pair_from_market(&mkt("KXNBA-FINALS", "NBA champ", "", "0")).is_none());
         assert_eq!(detect_underlying("KXETH15M-X"), Some("eth"));
+        // [E102] One loop per configured underlying, with its own series.
+        let (plan, ignored) = rotation_plan(None, vec!["KXBTC15M".into(), "KXBTCD".into(), "KXETH15M".into()]);
+        assert_eq!(plan, vec![("btc".to_string(), vec!["KXBTC15M".to_string(), "KXBTCD".to_string()])], "unset: the B84 rule");
+        assert_eq!(ignored, vec!["KXETH15M".to_string()]);
+        let (plan, ignored) = rotation_plan(Some(vec!["btc".into(), "eth".into(), "sol".into()]),
+            vec!["KXBTC15M".into(), "KXBTCD".into(), "KXDOGE15M".into()]);
+        assert_eq!(plan, vec![
+            ("btc".to_string(), vec!["KXBTC15M".to_string(), "KXBTCD".to_string()]),
+            ("eth".to_string(), vec!["KXETH15M".to_string(), "KXETHD".to_string()]),
+            ("sol".to_string(), vec!["KXSOL15M".to_string(), "KXSOLD".to_string()]),
+        ], "configured series where given, the defaults otherwise");
+        assert_eq!(ignored, vec!["KXDOGE15M".to_string()]);
         // [B112] A holding's adoption kind follows its series.
         assert_eq!(holding_kind("KXETH15M-26NOV141015-15#yes"), db::AdoptionKind::Crypto(Some("eth".into())));
         assert_eq!(holding_kind("KXSOL15M-26NOV141015-15#no"), db::AdoptionKind::Crypto(Some("sol".into())));

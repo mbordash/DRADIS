@@ -112,6 +112,9 @@ pub struct KalshiVenue {
     /// rate-limited to one call per second and the pre-trade funding check
     /// reads it on every order, so reads within [`BALANCE_CACHE_SECS`] share one.
     pub(crate) balance_cache: tokio::sync::Mutex<Option<(std::time::Instant, types::BalanceResponse)>>,
+    /// [E102] The newest account positions read, shared by squadron loops'
+    /// dashboard sweeps (`positions_shared`).
+    pub(crate) positions_cache: tokio::sync::Mutex<Option<(std::time::Instant, Vec<crate::venues::core::Position>)>>,
 }
 
 /// How long a balance reading serves repeat callers before Kalshi is asked again.
@@ -137,6 +140,9 @@ const COLLATERAL_SHARED_SECS: u64 = 3;
 pub(crate) fn collateral_reading_is_shared(age: std::time::Duration) -> bool {
     age < std::time::Duration::from_secs(COLLATERAL_SHARED_SECS)
 }
+/// [E102] Bound on one shared positions read (`positions_shared`).
+const POSITIONS_FETCH_TIMEOUT_SECS: u64 = 5;
+
 /// Bound on one balance request. The cache lock is held across it so concurrent
 /// callers share a single reading; without a bound one stalled connection would
 /// hold every buy in the process.
@@ -165,6 +171,7 @@ impl KalshiVenue {
             order_tickers: dashmap::DashMap::new(),
             market_shards: dashmap::DashMap::new(),
             balance_cache: tokio::sync::Mutex::new(None),
+            positions_cache: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -330,6 +337,31 @@ impl KalshiVenue {
         self.fetch_balance_into(&mut cache).await
     }
 
+/// [E102] How long one account positions read serves other squadron loops'
+    /// dashboard sweeps. Short: the sweep adopts and confirms from it.
+    pub(crate) const POSITIONS_SHARED_SECS: u64 = 2;
+
+    /// The account's positions for a dashboard sweep: a read at most
+    /// [`Self::POSITIONS_SHARED_SECS`] old, so several squadron loops syncing
+    /// on the same beat share one `/portfolio/positions` call. Callers that act
+    /// on a fill use `Execution::positions` directly.
+    pub(crate) async fn positions_shared(&self) -> anyhow::Result<Vec<crate::venues::core::Position>> {
+        let mut cache = self.positions_cache.lock().await;
+        if let Some((at, p)) = cache.as_ref() {
+            if at.elapsed() < std::time::Duration::from_secs(Self::POSITIONS_SHARED_SECS) {
+                return Ok(p.clone());
+            }
+        }
+        // Bounded: the lock is held across the call and every squadron's sweep
+        // waits on it, so a stalled request must not freeze them all.
+        let fresh = tokio::time::timeout(
+            std::time::Duration::from_secs(POSITIONS_FETCH_TIMEOUT_SECS),
+            crate::venues::core::Execution::positions(self),
+        ).await.map_err(|_| anyhow::anyhow!("Kalshi GET /portfolio/positions timed out after {POSITIONS_FETCH_TIMEOUT_SECS}s"))??;
+        *cache = Some((std::time::Instant::now(), fresh.clone()));
+        Ok(fresh)
+    }
+
     async fn fetch_balance_into(
         &self,
         cache: &mut Option<(std::time::Instant, types::BalanceResponse)>,
@@ -345,6 +377,9 @@ impl KalshiVenue {
     /// Forget the cached balance: a fill or a cancel has moved money.
     pub(crate) async fn invalidate_balance(&self) {
         *self.balance_cache.lock().await = None;
+        // [E102 review] A fill or a cancel moved holdings too: the next sweep
+        // must not confirm or snapshot from the pre-fill positions list.
+        *self.positions_cache.lock().await = None;
     }
 
     /// Every open market under the given Kalshi categories, paged.

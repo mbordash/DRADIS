@@ -1890,6 +1890,9 @@ impl Squadron {
                         // from its card; exits and cancels still flow.
                         if signal.opens_exposure() && dynamic_config.read().unwrap().squadron_held {
                             crate::helpers::viper_status::report_reason(&crypto_filter, &strategy_name, crate::helpers::viper_status::SQUADRON_HELD);
+                            for t in signal.tokens_opened() {
+                                crate::vipers::scripted::adapter::release_reservation(&strategy_name, &squadron_id, t.as_str());
+                            }
                             continue;
                         }
 

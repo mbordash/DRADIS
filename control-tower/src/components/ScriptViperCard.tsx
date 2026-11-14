@@ -22,7 +22,7 @@
  * its parameters are edited on the Build a Viper page.
  */
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { DynamicConfig } from '@/lib/types';
 import type { ViperStatusRow } from '@/lib/api';
 import { fmtAgo, isTroubled } from '@/components/ViperCard';
@@ -47,6 +47,8 @@ export default function ScriptViperCard({ row, config, onPatch }: {
   // only the script's cap applies.
   const savedHere = cfg.max_exposure_here_usdc == null ? '' : String(cfg.max_exposure_here_usdc);
   const [capHere, setCapHere] = useState(savedHere);
+  // Follow the saved value after a save or a config poll.
+  useEffect(() => { setCapHere(savedHere); }, [savedHere]);
   const capDirty = capHere.trim() !== savedHere;
   const capValid = capHere.trim() === '' || (Number.isFinite(Number(capHere)) && Number(capHere) > 0);
 

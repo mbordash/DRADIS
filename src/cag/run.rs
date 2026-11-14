@@ -309,6 +309,8 @@ where
         // A retired instance keeps its crypto squadron down: the instance
         // replacing it is taking over the wallet (helpers::migration).
         if crate::helpers::migration::is_retired() {
+            // [E102] Idling on purpose: keep this loop's heartbeat fresh.
+            crate::helpers::rotation::touch(&process_heartbeat_secs);
             let cancelled = tokio::select! {
                 _ = cancel.cancelled() => true,
                 _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => false,
@@ -448,7 +450,8 @@ where
         // [E102a] An asset other than the instance's primary one starts held
         // the first time its squadron row is created.
         let held = crate::helpers::dynamic_config::starts_held(&patrol_ctx.crypto_filter, true).await;
-        let squadron_config = DynamicConfig::load_or_init_for_squadron_held(&squadron.id, held).await;
+        let hold_existing = crate::helpers::dynamic_config::holds_existing_row(&patrol_ctx.crypto_filter, true);
+        let squadron_config = DynamicConfig::load_or_init_for_squadron_held(&squadron.id, held, hold_existing).await;
         patrol_ctx.dynamic_config = Arc::new(RwLock::new((*squadron_config).clone()));
 
         // Register the live config handle so squadron-scoped PATCHes apply on the

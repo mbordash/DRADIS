@@ -442,12 +442,49 @@ async fn run() -> Result<()> {
     #[cfg(feature = "intl_clob")]
     let default_asset = "btc";
     let crypto_filter = env::var("CRYPTO_FILTER").unwrap_or_else(|_| default_asset.to_string()).to_lowercase();
-    let assets: Vec<String> = env::var("ASSETS")
-        .unwrap_or_else(|_| crypto_filter.clone())
+    // [E102] `ROTATION_UNDERLYINGS` is the venue-neutral name for the
+    // underlyings to fly. On the intl CLOB the asset list IS that (one patrol
+    // loop and one shard per asset), so it stands in for an unset `ASSETS`
+    // there. Never elsewhere: on Kalshi and Polymarket US `ASSETS` names the
+    // primary database shard, and a list of underlyings there would hand the
+    // primary pool to an empty `logs/btc-dradis.db` (see the note above).
+    #[cfg(feature = "intl_clob")]
+    let assets_raw = match (env::var("ASSETS").ok(), dradis::helpers::rotation::configured_underlyings()) {
+        (Some(a), Some(_)) => {
+            tracing::warn!("⚠️ ASSETS={a} is set, so ROTATION_UNDERLYINGS (the Setup field) is ignored on this venue");
+            a
+        }
+        (Some(a), None) => a,
+        // The first asset names the primary database shard, so the instance's
+        // existing primary (CRYPTO_FILTER) stays first: adding coins in Setup
+        // must not move the global config and squadron rows to an empty shard.
+        (None, Some(mut list)) => {
+            if let Some(i) = list.iter().position(|u| *u == crypto_filter) {
+                let p = list.remove(i);
+                list.insert(0, p);
+            } else if env::var("CRYPTO_FILTER").is_ok() {
+                tracing::warn!("⚠️ ROTATION_UNDERLYINGS {list:?} does not include CRYPTO_FILTER={crypto_filter}; the primary database becomes {}-dradis.db", list[0]);
+            }
+            list.join(",")
+        }
+        (None, None) => crypto_filter.clone(),
+    };
+    #[cfg(not(feature = "intl_clob"))]
+    let assets_raw = env::var("ASSETS").unwrap_or_else(|_| crypto_filter.clone());
+    #[allow(unused_mut)]
+    let mut assets: Vec<String> = assets_raw
         .split(',')
         .map(|s| s.trim().to_lowercase())
         .filter(|s| !s.is_empty())
         .collect();
+    #[cfg(not(feature = "intl_clob"))]
+    if assets.len() > 1 {
+        tracing::warn!(
+            "⚠️ ASSETS={assets:?} is ignored on this venue: it names the database shard, not the markets. \
+             Set ROTATION_UNDERLYINGS to fly several underlyings; using {:?}.", assets[0],
+        );
+        assets.truncate(1);
+    }
     let primary_asset = assets.first().cloned().unwrap_or_else(|| crypto_filter.clone());
     // [E102a] Squadrons for any other asset start held when first created.
     dradis::helpers::dynamic_config::set_primary_underlying(&primary_asset);
@@ -1199,7 +1236,9 @@ async fn run() -> Result<()> {
             tw_api_secret:         env::var("X_API_SECRET").unwrap_or_default(),
             tw_access_token:       env::var("X_ACCESS_TOKEN").unwrap_or_default(),
             tw_access_token_secret: env::var("X_ACCESS_TOKEN_SECRET").unwrap_or_default(),
-            process_heartbeat_secs: Arc::clone(&process_heartbeat_secs),
+            // [E102] Each asset loop's own heartbeat (shown in /api/status);
+            // the forwarder below carries the newest to the process watchdog.
+            process_heartbeat_secs: dradis::helpers::rotation::register_loop(&format!("intl:{asset}")),
             cancel:         loop_cancel.clone(),
         };
 
@@ -1218,8 +1257,17 @@ async fn run() -> Result<()> {
                 }) as dradis::venues::core::ResolverFuture
             }));
         }
+        if loop_tasks.is_empty() {
+            dradis::helpers::rotation::spawn_heartbeat_forwarder(Arc::clone(&process_heartbeat_secs), CancellationToken::new());
+        }
         info!(" Spawning market loop for asset: {}", asset.to_uppercase());
-        let handle = tokio::spawn(run_market_loop(args));
+        // [E102] A loop that ends (stand-down, cancellation) is no longer
+        // tracked, so it is not reported as stuck.
+        let loop_name = format!("intl:{asset}");
+        let handle = tokio::spawn(async move {
+            run_market_loop(args).await;
+            dradis::helpers::rotation::retire_loop(&loop_name);
+        });
 
         // Register the AbortHandle + cancel token with the CAG so stand_down_asset()
         // can gracefully exit or forcibly abort this loop at any time.

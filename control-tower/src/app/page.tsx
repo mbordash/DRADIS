@@ -229,6 +229,28 @@ function VenueIncomeLine({ income }: { income: VenueIncome }) {
 /// and declining quietly looks exactly like a quiet market. An operator whose
 /// connection drops would otherwise see a healthy engine that has silently
 /// stopped being able to trade.
+/** [E102] A rotation loop (one per underlying) that has stopped ticking. The
+ *  process watchdog counts any loop's tick, so one stuck loop shows only here. */
+function StalledLoopBanner({ loops }: { loops?: Record<string, number> }) {
+  const stalled = Object.entries(loops ?? {}).filter(([, age]) => age > 180);
+  if (stalled.length === 0) return null;
+  return (
+    <div className="card px-4 py-3 border border-amber-500/30 bg-amber-500/10">
+      <p className="text-sm font-mono text-amber-300">
+        {stalled.length === 1 ? 'A market loop has' : `${stalled.length} market loops have`} stopped ticking
+      </p>
+      <p className="text-[11px] text-gray-400 mt-1">
+        The other loops keep trading. A loop silent this long is stuck; restarting the engine restarts it.
+      </p>
+      <ul className="mt-2 space-y-0.5">
+        {stalled.map(([name, age]) => (
+          <li key={name} className="text-[11px] font-mono text-amber-200">{name.replace(':', ' · ').toUpperCase()} — silent {Math.floor(age / 60)}m {age % 60}s</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 function DarkFeedBanner({ feeds }: { feeds?: { market: string; market_name?: string; dark_for_secs: number }[] }) {
   if (!feeds || feeds.length === 0) return null;
   return (
@@ -1005,6 +1027,7 @@ export default function DashboardPage() {
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
           {config?.ghost_mode && <GhostBanner ghost />}
           <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <StalledLoopBanner loops={status?.rotation_loops} />
           <OddsFeedBanner feed={status?.odds_feed} />
           <SquadronDetailView squadron={focusedSquadron} onBack={handleBackToCag} onOpenMarket={selectMarket} />
           <div className="mt-12"><Footer /></div>
@@ -1078,6 +1101,7 @@ export default function DashboardPage() {
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
           <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <StalledLoopBanner loops={status?.rotation_loops} />
           <OddsFeedBanner feed={status?.odds_feed} />
           <TradelogPage availableAssets={availableAssets} />
           <Footer />
@@ -1100,6 +1124,7 @@ export default function DashboardPage() {
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
           <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <StalledLoopBanner loops={status?.rotation_loops} />
           <OddsFeedBanner feed={status?.odds_feed} />
           <ErrorBoundary label="Helm">
             <HelmPage />
@@ -1113,6 +1138,7 @@ export default function DashboardPage() {
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
           <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <StalledLoopBanner loops={status?.rotation_loops} />
           <OddsFeedBanner feed={status?.odds_feed} />
           <ErrorBoundary label="Telemetry">
             <ChunkBoundary name="Telemetry">
@@ -1128,6 +1154,7 @@ export default function DashboardPage() {
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
           <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <StalledLoopBanner loops={status?.rotation_loops} />
           <OddsFeedBanner feed={status?.odds_feed} />
           <ErrorBoundary label="Markets">
             <ChunkBoundary name="Markets">
@@ -1154,6 +1181,7 @@ export default function DashboardPage() {
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
           <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <StalledLoopBanner loops={status?.rotation_loops} />
           <OddsFeedBanner feed={status?.odds_feed} />
           <ErrorBoundary label="AI Actions">
             <AiActionsPage />
@@ -1190,6 +1218,7 @@ export default function DashboardPage() {
         {config?.ghost_mode && <GhostBanner ghost />}
           <CommunityUpdatesBanner notices={communityUpdates?.notices} onOpen={() => navigate('vipers')} />
           <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <StalledLoopBanner loops={status?.rotation_loops} />
           <OddsFeedBanner feed={status?.odds_feed} />
 
         {/* ── Portfolio Value Banner ─────────────────────────────────── */}

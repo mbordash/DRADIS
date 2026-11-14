@@ -232,6 +232,13 @@ function groupsForVenue(venue: VenueId) {
       { title: 'Polymarket US API Keys', blurb: 'Custodial venue key ID + secret from your Polymarket US account.', keys: ['POLYMARKET_US_KEY_ID', 'POLYMARKET_US_SECRET_KEY'], test: 'us_keys' },
     );
   }
+  // [E102] Which crypto underlyings the rotation flies, one squadron each.
+  // Polymarket US lists BTC crypto only, so the choice has nothing to split there.
+  if (venue === 'intl' || venue === 'kalshi') {
+    groups.push(
+      { title: 'Crypto Underlyings', blurb: 'Which coins to fly, one squadron each, e.g. btc,eth,sol (supported: btc, eth, sol). The first is your main one. A squadron for a coin you add starts held: its vipers evaluate and scripts paper-trade, but nothing real opens until you arm it from its page. Blank keeps today\'s single coin. Applies on restart.', keys: ['ROTATION_UNDERLYINGS'] },
+    );
+  }
   // Raptor signal keys (Alpaca, The Odds API, …) deliberately do NOT appear
   // here — they live in the Raptor Signal Sources panel below, which is driven
   // by GET /api/setup/raptors so a new Raptor needs no change to this file.

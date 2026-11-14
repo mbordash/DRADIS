@@ -469,6 +469,18 @@ pub async fn run_us_trader(
 ) {
     let filter = std::env::var(ENV_MARKET_FILTER).ok().filter(|s| !s.is_empty());
     info!("🇺🇸 US trader starting — market filter={filter:?}");
+    // [E102] The venue-neutral underlyings setting. Polymarket US lists crypto
+    // as BTC hourly/daily/weekly/yearly ladders only (checked 2026-11-14: no
+    // ETH or SOL markets, no 15-minute markets), so its one crypto wing flies
+    // whatever the venue lists and there is nothing per underlying to split.
+    // Said once at startup rather than ignored in silence.
+    if let Some(us) = crate::helpers::rotation::configured_underlyings() {
+        info!(
+            "🇺🇸 {} = {us:?}: Polymarket US runs one crypto wing over the crypto markets it lists \
+             (BTC only, no 15-minute markets as of 2026-11-14); other underlyings have no markets here.",
+            crate::helpers::rotation::ENV_ROTATION_UNDERLYINGS,
+        );
+    }
 
     // Register a session with the CAG so the venue-neutral API handlers work.
     //
@@ -1728,21 +1740,34 @@ async fn trade_one_market(
             // Inside the RTB window we manage what we hold but take on nothing
             // new: cancels and exits still flow, entries and quotes do not.
             if winding_down && signal.opens_exposure() {
+                release_entry_reservations(&squadron_id, &strategy_name, &signal);
                 continue;
             }
             // [E102a] A held squadron opens nothing until it is armed from its
             // card; exits and cancels still flow.
             if dyn_cfg.squadron_held && signal.opens_exposure() {
                 crate::helpers::viper_status::report_reason(&asset.to_uppercase(), &strategy_name, crate::helpers::viper_status::SQUADRON_HELD);
+                release_entry_reservations(&squadron_id, &strategy_name, &signal);
                 continue;
             }
             if dispatch_signal(&squadron_id, venue.as_ref(), &pool, &positions, &lifecycle, &scope, &strategy_name, &signal, starting).await {
                 acted = true;
+            } else if signal.opens_exposure() {
+                release_entry_reservations(&squadron_id, &strategy_name, &signal);
             }
         }
         if acted {
             cooldown_until = Instant::now() + Duration::from_secs(ACTION_COOLDOWN_SECS);
         }
+    }
+}
+
+/// [E102b] Free a script entry's cap reservation when the loop drops the
+/// entry or it fills nothing, so it neither blocks the script's own retry nor
+/// holds the cap against other squadrons until it expires.
+fn release_entry_reservations(squadron_id: &str, strategy_name: &str, signal: &StrategySignal) {
+    for t in signal.tokens_opened() {
+        crate::vipers::scripted::adapter::release_reservation(strategy_name, squadron_id, t.as_str());
     }
 }
 

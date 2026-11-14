@@ -513,6 +513,18 @@ pub fn set_primary_underlying(u: &str) {
     }
 }
 
+/// The instance's primary underlying, once recorded.
+pub fn primary_underlying() -> Option<String> {
+    PRIMARY_UNDERLYING.lock().ok().and_then(|g| g.as_ref().map(|(u, _)| u.clone()))
+}
+
+/// [E102 review] Whether an EXISTING rotation squadron row for `asset` must be
+/// held once: only for a non-primary underlying (the primary's row is the one
+/// trading today and is never touched).
+pub fn holds_existing_row(asset: &str, rotation: bool) -> bool {
+    rotation && primary_underlying().is_some_and(|p| !p.eq_ignore_ascii_case(asset))
+}
+
 /// The crypto underlying of a rotation squadron id (`btc-open`, no name
 /// suffix), if it is one.
 fn rotation_underlying(squadron_id: &str) -> Option<&str> {
@@ -547,13 +559,49 @@ pub fn starts_held_given(primary: Option<&str>, earlier: &[String], asset: &str,
 /// Turn a config seeded from the global row into a held squadron's.
 pub fn held_seed(cfg: &mut DynamicConfig) {
     cfg.squadron_held = true;
+    cfg.held_reviewed = true;
     for c in cfg.custom_vipers.values_mut() { c.paper_here = true; }
+}
+
+/// [E102b review] Before a squadron patch is merged, give every script it
+/// names that the row has no entry for a copy of the global entry, so the
+/// merge changes only the fields the patch names.
+pub fn seed_missing_script_entries(row: &mut serde_json::Value, patch: &serde_json::Value, global: &DynamicConfig) {
+    let Some(names) = patch.get("custom_vipers").and_then(|v| v.as_object()) else { return };
+    let Some(obj) = row.as_object_mut() else { return };
+    let entries = obj.entry("custom_vipers").or_insert_with(|| serde_json::json!({}));
+    let Some(entries) = entries.as_object_mut() else { return };
+    for (name, p) in names {
+        if p.is_null() || entries.contains_key(name) { continue; }
+        if let Some(g) = global.custom_vipers.get(name) {
+            let mut g = g.clone();
+            g.paper_here = false;
+            g.max_exposure_here_usdc = None;
+            if let Ok(v) = serde_json::to_value(g) { entries.insert(name.clone(), v); }
+        }
+    }
+}
+
+/// [E102b review] A squadron's share of a script's cap must be above zero; 0
+/// or less would silently block the script there. Clear it with null.
+fn refuse_nonpositive_cap_here(patch: &serde_json::Value) -> Result<()> {
+    let Some(m) = patch.get("custom_vipers").and_then(|v| v.as_object()) else { return Ok(()) };
+    for (name, e) in m {
+        let Some(v) = e.get("max_exposure_here_usdc") else { continue };
+        if v.is_null() { continue; }
+        let n = v.as_str().map(|s| s.trim().parse::<Decimal>().ok()).unwrap_or_else(|| v.as_f64().and_then(Decimal::from_f64_retain));
+        match n {
+            Some(n) if n > Decimal::ZERO => {}
+            _ => anyhow::bail!("{name}: Cap here must be a dollar amount above 0, or null to clear it (got {v})"),
+        }
+    }
+    Ok(())
 }
 
 /// A global patch may not name squadron-only switches: the fan-out would
 /// write them to every squadron row, arming or holding all of them at once.
 pub fn refuse_squadron_only_keys(patch: &serde_json::Value) -> Result<()> {
-    if patch.get("squadron_held").is_some() {
+    if patch.get("squadron_held").is_some() || patch.get("held_reviewed").is_some() {
         anyhow::bail!("squadron_held is set per squadron (PATCH /api/squadrons/{{id}}/config), never globally");
     }
     for key in ["paper_here", "max_exposure_here_usdc"] {
@@ -1585,6 +1633,13 @@ pub struct DynamicConfig {
     /// refused, so a Setup or profile change can never arm or hold squadrons.
     #[serde(default)]
     pub squadron_held: bool,
+    /// [E102 review] Set once this squadron row has been through the held
+    /// rule (seeded held, or held at its first multi-underlying start). A row
+    /// for a non-primary underlying without it predates E102 (e.g. an
+    /// `eth-open` row a pre-1.5.8 rotation hop created with real-money vipers
+    /// on) and is held once at startup; the operator's later Arm sticks.
+    #[serde(default)]
+    pub held_reviewed: bool,
     /// Ceiling on total Helm notional across every Helm squadron (shared session).
     #[serde(default = "default_helm_max_exposure_usdc")]
     pub helm_max_exposure_usdc: Decimal,
@@ -1992,6 +2047,7 @@ impl Default for DynamicConfig {
             helm_live_enabled: config::HELM_LIVE_ENABLED,
             custom_vipers: Default::default(),
             squadron_held: false,
+            held_reviewed: false,
             helm_max_exposure_usdc: config::HELM_MAX_EXPOSURE_USDC,
             helm_fee_verdict_enforce: config::HELM_FEE_VERDICT_ENFORCE,
             helm_fee_max_ratio: config::HELM_FEE_MAX_RATIO,
@@ -2978,16 +3034,39 @@ impl DynamicConfig {
     /// [E102a] Like [`Self::load_or_init_for_squadron`], but a squadron seeded
     /// here for the first time starts held (see `squadron_held`) when `held`,
     /// with every script the instance has paper on it.
-    pub async fn load_or_init_for_squadron_held(squadron_id: &str, held: bool) -> Arc<Self> {
-        if !held || read_only_mode() {
+    ///
+    /// `held_if_new` decides a row created here (`starts_held`); `hold_if_existing`
+    /// decides an existing row, held once if it never went through the rule
+    /// (`holds_existing_row`: non-primary underlyings only, so the primary's
+    /// trading row is never touched).
+    pub async fn load_or_init_for_squadron_held(squadron_id: &str, held_if_new: bool, hold_if_existing: bool) -> Arc<Self> {
+        if read_only_mode() {
             return Self::load_or_init_for_squadron(squadron_id).await;
         }
-        if let Some(pool) = db::pool() {
-            if db::squadron_config_get(pool, squadron_id).await.is_some() {
-                return Self::load_for_squadron(squadron_id).await;
-            }
+        let exists = match db::pool() {
+            Some(pool) => db::squadron_config_get(pool, squadron_id).await.is_some(),
+            None => return Self::load_or_init_for_squadron(squadron_id).await,
+        };
+        match (exists, held_if_new, hold_if_existing) {
+            (true, _, true) => Self::hold_existing_once(squadron_id).await,
+            (true, _, false) => Self::load_for_squadron(squadron_id).await,
+            (false, true, _) => Self::init_held_for_squadron(squadron_id).await,
+            (false, false, _) => Self::init_for_squadron(squadron_id).await,
         }
-        Self::init_held_for_squadron(squadron_id).await
+    }
+
+    /// [E102 review] Hold an existing non-primary rotation row once, if it has
+    /// never been through the held rule; otherwise load it as it stands.
+    pub async fn hold_existing_once(squadron_id: &str) -> Arc<Self> {
+        let current = Self::load_for_squadron(squadron_id).await;
+        if current.held_reviewed {
+            return current;
+        }
+        let mut cfg = (*current).clone();
+        held_seed(&mut cfg);
+        cfg.save_for_squadron(squadron_id).await;
+        warn!("⏸️  Squadron {squadron_id} existed before multi-underlying support and is now HELD (scripts paper here). Nothing opens there until it is armed from its card.");
+        Arc::new(cfg)
     }
 
     /// [E102a] Seed a squadron row held: the global row's settings, but
@@ -3074,6 +3153,18 @@ impl DynamicConfig {
         refuse_fee_floor_violations(&patch)?;
         refuse_negative_drawdown_limit(&patch)?;
         refuse_cap_above_manifest(&patch)?;
+        refuse_nonpositive_cap_here(&patch)?;
+
+        // [E102b review] A squadron row with no entry for a script reads the
+        // global entry (`custom_viper`). A patch naming that script here (Off
+        // here, Paper here, Cap here) must start from the global entry, or the
+        // bare patch becomes the whole entry: switched on and at manifest
+        // defaults on a squadron where the instance had it off or tuned.
+        let global_now: Arc<DynamicConfig> = match global_config_tx() {
+            Some(tx) => tx.borrow().clone(),
+            None => Self::load_or_default().await,
+        };
+        seed_missing_script_entries(&mut value, &patch, &global_now);
 
         if let (Some(obj), Some(patch_obj)) = (value.as_object_mut(), patch.as_object()) {
             merge_patch_into(obj, patch_obj);
@@ -3294,6 +3385,29 @@ mod custom_viper_patch_tests {
         assert!(held.custom_viper("not-on-this-row").paper_here);
     }
 
+    /// [E102b review] A squadron patch naming a script the row has no entry
+    /// for keeps the instance's switches and params; Cap here must be > 0.
+    #[test]
+    fn e102b_a_squadron_patch_starts_from_the_global_entry() {
+        let mut global = DynamicConfig::default();
+        let mut g = CustomViperConfig { enabled: false, ..Default::default() };
+        g.params.insert("contracts".into(), serde_json::json!(10));
+        global.custom_vipers.insert("sniper".into(), g);
+        let mut row = serde_json::to_value(DynamicConfig::default()).unwrap();
+        let patch = serde_json::json!({"custom_vipers": {"sniper": {"paper_here": true}}});
+        seed_missing_script_entries(&mut row, &patch, &global);
+        merge_patch_into(row.as_object_mut().unwrap(), patch.as_object().unwrap());
+        let out: DynamicConfig = serde_json::from_value(row).unwrap();
+        let c = &out.custom_vipers["sniper"];
+        assert!(!c.enabled, "off on the instance stays off here");
+        assert_eq!(c.params.get("contracts"), Some(&serde_json::json!(10)));
+        assert!(c.paper_here);
+        assert!(refuse_nonpositive_cap_here(&serde_json::json!({"custom_vipers": {"s": {"max_exposure_here_usdc": "0"}}})).is_err());
+        assert!(refuse_nonpositive_cap_here(&serde_json::json!({"custom_vipers": {"s": {"max_exposure_here_usdc": "-5"}}})).is_err());
+        assert!(refuse_nonpositive_cap_here(&serde_json::json!({"custom_vipers": {"s": {"max_exposure_here_usdc": "7.5"}}})).is_ok());
+        assert!(refuse_nonpositive_cap_here(&serde_json::json!({"custom_vipers": {"s": {"max_exposure_here_usdc": null}}})).is_ok());
+    }
+
     /// [E102a] Squadron-only switches never travel through the global row.
     #[test]
     fn e102a_a_global_patch_may_not_hold_arm_or_paper_squadrons() {
@@ -3320,6 +3434,7 @@ mod custom_viper_patch_tests {
         v.as_object_mut().unwrap().remove("squadron_held");
         let out: DynamicConfig = serde_json::from_value(v).unwrap();
         assert!(!out.squadron_held, "an older saved row is not held");
+        assert!(!out.held_reviewed, "an older saved row has not been through the held rule");
         let c: CustomViperConfig = serde_json::from_value(serde_json::json!({"live": true})).unwrap();
         assert!(!c.paper_here);
     }

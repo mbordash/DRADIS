@@ -683,6 +683,8 @@ export interface LlmAdvisorHealth {
 /** Response from GET /api/status — maps strategy key to active market name. */
 export interface StatusResponse {
   strategy_markets: Record<string, string>;
+  /** [E102] Seconds since each rotation loop last ticked (`kalshi:btc`, `intl:eth`, ...). */
+  rotation_loops?: Record<string, number>;
   /** Whether the LLM Advisor is switched on. Absent on older engines. */
   llm_advisor_enabled?: boolean;
   /** The advisor's current state. Absent on older engines. */

@@ -43,6 +43,7 @@ pub mod volatility;
 pub mod clob_public;
 pub mod sigma_profile;
 pub mod watchdog;
+pub mod rotation;
 pub mod logbuf;
 pub mod latency;
 pub mod viper_status;
