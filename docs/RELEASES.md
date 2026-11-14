@@ -6,7 +6,7 @@ version's release notes field; the detail below it is the full account.
 
 ## 1.8.5 (unreleased)
 
-- Fly several crypto underlyings at once: set "Crypto Underlyings" in Setup (for example btc,eth,sol; the first is your main one) and restart. On Kalshi each coin gets its own squadron and 15-minute market; Polymarket International already ran one squadron per coin and now reads the same setting. Polymarket US lists BTC crypto markets only, so the setting has nothing to add there.
+- Fly several crypto underlyings at once: set "Coins to Trade" on the Setup Venue tab (for example btc,eth,sol; the first is your main coin) and restart. On Kalshi each coin gets its own squadron and 15-minute market; Polymarket International already ran one squadron per coin and now reads the same setting. Polymarket US lists BTC crypto markets only, so the setting has nothing to add there.
 - New squadrons for other coins start held: their vipers evaluate and your scripts paper-trade, but nothing real opens until you press "Arm squadron" on the squadron's page. A squadron for another coin left from an earlier version is held once the same way.
 - Scripts: a "Paper here" switch on each squadron's script card keeps a live script paper-trading on that squadron only, and "Cap here" limits how much it may hold there inside its overall cap. Entries from several squadrons at the same moment can no longer pass the cap together.
 - The dashboard warns when one coin's market loop stops, and the engine restarts itself if one stays silent for five minutes.

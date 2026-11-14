@@ -217,7 +217,9 @@ function BoolCredential({
 }
 
 function groupsForVenue(venue: VenueId) {
-  const groups: { title: string; blurb: string; keys: string[]; test?: keyof typeof TEST_KINDS }[] = [];
+  // `onVenueTab`: shown on the Venue tab instead of Credentials (a plain
+  // setting, not a credential).
+  const groups: { title: string; blurb: string; keys: string[]; test?: keyof typeof TEST_KINDS; onVenueTab?: boolean }[] = [];
   if (venue === 'intl') {
     groups.push(
       { title: 'Polymarket Wallet', blurb: 'Self-custody EOA key — Safe address and CLOB auth are derived from it.', keys: ['POLYMARKET_PRIVATE_KEY'], test: 'intl_wallet' },
@@ -232,11 +234,12 @@ function groupsForVenue(venue: VenueId) {
       { title: 'Polymarket US API Keys', blurb: 'Custodial venue key ID + secret from your Polymarket US account.', keys: ['POLYMARKET_US_KEY_ID', 'POLYMARKET_US_SECRET_KEY'], test: 'us_keys' },
     );
   }
-  // [E102] Which crypto underlyings the rotation flies, one squadron each.
-  // Polymarket US lists BTC crypto only, so the choice has nothing to split there.
+  // [E102] Which coins the venue trades, one squadron each. A plain setting,
+  // shown on the Venue tab. Polymarket US lists BTC crypto only, so the choice
+  // has nothing to add there.
   if (venue === 'intl' || venue === 'kalshi') {
     groups.push(
-      { title: 'Crypto Underlyings', blurb: 'Which coins to fly, one squadron each, e.g. btc,eth,sol (supported: btc, eth, sol). The first is your main one. A squadron for a coin you add starts held: its vipers evaluate and scripts paper-trade, but nothing real opens until you arm it from its page. Blank keeps today\'s single coin. Applies on restart.', keys: ['ROTATION_UNDERLYINGS'] },
+      { title: 'Coins to Trade', onVenueTab: true, blurb: 'Which coins to trade, one squadron each, e.g. btc,eth,sol (supported: btc, eth, sol). The first is your main coin. A squadron for a coin you add starts held: its vipers evaluate and your scripts paper-trade, but nothing real opens until you press Arm on its page. Blank keeps trading your current single coin. Applies on restart.', keys: ['TRADE_COINS'] },
     );
   }
   // Raptor signal keys (Alpaca, The Odds API, …) deliberately do NOT appear
@@ -1027,9 +1030,11 @@ function CredentialGroup({
               </>
             ) : (
               <input
-                type={/URL|CHAT_ID|PROVIDER|MODEL|BASE|DEMO|ENABLE_/.test(c.key) ? 'text' : 'password'}
+                type={c.kind === 'setting' || /URL|CHAT_ID|PROVIDER|MODEL|BASE|DEMO|ENABLE_/.test(c.key) ? 'text' : 'password'}
                 className={inputCls}
-                placeholder={c.set ? '•••••••• (leave blank to keep current)' : 'Enter value'}
+                placeholder={c.kind === 'setting'
+                  ? (c.set ? `${c.hint} (type to change)` : 'e.g. btc,eth,sol')
+                  : c.set ? '•••••••• (leave blank to keep current)' : 'Enter value'}
                 value={drafts[c.key] ?? ''}
                 onChange={e => onDraft(c.key, e.target.value)}
                 autoComplete="off"
@@ -2492,7 +2497,7 @@ export default function SetupPage() {
     for (const [k, v] of Object.entries(drafts)) {
       if (v.trim() === '') continue;
       const g = groups.find(g => g.keys.includes(k));
-      out.add(!g ? 'signals' : isAiGroup(g.keys) ? 'ai' : 'credentials');
+      out.add(!g ? 'signals' : g.onVenueTab ? 'venue' : isAiGroup(g.keys) ? 'ai' : 'credentials');
     }
     return out;
   }, [drafts, status]);
@@ -2613,7 +2618,7 @@ export default function SetupPage() {
   /** The credential groups for one tab: venue keys, or Telegram + LLM. */
   const credentialGrid = (ai: boolean) => creds ? (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-      {groups.filter(g => isAiGroup(g.keys) === ai).map(g => (
+      {groups.filter(g => !g.onVenueTab && isAiGroup(g.keys) === ai).map(g => (
         <CredentialGroup
           key={g.title}
           title={g.title}
@@ -2720,6 +2725,20 @@ export default function SetupPage() {
             onSwitched={text => { setNotice({ kind: 'ok', text }); loadStatus(); }}
           />
           <CollateralPoolsCard />
+          {/* [E102] Plain venue settings (Coins to Trade). */}
+          {creds && groups.filter(g => g.onVenueTab).map(g => (
+            <CredentialGroup
+              key={g.title}
+              title={g.title}
+              blurb={g.blurb}
+              creds={g.keys.map(k => creds.find(c => c.key === k)).filter((c): c is CredentialInfo => !!c)}
+              drafts={drafts}
+              onDraft={(k, v) => setDrafts(d => ({ ...d, [k]: v }))}
+              testKind={g.test}
+              help={g.keys.map(k => HELP[k]).find(Boolean)}
+              presets={false}
+            />
+          ))}
         </>
       )}
 

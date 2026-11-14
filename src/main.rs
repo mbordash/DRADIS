@@ -442,7 +442,7 @@ async fn run() -> Result<()> {
     #[cfg(feature = "intl_clob")]
     let default_asset = "btc";
     let crypto_filter = env::var("CRYPTO_FILTER").unwrap_or_else(|_| default_asset.to_string()).to_lowercase();
-    // [E102] `ROTATION_UNDERLYINGS` is the venue-neutral name for the
+    // [E102] `TRADE_COINS` is the venue-neutral name for the
     // underlyings to fly. On the intl CLOB the asset list IS that (one patrol
     // loop and one shard per asset), so it stands in for an unset `ASSETS`
     // there. Never elsewhere: on Kalshi and Polymarket US `ASSETS` names the
@@ -451,7 +451,7 @@ async fn run() -> Result<()> {
     #[cfg(feature = "intl_clob")]
     let assets_raw = match (env::var("ASSETS").ok(), dradis::helpers::rotation::configured_underlyings()) {
         (Some(a), Some(_)) => {
-            tracing::warn!("⚠️ ASSETS={a} is set, so ROTATION_UNDERLYINGS (the Setup field) is ignored on this venue");
+            tracing::warn!("⚠️ ASSETS={a} is set, so TRADE_COINS (the Setup field) is ignored on this venue");
             a
         }
         (Some(a), None) => a,
@@ -463,7 +463,7 @@ async fn run() -> Result<()> {
                 let p = list.remove(i);
                 list.insert(0, p);
             } else if env::var("CRYPTO_FILTER").is_ok() {
-                tracing::warn!("⚠️ ROTATION_UNDERLYINGS {list:?} does not include CRYPTO_FILTER={crypto_filter}; the primary database becomes {}-dradis.db", list[0]);
+                tracing::warn!("⚠️ TRADE_COINS {list:?} does not include CRYPTO_FILTER={crypto_filter}; the primary database becomes {}-dradis.db", list[0]);
             }
             list.join(",")
         }
@@ -481,7 +481,7 @@ async fn run() -> Result<()> {
     if assets.len() > 1 {
         tracing::warn!(
             "⚠️ ASSETS={assets:?} is ignored on this venue: it names the database shard, not the markets. \
-             Set ROTATION_UNDERLYINGS to fly several underlyings; using {:?}.", assets[0],
+             Set TRADE_COINS to fly several underlyings; using {:?}.", assets[0],
         );
         assets.truncate(1);
     }

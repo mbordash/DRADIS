@@ -747,7 +747,7 @@ enum MarketOutcome {
 /// rotate.
 /// [E102] The rotation plan: one (underlying, series) per rotation loop.
 ///
-/// With `ROTATION_UNDERLYINGS` set, each underlying flies the configured series
+/// With `TRADE_COINS` set, each underlying flies the configured series
 /// that belong to it (`KALSHI_SERIES` grouped by `detect_underlying`), or its
 /// default 15-minute and daily series when none are configured. Without it,
 /// the pre-E102 rule stands: one loop for the first configured series'
@@ -795,7 +795,7 @@ pub async fn run_kalshi_trader(
         warn!(
             "⚠️ Kalshi rotation ignores {ignored:?} from {ENV_SERIES}: no configured underlying flies them. \
              Set {} to fly several underlyings, each as its own squadron.",
-            crate::helpers::rotation::ENV_ROTATION_UNDERLYINGS,
+            crate::helpers::rotation::ENV_TRADE_COINS,
         );
     }
 

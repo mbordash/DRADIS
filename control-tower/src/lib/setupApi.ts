@@ -90,9 +90,9 @@ export interface CredentialInfo {
   /** What control to draw. 'bool' persists "true"/"false", 'bool01' persists
    *  "1"/"0". Without this every key was a free-text box and a yes/no setting
    *  made the operator type the word "true". */
-  kind?: 'text' | 'bool' | 'bool01';
+  kind?: 'text' | 'bool' | 'bool01' | 'setting';
   set: boolean;
-  hint: string;            // "…last4" when set
+  hint: string;            // "…last4" when set; the whole value for kind 'setting'
   source: 'managed' | 'env' | 'unset';
   /** True for PEM-style values, which need a textarea: a single-line input
    *  silently strips the newlines a PEM cannot do without. */

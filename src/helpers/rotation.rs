@@ -17,7 +17,7 @@
 //! [E102] Which crypto underlyings the venue's rotation flies, and whether each
 //! rotation loop is alive. Venue-neutral: Polymarket International runs one
 //! patrol loop per asset, Kalshi one rotation loop per underlying, and both
-//! read the same setting (`ROTATION_UNDERLYINGS`, e.g. `btc,eth,sol`).
+//! read the same setting (`TRADE_COINS`, e.g. `btc,eth,sol`).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,7 +30,7 @@ pub const SUPPORTED_UNDERLYINGS: &[&str] = &["btc", "eth", "sol"];
 
 /// The environment variable naming the underlyings, in order; the first is the
 /// instance's primary one (see `dynamic_config::starts_held`).
-pub const ENV_ROTATION_UNDERLYINGS: &str = "ROTATION_UNDERLYINGS";
+pub const ENV_TRADE_COINS: &str = "TRADE_COINS";
 
 /// Parse a comma-separated list: lower-cased, de-duplicated, order kept.
 /// Returns (accepted, refused).
@@ -50,11 +50,11 @@ pub fn parse_underlyings(raw: &str) -> (Vec<String>, Vec<String>) {
 /// The configured underlyings, if the operator set any. `None` keeps each
 /// venue's pre-E102 behavior (one underlying from its own settings).
 pub fn configured_underlyings() -> Option<Vec<String>> {
-    let raw = std::env::var(ENV_ROTATION_UNDERLYINGS).ok()?;
+    let raw = std::env::var(ENV_TRADE_COINS).ok()?;
     let (ok, refused) = parse_underlyings(&raw);
     if !refused.is_empty() {
         tracing::warn!(
-            "⚠️ {ENV_ROTATION_UNDERLYINGS}: ignoring {refused:?}; supported underlyings are {SUPPORTED_UNDERLYINGS:?}"
+            "⚠️ {ENV_TRADE_COINS}: ignoring {refused:?}; supported underlyings are {SUPPORTED_UNDERLYINGS:?}"
         );
     }
     (!ok.is_empty()).then_some(ok)

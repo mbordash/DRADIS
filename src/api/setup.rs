@@ -101,7 +101,8 @@ const INTERNAL_KEYS: &[&str] = &["DRADIS_ADMIN_HASH", "DRADIS_SESSION_KEY"];
 /// `(key, label, scope, panel, kind)`.
 ///
 /// `kind` tells the Setup panel what control to draw: "text" for a credential,
-/// "bool" for a true/false switch, "bool01" for one that persists 1/0. Without
+/// "bool" for a true/false switch, "bool01" for one that persists 1/0, and
+/// "setting" for a plain, non-secret value shown in full (a visible text box). Without
 /// it every key rendered as a free-text box, so a yes/no setting like
 /// ENABLE_LLM_ADVISOR made the operator type the word "true" — and its label
 /// had to carry "(true/false)" to explain what to type.
@@ -143,7 +144,7 @@ const MANAGED_KEYS: &[(&str, &str, &str, &str, &str)] = &[
     // squadron each (`btc,eth,sol`; the first is the primary one). Read at
     // startup, so a change asks for a restart. Squadrons for new underlyings
     // start held: nothing opens there until the operator arms them.
-    ("ROTATION_UNDERLYINGS",     "Crypto underlyings to fly (btc, eth, sol; the first is your main one)", "shared", "integration", "text"),
+    ("TRADE_COINS",              "Coins to trade (btc, eth, sol; the first is your main coin)", "shared", "venue", "setting"),
 ];
 
 /// Managed keys the engine reads from the process environment each time it
@@ -818,7 +819,10 @@ async fn get_credentials() -> Response {
             .or_else(|| std::env::var(key).ok().filter(|v| !v.is_empty()));
         let (set, hint, source) = match val {
             Some(v) => {
-                let hint = if v.len() > 4 { format!("…{}", &v[v.len() - 4..]) } else { "•••".to_string() };
+                // [E102] A "setting" is not a secret: show it whole so the
+                // operator can read what is configured.
+                let hint = if *kind == "setting" { v.clone() }
+                    else if v.len() > 4 { format!("…{}", &v[v.len() - 4..]) } else { "•••".to_string() };
                 let source = if secrets.contains_key(*key) { "managed" } else { "env" };
                 (true, hint, source)
             }
@@ -2122,7 +2126,7 @@ mod tests {
     fn every_managed_key_declares_a_known_kind() {
         for (key, _, _, _, kind) in MANAGED_KEYS {
             assert!(
-                matches!(*kind, "text" | "bool" | "bool01"),
+                matches!(*kind, "text" | "bool" | "bool01" | "setting"),
                 "{key} declares unknown kind '{kind}' — it would render as a text box",
             );
         }

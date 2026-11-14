@@ -478,7 +478,7 @@ pub async fn run_us_trader(
         info!(
             "🇺🇸 {} = {us:?}: Polymarket US runs one crypto wing over the crypto markets it lists \
              (BTC only, no 15-minute markets as of 2026-11-14); other underlyings have no markets here.",
-            crate::helpers::rotation::ENV_ROTATION_UNDERLYINGS,
+            crate::helpers::rotation::ENV_TRADE_COINS,
         );
     }
 
