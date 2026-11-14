@@ -116,9 +116,11 @@ function fmtTime(d: Date) {
 
 function fmtPnl(n: number | null, prefix = true) {
   if (n === null) return <span className="text-gray-600">—</span>;
-  const sign = n >= 0 ? '+' : '';
+  // [B113] A loss keeps its minus: with '' for negatives and Math.abs, a
+  // loss printed as "$0.1234" with only the color to mark it.
+  const sign = n >= 0 ? '+' : '-';
   const cls  = n > 0 ? 'text-green-400' : n < 0 ? 'text-red-400' : 'text-gray-400';
-  return <span className={cls}>{prefix ? `${sign}$${Math.abs(n).toFixed(4)}` : `${sign}$${n.toFixed(4)}`}</span>;
+  return <span className={cls}>{prefix ? `${sign}$${Math.abs(n).toFixed(4)}` : `${n >= 0 ? '+' : ''}$${n.toFixed(4)}`}</span>;
 }
 
 /** P&L as a percent of the capital put in at entry (entry price × shares). */

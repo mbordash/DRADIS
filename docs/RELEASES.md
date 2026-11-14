@@ -10,6 +10,8 @@ version's release notes field; the detail below it is the full account.
 - Control Tower: the Trades log shows its Realized / Unrealized / Net summary (and the ghost and paper lines) above the table as well as below it, so you see your cash performance without scrolling to the bottom.
 - Build a Viper: the "unknown" market class tickbox is now labeled "other (unclassified)", with a hint explaining it covers markets no class rule matches. Saved vipers are unchanged.
 - Build a Viper: scripts can read the Eastern clock (ctx.et_hour, ctx.et_minute, ctx.et_weekday, daylight saving applied) to fly only certain hours or days. The blank starter and the scripting guide show how.
+- Kalshi: a position the engine finds in your account but did not open (a manual trade, or one left from an earlier run) is now recorded under the squadron that trades that market, BTC under the BTC squadron and sports under the sports squadron, instead of whichever squadron saw it first. A position no running squadron trades is still recorded, after ten minutes.
+- Control Tower: the portfolio card's percentage change now shows a minus sign on a loss (it read "+12.23%" next to a down arrow), and a losing trade's P&L in the Trades log shows its minus sign instead of relying on the red color alone.
 
 ## 1.8.3 (2026-11-13)
 

@@ -471,7 +471,8 @@ function PortfolioValueBanner({
         )}
         {!isLoading && delta !== null && startingPortfolioVal !== null && startingPortfolioVal > 0 && (
           <span className={`text-sm font-mono mt-0.5 ${isPositive ? 'text-green-400' : 'text-red-400'}`} title={deltaTitle}>
-            {isPositive ? '▲' : '▼'} {fmt$(Math.abs(delta))} ({fmtPct(Math.abs(deltaPct))}) {deltaLabel}
+            {/* [B113] The percent keeps its sign: Math.abs here printed a loss as "▼ $4.03 (+12.23%)". */}
+            {isPositive ? '▲' : '▼'} {fmt$(Math.abs(delta))} ({fmtPct(deltaPct)}) {deltaLabel}
           </span>
         )}
       </div>

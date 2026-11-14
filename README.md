@@ -18,6 +18,8 @@
 
 Public Demo Site: https://demo.dradis.live/
 
+![DRADIS Control Tower](docs/ui-screenshot.png)
+
 ## Two ways to run it
 
 **From source — this repository**

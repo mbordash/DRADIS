@@ -5062,15 +5062,195 @@ pub fn adoption_due(first_seen: Option<std::time::Instant>, now: std::time::Inst
 /// Note that `squadron_id`'s sweep found `token_id` unclaimed now; true once
 /// it has been unclaimed for [`UNCLAIMED_ADOPT_GRACE_SECS`].
 pub fn unclaimed_holding_adoptable(squadron_id: &str, token_id: &str) -> bool {
+    unclaimed_holding_adoptable_after(squadron_id, token_id, UNCLAIMED_ADOPT_GRACE_SECS)
+}
+
+/// [`unclaimed_holding_adoptable`] with its own grace, for the longer wait an
+/// out-of-scope adoption takes ([B112]).
+pub fn unclaimed_holding_adoptable_after(squadron_id: &str, token_id: &str, grace_secs: u64) -> bool {
     let now = std::time::Instant::now();
     let mut map = match unclaimed_since().lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
     let key = (squadron_id.to_string(), token_id.to_string());
-    let (due, since) = adoption_due(map.get(&key).copied(), now, std::time::Duration::from_secs(UNCLAIMED_ADOPT_GRACE_SECS));
+    let (due, since) = adoption_due(map.get(&key).copied(), now, std::time::Duration::from_secs(grace_secs));
     map.insert(key, since);
     due
+}
+
+// ─── [B112] Which squadron may adopt an unclaimed holding ───────────────────
+//
+// Every squadron on a shared account (Kalshi, Polymarket US) sweeps the whole
+// account's holdings, and before B112 the first to pass the grace adopted any
+// unclaimed one: a `KXETH` orphan could be filed under `btc-open` or the sports
+// squadron, its P&L and settlement booked to a squadron that never flies it.
+// A holding now goes to the squadron whose kind fits it; one that fits no
+// running squadron is still filed (by anyone, after a longer wait) so it is
+// never left unrecorded.
+
+/// What a squadron flies, or what a holding is, for adoption purposes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdoptionKind {
+    /// A crypto market; `Some(underlying)` when known (`btc`, `eth`, ...),
+    /// `None` for a squadron that flies every crypto underlying.
+    Crypto(Option<String>),
+    /// Any non-crypto market (sports, politics, ...). One bucket on purpose:
+    /// a sports squadron may file a politics orphan when nothing else fits,
+    /// which is only a filing label (no viper manages a `ChainAdopted` row).
+    Other,
+    /// Cannot tell. Fits everything, which is the pre-B112 behavior.
+    Unknown,
+}
+
+impl AdoptionKind {
+    /// A squadron's kind from its id (`{asset}-open[-name]`): a crypto asset
+    /// slug is that underlying; `helm` is Unknown (the operator's market can be
+    /// anything); every other asset is a non-crypto class.
+    pub fn of_squadron(squadron_id: &str) -> Self {
+        let asset = squadron_id.split("-open").next().unwrap_or(squadron_id);
+        match asset {
+            "btc" | "eth" | "sol" | "xrp" | "doge" => Self::Crypto(Some(asset.to_string())),
+            // An operator-deployed crypto market (`crypto-open[-name]`) or a
+            // Polymarket US wing over every coin.
+            "crypto" | "us-crypto" => Self::Crypto(None),
+            "" | "helm" => Self::Unknown,
+            a if a.starts_with("helm") => Self::Unknown,
+            _ => Self::Other,
+        }
+    }
+
+    /// Whether a squadron of kind `self` is the right owner for a holding of
+    /// kind `holding`.
+    pub fn fits(&self, holding: &AdoptionKind) -> bool {
+        match (self, holding) {
+            (Self::Unknown, _) | (_, Self::Unknown) => true,
+            (Self::Other, Self::Other) => true,
+            (Self::Crypto(a), Self::Crypto(b)) => match (a, b) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            },
+            _ => false,
+        }
+    }
+}
+
+/// How long an out-of-scope holding waits before a squadron that does not fit
+/// it files it anyway: long enough for the fitting squadron, if one runs, to
+/// have swept (dashboard syncs are every 30 s) many times over.
+pub const OUT_OF_SCOPE_ADOPT_GRACE_SECS: u64 = 600;
+/// A squadron counts as running for [`fitting_squadron_running`] while it has
+/// swept within this window.
+const ADOPTION_SCOPE_FRESH_SECS: u64 = 300;
+
+static ADOPTION_SCOPES: OnceLock<std::sync::Mutex<std::collections::HashMap<String, (AdoptionKind, std::time::Instant)>>> =
+    OnceLock::new();
+
+fn adoption_scopes() -> &'static std::sync::Mutex<std::collections::HashMap<String, (AdoptionKind, std::time::Instant)>> {
+    ADOPTION_SCOPES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+static ADOPTION_KINDS: OnceLock<std::sync::Mutex<std::collections::HashMap<String, AdoptionKind>>> = OnceLock::new();
+
+fn adoption_kinds() -> &'static std::sync::Mutex<std::collections::HashMap<String, AdoptionKind>> {
+    ADOPTION_KINDS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record what a squadron flies, from what its registration knows (the
+/// market's underlying), so the id never has to be parsed for it: an XRP
+/// rotation registers as `btc-open` and an operator's crypto deployment as
+/// `crypto-open`, neither of which the id says correctly.
+pub fn set_adoption_kind(squadron_id: &str, kind: AdoptionKind) {
+    let mut map = match adoption_kinds().lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    map.insert(squadron_id.to_string(), kind);
+}
+
+/// A squadron's kind: the registered one, else read from its id.
+pub fn adoption_kind_of(squadron_id: &str) -> AdoptionKind {
+    let map = match adoption_kinds().lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    map.get(squadron_id).cloned().unwrap_or_else(|| AdoptionKind::of_squadron(squadron_id))
+}
+
+/// Record that `squadron_id` swept the account successfully just now. Called
+/// only once the venue's positions have been read, so a squadron whose reads
+/// keep failing does not hold other squadrons back as the "running" owner.
+pub fn note_adoption_scope(squadron_id: &str) {
+    let kind = adoption_kind_of(squadron_id);
+    let mut map = match adoption_scopes().lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    map.insert(squadron_id.to_string(), (kind, std::time::Instant::now()));
+}
+
+/// Pure rule behind [`fitting_squadron_running`].
+pub fn fitting_squadron_among<'a>(
+    others: impl IntoIterator<Item = (&'a str, &'a AdoptionKind, std::time::Duration)>,
+    me: &str,
+    holding: &AdoptionKind,
+    fresh: std::time::Duration,
+) -> bool {
+    // An Unknown squadron fits everything, so it is not counted as the owner
+    // that others wait for: it would absorb every out-of-scope holding.
+    others.into_iter().any(|(id, kind, age)| {
+        id != me && age <= fresh && *kind != AdoptionKind::Unknown && kind.fits(holding)
+    })
+}
+
+/// Whether some other squadron that has swept recently fits `holding`.
+pub fn fitting_squadron_running(me: &str, holding: &AdoptionKind) -> bool {
+    let map = match adoption_scopes().lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    let now = std::time::Instant::now();
+    fitting_squadron_among(
+        map.iter().map(|(id, (k, at))| (id.as_str(), k, now.saturating_duration_since(*at))),
+        me, holding, std::time::Duration::from_secs(ADOPTION_SCOPE_FRESH_SECS),
+    )
+}
+
+/// The adoption decision for one unclaimed holding on one sweep [B112].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptionVerdict {
+    /// This squadron fits: adopt after the normal grace.
+    Mine,
+    /// Another running squadron fits: leave it to that one.
+    Theirs,
+    /// Nobody running fits: adopt after [`OUT_OF_SCOPE_ADOPT_GRACE_SECS`].
+    Fallback,
+}
+
+/// Decide who adopts `holding` from `squadron_id`'s sweep.
+pub fn adoption_verdict(squadron_id: &str, holding: &AdoptionKind) -> AdoptionVerdict {
+    let mine = adoption_kind_of(squadron_id);
+    verdict_for(&mine, holding, || fitting_squadron_running(squadron_id, holding))
+}
+
+/// Pure rule behind [`adoption_verdict`].
+pub fn verdict_for(mine: &AdoptionKind, holding: &AdoptionKind, other_fits: impl FnOnce() -> bool) -> AdoptionVerdict {
+    if mine.fits(holding) {
+        AdoptionVerdict::Mine
+    } else if other_fits() {
+        AdoptionVerdict::Theirs
+    } else {
+        AdoptionVerdict::Fallback
+    }
+}
+
+/// Whether `squadron_id` may adopt the unclaimed `token_id` (of kind `holding`)
+/// on this sweep: the grace has passed for its verdict. Logs the out-of-scope
+/// cases once per decision.
+pub fn may_adopt_unclaimed(squadron_id: &str, token_id: &str, holding: &AdoptionKind) -> bool {
+    match adoption_verdict(squadron_id, holding) {
+        AdoptionVerdict::Mine => unclaimed_holding_adoptable(squadron_id, token_id),
+        AdoptionVerdict::Theirs => {
+            forget_unclaimed_holding(squadron_id, token_id);
+            debug!("[{squadron_id}] {token_id} ({holding:?}) belongs to another running squadron — not adopting [B112]");
+            false
+        }
+        AdoptionVerdict::Fallback => {
+            let due = unclaimed_holding_adoptable_after(squadron_id, token_id, OUT_OF_SCOPE_ADOPT_GRACE_SECS);
+            if due {
+                warn!("🧾 [{squadron_id}] {token_id} ({holding:?}) is unclaimed and no running squadron flies it; filing it here so it is not left unrecorded [B112]");
+            }
+            due
+        }
+    }
 }
 
 /// Forget an unclaimed sighting: the holding is now claimed, adopted, or gone.
@@ -9534,6 +9714,96 @@ mod reconcile_tests {
         let later = now + grace;
         let (due, _) = adoption_due(Some(now), later, grace);
         assert!(due);
+    }
+
+    /// [B112] A squadron's kind comes from its id, and only a fitting one
+    /// owns a holding: the coin's squadron for a crypto holding, a non-crypto
+    /// squadron for anything else; Unknown on either side fits (old rule).
+    #[test]
+    fn b112_only_the_squadron_that_flies_a_holding_fits_it() {
+        use AdoptionKind::*;
+        let eth = Crypto(Some("eth".into()));
+        let btc = Crypto(Some("btc".into()));
+        assert_eq!(AdoptionKind::of_squadron("btc-open"), btc);
+        assert_eq!(AdoptionKind::of_squadron("eth-open-fast"), eth);
+        assert_eq!(AdoptionKind::of_squadron("sports-open"), Other);
+        assert_eq!(AdoptionKind::of_squadron("politics-open"), Other);
+        assert_eq!(AdoptionKind::of_squadron("us-crypto-open"), Crypto(None));
+        assert_eq!(AdoptionKind::of_squadron("us-open"), Other);
+        assert_eq!(AdoptionKind::of_squadron("helm-open-x"), Unknown);
+
+        assert!(btc.fits(&btc));
+        assert!(!btc.fits(&eth), "btc-open must not adopt an ETH holding");
+        assert!(!Other.fits(&eth), "the sports squadron must not adopt an ETH holding");
+        assert!(!btc.fits(&Other), "btc-open must not adopt a sports holding");
+        assert!(Other.fits(&Other));
+        assert!(Crypto(None).fits(&eth), "a wing over every coin fits any coin");
+        assert!(btc.fits(&Unknown) && Unknown.fits(&eth), "Unknown keeps the old rule");
+    }
+
+    /// [B112] An out-of-scope squadron leaves a holding to a fitting squadron
+    /// that has swept recently, and only falls back when none has.
+    #[test]
+    fn b112_a_holding_waits_for_a_running_fitting_squadron() {
+        use AdoptionKind::*;
+        let eth = Crypto(Some("eth".into()));
+        let fresh = std::time::Duration::from_secs(300);
+        let recent = std::time::Duration::from_secs(10);
+        let stale = std::time::Duration::from_secs(301);
+        let btc_k = Crypto(Some("btc".into()));
+        let eth_k = Crypto(Some("eth".into()));
+        // Only btc-open and sports-open run: nobody fits an ETH holding.
+        let running = [("btc-open", &btc_k, recent), ("sports-open", &Other, recent)];
+        assert!(!fitting_squadron_among(running, "btc-open", &eth, fresh));
+        // eth-open runs: btc-open leaves it alone.
+        let running = [("btc-open", &btc_k, recent), ("eth-open", &eth_k, recent)];
+        assert!(fitting_squadron_among(running, "btc-open", &eth, fresh));
+        // eth-open stopped sweeping: no longer counted.
+        let running = [("btc-open", &btc_k, recent), ("eth-open", &eth_k, stale)];
+        assert!(!fitting_squadron_among(running, "btc-open", &eth, fresh));
+        // A squadron never counts itself.
+        let running = [("eth-open", &eth_k, recent)];
+        assert!(!fitting_squadron_among(running, "eth-open", &eth, fresh));
+        assert!(OUT_OF_SCOPE_ADOPT_GRACE_SECS > UNCLAIMED_ADOPT_GRACE_SECS);
+    }
+
+    /// [B112] The verdict: own kind adopts, another running owner is left to
+    /// it, and nobody running falls back. Pure, so no shared registry.
+    #[test]
+    fn b112_adoption_verdict() {
+        use AdoptionKind::*;
+        let sol = Crypto(Some("sol".into()));
+        let btc = Crypto(Some("btc".into()));
+        assert_eq!(verdict_for(&sol, &sol, || true), AdoptionVerdict::Mine);
+        assert_eq!(verdict_for(&btc, &sol, || true), AdoptionVerdict::Theirs);
+        assert_eq!(verdict_for(&btc, &sol, || false), AdoptionVerdict::Fallback);
+        assert_eq!(verdict_for(&Other, &sol, || false), AdoptionVerdict::Fallback);
+    }
+
+    /// [B112 review] An operator's crypto deployment fits crypto, and a
+    /// registered kind wins over the id (an XRP rotation is `btc-open`).
+    #[test]
+    fn b112_registered_kind_beats_the_id() {
+        use AdoptionKind::*;
+        assert_eq!(AdoptionKind::of_squadron("crypto-open"), Crypto(None));
+        assert_eq!(AdoptionKind::of_squadron("crypto-open-fast"), Crypto(None));
+        let id = "b112t-btc-open";
+        assert_eq!(adoption_kind_of(id), Other, "unregistered: read from the id");
+        set_adoption_kind(id, Crypto(Some("xrp".into())));
+        assert_eq!(adoption_kind_of(id), Crypto(Some("xrp".into())));
+        adoption_kinds().lock().unwrap().remove(id);
+    }
+
+    /// [B112 review] A running Unknown squadron (e.g. an unregistered helm) is
+    /// not the owner others wait for, or it would absorb every orphan.
+    #[test]
+    fn b112_an_unknown_squadron_is_not_a_fitting_owner() {
+        use AdoptionKind::*;
+        let eth = Crypto(Some("eth".into()));
+        let fresh = std::time::Duration::from_secs(300);
+        let recent = std::time::Duration::from_secs(10);
+        let running = [("helm-open-x", &Unknown, recent)];
+        assert!(!fitting_squadron_among(running, "btc-open", &eth, fresh));
     }
 
     async fn mem_pool() -> SqlitePool {

@@ -3571,6 +3571,8 @@ async fn sync_dashboard(
             return (collateral, None);
         }
     };
+    // [B112] Counted as a running owner only after a sweep that can adopt.
+    db::note_adoption_scope(squadron_id);
 
     // token → (owning viper, market name) from the live guard map, so a venue
     // holding is attributed to the viper that opened it. Holdings with no guard
@@ -3654,7 +3656,10 @@ async fn sync_dashboard(
                 // [B76] The claim check and the insert run under one process-wide
                 // gate, and the insert refuses when any row claims the token, so
                 // two squadrons passing the grace in the same pass write one row.
-                Ok(false) if db::unclaimed_holding_adoptable(squadron_id, sym) => {
+                // [B112] Only the squadron that flies the holding's underlying
+                // (or class) adopts it; one nobody running flies is filed by
+                // anyone after a longer wait.
+                Ok(false) if db::may_adopt_unclaimed(squadron_id, sym, &holding_kind(sym)) => {
                     db::forget_unclaimed_holding(squadron_id, sym);
                     if db::adopt_unclaimed_holding(
                         pool, &adopt_scope, squadron_id, "ChainAdopted", sym, sym, side_label(sym), p.avg_price, p.shares,
@@ -3663,7 +3668,7 @@ async fn sync_dashboard(
                     }
                 }
                 Ok(false) => {
-                    debug!("Kalshi dashboard sync [{squadron_id}]: {sym} unclaimed — adopting if still so after {}s", db::UNCLAIMED_ADOPT_GRACE_SECS);
+                    debug!("Kalshi dashboard sync [{squadron_id}]: {sym} unclaimed — not adopted this pass (grace or another squadron's, see db::may_adopt_unclaimed)");
                 }
                 // Could not tell: a duplicate row is worse than a thirty-second
                 // delay, so adopt nothing this pass.
@@ -3777,6 +3782,16 @@ fn side_label(symbol: &str) -> &'static str {
     if symbol.ends_with("#no") { "NO" } else { "YES" }
 }
 
+/// [B112] What a Kalshi holding is, for adoption: the underlying of a crypto
+/// series, otherwise a non-crypto market.
+fn holding_kind(symbol: &str) -> db::AdoptionKind {
+    let (ticker, _) = super::split_market_id(symbol);
+    match detect_underlying(&ticker) {
+        Some(u) => db::AdoptionKind::Crypto(Some(u.to_string())),
+        None => db::AdoptionKind::Other,
+    }
+}
+
 async fn wait_or_cancel(cancel: &CancellationToken, secs: u64) -> bool {
     tokio::select! {
         _ = cancel.cancelled() => true,
@@ -3868,6 +3883,14 @@ fn register_kalshi_squadron(
         squadron_name,
     );
     cag.register_with_cancel(&squadron, cancel.clone());
+    // [B112] What this squadron flies, from the market itself: the id does not
+    // say it for an operator's crypto deployment (`crypto-open`) or an XRP or
+    // DOGE rotation (which registers as `btc-open`).
+    db::set_adoption_kind(&squadron.id, if pair.is_crypto() {
+        db::AdoptionKind::Crypto(Some(pair.underlying.to_string()))
+    } else {
+        db::AdoptionKind::Other
+    });
     squadron
 }
 
@@ -3964,6 +3987,10 @@ mod tests {
     fn non_crypto_series_rejected() {
         assert!(pair_from_market(&mkt("KXNBA-FINALS", "NBA champ", "", "0")).is_none());
         assert_eq!(detect_underlying("KXETH15M-X"), Some("eth"));
+        // [B112] A holding's adoption kind follows its series.
+        assert_eq!(holding_kind("KXETH15M-26NOV141015-15#yes"), db::AdoptionKind::Crypto(Some("eth".into())));
+        assert_eq!(holding_kind("KXSOL15M-26NOV141015-15#no"), db::AdoptionKind::Crypto(Some("sol".into())));
+        assert_eq!(holding_kind("KXNFLGAME-26NOV16KCBUF-KC#yes"), db::AdoptionKind::Other);
         assert_eq!(detect_underlying("KXDOGE15M-X"), Some("doge"));
         assert_eq!(detect_underlying("FED-23DEC"), None);
     }

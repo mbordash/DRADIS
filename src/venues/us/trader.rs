@@ -3017,6 +3017,8 @@ async fn sync_dashboard(
             return (collateral, None);
         }
     };
+    // [B112] Counted as a running owner only after a sweep that can adopt.
+    db::note_adoption_scope(squadron_id);
 
     // token → (owning viper, market name) from the live guard map, so a venue
     // holding is attributed to the viper that opened it. Holdings with no guard
@@ -3105,7 +3107,10 @@ async fn sync_dashboard(
                 // [B76] The claim check and the insert run under one process-wide
                 // gate, and the insert refuses when any row claims the token, so
                 // two squadrons passing the grace in the same pass write one row.
-                Ok(false) if db::unclaimed_holding_adoptable(squadron_id, sym) => {
+                // [B112] A US holding's symbol does not say its market class,
+                // so it is Unknown and fits every squadron: the pre-B112 rule.
+                // The scope rule still applies once a holding can be classed.
+                Ok(false) if db::may_adopt_unclaimed(squadron_id, sym, &db::AdoptionKind::Unknown) => {
                     db::forget_unclaimed_holding(squadron_id, sym);
                     if db::adopt_unclaimed_holding(
                         pool, &adopt_scope, squadron_id, "ChainAdopted", sym, sym, side_label(sym), p.avg_price, p.shares,
@@ -3114,7 +3119,7 @@ async fn sync_dashboard(
                     }
                 }
                 Ok(false) => {
-                    debug!("US dashboard sync [{squadron_id}]: {sym} unclaimed — adopting if still so after {}s", db::UNCLAIMED_ADOPT_GRACE_SECS);
+                    debug!("US dashboard sync [{squadron_id}]: {sym} unclaimed — not adopted this pass (grace or another squadron's, see db::may_adopt_unclaimed)");
                 }
                 // Could not tell: a duplicate row is worse than a thirty-second
                 // delay, so adopt nothing this pass.
