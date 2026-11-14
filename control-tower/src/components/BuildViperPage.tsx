@@ -401,6 +401,9 @@ function SettingsPanel({ name, manifest, cfg, instanceGhost, paperCount, paperPn
               Its paper record so far: {paperCount} scored trade{paperCount === 1 ? '' : 's'}, {money(paperPnl)} net.
               {paperCount < 20 && ' That is too few trades to tell skill from luck.'}
             </p>
+            <p>
+              Live applies on every armed squadron where it is not set to <span className="text-gray-100">Paper here</span> (a switch on each squadron&apos;s script card). Held squadrons stay paper until you arm them.
+            </p>
             <p className="text-gray-500">Taking it off live later stops new entries; what it holds keeps its stop and take-profit until it closes.</p>
           </div>
         ),

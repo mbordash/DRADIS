@@ -760,6 +760,8 @@ pub async fn run_kalshi_trader(
 ) {
     let filter = std::env::var(ENV_MARKET_FILTER).ok().filter(|s| !s.is_empty());
     let (underlying, series, ignored) = rotation_series(configured_series());
+    // [E102a] The rotation's underlying is the instance's primary one.
+    if let Some(u) = underlying { crate::helpers::dynamic_config::set_primary_underlying(u); }
     info!("🏛️ Kalshi trader starting — underlying={underlying:?} series={series:?} filter={filter:?}");
     if !ignored.is_empty() {
         warn!(
@@ -1524,7 +1526,11 @@ async fn trade_one_market(
     // and the crypto one only registers when a market is already selected, which
     // leaves a window across restarts and underlying rotations.
     db::alias_pool(status_scope, asset);
-    seed_squadron_config(&squadron_id, viper_budgets).await;
+    // [E102a] A rotation squadron for an underlying other than the instance's
+    // primary one starts held the first time its row is created.
+    let held = deployed_as.is_none() && mandate == MarketMandate::Rotating
+        && crate::helpers::dynamic_config::starts_held(pair.underlying, true).await;
+    seed_squadron_config(&squadron_id, viper_budgets, held).await;
     let market_class = squadron.classify_and_link().await;
     // Carried into every tick's StrategyContext: the class is what a viper
     // asks to know what kind of market it is looking at.
@@ -2353,6 +2359,12 @@ async fn trade_one_market(
             // Inside the RTB window we manage what we hold but take on nothing
             // new: cancels and exits still flow, entries and quotes do not.
             if winding_down && signal.opens_exposure() {
+                continue;
+            }
+            // [E102a] A held squadron opens nothing until it is armed from its
+            // card; exits and cancels still flow.
+            if dyn_cfg.squadron_held && signal.opens_exposure() {
+                crate::helpers::viper_status::report_reason(&status_scope.to_uppercase(), &strategy_name, crate::helpers::viper_status::SQUADRON_HELD);
                 continue;
             }
             // [E95] The ultra-short market's own last minute, or a slot kept
@@ -3903,10 +3915,14 @@ fn register_kalshi_squadron(
 /// squadron id that already has config still honors the numbers just entered,
 /// which is what the deploy dialog implies and what Polymarket International
 /// has always done.
-async fn seed_squadron_config(squadron_id: &str, budgets: &std::collections::HashMap<String, f64>) {
+async fn seed_squadron_config(squadron_id: &str, budgets: &std::collections::HashMap<String, f64>, held: bool) {
     if let Some(pool) = db::pool() {
         if db::squadron_config_get(pool, squadron_id).await.is_none() {
-            DynamicConfig::init_for_squadron(squadron_id).await;
+            if held {
+                DynamicConfig::init_held_for_squadron(squadron_id).await;
+            } else {
+                DynamicConfig::init_for_squadron(squadron_id).await;
+            }
         }
     }
     if budgets.is_empty() {

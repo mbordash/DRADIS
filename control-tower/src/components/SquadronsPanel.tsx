@@ -153,11 +153,12 @@ function ViperCoverage({ squadronId, marketClass, vipers }: {
   return (
     <span
       className={`text-[10px] font-mono rounded px-2 py-0.5 border ${
-        partial
+        partial || cfg?.squadron_held
           ? 'bg-amber-500/10 text-amber-300 border-amber-500/25'
           : 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20'
       }`}
       title={[
+        cfg?.squadron_held ? 'Held: this squadron opens nothing until you arm it from its page.' : '',
         on === undefined
           ? `${total} strategies apply to ${marketClass} markets.`
           : `${on} of ${total} strategies active: ${onNames!.join(', ') || 'none'}.`,
@@ -168,7 +169,7 @@ function ViperCoverage({ squadronId, marketClass, vipers }: {
           : '',
       ].filter(Boolean).join(' ')}
     >
-      {on === undefined ? total : on}/{total} strategies active
+      {cfg?.squadron_held ? '⏸ held · ' : ''}{on === undefined ? total : on}/{total} strategies {cfg?.squadron_held ? 'armable' : 'active'}
     </span>
   );
 }

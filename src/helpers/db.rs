@@ -3370,6 +3370,15 @@ pub async fn squadron_config_set(pool: &SqlitePool, squadron_id: &str, config_js
     }
 }
 
+/// [E102a] Squadron ids whose config rows were created before `cutoff`
+/// (RFC 3339, as `created_at` is stored).
+pub async fn squadron_configs_created_before(pool: &SqlitePool, cutoff: &str) -> Vec<String> {
+    sqlx::query_scalar::<_, String>("SELECT squadron_id FROM squadron_configs WHERE created_at < ? ORDER BY squadron_id")
+        .bind(cutoff)
+        .fetch_all(pool).await
+        .unwrap_or_default()
+}
+
 /// List all squadron IDs that have stored configs.
 pub async fn squadron_config_list(pool: &SqlitePool) -> Vec<String> {
     sqlx::query("SELECT squadron_id FROM squadron_configs ORDER BY created_at DESC")

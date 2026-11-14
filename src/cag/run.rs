@@ -445,7 +445,10 @@ where
         // Control Tower. Only seeds compile-time defaults the first time this
         // squadron is deployed — a restart or hourly rotation reuses the stable
         // squadron id and the persisted row, so a disabled viper stays disabled.
-        let squadron_config = DynamicConfig::load_or_init_for_squadron(&squadron.id).await;
+        // [E102a] An asset other than the instance's primary one starts held
+        // the first time its squadron row is created.
+        let held = crate::helpers::dynamic_config::starts_held(&patrol_ctx.crypto_filter, true).await;
+        let squadron_config = DynamicConfig::load_or_init_for_squadron_held(&squadron.id, held).await;
         patrol_ctx.dynamic_config = Arc::new(RwLock::new((*squadron_config).clone()));
 
         // Register the live config handle so squadron-scoped PATCHes apply on the

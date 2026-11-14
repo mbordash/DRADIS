@@ -313,6 +313,9 @@ export interface DynamicConfig {
    *  by the engine, so a patch naming one viper never drops another's
    *  settings; `null` for a name removes its settings. */
   custom_vipers?: Record<string, CustomViperConfig | null>;
+  /** [E102a] This squadron opens nothing until it is armed from its page.
+   *  Set when it was created for an underlying other than the primary one. */
+  squadron_held?: boolean;
   helm_max_exposure_usdc?: string;
   helm_max_open_intents?: number;
   helm_entry_window_secs?: number;
@@ -1278,6 +1281,12 @@ export interface CustomViperConfig {
   max_exposure_usdc?: string | number | null;
   /** Parameter overrides, checked against the manifest by the engine. */
   params?: Record<string, number | string | boolean>;
+  /** [E102a] Paper on this squadron even while the script is live on the
+   *  instance. Squadron rows only; the engine refuses it on the global row. */
+  paper_here?: boolean;
+  /** [E102b] This squadron's share of the script's cap (decimal string);
+   *  squadron rows only. */
+  max_exposure_here_usdc?: string | number | null;
 }
 
 export type ScriptParamType = 'decimal' | 'int' | 'bool';

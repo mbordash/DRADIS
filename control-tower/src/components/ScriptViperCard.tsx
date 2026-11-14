@@ -22,6 +22,7 @@
  * its parameters are edited on the Build a Viper page.
  */
 
+import { useState } from 'react';
 import type { DynamicConfig } from '@/lib/types';
 import type { ViperStatusRow } from '@/lib/api';
 import { fmtAgo, isTroubled } from '@/components/ViperCard';
@@ -34,11 +35,20 @@ export default function ScriptViperCard({ row, config, onPatch }: {
   const name = row.strategy.replace(/^Script:/, '');
   const cfg = config.custom_vipers?.[name] ?? {};
   const enabled = cfg.enabled ?? true;
-  const mode = !enabled ? 'off' : cfg.live ? (config.ghost_mode ? 'live · ghost' : 'live') : 'paper';
+  const paperHere = (cfg.paper_here ?? false) || !!config.squadron_held;
+  // [E102a] Live on the instance, but paper on a squadron that says so.
+  const live = !!cfg.live && !paperHere;
+  const mode = !enabled ? 'off' : live ? (config.ghost_mode ? 'live · ghost' : 'live') : (cfg.live ? 'paper here' : 'paper');
   const modeCls = mode === 'live' ? 'text-red-300 border-red-500/40'
     : mode === 'live · ghost' ? 'text-amber-300 border-amber-500/40'
-    : mode === 'paper' ? 'text-teal-300 border-teal-500/40' : 'text-gray-500 border-gray-600/40';
+    : mode === 'paper' || mode === 'paper here' ? 'text-teal-300 border-teal-500/40' : 'text-gray-500 border-gray-600/40';
   const bad = isTroubled(row);
+  // [E102b] This squadron's share of the script's cap; blank = no share,
+  // only the script's cap applies.
+  const savedHere = cfg.max_exposure_here_usdc == null ? '' : String(cfg.max_exposure_here_usdc);
+  const [capHere, setCapHere] = useState(savedHere);
+  const capDirty = capHere.trim() !== savedHere;
+  const capValid = capHere.trim() === '' || (Number.isFinite(Number(capHere)) && Number(capHere) > 0);
 
   return (
     <div className={`card p-4 border ${bad ? 'border-red-500/40' : 'border-indigo-500/20'} space-y-2`}>
@@ -60,6 +70,25 @@ export default function ScriptViperCard({ row, config, onPatch }: {
           buy refused {fmtAgo(row.last_buy_refused_secs_ago ?? null)}: {row.last_buy_refused}
         </div>
       )}
+      <div className="flex items-center gap-2 text-[11px] font-mono text-gray-400"
+           title="This squadron's share of the script's cap: at most this much open here. The script's own cap still applies across every squadron. Blank: no share.">
+        <span>Cap here $</span>
+        <input
+          className="w-16 bg-[#0d0d1a] border border-[#1e1e32] rounded px-1 py-0.5 text-gray-200"
+          value={capHere}
+          placeholder="—"
+          onChange={(e) => setCapHere(e.target.value)}
+        />
+        {capDirty && (
+          <button
+            disabled={!capValid}
+            className="px-2 py-0.5 rounded border border-indigo-500/50 text-indigo-200 disabled:opacity-40"
+            onClick={() => onPatch({ custom_vipers: { [name]: { max_exposure_here_usdc: capHere.trim() === '' ? null : capHere.trim() } } })}
+          >
+            Save
+          </button>
+        )}
+      </div>
       <div className="flex items-center justify-between pt-1">
         <button
           className={`px-2 py-1 rounded border text-[11px] font-mono ${enabled ? 'border-teal-500/50 bg-teal-500/10 text-teal-200' : 'border-[#1e1e32] text-gray-400'}`}
@@ -68,6 +97,16 @@ export default function ScriptViperCard({ row, config, onPatch }: {
         >
           {enabled ? 'On here' : 'Off here'}
         </button>
+        {/* [E102a] Hidden while the squadron is held: every script is paper there. */}
+        {cfg.live && !config.squadron_held && (
+          <button
+            className={`px-2 py-1 rounded border text-[11px] font-mono ${paperHere ? 'border-teal-500/50 bg-teal-500/10 text-teal-200' : 'border-red-500/40 text-red-200'}`}
+            onClick={() => onPatch({ custom_vipers: { [name]: { paper_here: !paperHere } } })}
+            title="This squadron only. Paper here keeps the script in its paper ledger on this squadron while it trades live elsewhere."
+          >
+            {paperHere ? 'Paper here' : 'Live here'}
+          </button>
+        )}
         <a href="#vipers" className="text-[11px] font-mono text-indigo-300 hover:text-indigo-200">Edit in Build a Viper →</a>
       </div>
     </div>

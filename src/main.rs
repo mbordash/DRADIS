@@ -449,6 +449,8 @@ async fn run() -> Result<()> {
         .filter(|s| !s.is_empty())
         .collect();
     let primary_asset = assets.first().cloned().unwrap_or_else(|| crypto_filter.clone());
+    // [E102a] Squadrons for any other asset start held when first created.
+    dradis::helpers::dynamic_config::set_primary_underlying(&primary_asset);
 
     // Phase 3f-7: initialize a per-asset SQLite pool for EVERY asset in the fleet.
     // The first call claims the global "primary" pool slot for backward-compat

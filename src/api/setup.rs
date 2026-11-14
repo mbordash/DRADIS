@@ -1948,6 +1948,9 @@ mod tests {
                 // for the account; applying a profile never moves it (0 keeps
                 // the profile's compiled limit anyway).
                 "max_daily_drawdown_usdc",
+                // [E102a] Whether a squadron is held is the operator's per-squadron
+                // decision; a profile must never arm or hold anything.
+                "squadron_held",
             ];
             // `autoscale_` [E91]: the capital auto-scaler is the operator's sizing
             // policy across every profile, so applying a profile never arms,

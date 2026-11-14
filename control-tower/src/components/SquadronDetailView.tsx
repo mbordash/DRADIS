@@ -568,6 +568,23 @@ export default function SquadronDetailView({ squadron, onBack, onOpenMarket }: P
           </div>
         </div>
 
+        {/* [E102a] A held squadron opens nothing until the operator arms it. */}
+        {config?.squadron_held && (
+          <div className="mb-3 px-4 py-3 bg-amber-500/10 border border-amber-500/40 rounded-lg text-xs font-mono text-amber-200 flex flex-wrap items-center justify-between gap-3">
+            <span>
+              <span className="font-semibold">Held:</span> this squadron is new and opens nothing yet. Its vipers still
+              evaluate and every script is paper here. Check which vipers are on below, then arm it to let it trade.
+              Arming reaches the engine within about 30 seconds; scripts stay paper here until you switch them to Live here.
+            </span>
+            <button
+              className="px-3 py-1 rounded border border-amber-400/60 bg-amber-500/20 text-amber-100 hover:bg-amber-500/30"
+              onClick={() => handlePatch({ squadron_held: false })}
+            >
+              Arm squadron
+            </button>
+          </div>
+        )}
+
         {/* Info banner explaining squadron configs */}
         <div className="mb-3 px-4 py-2 bg-indigo-500/5 border border-indigo-500/20 rounded-lg text-xs font-mono text-indigo-300">
           <span className="font-semibold">Squadron Config:</span> Changes here only affect this squadron.

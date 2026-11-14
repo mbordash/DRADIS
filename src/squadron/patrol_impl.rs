@@ -1886,6 +1886,13 @@ impl Squadron {
 
                     for (strategy_name, signal) in resolved_signals {
 
+                        // [E102a] A held squadron opens nothing until it is armed
+                        // from its card; exits and cancels still flow.
+                        if signal.opens_exposure() && dynamic_config.read().unwrap().squadron_held {
+                            crate::helpers::viper_status::report_reason(&crypto_filter, &strategy_name, crate::helpers::viper_status::SQUADRON_HELD);
+                            continue;
+                        }
+
                         let sn = strategy_name.clone();
                         let sq_key = squadron_id.clone();
                         let (target_yes_token, target_no_token, target_market_close_time, target_is_neg_risk, target_yes_fee_bps, target_no_fee_bps) = {

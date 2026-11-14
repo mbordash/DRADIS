@@ -92,7 +92,8 @@ pub fn no_market_reason(role: crate::orchestrator::strategy::MarketRole) -> Stri
 pub const ORACLE_UNKNOWN: &str = "oracle price unknown (the price feed has not printed yet)";
 
 pub fn mode(cfg: &CustomViperConfig, instance_ghost: bool) -> Mode {
-    if cfg.live { Mode::Orders { ghost: instance_ghost } } else { Mode::Paper }
+    // [E102a] Live on the instance, but paper on a squadron that says so.
+    if cfg.live && !cfg.paper_here { Mode::Orders { ghost: instance_ghost } } else { Mode::Paper }
 }
 
 /// A buy, checked and sized; what the adapter will actually do.
@@ -300,6 +301,75 @@ async fn db_exposure(strategy: &str) -> Decimal {
     total
 }
 
+/// [E102b] [`db_exposure`] for one squadron.
+async fn db_exposure_here(strategy: &str, squadron: &str) -> Decimal {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, String), (std::time::Instant, Decimal)>>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (strategy.to_string(), squadron.to_string());
+    if let Some((at, v)) = cache.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        if at.elapsed().as_secs() < 2 { return *v; }
+    }
+    let mut total = Decimal::ZERO;
+    for pool in crate::helpers::db::all_pools() {
+        let rows: Vec<(String, String)> = sqlx::query_as("SELECT entry_price, shares FROM open_positions WHERE strategy = ? AND squadron_id = ?")
+            .bind(strategy).bind(squadron).fetch_all(&pool).await.unwrap_or_default();
+        for (p, n) in rows {
+            let (Ok(p), Ok(n)) = (p.parse::<Decimal>(), n.parse::<Decimal>()) else { continue };
+            total += p * n + crate::venues::taker_fee_per_share(p) * n;
+        }
+    }
+    cache.lock().unwrap_or_else(|p| p.into_inner()).insert(key, (std::time::Instant::now(), total));
+    total
+}
+
+/// [E102b] How long an entry's reserved cost counts against the cap: long
+/// enough for its fill to land in `open_positions` and pass the 2 s exposure
+/// cache, short enough that a refused or unfilled order frees it quickly.
+pub const RESERVATION_SECS: u64 = 6;
+
+type Reservations = Vec<(String, String, Decimal, std::time::Instant)>;
+
+fn reservations() -> &'static std::sync::Mutex<Reservations> {
+    static R: std::sync::OnceLock<std::sync::Mutex<Reservations>> = std::sync::OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// Pure rule behind [`reserve_entry`]: `reserved` and `reserved_here` are the
+/// live reservations of this script, in total and on this squadron.
+pub fn entry_fits(
+    exposure: Decimal, exposure_here: Decimal, reserved: Decimal, reserved_here: Decimal, cost: Decimal,
+    max_exposure: Decimal, max_here: Option<Decimal>,
+) -> Result<(), String> {
+    if exposure + reserved + cost > max_exposure {
+        return Err(format!(
+            "exposure cap: ${exposure:.2} open + ${reserved:.2} in flight + ${cost:.2} for this order is over ${max_exposure:.2}"
+        ));
+    }
+    if let Some(cap) = max_here {
+        if exposure_here + reserved_here + cost > cap {
+            return Err(format!(
+                "squadron cap: ${exposure_here:.2} open here + ${reserved_here:.2} in flight + ${cost:.2} for this order is over this squadron's ${cap:.2}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Check the caps with every live reservation counted, and reserve `cost` if
+/// the entry fits, atomically, so two squadrons cannot both pass on one tick.
+pub fn reserve_entry(
+    script: &str, squadron: &str, exposure: Decimal, exposure_here: Decimal, cost: Decimal,
+    max_exposure: Decimal, max_here: Option<Decimal>,
+) -> Result<(), String> {
+    let mut r = reservations().lock().unwrap_or_else(|p| p.into_inner());
+    r.retain(|(_, _, _, at)| at.elapsed().as_secs() < RESERVATION_SECS);
+    let reserved: Decimal = r.iter().filter(|(s, _, _, _)| s == script).map(|(_, _, c, _)| *c).sum();
+    let reserved_here: Decimal = r.iter().filter(|(s, q, _, _)| s == script && q == squadron).map(|(_, _, c, _)| *c).sum();
+    entry_fits(exposure, exposure_here, reserved, reserved_here, cost, max_exposure, max_here)?;
+    r.push((script.to_string(), squadron.to_string(), cost, std::time::Instant::now()));
+    Ok(())
+}
+
 /// One warning per script per minute, so a broken script does not flood the log.
 fn warn_throttled(script: &str, msg: &str) {
     if throttle_ok(script, 60) { warn!("📜 Script viper '{script}': {msg}"); }
@@ -399,12 +469,13 @@ impl ScriptedStrategy {
 
     /// This viper's open cost basis, fees included, across every squadron, and
     /// the side it holds on this squadron's market, if any.
-    async fn holdings(&self, ctx: &StrategyContext, paper_mode: bool) -> Option<(Decimal, Option<Side>)> {
+    async fn holdings(&self, ctx: &StrategyContext, paper_mode: bool) -> Option<(Decimal, Decimal, Option<Side>)> {
         if paper_mode {
             let pool = crate::helpers::db::pool_for(&Self::asset(ctx))?;
             let here = paper::cached_open(&pool, &ctx.squadron_id, &self.script).await;
             let exposure = paper::cached_all(&self.script).iter().map(PaperRow::cost).sum();
-            Some((exposure, here.iter().find_map(|r| Self::side_of(ctx, &r.token_id))))
+            let exposure_here = here.iter().map(PaperRow::cost).sum();
+            Some((exposure, exposure_here, here.iter().find_map(|r| Self::side_of(ctx, &r.token_id))))
         } else {
             // Each market loop (Kalshi, US) and each asset (intl) has its own
             // position map, so the map alone would let the cap multiply by the
@@ -413,8 +484,11 @@ impl ScriptedStrategy {
             let here = self.order_positions(ctx, true).await;
             let in_map: Decimal = here.iter().map(|(_, p)| p.avg_entry * p.shares + p.entry_fee).sum();
             let exposure = in_map.max(db_exposure(&self.name).await);
-            let held = self.order_positions(ctx, false).await.iter().find_map(|(t, _)| Self::side_of(ctx, t.as_str()));
-            Some((exposure, held))
+            let mine = self.order_positions(ctx, false).await;
+            let here_in_map: Decimal = mine.iter().map(|(_, p)| p.avg_entry * p.shares + p.entry_fee).sum();
+            let exposure_here = here_in_map.max(db_exposure_here(&self.name, &ctx.squadron_id).await);
+            let held = mine.iter().find_map(|(t, _)| Self::side_of(ctx, t.as_str()));
+            Some((exposure, exposure_here, held))
         }
     }
 
@@ -493,7 +567,7 @@ impl ScriptedStrategy {
         }
         let asset = Self::asset(ctx);
         let pool = crate::helpers::db::pool_for(&asset);
-        let Some((exposure, held)) = self.holdings(ctx, paper).await else {
+        let Some((exposure, exposure_here, held)) = self.holdings(ctx, paper).await else {
             self.reason(ctx, "no database for the paper ledger");
             return StrategySignal::NoSignal;
         };
@@ -548,6 +622,19 @@ impl ScriptedStrategy {
                 return StrategySignal::NoSignal;
             }
         };
+        // [E102b] This squadron's share of the cap, and a reservation of the
+        // order's cost taken before it is sent: positions land in the ledger
+        // after their fill, so without it two squadrons entering on the same
+        // tick would each pass the instance cap against the same open amount.
+        let cost = b.price * b.shares + b.fee;
+        if let Err(r) = reserve_entry(&self.script, &ctx.squadron_id, exposure, exposure_here, cost,
+                                      live.max_exposure, live.cfg.max_exposure_here_usdc) {
+            viper_status::report_buy_refused(&ctx.crypto_filter, &self.name, &r);
+            if throttle_ok(&format!("{}#buy-refused", self.script), 300) {
+                warn!("📜 [{}] {} buy refused on {}: {r}", self.name, side.as_str().to_uppercase(), ctx.market.market_name);
+            }
+            return StrategySignal::NoSignal;
+        }
         let why = why.unwrap_or_else(|| "script entry".into());
         let label = side.as_str().to_uppercase();
 
@@ -615,7 +702,7 @@ impl ScriptedStrategy {
     async fn exit(&self, ctx: &StrategyContext, full: &StrategyContext) -> StrategySignal {
         let Some(live) = self.settings(ctx) else { return StrategySignal::NoSignal };
         let paper_mode = live.mode == Mode::Paper;
-        let exposure = self.holdings(ctx, paper_mode).await.map_or(Decimal::ZERO, |(e, _)| e);
+        let exposure = self.holdings(ctx, paper_mode).await.map_or(Decimal::ZERO, |(e, _, _)| e);
         self.paper_exits(ctx, full, &live, &self.context_as(ctx, &live, exposure, true)).await;
         let ghost = config::GHOST_MODE || ctx.dynamic_config.ghost_mode;
         self.order_exits(ctx, full, &live, &self.context_as(ctx, &live, exposure, ghost), ghost).await
@@ -869,6 +956,45 @@ pub fn dry_run(squadron: &str, script: &str, source: Option<&str>,
 
 #[cfg(test)]
 mod tests {
+    /// [E102b] The instance cap counts entries in flight, and a squadron's
+    /// share caps what is open there.
+    #[test]
+    fn e102b_caps_count_entries_in_flight_and_the_squadron_share() {
+        use rust_decimal_macros::dec;
+        assert!(entry_fits(dec!(10), dec!(10), dec!(0), dec!(0), dec!(9.9), dec!(20), None).is_ok());
+        let e = entry_fits(dec!(10), dec!(0), dec!(9.9), dec!(0), dec!(9.9), dec!(20), None).unwrap_err();
+        assert!(e.starts_with("exposure cap") && e.contains("in flight"), "{e}");
+        let e = entry_fits(dec!(0), dec!(0), dec!(0), dec!(0), dec!(9.9), dec!(20), Some(dec!(5))).unwrap_err();
+        assert!(e.starts_with("squadron cap"), "{e}");
+        assert!(entry_fits(dec!(9.9), dec!(0), dec!(0), dec!(0), dec!(9.9), dec!(20), Some(dec!(10))).is_ok(),
+            "another squadron's position counts against the instance cap, not this squadron's share");
+    }
+
+    /// [E102b] Two squadrons on the same tick: the second sees the first's
+    /// reservation and is refused, though neither position has landed yet.
+    #[test]
+    fn e102b_two_squadrons_on_one_tick_cannot_both_pass_the_cap() {
+        use rust_decimal_macros::dec;
+        let script = "e102b-race-test";
+        assert!(reserve_entry(script, "btc-open", dec!(0), dec!(0), dec!(9.9), dec!(15), None).is_ok());
+        let e = reserve_entry(script, "eth-open", dec!(0), dec!(0), dec!(9.9), dec!(15), None).unwrap_err();
+        assert!(e.contains("in flight"), "{e}");
+        assert!(reserve_entry(script, "sol-open", dec!(0), dec!(0), dec!(5), dec!(15), None).is_ok(), "what still fits is reserved");
+        reservations().lock().unwrap().retain(|(s, _, _, _)| s != script);
+    }
+
+    /// [E102a] Paper here narrows a live script to paper on one squadron.
+    #[test]
+    fn e102a_paper_here_keeps_a_live_script_on_paper() {
+        use crate::helpers::dynamic_config::CustomViperConfig;
+        let live = CustomViperConfig { live: true, ..Default::default() };
+        assert!(matches!(mode(&live, false), Mode::Orders { ghost: false }));
+        let here = CustomViperConfig { live: true, paper_here: true, ..Default::default() };
+        assert!(matches!(mode(&here, false), Mode::Paper));
+        let paper = CustomViperConfig { paper_here: true, ..Default::default() };
+        assert!(matches!(mode(&paper, false), Mode::Paper));
+    }
+
     use super::*;
     use rust_decimal_macros::dec;
     use std::sync::Arc;

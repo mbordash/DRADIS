@@ -174,6 +174,9 @@ impl ViperStatus {
 /// `net_exposure $12.50 > max $10.00` becomes `net_exposure # > max #`. Words
 /// containing digits (`velocity_5s`, `0.50`) are left alone only when the digit
 /// run is glued to letters on both sides — `drift_60m` keeps its name.
+/// [E102a] The reason shown while a squadron is held (`squadron_held`).
+pub const SQUADRON_HELD: &str = "squadron held: new squadron, nothing opens until you arm it from its card";
+
 pub fn normalize_reason(reason: &str) -> String {
     let chars: Vec<char> = reason.chars().collect();
     let mut out = String::with_capacity(reason.len());

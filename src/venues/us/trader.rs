@@ -1208,7 +1208,7 @@ async fn trade_one_market(
     crate::helpers::ghost_quotes::clear_squadron(&squadron_id);
 
     // Seed the squadron's Viper config so the detail view's strategy cards render.
-    seed_squadron_config(&squadron_id, viper_budgets).await;
+    seed_squadron_config(&squadron_id, viper_budgets).await; // US wings are not per underlying: never held
 
     // Classify the market's domain and link it to its eligible raptors/vipers via
     // the shared, venue-neutral taxonomy (same path intl uses).
@@ -1728,6 +1728,12 @@ async fn trade_one_market(
             // Inside the RTB window we manage what we hold but take on nothing
             // new: cancels and exits still flow, entries and quotes do not.
             if winding_down && signal.opens_exposure() {
+                continue;
+            }
+            // [E102a] A held squadron opens nothing until it is armed from its
+            // card; exits and cancels still flow.
+            if dyn_cfg.squadron_held && signal.opens_exposure() {
+                crate::helpers::viper_status::report_reason(&asset.to_uppercase(), &strategy_name, crate::helpers::viper_status::SQUADRON_HELD);
                 continue;
             }
             if dispatch_signal(&squadron_id, venue.as_ref(), &pool, &positions, &lifecycle, &scope, &strategy_name, &signal, starting).await {
