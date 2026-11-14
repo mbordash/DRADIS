@@ -51,6 +51,15 @@ const btnPlain = `${btn} border-[#1e1e32] text-gray-300 hover:bg-white/[0.03]`;
 const btnDanger = `${btn} border-red-500/40 text-red-300 hover:bg-red-500/10`;
 
 const CLASSES = ['crypto', 'sports', 'politics', 'unknown'];
+/** Labels shown on the checkboxes. The stored value stays `unknown` (the
+ *  engine's class for a market no class rule matches), so manifests and
+ *  community exports are unchanged; only the wording is friendlier. */
+const CLASS_LABELS: Record<string, { label: string; hint?: string }> = {
+  unknown: {
+    label: 'other (unclassified)',
+    hint: 'Markets that match no class rule, e.g. a category the engine has no rule for yet. Tick it only for a script that does not depend on the market type.',
+  },
+};
 const EMPTY_CFG: CustomViperConfig = {};
 const VENUES: { id: string; label: string }[] = [
   { id: 'kalshi', label: 'Kalshi' },
@@ -212,10 +221,11 @@ function ManifestForm({ draft, setDraft, disabled }: { draft: Draft; setDraft: (
           <label className={labelCls}>Market classes it flies</label>
           <div className="flex flex-wrap gap-3">
             {CLASSES.map((c) => (
-              <label key={c} className="flex items-center gap-1.5 text-xs font-mono text-gray-300">
+              <label key={c} className="flex items-center gap-1.5 text-xs font-mono text-gray-300"
+                     title={CLASS_LABELS[c]?.hint}>
                 <input type="checkbox" checked={m.classes.includes(c)} disabled={disabled}
                        onChange={() => set({ classes: toggle(m.classes, c) })} />
-                {c}
+                {CLASS_LABELS[c]?.label ?? c}
               </label>
             ))}
           </div>
@@ -803,11 +813,12 @@ function ReferencePanel() {
         <h4 className="text-gray-300 mb-1">ctx</h4>
         <table className="w-full"><tbody>
           {row('market_name, venue', 'strings')}
-          {row('market_class', '"crypto", "sports", "politics" or "unknown"; () on a squadron with no class')}
+          {row('market_class', '"crypto", "sports", "politics" or "unknown" (shown as other); () on a squadron with no class')}
           {row('has_price_feed', 'true when this squadron has a price feed behind oracle and the other signals')}
           {row('strike', 'decimal, or () when the market has none')}
           {row('secs_to_close, market_age_secs, window_secs', 'integers (secs_to_close and window_secs may be ())')}
           {row('now_secs, book_age_secs', 'integers: the tick’s clock (the only one a script has) and the book’s age')}
+          {row('et_hour, et_minute, et_weekday', 'integers: the same clock in US/Eastern, daylight saving applied (hour 0-23, weekday 1 = Monday .. 7 = Sunday); check them in entry to fly only certain hours')}
           {row('yes, no', 'each #{ bid, ask, bid_depth, ask_depth, bid_depth_total, ask_depth_total, obi }')}
           {row('oracle', 'the price feed’s level in dollars; () without a feed')}
           {row('velocity, velocity_1s', 'the oracle’s move over 5 s and 1 s, in dollars (divide by ctx.oracle for a fraction)')}

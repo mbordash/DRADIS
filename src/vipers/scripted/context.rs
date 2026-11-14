@@ -25,7 +25,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::Utc;
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use rhai::{Dynamic, Map};
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
@@ -37,6 +37,15 @@ fn d(x: Decimal) -> Dynamic { Dynamic::from_decimal(x) }
 fn i(x: i64) -> Dynamic { Dynamic::from_int(x) }
 fn f(x: f64) -> Dynamic { Decimal::from_f64(x).map(|v| d(v.round_dp(10))).unwrap_or(Dynamic::UNIT) }
 fn opt<T>(x: Option<T>, g: impl FnOnce(T) -> Dynamic) -> Dynamic { x.map(g).unwrap_or(Dynamic::UNIT) }
+
+/// The tick's wall clock in US/Eastern (the engine's time zone), as
+/// `(hour 0-23, minute 0-59, weekday 1 = Monday .. 7 = Sunday)`. Daylight
+/// saving is applied here so a script that flies only certain hours does not
+/// have to work it out from `now_secs`.
+fn et_clock(now: DateTime<Utc>) -> (i64, i64, i64) {
+    let et = now.with_timezone(&chrono_tz::US::Eastern);
+    (et.hour() as i64, et.minute() as i64, et.weekday().number_from_monday() as i64)
+}
 
 /// The account and budget figures the adapter computes for this viper.
 pub struct Account {
@@ -62,6 +71,10 @@ pub fn build(ctx: &StrategyContext, params: &BTreeMap<String, ParamValue>, acct:
     c.insert("market_age_secs".into(), i((now - ctx.market_started_at).num_seconds().max(0)));
     c.insert("window_secs".into(), opt(m.window_secs, i));
     c.insert("now_secs".into(), i(now.timestamp()));
+    let (et_hour, et_minute, et_weekday) = et_clock(now);
+    c.insert("et_hour".into(), i(et_hour));
+    c.insert("et_minute".into(), i(et_minute));
+    c.insert("et_weekday".into(), i(et_weekday));
     c.insert("book_age_secs".into(), i((now - s.timestamp).num_seconds().max(0)));
 
     // ── Book ──
@@ -167,4 +180,24 @@ pub fn position(p: &PosView) -> Map {
     x.insert("take_profit".into(), opt(p.take_profit, d));
     x.insert("market_name".into(), p.market_name.clone().into());
     x
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn et_clock_applies_daylight_saving() {
+        // 2026-07-15 (Wednesday) 13:05 UTC is 09:05 EDT (UTC-4).
+        assert_eq!(et_clock(Utc.with_ymd_and_hms(2026, 7, 15, 13, 5, 0).unwrap()), (9, 5, 3));
+        // 2026-12-15 (Tuesday) 13:05 UTC is 08:05 EST (UTC-5).
+        assert_eq!(et_clock(Utc.with_ymd_and_hms(2026, 12, 15, 13, 5, 0).unwrap()), (8, 5, 2));
+    }
+
+    #[test]
+    fn et_clock_weekday_follows_eastern_date() {
+        // Monday 2026-11-16 02:30 UTC is still Sunday 21:30 EST.
+        assert_eq!(et_clock(Utc.with_ymd_and_hms(2026, 11, 16, 2, 30, 0).unwrap()), (21, 30, 7));
+    }
 }

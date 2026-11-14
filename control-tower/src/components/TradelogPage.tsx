@@ -488,6 +488,62 @@ function ExportCsvButton({ assets }: { assets: string[] }) {
   );
 }
 
+/** The filtered rows' money summary. Shown above the table and again below
+ *  it, so the operator sees their cash performance without scrolling to the
+ *  bottom of a long log. */
+function FilteredPnl({ filtered, edge }: { filtered: LogEntry[]; edge: 'border-t' | 'border-b' }) {
+  // Simulated rows (instance ghost mode, the GBoost and Anchor shadow
+  // lanes) stay out of the money figures, matching the lifetime cards
+  // above, which the server already scopes to real rows. A live
+  // operator must never read a simulated loss as money lost; a customer
+  // in ghost mode still gets their simulated running total on its own
+  // line, labeled as such.
+  const sum  = (xs: LogEntry[]) => xs.reduce((s, e) => s + (e.pnl ?? 0), 0);
+  const real = filtered.filter(e => !e.ghost && !e.paper);
+  const sim  = filtered.filter(e => e.ghost);
+  const paper = filtered.filter(e => e.paper && e.status === 'completed' && e.pnl !== null);
+  const paperPnl = sum(paper);
+  const realized   = sum(real.filter(e => e.status === 'completed'));
+  const unrealized = sum(real.filter(e => e.status !== 'completed' && e.pnl !== null));
+  const net = realized + unrealized;
+  const simulated = sum(sim.filter(e => e.status === 'completed' || e.pnl !== null));
+  return (
+    <div className={`px-4 py-3 ${edge} border-[#1e1e32] flex flex-wrap gap-6 text-xs font-mono`}>
+      <span className="text-gray-500">
+        Realized: <span className={realized >= 0 ? 'text-green-400' : 'text-red-400'}>
+          {realized >= 0 ? '+' : ''}${realized.toFixed(4)}
+        </span>
+      </span>
+      <span className="text-gray-500">
+        Unrealized: <span className={unrealized >= 0 ? 'text-green-400' : 'text-red-400'}>
+          {unrealized >= 0 ? '+' : ''}${unrealized.toFixed(4)}
+        </span>
+      </span>
+      <span className="text-gray-500">
+        Net: <span className={`font-semibold ${net >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+          {net >= 0 ? '+' : ''}${net.toFixed(4)}
+        </span>
+      </span>
+      {sim.length > 0 && (
+        <span className="text-gray-500" title="Ghost rows: instance ghost mode and the GBoost / Anchor shadow lanes. Simulated fills, not money; kept out of Realized, Unrealized and Net.">
+          👻 Ghost: <span className="text-amber-400 opacity-80">
+            {simulated >= 0 ? '+' : ''}${simulated.toFixed(4)}
+          </span>
+          <span className="text-gray-600"> ({sim.length} {sim.length === 1 ? 'row' : 'rows'}, not money)</span>
+        </span>
+      )}
+      {paper.length > 0 && (
+        <span className="text-gray-500" title="Script vipers' paper trades: each script's own ledger; no order was sent. Not money; kept out of Realized, Unrealized and Net.">
+          📝 Paper: <span className="text-sky-300 opacity-80">
+            {paperPnl >= 0 ? '+' : ''}${paperPnl.toFixed(4)}
+          </span>
+          <span className="text-gray-600"> ({paper.length} closed, not money)</span>
+        </span>
+      )}
+    </div>
+  );
+}
+
 export default function TradelogPage({ availableAssets }: Props) {
   // ── Filters ──────────────────────────────────────────────────────────────────
   const [assetFilter,    setAssetFilter]    = useState<string>('all');
@@ -803,6 +859,9 @@ export default function TradelogPage({ availableAssets }: Props) {
           </div>
         </div>
 
+        {/* Filtered P&L header: the footer's summary, so it is visible without scrolling */}
+        {!isLoading && filtered.length > 0 && <FilteredPnl filtered={filtered} edge="border-b" />}
+
         {isLoading ? (
           <div className="flex items-center justify-center h-40 text-gray-600 text-sm">
             Loading tradelog across all assets…
@@ -812,7 +871,10 @@ export default function TradelogPage({ availableAssets }: Props) {
             No entries match the current filters.
           </div>
         ) : (
-          <div className="overflow-x-auto">
+          // `isolate`: the pinned first and last columns use z-index to stay
+          // above the scrolling cells; scoping that to the table keeps them
+          // under the page's sticky top header (z-10) when the page scrolls.
+          <div className="overflow-x-auto isolate">
             <table className="w-full text-xs font-mono border-separate border-spacing-0 [&_td]:border-b [&_td]:border-[#1e1e32] [&_th]:border-b [&_th]:border-[#1e1e32]">
               <thead>
                 <tr>
@@ -1043,59 +1105,8 @@ export default function TradelogPage({ availableAssets }: Props) {
           </div>
         )}
 
-        {/* Filtered P&L footer */}
-        {!isLoading && filtered.length > 0 && (() => {
-          // Simulated rows (instance ghost mode, the GBoost and Anchor shadow
-          // lanes) stay out of the money figures, matching the lifetime cards
-          // above, which the server already scopes to real rows. A live
-          // operator must never read a simulated loss as money lost; a customer
-          // in ghost mode still gets their simulated running total on its own
-          // line, labeled as such.
-          const sum  = (xs: LogEntry[]) => xs.reduce((s, e) => s + (e.pnl ?? 0), 0);
-          const real = filtered.filter(e => !e.ghost && !e.paper);
-          const sim  = filtered.filter(e => e.ghost);
-          const paper = filtered.filter(e => e.paper && e.status === 'completed' && e.pnl !== null);
-          const paperPnl = sum(paper);
-          const realized   = sum(real.filter(e => e.status === 'completed'));
-          const unrealized = sum(real.filter(e => e.status !== 'completed' && e.pnl !== null));
-          const net = realized + unrealized;
-          const simulated = sum(sim.filter(e => e.status === 'completed' || e.pnl !== null));
-          return (
-            <div className="px-4 py-3 border-t border-[#1e1e32] flex flex-wrap gap-6 text-xs font-mono">
-              <span className="text-gray-500">
-                Realized: <span className={realized >= 0 ? 'text-green-400' : 'text-red-400'}>
-                  {realized >= 0 ? '+' : ''}${realized.toFixed(4)}
-                </span>
-              </span>
-              <span className="text-gray-500">
-                Unrealized: <span className={unrealized >= 0 ? 'text-green-400' : 'text-red-400'}>
-                  {unrealized >= 0 ? '+' : ''}${unrealized.toFixed(4)}
-                </span>
-              </span>
-              <span className="text-gray-500">
-                Net: <span className={`font-semibold ${net >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                  {net >= 0 ? '+' : ''}${net.toFixed(4)}
-                </span>
-              </span>
-              {sim.length > 0 && (
-                <span className="text-gray-500" title="Ghost rows: instance ghost mode and the GBoost / Anchor shadow lanes. Simulated fills, not money; kept out of Realized, Unrealized and Net.">
-                  👻 Ghost: <span className="text-amber-400 opacity-80">
-                    {simulated >= 0 ? '+' : ''}${simulated.toFixed(4)}
-                  </span>
-                  <span className="text-gray-600"> ({sim.length} {sim.length === 1 ? 'row' : 'rows'}, not money)</span>
-                </span>
-              )}
-              {paper.length > 0 && (
-                <span className="text-gray-500" title="Script vipers' paper trades: each script's own ledger; no order was sent. Not money; kept out of Realized, Unrealized and Net.">
-                  📝 Paper: <span className="text-sky-300 opacity-80">
-                    {paperPnl >= 0 ? '+' : ''}${paperPnl.toFixed(4)}
-                  </span>
-                  <span className="text-gray-600"> ({paper.length} closed, not money)</span>
-                </span>
-              )}
-            </div>
-          );
-        })()}
+        {/* Filtered P&L footer (the same summary sits above the table) */}
+        {!isLoading && filtered.length > 0 && <FilteredPnl filtered={filtered} edge="border-t" />}
       </div>
 
       {/* RTB Modal */}

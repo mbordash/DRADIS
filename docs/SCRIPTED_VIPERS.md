@@ -51,7 +51,7 @@ ghost instance, turning a script's Live switch on moves it from paper to ghost.
   stops new entries only. Whatever it holds keeps its stop and take-profit
   until the position closes or settles.
 - **Sandboxed.** A script has no file, network or clock access (`ctx.now_secs`
-  is its only clock), cannot `eval` or import, and each call is stopped after
+  and the `ctx.et_*` fields are its only clock), cannot `eval` or import, and each call is stopped after
   about half a millisecond of work. A script that errors, loops or returns
   something malformed simply sits out that tick, with the error as its
   reason on the viper card.
@@ -187,6 +187,21 @@ if this.last_entry != () && ctx.now_secs - this.last_entry < 600 {
 this.last_entry = ctx.now_secs;
 ```
 
+**Trading hours.** To fly only certain hours, check the Eastern clock in
+`entry` and leave `exit` alone, so a position opened inside the window is
+still managed after it closes. With `start_hour` and `end_hour` as
+parameters, the operator can change the window from the viper card:
+
+```rust
+let h = ctx.et_hour;
+let inside = if ctx.params.start_hour <= ctx.params.end_hour {
+    h >= ctx.params.start_hour && h < ctx.params.end_hour
+} else {                                  // overnight, e.g. 22 to 6
+    h >= ctx.params.start_hour || h < ctx.params.end_hour
+};
+if !inside || ctx.et_weekday > 5 { return #{ hold: "outside trading hours" }; }
+```
+
 ### Numbers
 
 Every number with a decimal point is an exact decimal, the same type the
@@ -209,6 +224,7 @@ running on this squadron, is `()`, not 0.
 | `secs_to_close`, `window_secs` | integers, or `()` |
 | `market_age_secs`, `book_age_secs` | integers |
 | `now_secs` | integer: the tick's clock (Unix seconds) |
+| `et_hour`, `et_minute`, `et_weekday` | integers: the same clock in US/Eastern, daylight saving applied. Hour 0-23, minute 0-59, weekday 1 (Monday) to 7 (Sunday) |
 | `yes`, `no` | each `#{ bid, ask, bid_depth, ask_depth, bid_depth_total, ask_depth_total, obi }` |
 | `has_price_feed` | bool: true while the squadron's price feed is attached **and** has a price. False on a squadron with no feed, and for the first moments after a start, before the feed's first print; every signal below is then `()`, and on a squadron with a feed the engine refuses new entries until it prints (exits keep running). A comparison with `()` is false, not an error, so test `ctx.oracle == ()` before relying on an `else` branch. During a mid-session outage the feed keeps its last price |
 | `oracle` | the price feed's level, in dollars, or `()` (see `has_price_feed`) |

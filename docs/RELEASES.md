@@ -4,7 +4,14 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
-## 1.8.3 (unreleased)
+## 1.8.4 (unreleased)
+
+- Control Tower: the Trades log's pinned first and last columns no longer draw over the page's top header when you scroll down.
+- Control Tower: the Trades log shows its Realized / Unrealized / Net summary (and the ghost and paper lines) above the table as well as below it, so you see your cash performance without scrolling to the bottom.
+- Build a Viper: the "unknown" market class tickbox is now labeled "other (unclassified)", with a hint explaining it covers markets no class rule matches. Saved vipers are unchanged.
+- Build a Viper: scripts can read the Eastern clock (ctx.et_hour, ctx.et_minute, ctx.et_weekday, daylight saving applied) to fly only certain hours or days. The blank starter and the scripting guide show how.
+
+## 1.8.3 (2026-11-13)
 
 - GBoost: no longer enters on a stale price. It compared the market's price from the last minute's sample, up to 3 minutes old, with the live ask, so whenever the price had just fallen the old price looked like an edge and it bought the side that had just gotten cheaper. A side whose ask is below the price it was scored against is now refused for that minute (the card says "ask below the minute's market price"), the nightly trainer's check uses the same rule, and simulated trades taken before this fix no longer count toward a model's shadow record. Expect GBoost to enter rarely until a model shows real skill over the market price.
 - Price feed: when the Binance price feed drops, or prints nothing for 10 seconds, the engine now publishes "not connected" (price and every rate at 0) until ticks resume, and for the first 5 seconds of a new connection while its velocity window refills. Before, the last price and velocity stayed in place and every viper read them as live for up to a minute, or for the whole outage. Momentum, TrendReversal, Convergence and Basis now refuse entries while the price is unknown (the card says "no oracle price"), as Maker, Time Decay, Anchor, FairValue and scripted vipers already did. Exits keep running, but none acts on a missing price: the ETF tide signal holds its last reading instead of reading collapsed (which would have made Convergence sell), and the Telemetry chart shows a gap instead of a drop to $0.

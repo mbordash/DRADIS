@@ -35,6 +35,10 @@ pub const BLANK: &str = r#"// entry(ctx) is called every tick while the squadron
 // Return () or #{ hold: "why" } to sit out, or an order:
 //   #{ buy: "yes" | "no", price: ctx.yes.ask, shares: 5, take_profit: 0.60, reason: "..." }
 fn entry(ctx) {
+    // To fly only certain hours (US/Eastern), e.g. 09:00-16:00 on weekdays:
+    // if ctx.et_weekday > 5 || ctx.et_hour < 9 || ctx.et_hour >= 16 {
+    //     return #{ hold: "outside trading hours" };
+    // }
     #{ hold: "not written yet" }
 }
 
