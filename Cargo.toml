@@ -22,6 +22,10 @@ kalshi    = ["dep:rsa"]
 # Off by default so the Docker build never compiles it; it runs on the
 # publisher's machine only, with the offline signing key.
 registry-tool = []
+# Parse Alpaca IEX trade prints (Tide Raptor) with fin-stream's exact-decimal
+# normalizer instead of the `as_f64` -> `Decimal::from_f64` hop. Off by default;
+# a print it rejects falls back to the existing parser.
+fin-stream = ["dep:fin-stream"]
 
 [dependencies]
 polymarket_client_sdk_v2 = { version = "0.7.0", optional = true, features = ["clob", "ws", "data", "ctf"] }
@@ -37,6 +41,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rust_decimal = "1.36"
 rust_decimal_macros = "1.36"
+fin-stream = { version = "2.13", optional = true, default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10.4"
 futures = "0.3"

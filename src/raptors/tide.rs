@@ -564,8 +564,7 @@ async fn ingest_trade(
     vol_windows: &mut HashMap<&'static str, VecDeque<(Instant, Decimal)>>,
 ) {
     let Some(sym) = m.get("S").and_then(|s| s.as_str()).and_then(resolve_ticker) else { return };
-    let Some(price) = m.get("p").and_then(json_decimal) else { return };
-    let size = m.get("s").and_then(json_decimal).unwrap_or(dec!(0));
+    let Some((price, size)) = trade_price_size(m) else { return };
     if price <= dec!(0) { return; }
 
     let now = Instant::now();
@@ -596,12 +595,66 @@ fn resolve_ticker(s: &str) -> Option<&'static str> {
     HORIZON_SYMBOLS.iter().copied().find(|&t| t == s)
 }
 
+/// Price and size of a trade print. A missing size counts as `0`.
+///
+/// With the `fin-stream` feature the print goes through fin-stream's Alpaca
+/// normalizer, which parses the number's text straight to `Decimal` rather than
+/// via `f64`. Anything it rejects (e.g. no `s` field) takes the path below.
+fn trade_price_size(m: &serde_json::Value) -> Option<(Decimal, Decimal)> {
+    #[cfg(feature = "fin-stream")]
+    {
+        use fin_stream::{Exchange, RawTick, TickNormalizer};
+        let raw = RawTick::new(Exchange::Alpaca, "", m.clone());
+        if let Ok(tick) = TickNormalizer::new().normalize(raw) {
+            return Some((tick.price, tick.quantity));
+        }
+    }
+    let price = m.get("p").and_then(json_decimal)?;
+    let size = m.get("s").and_then(json_decimal).unwrap_or(dec!(0));
+    Some((price, size))
+}
+
 /// Coerce a JSON number (or numeric string) to `Decimal`.
 fn json_decimal(v: &serde_json::Value) -> Option<Decimal> {
     if let Some(f) = v.as_f64() {
         return Decimal::from_f64(f);
     }
     v.as_str().and_then(|s| Decimal::from_str(s).ok())
+}
+
+#[cfg(test)]
+mod trade_parse_tests {
+    use super::trade_price_size;
+    use rust_decimal_macros::dec;
+
+    fn print(text: &str) -> serde_json::Value { serde_json::from_str(text).unwrap() }
+
+    #[test]
+    fn a_trade_print_yields_price_and_size() {
+        let m = print(r#"{"T":"t","S":"IBIT","i":52983525029461,"x":"V","p":61.37,"s":100,"t":"2026-11-13T15:30:00.123Z","c":["@"],"z":"C"}"#);
+        assert_eq!(trade_price_size(&m), Some((dec!(61.37), dec!(100))));
+    }
+
+    /// A print with no size still updates the price, with zero notional.
+    #[test]
+    fn a_print_without_size_counts_as_zero_size() {
+        let m = print(r#"{"T":"t","S":"IBIT","p":"61.37"}"#);
+        assert_eq!(trade_price_size(&m), Some((dec!(61.37), dec!(0))));
+    }
+
+    #[test]
+    fn a_print_without_price_is_skipped() {
+        assert_eq!(trade_price_size(&print(r#"{"T":"t","S":"IBIT","s":100}"#)), None);
+    }
+
+    /// `Decimal::from_f64(4166.4049)` is `4166.404900000001`; the normalizer
+    /// keeps the digits Alpaca sent.
+    #[cfg(feature = "fin-stream")]
+    #[test]
+    fn prices_keep_the_digits_alpaca_sent() {
+        let m = print(r#"{"T":"t","S":"IBIT","p":4166.4049,"s":100}"#);
+        assert_eq!(trade_price_size(&m), Some((dec!(4166.4049), dec!(100))));
+    }
 }
 
 #[cfg(test)]
