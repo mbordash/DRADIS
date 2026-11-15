@@ -4,7 +4,7 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
-## 1.8.5 (unreleased)
+## 1.8.5 (2026-11-14)
 
 - Fly several crypto underlyings at once: set "Coins to Trade" on the Setup Venue tab (for example btc,eth,sol; the first is your main coin) and restart. On Kalshi each coin gets its own squadron and 15-minute market; Polymarket International already ran one squadron per coin and now reads the same setting. Polymarket US lists BTC crypto markets only, so the setting has nothing to add there.
 - New squadrons for other coins start held: their vipers evaluate and your scripts paper-trade, but nothing real opens until you press "Arm squadron" on the squadron's page. A squadron for another coin left from an earlier version is held once the same way.
