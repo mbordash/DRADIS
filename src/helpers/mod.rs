@@ -26,6 +26,8 @@ pub mod orders;
 #[cfg(feature = "intl_clob")]
 pub mod market;
 pub mod market_title;
+/// [B114] Venue-neutral at-the-money pick on a strike ladder.
+pub mod strike_ladder;
 pub mod notifications;
 pub mod metrics;
 pub mod config_helpers;

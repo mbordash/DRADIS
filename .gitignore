@@ -105,6 +105,7 @@ docs/spikes/scripted-viper-spike.md
 docs/spikes/ultra-short-market-spike.md
 docs/spikes/community-vipers-spike.md
 docs/spikes/multi-underlying-kalshi-design.md
+docs/spikes/b114-at-the-money-hourly-design.md
 
 # Private keys
 *.pem
@@ -139,3 +140,4 @@ deploy/ami/debuginfo/
 
 # Per-instance debug symbol bundles snapshotted by start-local.sh.
 *.dSYM/
+docs/spikes/sniper-cushion-replay/

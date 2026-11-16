@@ -49,6 +49,7 @@ use crate::api::server::AssetRaptorHealth;
 use crate::cag::Cag;
 use crate::helpers::db;
 use crate::helpers::dynamic_config::DynamicConfig;
+use crate::helpers::strike_ladder::{ladder_yes_mid, nearest_rung, pick_at_the_money, rungs_apart, AtmBasis, LadderRung};
 use crate::helpers::metrics;
 use crate::squadron::game_over::{sports_game_over_due, sports_game_over_verdict, GameOver, SportsBook, SportsGameSignals};
 use crate::orchestrator::{
@@ -225,6 +226,16 @@ pub struct KalshiPair {
     /// publish an open. This, not the cadence, is what `MarketConfig::window_secs`
     /// carries, so a model that scores one window length reads the real one.
     pub window_secs: Option<i64>,
+    /// [B114] The YES mid from the listing's top of book, when two-sided and
+    /// tighter than `ATM_MID_MAX_SPREAD`; the at-the-money picker's fallback
+    /// when the underlying has no live price.
+    pub yes_mid: Option<f64>,
+}
+
+/// [B114] The listing's YES mid as the ladder picker reads it.
+fn listing_yes_mid(m: &KalshiMarket) -> Option<f64> {
+    let f = |s: &str| super::types::fp(s).and_then(|d| d.to_f64());
+    ladder_yes_mid(f(&m.yes_bid_dollars), f(&m.yes_ask_dollars))
 }
 
 /// Close minus open, when both are published and the order makes sense.
@@ -252,6 +263,7 @@ fn pair_from_market(m: &KalshiMarket) -> Option<KalshiPair> {
         ticker: m.ticker.clone(),
         cadence: window_of(m).and_then(Cadence::from_window).or_else(|| Cadence::from_ticker(&m.ticker)),
         window_secs: window_of(m),
+        yes_mid: listing_yes_mid(m),
         question,
         underlying,
     })
@@ -281,6 +293,7 @@ fn pair_from_market_untethered(m: &KalshiMarket) -> KalshiPair {
         ticker: m.ticker.clone(),
         cadence: window_of(m).and_then(Cadence::from_window).or_else(|| Cadence::from_ticker(&m.ticker)),
         window_secs: window_of(m),
+        yes_mid: listing_yes_mid(m),
         question,
         // Empty is the marker for "no crypto underlying". Every crypto-specific
         // path in the trade loop checks this rather than the market class, so a
@@ -897,6 +910,13 @@ async fn run_rotation_loop(
     filter: Option<String>,
 ) {
     info!("🔁 Kalshi rotation loop for {underlying} flying {series:?}");
+    // [B114] The underlying's raptor stack, spawned before the first selection
+    // so the at-the-money picker has a price to read. The stack is
+    // process-lifetime and `trade_one_market` fetches this same instance, so
+    // this only moves the spawn a few seconds earlier; the first pick of the
+    // process may still land before the feed connects, and the first rescan
+    // corrects it (`should_rotate`'s distance rule).
+    let raptors = (!underlying.is_empty()).then(|| raptor_stack_for(&underlying, &raptor_health_tx));
     // The squadron the rotation loop currently owns, so the next rotation can
     // retire it when it lands on a different underlying.
     let mut last_rotation_squadron: Option<String> = None;
@@ -922,7 +942,7 @@ async fn run_rotation_loop(
             continue;
         }
 
-        let selection = match select_market(&venue, &series, &filter, &cancel, &process_heartbeat_secs, closed_rank.take()).await {
+        let selection = match select_market(&venue, &series, &filter, &cancel, &process_heartbeat_secs, closed_rank.take(), raptors.as_ref()).await {
             Some(s) => s,
             None => return,
         };
@@ -1350,6 +1370,10 @@ async fn select_market(
     cancel: &CancellationToken,
     process_heartbeat_secs: &AtomicU64,
     closed_rank: Option<u8>,
+    // [B114] The underlying's raptor stack, for the price the strike ladder is
+    // read against. Read on every scan: a feed that connects during a wait
+    // steers the pick that ends it.
+    raptors: Option<&CryptoRaptors>,
 ) -> Option<MarketSelection> {
     let started = std::time::Instant::now();
     let mut wait_logged = false;
@@ -1362,7 +1386,11 @@ async fn select_market(
         if pairs.is_empty() {
             warn!("Kalshi trader: no tradeable markets across {series:?} — retrying in {DISCOVERY_RETRY_SECS}s");
         } else {
-            let primary = choose_primary(&pairs, filter.as_deref());
+            let reference = reference_price(raptors);
+            let (primary, basis) = match choose_primary_with_basis(&pairs, filter.as_deref(), reference) {
+                Some((p, b)) => (Some(p), b),
+                None => (None, None),
+            };
             let wanted = wanted_rank(closed_rank, &pairs, Utc::now());
 
             if let Some(p) = primary.as_ref().filter(|p| wait_for_successor(wanted, p, started.elapsed().as_secs())) {
@@ -1390,12 +1418,18 @@ async fn select_market(
             );
 
             if let Some(p) = primary {
-                let maker = choose_maker(&pairs, &p);
+                let maker = choose_maker(&pairs, &p, reference);
 
-                info!(
-                    "🎯 Kalshi primary: \"{}\" [{}] {:?} close={:?} strike={:?}",
-                    p.question, p.ticker, p.cadence, p.close_time, p.strike
-                );
+                match basis {
+                    Some(AtmBasis::Volume) => warn!(
+                        "⚠️ Kalshi primary: \"{}\" [{}] {:?} close={:?} strike={:?} (by volume: no price reference and no quotes on the ladder)",
+                        p.question, p.ticker, p.cadence, p.close_time, p.strike
+                    ),
+                    _ => info!(
+                        "🎯 Kalshi primary: \"{}\" [{}] {:?} close={:?} strike={:?}{}",
+                        p.question, p.ticker, p.cadence, p.close_time, p.strike, atm_basis_note(basis, reference, p.yes_mid)
+                    ),
+                }
                 if let Some(ref m) = maker {
                     info!(
                         "🎯 Kalshi maker:   \"{}\" [{}] {:?} close={:?} strike={:?}",
@@ -1412,13 +1446,48 @@ async fn select_market(
     }
 }
 
-/// The market the hour-shaped Vipers fly: the hottest market of the best
-/// cadence on the board (one-hour first, then 15-minute, then daily), narrowed by
-/// the operator's ticker/title filter when one is set.
-///
-/// `pairs` arrive hottest-first from `discover_pairs`, so within a cadence the
-/// first match is the busiest strike of the ladder.
-fn choose_primary(pairs: &[KalshiPair], filter: Option<&str>) -> Option<KalshiPair> {
+/// [B114] The underlying's live price from its raptor stack, or None when
+/// there is no stack or the feed publishes nothing. `Decimal::ZERO` is the
+/// price raptor's "not connected" value, on connect and after
+/// `PRICE_TICK_STALE_SECS` of silence ([B96]), so a dead feed cannot steer a
+/// pick to a stale level; the ladder's own quotes take over.
+fn reference_price(raptors: Option<&CryptoRaptors>) -> Option<f64> {
+    raptors.map(|r| *r.oracle.borrow()).filter(|p| *p > Decimal::ZERO).and_then(|p| p.to_f64())
+}
+
+/// [B114] The strike ladder `pick_at_the_money` reads: the pairs of one cadence
+/// and one underlying that carry a strike, in the order given, with the rungs
+/// built from them (same indices).
+fn ladder_of<'a>(pairs: impl Iterator<Item = &'a KalshiPair>) -> (Vec<&'a KalshiPair>, Vec<LadderRung>) {
+    let strike_of = |p: &KalshiPair| p.strike.and_then(|s| s.to_f64()).filter(|s| s.is_finite());
+    let rows: Vec<&KalshiPair> = pairs.filter(|p| strike_of(p).is_some()).collect();
+    let rungs = rows.iter().map(|p| LadderRung {
+        strike: strike_of(p).unwrap_or_default(),
+        yes_mid: p.yes_mid,
+        volume: p.volume,
+    }).collect();
+    (rows, rungs)
+}
+
+/// Does this cadence list a ladder of strikes per window? The 15-minute
+/// market is one market per window; its pick is untouched by [B114].
+fn is_ladder_cadence(c: Option<Cadence>) -> bool {
+    matches!(c, Some(Cadence::Hourly) | Some(Cadence::Daily))
+}
+
+/// The market the hour-shaped Vipers fly: the best cadence on the board
+/// (one-hour first, then 15-minute, then daily), narrowed by the operator's
+/// ticker/title filter when one is set; within an hourly or daily ladder the
+/// at-the-money strike ([B114], `pick_at_the_money`), within the 15-minute
+/// cadence the hottest (`pairs` arrive hottest-first from `discover_pairs`,
+/// which stays volume-sorted for `choose_ultra`).
+fn choose_primary(pairs: &[KalshiPair], filter: Option<&str>, reference: Option<f64>) -> Option<KalshiPair> {
+    choose_primary_with_basis(pairs, filter, reference).map(|(p, _)| p)
+}
+
+/// `choose_primary`, with how the ladder rung was chosen (None when the
+/// cadence is not a ladder) for the selection log.
+fn choose_primary_with_basis(pairs: &[KalshiPair], filter: Option<&str>, reference: Option<f64>) -> Option<(KalshiPair, Option<AtmBasis>)> {
     let matches = |p: &KalshiPair| match filter {
         Some(f) => {
             let fl = f.to_lowercase();
@@ -1426,22 +1495,54 @@ fn choose_primary(pairs: &[KalshiPair], filter: Option<&str>) -> Option<KalshiPa
         }
         None => true,
     };
-    pairs.iter()
-        .filter(|p| matches(p))
-        .min_by_key(|p| Cadence::primary_rank(p.cadence))
-        .and_then(|best| {
-            // The hottest of the chosen cadence, not merely the first to rank.
-            pairs.iter().find(|p| matches(p) && p.cadence == best.cadence)
-        })
-        .cloned()
+    let best = pairs.iter().filter(|p| matches(p)).min_by_key(|p| Cadence::primary_rank(p.cadence))?;
+    if is_ladder_cadence(best.cadence) {
+        let (rows, rungs) = ladder_of(pairs.iter().filter(|p| matches(p) && p.cadence == best.cadence && p.underlying == best.underlying));
+        if let Some((i, basis)) = pick_at_the_money(&rungs, reference) {
+            return Some((rows[i].clone(), Some(basis)));
+        }
+    }
+    // The hottest of the chosen cadence, not merely the first to rank.
+    pairs.iter().find(|p| matches(p) && p.cadence == best.cadence).map(|p| (p.clone(), None))
 }
 
-/// The daily market the Window/Daily Vipers rest orders on: the hottest daily
-/// with the primary's underlying that is not the primary itself.
-fn choose_maker(pairs: &[KalshiPair], primary: &KalshiPair) -> Option<KalshiPair> {
-    pairs.iter()
-        .find(|d| d.cadence == Some(Cadence::Daily) && d.underlying == primary.underlying && d.ticker != primary.ticker)
-        .cloned()
+/// The daily market the Window/Daily Vipers rest orders on: the at-the-money
+/// daily strike with the primary's underlying ([B114]; the hottest when the
+/// ladder carries no strikes), never the primary itself. The slot is fixed at
+/// selection and re-picked only on a primary rotation, so the daily drifts
+/// from the money within a session; accepted, the daily rungs are coarse.
+fn choose_maker(pairs: &[KalshiPair], primary: &KalshiPair, reference: Option<f64>) -> Option<KalshiPair> {
+    let daily = |d: &&KalshiPair| d.cadence == Some(Cadence::Daily) && d.underlying == primary.underlying && d.ticker != primary.ticker;
+    let (rows, rungs) = ladder_of(pairs.iter().filter(daily));
+    if let Some((i, _)) = pick_at_the_money(&rungs, reference) {
+        return Some(rows[i].clone());
+    }
+    pairs.iter().find(daily).cloned()
+}
+
+/// The note the selection log carries on how the ladder rung was chosen.
+fn atm_basis_note(basis: Option<AtmBasis>, reference: Option<f64>, yes_mid: Option<f64>) -> String {
+    match (basis, reference, yes_mid) {
+        // "Nearest": a reference beyond the ladder's ends takes the end rung.
+        (Some(AtmBasis::Reference), Some(r), _) => format!(" ref=${r:.2} (nearest the money)"),
+        (Some(AtmBasis::Mid), _, Some(m)) => format!(" (by mid {m:.2}: no price reference)"),
+        (Some(AtmBasis::Mid), _, None) => " (by mid: no price reference)".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// [B114] How many rungs `current` sits from the money, and which way, on the
+/// ladder `board` (which need not include `current`). None without a
+/// reference, a strike, or a ladder cadence.
+fn rungs_off_the_money(current: &KalshiPair, board: &[KalshiPair], reference: Option<f64>) -> Option<(usize, &'static str)> {
+    if !is_ladder_cadence(current.cadence) { return None; }
+    let r = reference?;
+    let cur = current.strike?.to_f64()?;
+    let (_, mut rungs) = ladder_of(board.iter().filter(|p| p.cadence == current.cadence && p.underlying == current.underlying));
+    rungs.push(LadderRung { strike: cur, yes_mid: current.yes_mid, volume: current.volume });
+    let money = nearest_rung(&rungs, r)?;
+    let n = rungs_apart(&rungs, cur, money);
+    Some((n, if cur > money { "above" } else { "below" }))
 }
 
 /// Is the hourly market `current` past its settle window, so the loop holds it
@@ -1460,23 +1561,40 @@ fn hourly_pinned(current: &KalshiPair, now_s: i64) -> bool {
     }
 }
 
+/// [B114] One rung off the money is held; two or more moves (before the pin).
+const ROTATION_MIN_RUNGS_OFF: usize = 2;
+
 /// Should the loop leave `current` for `best`, the candidate `choose_primary`
-/// picked from a fresh scan that excluded `current`, at `now_s`?
+/// picked from a fresh scan that excluded `current` (`board`), at `now_s`?
 ///
 /// A better cadence always wins: a one-hour market appearing while the loop
 /// flies a 15-minute one is the market the hour-shaped Vipers exist for. Within
 /// the same cadence an hourly market that has settled (`hourly_pinned`) is held
 /// to its close against the rest of its own ladder. A market of another
-/// underlying is never a candidate ([B84]). Otherwise the old rule holds: only a clearly hotter market, by
-/// `ROTATION_VOLUME_THRESHOLD` contracts, is worth the churn of moving.
-fn should_rotate(current: &KalshiPair, best: &KalshiPair, now_s: i64) -> bool {
+/// underlying is never a candidate ([B84]).
+///
+/// Within a strike ladder with a live `reference` ([B114]): move iff `best` is
+/// strictly nearer the reference than `current` AND `current` sits at least
+/// `ROTATION_MIN_RUNGS_OFF` listed rungs from the rung nearest the reference.
+/// Distance REPLACES the volume gate here rather than joining it: the far ETH
+/// rung is hotter by far more than `ROTATION_VOLUME_THRESHOLD` and would pull
+/// the squadron off the money at the first rescan. Without a reference (or on
+/// a market with no strike) the old rule holds: only a clearly hotter market,
+/// by `ROTATION_VOLUME_THRESHOLD` contracts, is worth the churn of moving.
+fn should_rotate(current: &KalshiPair, best: &KalshiPair, now_s: i64, reference: Option<f64>, board: &[KalshiPair]) -> bool {
     // [B84] Never across underlyings: the series are already narrowed to one
     // (`rotation_series`); this keeps a stray pair from moving the squadron.
     if best.underlying != current.underlying { return false; }
     let (cur, new) = (Cadence::primary_rank(current.cadence), Cadence::primary_rank(best.cadence));
     if new < cur { return true; }
     if new > cur { return false; }
-    if best.underlying == current.underlying && hourly_pinned(current, now_s) { return false; }
+    if hourly_pinned(current, now_s) { return false; }
+    if let (Some(r), Some(c), Some(b)) = (reference, current.strike.and_then(|s| s.to_f64()), best.strike.and_then(|s| s.to_f64())) {
+        if is_ladder_cadence(current.cadence) && current.cadence == best.cadence {
+            let nearer = (b - r).abs() < (c - r).abs();
+            return nearer && rungs_off_the_money(current, board, reference).is_some_and(|(n, _)| n >= ROTATION_MIN_RUNGS_OFF);
+        }
+    }
     best.volume > current.volume + ROTATION_VOLUME_THRESHOLD
 }
 
@@ -1894,24 +2012,43 @@ async fn trade_one_market(
                 if let Some(cur) = candidates.iter().find(|p| p.ticker == pair.ticker) { pair.volume = cur.volume; }
                 candidates.retain(|p| p.ticker != pair.ticker);
                 let now_s = Utc::now().timestamp();
-                let best = choose_primary(&candidates, None);
+                // [B114] The ladder is read against the underlying's live price.
+                let reference = reference_price(Some(&raptors));
+                let best = choose_primary(&candidates, None, reference);
                 if let Some(b) = best.as_ref() {
-                    let hotter_same_ladder = b.cadence == pair.cadence && b.underlying == pair.underlying
-                        && b.volume > pair.volume + ROTATION_VOLUME_THRESHOLD;
-                    if !pin_logged && hotter_same_ladder && hourly_pinned(&pair, now_s) {
-                        pin_logged = true;
-                        info!(
-                            "📌 Kalshi hourly held: staying on \"{}\" vol={:.0} to its close; \"{}\" vol={:.0} is hotter, but the strike settled {}s into the window",
-                            pair.question, pair.volume, b.question, b.volume, HOURLY_SETTLE_SECS,
-                        );
+                    let same_ladder = b.cadence == pair.cadence && b.underlying == pair.underlying;
+                    if !pin_logged && same_ladder && hourly_pinned(&pair, now_s) {
+                        match rungs_off_the_money(&pair, &candidates, reference) {
+                            Some((n, way)) if n >= ROTATION_MIN_RUNGS_OFF => {
+                                pin_logged = true;
+                                info!(
+                                    "📌 Kalshi hourly held: staying on \"{}\" to its close; it is {} rung(s) {} spot ${:.2}, but the strike settled {}s into the window",
+                                    pair.question, n, way, reference.unwrap_or(0.0), HOURLY_SETTLE_SECS,
+                                );
+                            }
+                            None if b.volume > pair.volume + ROTATION_VOLUME_THRESHOLD => {
+                                pin_logged = true;
+                                info!(
+                                    "📌 Kalshi hourly held: staying on \"{}\" vol={:.0} to its close; \"{}\" vol={:.0} is hotter, but the strike settled {}s into the window",
+                                    pair.question, pair.volume, b.question, b.volume, HOURLY_SETTLE_SECS,
+                                );
+                            }
+                            _ => {}
+                        }
                     }
                 }
-                if let Some(best) = best.filter(|b| should_rotate(&pair, b, now_s)) {
+                if let Some(best) = best.filter(|b| should_rotate(&pair, b, now_s, reference, &candidates)) {
                     {
-                        info!(
-                            "🔍 Better Kalshi market: \"{}\" {:?} vol={:.0} over \"{}\" {:?} vol={:.0} (threshold {:.0} within a cadence) — rotating",
-                            best.question, best.cadence, best.volume, pair.question, pair.cadence, pair.volume, ROTATION_VOLUME_THRESHOLD
-                        );
+                        match rungs_off_the_money(&pair, &candidates, reference).filter(|_| best.cadence == pair.cadence && best.strike.is_some()) {
+                            Some((n, way)) => info!(
+                                "🔍 Strike drift: \"{}\" is {} rung(s) {} spot ${:.2} — moving to \"{}\" (strike {:?})",
+                                pair.question, n, way, reference.unwrap_or(0.0), best.question, best.strike
+                            ),
+                            None => info!(
+                                "🔍 Better Kalshi market: \"{}\" {:?} vol={:.0} over \"{}\" {:?} vol={:.0} (threshold {:.0} within a cadence) — rotating",
+                                best.question, best.cadence, best.volume, pair.question, pair.cadence, pair.volume, ROTATION_VOLUME_THRESHOLD
+                            ),
+                        }
                         lifecycle.cancel_all(venue.as_ref(), &positions).await;
                         settle_lifecycle_reports(&pool, &lifecycle).await;
                         // The cancels may have found a quote that traded, or an
@@ -4476,7 +4613,7 @@ mod hourly_market_tests {
             ticker: ticker.into(), question: ticker.into(),
             long: MarketId::new(format!("{ticker}#yes")), short: MarketId::new(format!("{ticker}#no")),
             close_time: None, volume, underlying: "btc", strike: None, cadence,
-            window_secs: cadence.map(Cadence::window_secs),
+            window_secs: cadence.map(Cadence::window_secs), yes_mid: None,
         }
     }
 
@@ -4540,13 +4677,13 @@ mod hourly_market_tests {
             pair("KXBTCD-HOUR-T81500", Some(Cadence::Hourly), 900.0),
             pair("KXBTCD-HOUR-T81000", Some(Cadence::Hourly), 300.0),
         ];
-        let p = choose_primary(&board, None).unwrap();
+        let p = choose_primary(&board, None, None).unwrap();
         assert_eq!(p.ticker, "KXBTCD-HOUR-T81500", "the hottest strike of the hourly ladder");
-        assert_eq!(choose_maker(&board, &p).unwrap().ticker, "KXBTCD-DAILY");
+        assert_eq!(choose_maker(&board, &p, None).unwrap().ticker, "KXBTCD-DAILY");
         let no_hourly: Vec<_> = board.iter().filter(|p| p.cadence != Some(Cadence::Hourly)).cloned().collect();
-        assert_eq!(choose_primary(&no_hourly, None).unwrap().ticker, "KXBTC15M-A");
+        assert_eq!(choose_primary(&no_hourly, None, None).unwrap().ticker, "KXBTC15M-A");
         // The operator's filter still narrows the field.
-        assert_eq!(choose_primary(&board, Some("daily")).unwrap().ticker, "KXBTCD-DAILY");
+        assert_eq!(choose_primary(&board, Some("daily"), None).unwrap().ticker, "KXBTCD-DAILY");
     }
 
     /// [B94] After a close the selection waits for the closed cadence's
@@ -4609,12 +4746,12 @@ mod hourly_market_tests {
     fn rotation_prefers_cadence_then_volume() {
         let quarter = pair("KXBTC15M-A", Some(Cadence::FifteenMin), 50_000.0);
         let hour = pair("KXBTCD-HOUR", Some(Cadence::Hourly), 100.0);
-        assert!(should_rotate(&quarter, &hour, 0), "an hourly market appearing is the move the hour-shaped Vipers wait for");
-        assert!(!should_rotate(&hour, &quarter, 0), "never back to the 15-minute market while an hourly is on the board");
+        assert!(should_rotate(&quarter, &hour, 0, None, &[]), "an hourly market appearing is the move the hour-shaped Vipers wait for");
+        assert!(!should_rotate(&hour, &quarter, 0, None, &[]), "never back to the 15-minute market while an hourly is on the board");
         let hotter_hour = pair("KXBTCD-HOUR-2", Some(Cadence::Hourly), 100.0 + ROTATION_VOLUME_THRESHOLD + 1.0);
         let warmer_hour = pair("KXBTCD-HOUR-3", Some(Cadence::Hourly), 100.0 + ROTATION_VOLUME_THRESHOLD - 1.0);
-        assert!(should_rotate(&hour, &hotter_hour, 0), "no published close: the volume rule, not a guessed pin");
-        assert!(!should_rotate(&hour, &warmer_hour, 0));
+        assert!(should_rotate(&hour, &hotter_hour, 0, None, &[]), "no published close: the volume rule, not a guessed pin");
+        assert!(!should_rotate(&hour, &warmer_hour, 0, None, &[]));
     }
 
     /// Once an hourly market is five minutes into its window the loop holds it
@@ -4630,38 +4767,205 @@ mod hourly_market_tests {
         hour.close_time = Some(close);
         let hotter = pair("KXBTCD-HOUR-B", Some(Cadence::Hourly), 100.0 + ROTATION_VOLUME_THRESHOLD + 1.0);
         assert!(hourly_pinned(&hour, open + HOURLY_SETTLE_SECS) && !hourly_pinned(&hour, open + HOURLY_SETTLE_SECS - 1));
-        assert!(should_rotate(&hour, &hotter, open + 10), "ten seconds in: the pick may still correct itself");
-        assert!(should_rotate(&hour, &hotter, open + HOURLY_SETTLE_SECS - 1));
-        assert!(!should_rotate(&hour, &hotter, open + HOURLY_SETTLE_SECS), "settled: held to the close");
-        assert!(!should_rotate(&hour, &hotter, close.timestamp() - 60));
+        assert!(should_rotate(&hour, &hotter, open + 10, None, &[]), "ten seconds in: the pick may still correct itself");
+        assert!(should_rotate(&hour, &hotter, open + HOURLY_SETTLE_SECS - 1, None, &[]));
+        assert!(!should_rotate(&hour, &hotter, open + HOURLY_SETTLE_SECS, None, &[]), "settled: held to the close");
+        assert!(!should_rotate(&hour, &hotter, close.timestamp() - 60, None, &[]));
         // The venue's own window length, not the cadence's nominal one, places the open.
         let mut odd = hour.clone();
         odd.window_secs = Some(3660);
-        assert!(!should_rotate(&odd, &hotter, open - 60 + HOURLY_SETTLE_SECS) && should_rotate(&odd, &hotter, open - 60 + HOURLY_SETTLE_SECS - 1));
+        assert!(!should_rotate(&odd, &hotter, open - 60 + HOURLY_SETTLE_SECS, None, &[]) && should_rotate(&odd, &hotter, open - 60 + HOURLY_SETTLE_SECS - 1, None, &[]));
         // No published window length: the cadence's nominal hour places the open.
         let mut nominal = hour.clone();
         nominal.window_secs = None;
-        assert!(!should_rotate(&nominal, &hotter, open + HOURLY_SETTLE_SECS) && should_rotate(&nominal, &hotter, open + HOURLY_SETTLE_SECS - 1));
+        assert!(!should_rotate(&nominal, &hotter, open + HOURLY_SETTLE_SECS, None, &[]) && should_rotate(&nominal, &hotter, open + HOURLY_SETTLE_SECS - 1, None, &[]));
         // [B84] Another underlying is never a move, however busy or however
         // early in the window: the squadron flies one underlying.
         let mut eth = pair("KXETHD-HOUR-A", Some(Cadence::Hourly), 20.0);
         eth.underlying = "eth";
         eth.close_time = Some(close);
         let btc_busier = pair("KXBTCD-HOUR-E", Some(Cadence::Hourly), 20.0 + ROTATION_VOLUME_THRESHOLD + 1.0);
-        assert!(!should_rotate(&eth, &btc_busier, open + 1800), "never across underlyings, settled");
-        assert!(!should_rotate(&eth, &btc_busier, open + 10), "never across underlyings, unsettled");
+        assert!(!should_rotate(&eth, &btc_busier, open + 1800, None, &[]), "never across underlyings, settled");
+        assert!(!should_rotate(&eth, &btc_busier, open + 10, None, &[]), "never across underlyings, unsettled");
         let mut eth_quarter = pair("KXETH15M-A", Some(Cadence::FifteenMin), 50_000.0);
         eth_quarter.underlying = "eth";
         let btc_hour = pair("KXBTCD-HOUR-F", Some(Cadence::Hourly), 5.0);
-        assert!(!should_rotate(&eth_quarter, &btc_hour, open + 10), "not even for a better cadence");
+        assert!(!should_rotate(&eth_quarter, &btc_hour, open + 10, None, &[]), "not even for a better cadence");
         let mut eth_busier = pair("KXETHD-HOUR-B", Some(Cadence::Hourly), 20.0 + ROTATION_VOLUME_THRESHOLD + 1.0);
         eth_busier.underlying = "eth";
-        assert!(!should_rotate(&eth, &eth_busier, open + 1800), "but holds against its own ladder");
+        assert!(!should_rotate(&eth, &eth_busier, open + 1800, None, &[]), "but holds against its own ladder");
         let mut quarter = pair("KXBTC15M-A", Some(Cadence::FifteenMin), 50_000.0);
         quarter.close_time = Some(close);
         let any_hour = pair("KXBTCD-HOUR-C", Some(Cadence::Hourly), 1.0);
-        assert!(should_rotate(&quarter, &any_hour, open + 3000), "a better cadence still wins; the pin is for strikes of the same hour");
-        assert!(!should_rotate(&hour, &quarter, open + 10), "and a worse one never does, settled or not");
+        assert!(should_rotate(&quarter, &any_hour, open + 3000, None, &[]), "a better cadence still wins; the pin is for strikes of the same hour");
+        assert!(!should_rotate(&hour, &quarter, open + 10, None, &[]), "and a worse one never does, settled or not");
+    }
+
+    /// A rung of a strike ladder as the board lists it.
+    fn rung(ticker: &str, cadence: Cadence, strike: f64, volume: f64, quote: Option<(f64, f64)>) -> KalshiPair {
+        let mut p = pair(ticker, Some(cadence), volume);
+        p.strike = Decimal::try_from(strike).ok();
+        p.yes_mid = quote.and_then(|(b, a)| ladder_yes_mid(Some(b), Some(a)));
+        p.underlying = if ticker.starts_with("KXETH") { "eth" } else { "btc" };
+        p
+    }
+
+    /// The 2026-11-14 ETH board in miniature: the $2,645 strike carries the
+    /// volume, spot sits near $1,790.
+    fn eth_board() -> Vec<KalshiPair> {
+        vec![
+            rung("KXETHD-HOUR-T2645", Cadence::Hourly, 2645.0, 40_000.0, Some((0.01, 0.99))),
+            pair("KXETH15M-A", Some(Cadence::FifteenMin), 9_000.0),
+            rung("KXETHD-DAILY-T2500", Cadence::Daily, 2500.0, 3_000.0, Some((0.01, 0.99))),
+            rung("KXETHD-HOUR-T1785", Cadence::Hourly, 1785.0, 300.0, Some((0.44, 0.52))),
+            rung("KXETHD-DAILY-T1800", Cadence::Daily, 1800.0, 200.0, Some((0.40, 0.50))),
+            rung("KXETHD-HOUR-T1780", Cadence::Hourly, 1780.0, 120.0, Some((0.70, 0.78))),
+            rung("KXETHD-HOUR-T1790", Cadence::Hourly, 1790.0, 90.0, Some((0.20, 0.30))),
+            rung("KXETHD-HOUR-T1795", Cadence::Hourly, 1795.0, 10.0, Some((0.10, 0.18))),
+            rung("KXETHD-DAILY-T1750", Cadence::Daily, 1750.0, 50.0, Some((0.80, 0.90))),
+            rung("KXETHD-DAILY-T1850", Cadence::Daily, 1850.0, 100.0, Some((0.15, 0.25))),
+        ].into_iter().map(|mut p| { if p.ticker.starts_with("KXETH") { p.underlying = "eth"; } p }).collect()
+    }
+
+    /// [B114] With a live price the hourly primary is the at-the-money strike,
+    /// whatever the far rung's volume; without one the tight mid nearest 0.50;
+    /// with neither, the hottest, as before.
+    #[test]
+    fn the_hourly_primary_is_the_at_the_money_strike() {
+        let board = eth_board();
+        let (p, basis) = choose_primary_with_basis(&board, None, Some(1789.4)).unwrap();
+        assert_eq!((p.ticker.as_str(), basis), ("KXETHD-HOUR-T1785", Some(AtmBasis::Reference)), "hotter of the 1,785/1,790 bracket");
+        let (p, basis) = choose_primary_with_basis(&board, None, Some(1791.0)).unwrap();
+        assert_eq!((p.ticker.as_str(), basis), ("KXETHD-HOUR-T1790", Some(AtmBasis::Reference)));
+        let (p, basis) = choose_primary_with_basis(&board, None, None).unwrap();
+        assert_eq!((p.ticker.as_str(), basis), ("KXETHD-HOUR-T1785", Some(AtmBasis::Mid)), "no price: the 0.44/0.52 book");
+        let blind: Vec<KalshiPair> = board.iter().cloned().map(|mut p| { p.yes_mid = None; p }).collect();
+        let (p, basis) = choose_primary_with_basis(&blind, None, None).unwrap();
+        assert_eq!((p.ticker.as_str(), basis), ("KXETHD-HOUR-T2645", Some(AtmBasis::Volume)), "the old rule, flagged");
+        // The operator's filter still narrows the ladder before the pick.
+        assert_eq!(choose_primary(&board, Some("T17"), Some(1789.4)).unwrap().ticker, "KXETHD-HOUR-T1785");
+        assert_eq!(choose_primary(&board, Some("daily"), Some(1789.4)).unwrap().ticker, "KXETHD-DAILY-T1800");
+    }
+
+    /// [B114] A feed that has not connected publishes `Decimal::ZERO` and reads
+    /// as no reference; a neutral stack likewise.
+    #[test]
+    fn a_zero_oracle_is_no_reference() {
+        assert_eq!(reference_price(Some(&CryptoRaptors::neutral())), None);
+        assert_eq!(reference_price(None), None);
+        let (tx, rx) = watch::channel(dec!(1789.40));
+        let mut live = CryptoRaptors::neutral();
+        live.oracle = rx;
+        assert_eq!(reference_price(Some(&live)), Some(1789.4));
+        tx.send(Decimal::ZERO).unwrap();
+        assert_eq!(reference_price(Some(&live)), None, "a stale feed steers nothing");
+    }
+
+    /// [B114] The daily maker slot is the at-the-money daily with a reference,
+    /// the hottest without quotes or price, and never the primary itself.
+    #[test]
+    fn the_maker_is_the_at_the_money_daily() {
+        let board = eth_board();
+        let primary = choose_primary(&board, None, Some(1789.4)).unwrap();
+        assert_eq!(choose_maker(&board, &primary, Some(1789.4)).unwrap().ticker, "KXETHD-DAILY-T1800", "1,750/1,800 bracket: 1,800 is hotter");
+        assert_eq!(choose_maker(&board, &primary, None).unwrap().ticker, "KXETHD-DAILY-T1800", "no price: the 0.40/0.50 book");
+        let blind: Vec<KalshiPair> = board.iter().cloned().map(|mut p| { p.yes_mid = None; p }).collect();
+        assert_eq!(choose_maker(&blind, &primary, None).unwrap().ticker, "KXETHD-DAILY-T2500", "the old rule");
+        let daily_primary = choose_primary(&board, Some("daily"), Some(1789.4)).unwrap();
+        assert_eq!(daily_primary.ticker, "KXETHD-DAILY-T1800");
+        assert_eq!(choose_maker(&board, &daily_primary, Some(1789.4)).unwrap().ticker, "KXETHD-DAILY-T1850", "never the primary: the ladder without it brackets 1,750/1,850, and 1,850 is hotter");
+    }
+
+    /// [B114] Within the hour, with a reference, distance replaces volume: one
+    /// rung off is held, two or more moves before the pin, nothing moves after
+    /// it, and a far rung hotter than the volume threshold never pulls the
+    /// squadron off the money.
+    #[test]
+    fn rotation_within_a_ladder_is_by_distance_from_the_money() {
+        let close = chrono::DateTime::<Utc>::from_timestamp(1_792_540_800, 0).unwrap();
+        let open = close.timestamp() - 3600;
+        let at = |mut p: KalshiPair| { p.close_time = Some(close); p };
+        let board = eth_board();
+        let r = Some(1791.0); // the money is the 1,790 rung
+        let cur = |t: &str| at(board.iter().find(|p| p.ticker == t).unwrap().clone());
+        let rest = |t: &str| -> Vec<KalshiPair> { board.iter().filter(|p| p.ticker != t).cloned().collect() };
+        let early = open + 10;
+        // One rung off: held, even though the best pick is nearer.
+        let c = cur("KXETHD-HOUR-T1785");
+        let best = choose_primary(&rest("KXETHD-HOUR-T1785"), None, r).unwrap();
+        assert_eq!(best.ticker, "KXETHD-HOUR-T1790");
+        assert!(!should_rotate(&c, &best, early, r, &rest("KXETHD-HOUR-T1785")), "one rung off the money is held");
+        // Two rungs off, before the pin: move.
+        let c = cur("KXETHD-HOUR-T1780");
+        let best = choose_primary(&rest("KXETHD-HOUR-T1780"), None, r).unwrap();
+        assert_eq!(best.ticker, "KXETHD-HOUR-T1790", "1,790/1,795 bracket: 1,790 is hotter");
+        assert!(should_rotate(&c, &best, early, r, &rest("KXETHD-HOUR-T1780")), "two rungs off, unsettled: move to the money");
+        assert!(!should_rotate(&c, &best, open + HOURLY_SETTLE_SECS, r, &rest("KXETHD-HOUR-T1780")), "settled: held to the close");
+        // On the money: the far rung is hotter by far more than the volume
+        // threshold and must not move the squadron.
+        let c = cur("KXETHD-HOUR-T1790");
+        let far = board.iter().find(|p| p.ticker == "KXETHD-HOUR-T2645").unwrap().clone();
+        assert!(far.volume > c.volume + ROTATION_VOLUME_THRESHOLD);
+        assert!(!should_rotate(&c, &far, early, r, &rest("KXETHD-HOUR-T1790")), "distance replaces the volume gate");
+        assert!(should_rotate(&c, &far, early, None, &rest("KXETHD-HOUR-T1790")), "without a reference the volume rule still holds");
+        // Nearer but not two rungs off (strike between listed rungs): held.
+        let c = cur("KXETHD-HOUR-T1785");
+        assert!(!should_rotate(&c, &cur("KXETHD-HOUR-T1790"), early, Some(1788.0), &rest("KXETHD-HOUR-T1785")));
+        // The pin log's measure agrees with the ladder the operator sees.
+        assert_eq!(rungs_off_the_money(&cur("KXETHD-HOUR-T1780"), &rest("KXETHD-HOUR-T1780"), r), Some((2, "below")));
+        assert_eq!(rungs_off_the_money(&cur("KXETHD-HOUR-T2645"), &rest("KXETHD-HOUR-T2645"), r), Some((2, "above")), "1,790 -> 1,795 -> 2,645: listed rungs, not dollars");
+        assert_eq!(rungs_off_the_money(&cur("KXETHD-HOUR-T1790"), &rest("KXETHD-HOUR-T1790"), r), Some((0, "below")));
+        assert_eq!(rungs_off_the_money(&cur("KXETHD-HOUR-T1790"), &rest("KXETHD-HOUR-T1790"), None), None);
+        assert_eq!(rungs_off_the_money(&pair("KXETH15M-A", Some(Cadence::FifteenMin), 1.0), &board, r), None, "not a ladder");
+    }
+
+    /// [B114] Cold start: the top-of-hour pick lands by mid before the feed
+    /// connects; the first rescan with a live price finds the current strike
+    /// rungs off the money and moves before the pin.
+    #[test]
+    fn a_cold_start_pick_is_corrected_at_the_first_rescan() {
+        let close = chrono::DateTime::<Utc>::from_timestamp(1_792_540_800, 0).unwrap();
+        let open = close.timestamp() - 3600;
+        let board = eth_board();
+        let mut current = choose_primary(&board, None, None).unwrap();
+        assert_eq!(current.ticker, "KXETHD-HOUR-T1785", "picked by mid");
+        current.close_time = Some(close);
+        // Spot turns out to be $1,765: the money is the 1,780 rung, the pick
+        // one rung off; held.
+        let rest: Vec<KalshiPair> = board.iter().filter(|p| p.ticker != current.ticker).cloned().collect();
+        let best = choose_primary(&rest, None, Some(1765.0)).unwrap();
+        assert_eq!(best.ticker, "KXETHD-HOUR-T1780");
+        assert!(!should_rotate(&current, &best, open + 140, Some(1765.0), &rest));
+        // Spot is $2,700: the far rung is the money, three rungs off; move.
+        let best = choose_primary(&rest, None, Some(2700.0)).unwrap();
+        assert_eq!(best.ticker, "KXETHD-HOUR-T2645");
+        assert!(should_rotate(&current, &best, open + 140, Some(2700.0), &rest));
+        assert!(!should_rotate(&current, &best, open + HOURLY_SETTLE_SECS + 1, Some(2700.0), &rest), "but not after the pin");
+    }
+
+    /// [B114] The 15-minute cadence is one market per window and the ultra
+    /// slot reads the volume-sorted board: neither notices the primary moving
+    /// to the money. [B84] A rung of another underlying never moves the
+    /// squadron, reference or not.
+    #[test]
+    fn fifteen_minute_and_cross_underlying_picks_are_untouched() {
+        let mut board = eth_board();
+        board.retain(|p| p.cadence != Some(Cadence::Hourly));
+        board.insert(0, { let mut q = pair("KXETH15M-B", Some(Cadence::FifteenMin), 20_000.0); q.underlying = "eth"; q });
+        board.iter_mut().filter(|p| p.ticker.starts_with("KXETH15M")).for_each(|p| p.underlying = "eth");
+        let p = choose_primary(&board, None, Some(1789.4)).unwrap();
+        assert_eq!(p.ticker, "KXETH15M-B", "the hottest 15-minute market, as before");
+        let full = eth_board();
+        let hot = choose_primary(&full, None, Some(1789.4)).unwrap();
+        let old = full.iter().find(|p| p.ticker == "KXETHD-HOUR-T2645").unwrap();
+        assert_eq!(choose_ultra(&full, &hot).map(|u| u.ticker), choose_ultra(&full, old).map(|u| u.ticker));
+        assert_eq!(choose_ultra(&full, &hot).unwrap().ticker, "KXETH15M-A");
+        let mut eth = full.iter().find(|p| p.ticker == "KXETHD-HOUR-T1780").unwrap().clone();
+        eth.close_time = Some(chrono::DateTime::<Utc>::from_timestamp(1_792_540_800, 0).unwrap());
+        let btc = rung("KXBTCD-HOUR-T1790", Cadence::Hourly, 1790.0, 90_000.0, None);
+        let mut with_btc = full.clone();
+        with_btc.push(btc.clone());
+        assert!(!should_rotate(&eth, &btc, 1_792_540_800 - 3590, Some(1791.0), &with_btc), "never across underlyings");
     }
 }
 
