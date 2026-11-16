@@ -4,6 +4,12 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
+## 1.8.6 (unreleased)
+
+- Kalshi: the hourly crypto market each squadron trades is now the strike nearest the current price (the at-the-money strike), chosen against the live price feed, instead of the strike with the most volume. The ETH and SOL squadrons had been sitting on far-away strikes for most of the night, so their hourly vipers never fired. When the market drifts two or more strikes away the squadron rotates to the new at-the-money strike; the 15-minute markets are unchanged.
+- Build a Viper: a "Make a copy" button on a saved viper opens it as a new viper under a free name (for example my_sniper_copy) with the same script and parameters, so you can test other settings on the same strategy side by side. Nothing is written until you save the copy; it then starts on paper with its own switches, cap and parameter values. Requested by a customer.
+- Anchor: new default settings for fresh installs and new squadrons. Entries now stop 20 minutes before the close (Min Time To Close 1200 s, was 300 s): the research put Anchor's edge in minutes 30 to 45 of the hour, and on 109 live BTC trades the entries made in the last 20 minutes lost money as a group while the earlier ones made it. The take-profit exit, when you turn it on, sells at +50% (was +100%) and no longer sells on the fair-value trigger (Exit Over Fair Value 1.00, was 0.02), which had sold holds for well below what settlement paid in range-bound weeks. The exit stays off by default. Settings you have already saved are not changed.
+
 ## 1.8.5 (2026-11-14)
 
 - Fly several crypto underlyings at once: set "Coins to Trade" on the Setup Venue tab (for example btc,eth,sol; the first is your main coin) and restart. On Kalshi each coin gets its own squadron and 15-minute market; Polymarket International already ran one squadron per coin and now reads the same setting. Polymarket US lists BTC crypto markets only, so the setting has nothing to add there.

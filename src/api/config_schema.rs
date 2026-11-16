@@ -1301,8 +1301,9 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
                 "Asks at or above this are refused. The edge lived on the cheap side: 0.20 to 0.40 was best, 0.40 to 0.60 \
                  positive, above 0.60 flat to negative.").range(0.01, 0.99).step(0.01).classes(&["crypto"]));
             v.push(F::new(g, e, "anchor_min_secs_to_close", "Min Time To Close", "secs", true,
-                "No entry inside this many seconds of the close. The last five minutes carried no edge once the fee \
-                 was paid.").min(0.0).step(30.0).unit("s").classes(&["crypto"]));
+                "No entry inside this many seconds of the close. Default 1200 (minute 40) since 1.8.6, 300 (minute 55) \
+                 before: the research put the edge in minutes 30 to 45, and on 109 live Kalshi BTC trades the entries \
+                 with under 1200 s left made -$4.68 over 31 trades against +$29.05 over 78 for the earlier ones.").min(0.0).step(30.0).unit("s").classes(&["crypto"]));
             v.push(F::new(g, e, "anchor_max_secs_to_close", "Max Time To Close", "secs", true,
                 "No entry earlier than this many seconds before the close. Before minute 30 the anchor is young and \
                  the record was negative; minutes 30 to 45 carried most of the edge.").min(60.0).step(60.0).unit("s").classes(&["crypto"]));
@@ -1334,14 +1335,16 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
                  settlement. Each ledger row records the best bid seen while held either way, so the two postures can \
                  be compared.").classes(&["crypto"]));
             v.push(F::new(g, e, "anchor_take_profit_pct", "Take Profit At", "pct", false,
-                "Sell once the gain on the cost (entry plus entry fee), net of the exit fee, reaches this: 1.00 is \
-                 +100%, a 0.30 entry sold at about 0.62. Zero turns this trigger off and leaves only the fair-value \
-                 trigger.").range(0.0, 5.0).step(0.05).classes(&["crypto"]));
+                "Sell once the gain on the cost (entry plus entry fee), net of the exit fee, reaches this: 0.50 is \
+                 +50%, a 0.30 entry sold at about 0.49; 1.00 is +100%, sold at about 0.62. Zero turns this trigger \
+                 off and leaves only the fair-value trigger. Entered as a percentage in the Control Tower: 50 is +50%.").range(0.0, 5.0).step(0.05).classes(&["crypto"]));
             v.push(F::new(g, e, "anchor_exit_fair_edge", "Exit Over Fair Value", "price", true,
                 "The fair-value trigger: sell when the bid, net of the exit fee, is at least the model's live fair \
                  value for the held side plus this margin, i.e. the market pays more than the model thinks the \
                  contract will settle at. Needs a readable anchor; late in the hour, deep in the money, the last \
-                 readable anchor is used.").range(-0.10, 0.50).step(0.005).classes(&["crypto"]));
+                 readable anchor is used. 1.00 (the default since 1.8.6) switches this trigger off, since a bid can never \
+                 pay a full dollar over the model's value, and the dial sells on the take-profit alone; 0.02 sold \
+                 range-week holds well below what settlement paid.").range(-0.10, 1.00).step(0.005).classes(&["crypto"]));
         }
         // ── Bookline (sports, maker-first, ghost-only) ────────────────────────
         // MUST equal the Control Tower card name in `VIPER_DEFS`: both ViperCard and

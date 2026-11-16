@@ -276,6 +276,13 @@ feed is not running.
 - **Narrowing a viper that holds a real position is refused.** A save may not
   drop a class or this venue while the viper holds one, because the viper
   would detach from the squadron and stop managing it.
+- **Make a copy** opens a saved viper as a new, unsaved one under a free name
+  (`<name>_copy`, then `_copy2` and so on; a copy of a copy is `_copy2`, not
+  `_copy_copy`), with the same script and
+  parameters, so you can try other settings on the same strategy side by
+  side. Rename it if you like, then Save: the copy starts on paper with its
+  own switches, cap and parameter values. A copy of an imported viper is your
+  own viper; the community update check does not follow it.
 - **Deleting** is refused while the viper holds a real position. Switch it
   off, so its exits keep running, and delete it once those positions have
   closed. Its open paper positions are closed unscored, and the record says

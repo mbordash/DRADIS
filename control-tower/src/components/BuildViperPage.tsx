@@ -86,6 +86,19 @@ let nextParamId = 1;
 function toEntries(m: ScriptManifest): ParamEntry[] {
   return Object.entries(m.params ?? {}).map(([name, p]) => ({ id: nextParamId++, name, p }));
 }
+/** [E104] A free name for a copy: `<name>_copy`, then `_copy2`, `_copy3`...,
+ *  trimmed so the result stays inside the engine's `[a-z0-9_]{3,32}` rule. */
+function copyName(name: string, taken: Set<string>): string {
+  // A copy of a copy is `foo_copy2`, not `foo_copy_copy`.
+  const stripped = name.replace(/_copy\d*$/, '');
+  const stem = stripped.length >= 3 ? stripped : name;
+  for (let i = 1; i < 1000; i++) {
+    const suffix = i === 1 ? '_copy' : `_copy${i}`;
+    const candidate = `${stem.slice(0, 32 - suffix.length)}${suffix}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+  return `${stem.slice(0, 27)}_copy`;
+}
 function draftOf(manifest: ScriptManifest, source: string, isNew: boolean): Draft {
   return { manifest, params: toEntries(manifest), source, isNew };
 }
@@ -1038,6 +1051,42 @@ export default function BuildViperPage() {
     }
   };
 
+  // [E104] Make a copy: the saved version opens as a new, unsaved viper under
+  // a free name, so the operator can test other parameters on the same script.
+  // Nothing is written until Save; the copy then starts on paper with its own
+  // settings. Import provenance is not carried over: the copy is the
+  // operator's own viper, so the community update check leaves it alone.
+  const copyOf = async (name: string) => {
+    if (dirty && !(await confirm({ title: 'Discard unsaved changes?', tone: 'danger', confirmLabel: 'Discard' }))) return;
+    const seq = ++openSeq.current;
+    let d;
+    try {
+      d = await getScript(name);
+    } catch (e) {
+      if (seq === openSeq.current) setProblems([`Could not copy ${name}: ${problemsOf(e).join('; ')}`]);
+      return;
+    }
+    if (seq !== openSeq.current) return;
+    if (!d.manifest || typeof d.source !== 'string') {
+      setProblems([`${name} did not load, so it cannot be copied. Open it and fix it first.`]);
+      return;
+    }
+    const taken = new Set([...(list?.scripts ?? []).map((x) => x.name), ...(list?.broken ?? []).map((x) => x.name)]);
+    const { origin: _origin, ...rest } = d.manifest;
+    // The engine caps display names at 64 characters.
+    const base = (d.manifest.display_name || name).slice(0, 64 - ' (copy)'.length);
+    const manifest: ScriptManifest = {
+      ...rest,
+      name: copyName(name, taken),
+      display_name: `${base} (copy)`,
+    };
+    setImporting(null);
+    setSelected(null); setProblems(null); setTab('script');
+    setDraft(draftOf(manifest, d.source, true));
+    setSaved(null);
+    toast.success(`Copy of ${name} opened as a new viper. Change its name if you like, then Save: it starts on paper with its own settings.`);
+  };
+
   // [E96] Import: the browser reads the file and the engine receives it as a
   // request body. The review panel replaces the editor until it is done.
   const openImport = async (next: { bundle: ViperBundle; fileName: string; localName?: string }) => {
@@ -1249,6 +1298,8 @@ export default function BuildViperPage() {
                     )}
                     {!draft.isNew && saved && <button className={btnPlain} disabled={busy} onClick={exportCurrent}
                                                        title="Download the saved version as a bundle file another DRADIS can import">Export</button>}
+                    {!draft.isNew && saved && selected && <button className={btnPlain} disabled={busy} onClick={() => copyOf(selected)}
+                                                                   title="Open the saved version as a new viper under another name, to try other parameters on the same script">Make a copy</button>}
                     {!draft.isNew && <button className={btnDanger} disabled={busy} onClick={remove}>{pending === 'delete' ? 'Deleting…' : 'Delete'}</button>}
                   </div>
                   <p className="text-[10px] font-mono text-gray-600">
