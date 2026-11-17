@@ -3275,18 +3275,157 @@ pub async fn venue_income_rows(pool: &SqlitePool) -> Vec<VenueIncomeRow> {
     })
 }
 
+/// How long a repeated snapshot is dropped for. Every squadron loop records
+/// the whole account on its own 30 s dashboard sync, so an instance flying
+/// five squadrons wrote five identical rows per sync (602 rows an hour on
+/// production against 363 with one coin, B116). A figure the chart already
+/// holds is not a new fact; one that changed is, whichever loop saw it first.
+/// Shorter than the sync so a flat account still lands one row per sync: the
+/// same sync's duplicates arrive within a second of each other.
+pub const SNAPSHOT_REPEAT_SECS: u64 = 20;
+
+/// The last snapshot written to each database file: when, and the three
+/// figures as stored. Process-wide so the loops dedupe against each other,
+/// keyed by file because Polymarket International keeps one database per
+/// asset and two flat squadrons would otherwise write identical figures into
+/// different tables, with the second shard's chart left empty.
+type LastSnapshot = Option<(std::time::Instant, [String; 3])>;
+static LAST_SNAPSHOT: std::sync::Mutex<Option<std::collections::HashMap<std::path::PathBuf, LastSnapshot>>> = std::sync::Mutex::new(None);
+
+/// True when `values` repeat the last written snapshot inside the window, in
+/// which case the row is not written. Pure: the caller notes a write with
+/// [`note_snapshot`] once the row has landed, so a failed insert does not
+/// silence the figure for a window.
+pub(crate) fn snapshot_is_repeat(
+    last: &LastSnapshot,
+    values: &[String; 3],
+    now: std::time::Instant,
+    window: std::time::Duration,
+) -> bool {
+    matches!(last, Some((at, prev)) if prev == values && now.duration_since(*at) < window)
+}
+
+/// Record that `values` were written at `now`.
+pub(crate) fn note_snapshot(last: &mut LastSnapshot, values: &[String; 3], now: std::time::Instant) {
+    *last = Some((now, values.clone()));
+}
+
+fn with_last_snapshot<R>(pool: &SqlitePool, f: impl FnOnce(&mut LastSnapshot) -> R) -> R {
+    let key = pool.connect_options().get_filename().to_path_buf();
+    let mut guard = LAST_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner());
+    f(guard.get_or_insert_with(Default::default).entry(key).or_default())
+}
+
 pub async fn record_pnl_snapshot(pool: &SqlitePool, session_pnl: Decimal, collateral: Decimal, total_value: Decimal) {
+    let values = [session_pnl.to_string(), collateral.to_string(), total_value.to_string()];
+    let window = std::time::Duration::from_secs(SNAPSHOT_REPEAT_SECS);
+    if with_last_snapshot(pool, |last| snapshot_is_repeat(last, &values, std::time::Instant::now(), window)) {
+        return;
+    }
     let ts = Utc::now().to_rfc3339();
     if let Err(e) = sqlx::query(
         "INSERT INTO pnl_snapshots (ts, session_pnl, collateral, total_value) VALUES (?, ?, ?, ?)"
     )
     .bind(&ts)
-    .bind(session_pnl.to_string())
-    .bind(collateral.to_string())
-    .bind(total_value.to_string())
+    .bind(&values[0])
+    .bind(&values[1])
+    .bind(&values[2])
     .execute(pool)
     .await {
         error!("❌ DB pnl_snapshot write failed: {}", e);
+    } else {
+        with_last_snapshot(pool, |last| note_snapshot(last, &values, std::time::Instant::now()));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_repeat_tests {
+    use super::{note_snapshot, snapshot_is_repeat, LastSnapshot};
+    use std::time::{Duration, Instant};
+
+    fn v(a: &str, b: &str, c: &str) -> [String; 3] { [a.into(), b.into(), c.into()] }
+
+    /// The write path: check, and note the write when the row would land.
+    fn write(last: &mut LastSnapshot, values: &[String; 3], now: Instant, w: Duration) -> bool {
+        let repeat = snapshot_is_repeat(last, values, now, w);
+        if !repeat { note_snapshot(last, values, now); }
+        repeat
+    }
+
+    #[test]
+    fn first_write_and_changed_figures_are_kept() {
+        let mut last = None;
+        let t0 = Instant::now();
+        let w = Duration::from_secs(30);
+        assert!(!write(&mut last, &v("1", "100", "101"), t0, w), "first snapshot is written");
+        assert!(!write(&mut last, &v("1", "100", "102"), t0 + Duration::from_secs(1), w), "a changed total is a new fact");
+        assert!(!write(&mut last, &v("2", "100", "102"), t0 + Duration::from_secs(2), w), "a changed session P&L too");
+    }
+
+    #[test]
+    fn same_figures_inside_the_window_are_dropped_then_kept_after_it() {
+        let mut last = None;
+        let t0 = Instant::now();
+        let w = Duration::from_secs(30);
+        let same = v("2.8351", "114.6628", "114.6628");
+        assert!(!write(&mut last, &same, t0, w));
+        assert!(write(&mut last, &same, t0 + Duration::from_secs(2), w), "second squadron's identical row is dropped");
+        assert!(write(&mut last, &same, t0 + Duration::from_secs(29), w), "fifth squadron's too");
+        assert!(!write(&mut last, &same, t0 + Duration::from_secs(30), w), "the next sync writes the flat figure again");
+        assert!(write(&mut last, &same, t0 + Duration::from_secs(31), w), "and its repeats are dropped from that write, not the first");
+    }
+
+    #[test]
+    fn a_change_resets_the_window() {
+        let mut last = None;
+        let t0 = Instant::now();
+        let w = Duration::from_secs(30);
+        assert!(!write(&mut last, &v("1", "1", "1"), t0, w));
+        assert!(!write(&mut last, &v("1", "1", "2"), t0 + Duration::from_secs(10), w));
+        assert!(write(&mut last, &v("1", "1", "2"), t0 + Duration::from_secs(39), w), "window counts from the changed write");
+        assert!(!write(&mut last, &v("1", "1", "1"), t0 + Duration::from_secs(12), w), "going back to an earlier figure is still a change");
+    }
+
+    #[test]
+    fn a_failed_write_does_not_silence_the_figure() {
+        let mut last = None;
+        let t0 = Instant::now();
+        let w = Duration::from_secs(20);
+        let same = v("1", "1", "1");
+        // The check passes but the insert fails, so nothing is noted...
+        assert!(!snapshot_is_repeat(&last, &same, t0, w));
+        // ...and the next loop's identical figure is still written.
+        assert!(!snapshot_is_repeat(&last, &same, t0 + Duration::from_secs(1), w));
+    }
+
+    #[tokio::test]
+    async fn shards_dedupe_separately() {
+        // Two databases, the same flat figures: both charts get their row.
+        let a = super::memory_pool_for_tests().await;
+        let b = super::memory_pool_for_tests().await;
+        let x = rust_decimal_macros::dec!(0.0);
+        let y = rust_decimal_macros::dec!(5_513.2201);
+        super::record_pnl_snapshot(&a, x, y, y).await;
+        super::record_pnl_snapshot(&b, x, y, y).await;
+        for p in [&a, &b] {
+            let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pnl_snapshots WHERE collateral = '5513.2201'")
+                .fetch_one(p).await.unwrap();
+            assert_eq!(n, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn identical_rows_from_several_loops_land_once() {
+        let pool = super::memory_pool_for_tests().await;
+        // Figures no other test writes, so the process-wide memory cannot
+        // mistake them for a repeat of someone else's row.
+        let a = rust_decimal_macros::dec!(7.7701);
+        let b = rust_decimal_macros::dec!(9_301.4477);
+        for _ in 0..5 { super::record_pnl_snapshot(&pool, a, b, b).await; }
+        super::record_pnl_snapshot(&pool, a, b, b + rust_decimal_macros::dec!(0.01)).await;
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pnl_snapshots WHERE session_pnl = '7.7701'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 2, "five identical syncs write one row; the changed total writes the second");
     }
 }
 

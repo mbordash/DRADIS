@@ -23,11 +23,13 @@
 //! `watch::Sender` — the exact shape the intl venue's `spawn_ws_task` produces, so
 //! the (future) US patrol loop reads prices identically regardless of venue.
 //!
-//! Guardrails (spec §5):
-//!   * **Sequence tracking** — `sequence_number` must advance by exactly 1; a gap
-//!     means dropped frames, so the book is resynced (reconnect).
-//!   * **Timestamp rejection** — frames older than [`STALE_FRAME_MS`] are dropped
-//!     so a stalled socket can't feed strategies a stale book.
+//! Guardrails: a frame for another market or for a market not in
+//! `MARKET_STATE_OPEN` is not quoted, and a socket error reconnects after a
+//! short pause. The spec's §5 sequence tracking and timestamp rejection are not
+//! applied: the venue's frames carry no sequence number, and its `transactTime`
+//! is not yet checked against the clock (B117: measure the lag first, since a
+//! fixed budget against a venue clock from another region could silently drop
+//! every frame). Each `PriceState` is stamped with the time it was received.
 
 use rust_decimal::Decimal;
 use std::str::FromStr;
@@ -47,15 +49,11 @@ use crate::state::PriceState;
 use crate::venues::core::{FillEvent, MarketId, OrderId, Side};
 use crate::venues::us::auth::UsAuth;
 
-/// Drop order-book frames whose exchange timestamp lags wall-clock by more than
-/// this, shielding strategies from a stalled stream (spec §5 "Timestamp Rejection").
-pub const STALE_FRAME_MS: i64 = 200;
-
 /// Market-data WS path appended to the venue's WS base URL.
 const MARKETS_WS_PATH: &str = "/v1/ws/markets";
 /// Private account-feed WS path (order matches / fills — spec §4.2).
 const PRIVATE_WS_PATH: &str = "/v1/ws/private";
-/// Reconnect backoff after a socket error / sequence gap.
+/// Reconnect backoff after a socket error.
 const RECONNECT_DELAY_SECS: u64 = 5;
 
 /// Market-data subscription frame.
@@ -188,13 +186,6 @@ fn book_to_price(md: &MarketData) -> Option<PriceState> {
     Some((bid, bid_depth, ask, ask_depth, Utc::now(), bid_depth_total, ask_depth_total))
 }
 
-/// True if an epoch-millis frame timestamp lags wall-clock beyond the staleness
-/// budget. A non-positive timestamp (absent) is treated as fresh — some frames
-/// omit it and we don't want to discard an otherwise-valid book.
-fn is_stale(frame_ts_ms: i64, now_ms: i64) -> bool {
-    frame_ts_ms > 0 && now_ms.saturating_sub(frame_ts_ms) > STALE_FRAME_MS
-}
-
 /// Spawn one auto-reconnecting `order_book` subscriber for `symbol`.
 ///
 /// Pushes `PriceState` updates into `tx`; stops cleanly when `cancel` fires.
@@ -264,7 +255,6 @@ pub fn spawn_market_feed(
             }
             info!("✅ US WS market-data subscribe sent for {symbol}");
 
-            let resync = false;
             // A rejected subscription used to be indistinguishable from silence,
             // because every field was #[serde(default)] and an error frame
             // deserialized into an all-defaults event. Sampling the first few
@@ -333,8 +323,8 @@ pub fn spawn_market_feed(
                 }
             }
 
-            // Brief pause before reconnect (immediate on a deliberate resync).
-            if !resync && wait_or_cancel(&cancel, RECONNECT_DELAY_SECS).await {
+            // Brief pause before reconnect.
+            if wait_or_cancel(&cancel, RECONNECT_DELAY_SECS).await {
                 return;
             }
         }
@@ -636,15 +626,6 @@ mod tests {
         assert_eq!(bid_only.2.to_string(), "1"); // ask sentinel
         let ask_only = book_to_price(&ev(&[], &[["0.60", "10"]])).unwrap();
         assert_eq!(ask_only.0.to_string(), "0"); // bid sentinel
-    }
-
-    #[test]
-    fn staleness_threshold() {
-        let now = 1_000_000;
-        assert!(!is_stale(now, now)); // fresh
-        assert!(!is_stale(now - STALE_FRAME_MS, now)); // exactly at budget
-        assert!(is_stale(now - STALE_FRAME_MS - 1, now)); // just over
-        assert!(!is_stale(0, now)); // absent timestamp treated as fresh
     }
 }
 

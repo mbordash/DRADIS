@@ -1499,7 +1499,7 @@ pub async fn run_sports_ledger(
         }
         if cfg.sports_ledger_enabled {
             match std::env::var(config::SPORTS_ODDS_KEY_ENV).ok().filter(|k| !k.is_empty()) {
-                Some(key) => tick(&http, &catalog, &key, &cfg, &mut st, &raptor_health_tx).await,
+                Some(key) => tick(&http, &catalog, &key, &cfg, &mut st).await,
                 None if !st.warned_no_key => {
                     warn!("🏈 Sports ledger enabled but {} is not set — nothing to record", config::SPORTS_ODDS_KEY_ENV);
                     st.warned_no_key = true;
@@ -1532,7 +1532,6 @@ async fn tick(
     api_key: &str,
     cfg: &DynamicConfig,
     st: &mut LedgerState,
-    raptor_health_tx: &watch::Sender<HashMap<String, crate::api::server::AssetRaptorHealth>>,
 ) {
     let now = Utc::now();
     // After a restart the in-memory snapshot times are gone, and a target taken

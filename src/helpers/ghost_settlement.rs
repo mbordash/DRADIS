@@ -40,6 +40,7 @@ use crate::venues::core::MarketId;
 /// row may claim. A resolution is a result; a tie is its own category; a mark
 /// booked past the deferral bound is neither and must not read as either.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)] // `MarkFallback` is built by `price_for`, which only the intl Gamma sweep calls
 pub(crate) enum PriceSource { Resolved, Tie, MarkFallback }
 
 
@@ -58,6 +59,9 @@ pub(crate) enum PriceSource { Resolved, Tie, MarkFallback }
 /// held it forever and the retirement added in 1.4.1 would never have fired
 /// ("never over a position"). The seeder skips a class with a live squadron,
 /// so one simulated game would have ended ghost trading for sports.
+// Called from the Kalshi loop only; the Polymarket venues settle ghost holds
+// through the closed-hold sweep (B65), so their builds see no caller.
+#[allow(dead_code)]
 pub(crate) async fn settle_ghost_positions_at(
     positions: &Arc<Mutex<crate::state::PositionMap>>,
     pool: &sqlx::SqlitePool,
@@ -80,6 +84,9 @@ pub(crate) async fn settle_ghost_positions_at(
 
 /// Both legs' settlement prices from the final YES price: the NO leg pays the
 /// complement. $0.50 is the tie category, as `price_for` reads it.
+// Called from the Kalshi loop only; the Polymarket venues settle ghost holds
+// through the closed-hold sweep (B65), so their builds see no caller.
+#[allow(dead_code)]
 pub(crate) fn resolution_prices(
     yes_market: &MarketId,
     no_market: &MarketId,
@@ -99,6 +106,8 @@ pub(crate) fn resolution_prices(
 /// not been acknowledged as filled, and booking a settlement for it would invent
 /// a trade the operator never had. Split out from the lock so the filter itself
 /// can be tested.
+// Called by the Kalshi loop and the intl Gamma sweep; the US build sees no caller.
+#[allow(dead_code)]
 pub(crate) fn settlement_candidates(
     map: &crate::state::PositionMap,
     yes_market: &MarketId,
@@ -126,6 +135,9 @@ pub(crate) fn settlement_candidates(
 ///   trade-off the live sweep takes: a mark is not a result, but an unbounded
 ///   defer is the pin this whole path exists to remove;
 /// * past the bound with no mark still defers — there is nothing to book.
+// Called by the intl Gamma sweep only (`tasks::cleanup::settle_ghost_event_positions`);
+// the Kalshi and US builds see no caller.
+#[allow(dead_code)]
 pub(crate) fn price_for(
     settled: Option<Decimal>,
     past_defer_bound: bool,

@@ -468,7 +468,7 @@ pub async fn reconcile_orphaned_positions(
     let mut legs_by_market: std::collections::HashMap<String, Vec<(PositionKey, Position)>> =
         std::collections::HashMap::new();
     for (key, position) in pos_map.iter() {
-        let (strategy_name, token_id) = (&key.strategy, &key.market);
+        let strategy_name = &key.strategy;
         if strategy_name != "ArbitrageStrategy" && strategy_name != "TimeDecayStrategy" {
             continue;
         }

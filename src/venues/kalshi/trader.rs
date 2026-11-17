@@ -1902,7 +1902,7 @@ async fn trade_one_market(
     let mut ultra_job: Option<tokio::task::JoinHandle<Vec<KalshiPair>>> = None;
     // Whether the slot is wanted this tick; a slot kept only for a held
     // position (setting switched off) takes no new exposure.
-    let mut ultra_wanted = false;
+    let mut ultra_wanted: bool;
 
     // ── Tick loop ────────────────────────────────────────────────────────────
     let mut price_tick = tokio::time::interval(Duration::from_millis(TICK_MS));
@@ -4192,18 +4192,6 @@ fn publish_raptor_health(
         let h = map.entry(asset.to_string()).or_default();
         h.price_connected = connected;
         h.funding_connected = connected;
-    });
-}
-
-fn publish_strategy_market(
-    tx: &watch::Sender<HashMap<String, String>>,
-    viper_kinds: &[String],
-    market_name: &str,
-) {
-    tx.send_modify(|map| {
-        for kind in viper_kinds {
-            map.insert(kind.clone(), market_name.to_string());
-        }
     });
 }
 

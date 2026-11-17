@@ -2521,7 +2521,6 @@ async fn get_llm_actions(Query(q): Query<AssetQuery>) -> Response {
 /// market conditions and config may have moved since the LLM proposed it —
 /// then applied via the same hot-patch path as PATCH /api/config.
 async fn approve_llm_action(
-    State(s): State<ApiState>,
     AxumPath(id): AxumPath<i64>,
 ) -> Response {
     use crate::helpers::llm_patch::{self, RawProposal};

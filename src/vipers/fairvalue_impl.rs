@@ -354,6 +354,7 @@ pub(crate) fn event_in_horizon(now: DateTime<Utc>, close: DateTime<Utc>, events:
 /// (09:30 to 09:35), and they carried $2.83 of the hour's $3.58 loss. Treating
 /// the open as finished the moment it passed would have left most of the loss
 /// in place, because at 09:33 the trailing hour is still 95% pre-open.
+#[cfg(test)] // the entry path inlines this curve; the tests check them against each other
 pub(crate) fn post_event_multiplier(m: f64, secs_since_event: f64, window_secs: f64) -> f64 {
     post_event_multiplier_toward(m, m, secs_since_event, window_secs)
 }
@@ -536,6 +537,7 @@ impl FairValueStrategyImpl {
     /// alone took that NO from 0.300 to 0.260 in two minutes with spot
     /// unchanged, which withdrew the stop veto. The realized σ keeps the
     /// absolute backstop.
+    #[cfg(test)] // exercised by the tests against the inlined entry-side math
     fn conservative_side_fairs(
         spot: f64,
         strike: f64,
@@ -546,7 +548,7 @@ impl FairValueStrategyImpl {
         Self::conservative_side_fairs_ev(spot, strike, sigma_realized, floor, secs_left, 1.0)
     }
 
-    /// [`conservative_side_fairs`](Self::conservative_side_fairs), also priced
+    /// `conservative_side_fairs` (now test-only), also priced
     /// against a scheduled volatility event inside the horizon.
     ///
     /// `event_mult` above 1.0 adds a third σ, the floored σ scaled up, and keeps
@@ -2673,7 +2675,6 @@ pub(crate) mod stop_counterfactual {
         pub shares: Decimal,
         pub entry_fee: Decimal,
         pub stop_pnl: Decimal,
-        pub stop_exit_price: Decimal,
         pub live_catastrophic: bool,
         pub floor_price: Decimal,
         pub min_bid: Option<Decimal>,
@@ -2706,7 +2707,7 @@ pub(crate) mod stop_counterfactual {
                 market: r.market.clone(), side: r.side.clone(), stopped_at,
                 close_time: r.close_time.as_deref().and_then(parse_ts),
                 entry: d(r.entry_price), shares: d(r.shares), entry_fee: d(r.entry_fee),
-                stop_pnl: d(r.stop_pnl), stop_exit_price: d(r.stop_exit_price), live_catastrophic,
+                stop_pnl: d(r.stop_pnl), live_catastrophic,
                 floor_price: d(r.floor_price),
                 min_bid: r.min_bid_after.map(d), max_bid: r.max_bid_after.map(d),
                 last_bid_at: r.last_bid_at.as_deref().and_then(parse_ts),

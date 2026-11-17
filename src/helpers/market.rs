@@ -26,8 +26,6 @@ use std::cmp::Ordering;
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use rust_decimal::Decimal;
-use regex::Regex;
-use std::str::FromStr;
 
 /// Epoch-seconds timestamp of the last "no maker venue" log, used to debounce a message
 /// that fires every 90 s but is fully expected when no daily market exists for the asset.

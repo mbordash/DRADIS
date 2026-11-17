@@ -280,14 +280,10 @@ async fn tp_prune(pool: Option<&sqlx::SqlitePool>, sq: &str, script: &str, held:
 }
 
 /// This strategy's open cost basis in `open_positions` across every database,
-/// fee estimated at the taker rate. Read at most every two seconds per
-/// strategy: the entry tick runs every 50 ms.
-async fn db_exposure(strategy: &str) -> Decimal {
-    db_exposure_landed(strategy).await.0
-}
-
-/// [`db_exposure`] with the (squadron, token) of every row it counted, so a
-/// reservation whose position has landed stops counting twice [E102b].
+/// fee estimated at the taker rate, with the (squadron, token) of every row it
+/// counted so a reservation whose position has landed stops counting twice
+/// [E102b]. Read at most every two seconds per strategy: the entry tick runs
+/// every 50 ms.
 async fn db_exposure_landed(strategy: &str) -> (Decimal, Landed) {
     type Entry = (std::time::Instant, Decimal, Landed);
     static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Entry>>> = std::sync::OnceLock::new();
@@ -315,7 +311,7 @@ async fn db_exposure_landed(strategy: &str) -> (Decimal, Landed) {
 /// position map.
 pub type Landed = std::collections::HashSet<(String, String)>;
 
-/// [E102b] [`db_exposure`] for one squadron.
+/// [E102b] `db_exposure_landed` for one squadron.
 async fn db_exposure_here(strategy: &str, squadron: &str) -> Decimal {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, String), (std::time::Instant, Decimal)>>> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
