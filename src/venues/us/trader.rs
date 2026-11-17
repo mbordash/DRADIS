@@ -131,7 +131,7 @@ const ROTATION_VOLUME_THRESHOLD: f64 = 10_000.0;
 pub const US_ASSET: &str = "us-sports";
 /// Runtime venue identity persisted on every trade and entry row. Both US
 /// wings share one venue; they differ by shard and market class.
-pub const US_VENUE: &str = "polymarket-us";
+pub use crate::state::US_VENUE;
 /// Asset key for the US crypto wing — its own DB pool, squadron id, and
 /// viper-status scope so the sports and crypto squadrons never collide.
 pub const US_CRYPTO_ASSET: &str = "us-crypto";
@@ -3201,7 +3201,13 @@ async fn sync_dashboard(
     // intl chain-drift corrector does not run here).
     let mut resolved_marks: HashMap<String, (Decimal, Decimal)> = HashMap::new();
     let mut deferred: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // [B119] Legs with an order still working: a quote filling in parts is
+    // netted part by part, and the pair pass waits for the whole of it.
+    let mut working_orders: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (token, row_ts) in db::confirmed_open_positions(pool).await {
+        if crate::venues::lifecycle::any_lifecycle_tracks_leg(&MarketId::new(token.clone())).await {
+            working_orders.insert(token.clone());
+        }
         if live_ids.contains(&token) {
             // Live again (a portfolio blip that briefly hid it, or re-adopted):
             // clear any backoff so its NEXT stale spell probes immediately.
@@ -3241,7 +3247,10 @@ async fn sync_dashboard(
             }
         }
     }
-    let _ = db::purge_stale_open_positions(pool, &live_ids, &resolved_marks, &deferred).await;
+    // [B119] The account's size per held leg, so a pair netted against part
+    // of a leg the account still holds is recognized.
+    let held_sizes: HashMap<String, Decimal> = positions.iter().map(|p| (p.market.as_str().to_string(), p.shares)).collect();
+    let _ = db::purge_stale_open_positions_with_holdings(pool, &live_ids, &held_sizes, &working_orders, &resolved_marks, &deferred).await;
 
     let total = collateral + positions_value;
     // Same reasoning as the trade loop's session P&L: portfolio value never

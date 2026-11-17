@@ -32,7 +32,7 @@ pub mod orders;
 /// On this venue the SQLite shard key genuinely *is* the underlying asset
 /// (`btc`, `eth`, `sol`), which is why the two were conflated in the first
 /// place. They are still distinct concepts — see `state::TradeScope`.
-pub const INTL_VENUE: &str = "polymarket-intl";
+pub use crate::state::INTL_VENUE;
 
 use std::collections::HashSet;
 use std::sync::Arc;

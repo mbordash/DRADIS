@@ -24,6 +24,12 @@ WORKDIR /app
 # release build, and cargo rebuilds dependencies whenever the feature set
 # changes, so a three-venue image costs roughly three times the build time.
 ARG DRADIS_VENUES="intl"
+# Parallel rustc jobs for the release builds below; empty keeps cargo's default
+# (one per CPU). A production deploy builds this image on the live instance
+# beside the running engine, and two rustc jobs on a 4 GB box left 143 MB free
+# and took SSH down for forty minutes (B118); `--build-arg CARGO_BUILD_JOBS=1`
+# trades a slower build for a box that stays answerable.
+ARG CARGO_BUILD_JOBS=""
 COPY Cargo.toml Cargo.lock ./
 
 # ── Dependency caching layer ────────────────────────────────────────────────
@@ -40,7 +46,7 @@ RUN set -eux; \
         *) echo "unknown venue '$first' in DRADIS_VENUES (want: intl us kalshi)"; exit 1 ;; \
     esac; \
     mkdir -p src && echo "fn main() {}" > src/main.rs; \
-    cargo build --release --target x86_64-unknown-linux-musl $flags; \
+    cargo build --release --target x86_64-unknown-linux-musl $flags ${CARGO_BUILD_JOBS:+-j $CARGO_BUILD_JOBS}; \
     rm -rf src \
            target/x86_64-unknown-linux-musl/release/.fingerprint/dradis-* \
            target/x86_64-unknown-linux-musl/release/deps/dradis-* \
@@ -108,7 +114,7 @@ RUN set -eux; \
         esac; \
         echo "── building venue: $v ──"; \
         touch src/main.rs; \
-        cargo build --release --target x86_64-unknown-linux-musl $flags; \
+        cargo build --release --target x86_64-unknown-linux-musl $flags ${CARGO_BUILD_JOBS:+-j $CARGO_BUILD_JOBS}; \
         cp target/x86_64-unknown-linux-musl/release/dradis "/out/debug/dradis-$v.debug"; \
         strip target/x86_64-unknown-linux-musl/release/dradis; \
         cp target/x86_64-unknown-linux-musl/release/dradis "/out/bin/dradis-$v"; \

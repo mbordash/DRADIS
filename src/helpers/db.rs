@@ -2505,14 +2505,42 @@ pub async fn record_trade_db(
     timestamp: Option<DateTime<Utc>>,
 ) {
     let ts = timestamp.unwrap_or_else(|| Utc::now()).to_rfc3339();
-    let sid = current_session_id();
     let venue = resolved_venue_for(scope, pool);
-    if let Err(e) = sqlx::query(
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => { error!("❌ DB trade write failed: {}", e); return; }
+    };
+    if let Err(e) = insert_trade_row(&mut conn, scope, venue, fees, strategy, market, side, entry_price, exit_price, shares, pnl, reason, &ts).await {
+        error!("❌ DB trade write failed: {}", e);
+    }
+}
+
+/// The one `trades` INSERT, on a connection the caller owns: a pool connection
+/// for [`record_trade_db`], a transaction for a booking that must land with the
+/// row closures it belongs to ([`book_venue_netted_pairs`]). `venue` is already
+/// resolved (see `resolved_venue_for`), since that needs the pool.
+#[allow(clippy::too_many_arguments)]
+async fn insert_trade_row(
+    conn: &mut sqlx::SqliteConnection,
+    scope: &TradeScope,
+    venue: Option<String>,
+    fees: Decimal,
+    strategy: &str,
+    market: &str,
+    side: &str,
+    entry_price: Decimal,
+    exit_price: Decimal,
+    shares: Decimal,
+    pnl: Decimal,
+    reason: &str,
+    ts: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
         "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, session_id,
                              venue, market_class, underlying, fees, ghost)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
-    .bind(&ts)
+    .bind(ts)
     .bind(strategy)
     .bind(market)
     .bind(side)
@@ -2521,16 +2549,15 @@ pub async fn record_trade_db(
     .bind(shares.to_string())
     .bind(pnl.to_string())
     .bind(reason)
-    .bind(sid)
+    .bind(current_session_id())
     .bind(venue)
     .bind(scope.market_class.clone())
     .bind(scope.underlying.clone())
     .bind(fees.to_string())
     .bind(scope.ghost as i32)
-    .execute(pool)
-    .await {
-        error!("❌ DB trade write failed: {}", e);
-    }
+    .execute(conn)
+    .await
+    .map(|_| ())
 }
 
 /// What a settlement write actually did.
@@ -4874,6 +4901,48 @@ pub fn confirmed_row_protected(confirmed_at: Option<std::time::Instant>, now: st
     }
 }
 
+/// [B119] How a venue treats a YES holding and a NO holding of one market.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairNetting {
+    /// Netted into cash as soon as both are held: the pair leaves no position
+    /// behind and is booked by [`book_venue_netted_pairs`] as one row.
+    Nets,
+    /// Each leg is its own asset; a pair is held to resolution, redeemed or
+    /// merged by an explicit call, and its legs are booked leg by leg.
+    Separate,
+    /// Not observed either way. Treated as `Separate`, and the netting
+    /// signature (both legs of one strategy's pair leaving the account in one
+    /// sweep) is logged so the table can be settled from evidence.
+    Unobserved,
+}
+
+/// [B119] The per-venue table behind [`PairNetting`].
+///
+/// | venue           | pairs      | basis |
+/// |-----------------|------------|-------|
+/// | kalshi          | Nets       | 2026-11-17: two Time Decay pairs (YES, then NO, 5.15 contracts each) left the account flat and paid the $0.03 spread in cash within 9 s of the second fill |
+/// | polymarket-intl | Separate   | each leg is its own token; a pair is held to resolution or merged by an explicit on-chain call |
+/// | polymarket-us   | Unobserved | the gateway reports a quantity per leg symbol; selling past a holding opens the opposite leg there (see `exit_claims`), but a bought pair has not been seen netted |
+pub fn venue_pair_netting(venue: &str) -> PairNetting {
+    match venue {
+        crate::state::KALSHI_VENUE => PairNetting::Nets,
+        crate::state::INTL_VENUE => PairNetting::Separate,
+        _ => PairNetting::Unobserved,
+    }
+}
+
+/// How long after the later leg's confirmation the sweep may treat a pair the
+/// venue no longer lists as netted. Both legs were confirmed by the venue's own
+/// fill feed by order id, and the positions list dropped the market 9 s after
+/// the second fill on 2026-11-17, so a minute covers the list's lag. Not the
+/// 600 s single-leg grace: for those ten minutes the pair's guards stay in the
+/// viper's hands, and an expiry exit on a pair the account no longer holds
+/// would sell one leg and open the other.
+pub const NETTED_PAIR_GRACE_SECS: u64 = 60;
+
+/// Ledger reason for a pair the venue netted into cash.
+pub const NETTED_PAIR_REASON: &str = "Settlement (YES+NO → $1.00, netted by the venue)";
+
 /// When the engine last closed this token, if within the grace window.
 pub fn recently_exited_at(token_id: &str) -> Option<std::time::Instant> {
     recent_exits().lock().ok()?.get(token_id).copied()
@@ -5001,13 +5070,27 @@ pub async fn recent_exit_covers(pool: &SqlitePool, strategy: &str, market: &str,
 /// The most an engine exit leaves behind: sells floor to two decimals.
 const EXIT_DUST_SHARES: Decimal = Decimal::from_parts(1, 0, 0, false, 2); // 0.01
 
-pub async fn market_has_matching_trade(pool: &SqlitePool, market: &str, shares: Decimal) -> bool {
+pub async fn market_has_matching_trade(pool: &SqlitePool, market: &str, side: &str, shares: Decimal, since: Option<&str>) -> bool {
     let share_dust = Decimal::new(1, 3); // 0.001
     // Simulated rows (GBoost's and Anchor's shadow lanes) carry the real market
     // name at the real size; without the filter a real settlement booked a
     // moment later would read as already recorded and never reach the ledger.
-    let rows: Vec<String> = sqlx::query_scalar("SELECT shares FROM trades WHERE market = ? AND COALESCE(ghost, 0) = 0")
+    // [B119] The side too: a strategy's YES and NO legs on one market are the
+    // same size, and matched on market and size alone the second leg to reach
+    // the sweep read as the first leg's booking and was dropped unbooked
+    // (production trades 546 and 562, 2026-11-17). And `since`, the position's
+    // own open time when the caller has it: Kalshi hourly markets repeat the
+    // same question text hour after hour and Time Decay the same size, so a
+    // booking written before this position opened cannot be its booking. A row
+    // adopted from a lagging positions list AFTER the strategy's exit booked
+    // the sale is the one case this narrows; `adoption_allowed` holds such a
+    // re-adoption off for `CHAIN_ADOPT_EXIT_GRACE_SECS` first.
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT shares FROM trades WHERE market = ? AND side = ? AND COALESCE(ghost, 0) = 0 AND ts >= ?",
+    )
         .bind(market)
+        .bind(side)
+        .bind(since.unwrap_or(""))
         .fetch_all(pool)
         .await
         .unwrap_or_default();
@@ -6320,8 +6403,9 @@ pub fn release_swept_from_map(map: &mut crate::state::PositionMap) -> Vec<crate:
 ///
 /// One sale per token at a time. Without it a stop firing while the operator's
 /// order was in flight, or the other way round, sold the same contracts twice;
-/// on a netting venue (Kalshi, Polymarket US) the second sale opens the opposite
-/// leg rather than bouncing. Process-global like the registries above; a claim
+/// on a venue that nets a sale against a holding (Kalshi; Polymarket US is
+/// believed to behave the same) the second sale opens the opposite leg rather
+/// than bouncing. Process-global like the registries above; a claim
 /// is released by [`ExitClaim`]'s Drop on every path out ([B73]).
 fn exit_claims() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
     static REG: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = OnceLock::new();
@@ -6541,6 +6625,26 @@ pub async fn close_pending_open_position(pool: &SqlitePool, token_id: &str) {
 pub async fn purge_stale_open_positions(
     pool: &SqlitePool,
     live_token_ids: &std::collections::HashSet<String>,
+    redeemable_marks: &std::collections::HashMap<String, (Decimal, Decimal)>,
+    defer_tokens: &std::collections::HashSet<String>,
+) -> usize {
+    purge_stale_open_positions_with_holdings(
+        pool, live_token_ids, &std::collections::HashMap::new(), &std::collections::HashSet::new(), redeemable_marks, defer_tokens,
+    ).await
+}
+
+/// [`purge_stale_open_positions`] with the account's size per held token, which
+/// lets [`book_venue_netted_pairs`] recognize a pair netted against PART of a
+/// leg the account still holds, and the tokens with an order still working,
+/// which it waits on. The Kalshi and Polymarket US sweeps have both and pass
+/// them; the intl chain-sync and the tests use the wrapper.
+pub async fn purge_stale_open_positions_with_holdings(
+    pool: &SqlitePool,
+    live_token_ids: &std::collections::HashSet<String>,
+    // token_id → contracts the account holds, for every live token the caller knows
+    held_sizes: &std::collections::HashMap<String, Decimal>,
+    // tokens on which a tracked order is still working (a quote filling in parts)
+    working_orders: &std::collections::HashSet<String>,
     // token_id → (resolved cur_price, on-chain size) for redeemable positions
     redeemable_marks: &std::collections::HashMap<String, (Decimal, Decimal)>,
     // Tokens whose resolution could not be determined THIS sweep. Left entirely
@@ -6586,6 +6690,12 @@ pub async fn purge_stale_open_positions(
     // `clear_live_open_positions` already preserves ghost rows for the same
     // reason; this path simply never got the same treatment.
 
+    // [B119] A strategy's YES+NO pair the venue netted into cash is booked as
+    // one row and its rows closed BEFORE the per-row loop, which would book the
+    // first leg at entry and drop the second as a duplicate. Runs first so a
+    // leg written down to a remainder is read below at its new size.
+    let (netted, pair_wait) = book_venue_netted_pairs(pool, live_token_ids, held_sizes, working_orders, redeemable_marks, defer_tokens).await;
+
     let rows: Vec<(i64, String, Option<String>, String, String, String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> = match sqlx::query_as(
         "SELECT id, token_id, status, ts, strategy, market, side, entry_price, shares, current_price, entry_fee, settled_shares,
                 venue, market_class, underlying
@@ -6594,11 +6704,11 @@ pub async fn purge_stale_open_positions(
     .fetch_all(pool)
     .await {
         Ok(r)  => r,
-        Err(e) => { error!("❌ DB purge_stale_open_positions fetch failed: {}", e); return 0; }
+        Err(e) => { error!("❌ DB purge_stale_open_positions fetch failed: {}", e); return netted; }
     };
 
     let now = Utc::now();
-    let mut purged = 0usize;
+    let mut purged = netted;
     for (id, token_id, status, ts, strategy, market, side, entry_price, shares, current_price, entry_fee, settled_shares, row_venue, row_class, row_underlying) in rows {
         // File the booking as the position was filed. The row carries the
         // squadron's own scope; a chain-adopted row may not, in which case the
@@ -6645,6 +6755,13 @@ pub async fn purge_stale_open_positions(
 
         // Resolution unknown this pass — leave it entirely alone and retry later.
         if defer_tokens.contains(&token_id) {
+            continue;
+        }
+        // [B119] Half of a pair the venue netted whose other leg was confirmed
+        // moments ago: the pair pass books both together once the later leg's
+        // grace is up. Booked alone here it would be the 2026-11-17 row again
+        // (the YES leg's 600 s ran out a minute before the NO leg's).
+        if pair_wait.contains(&token_id) {
             continue;
         }
 
@@ -6856,8 +6973,14 @@ pub async fn purge_stale_open_positions(
             let qty   = shares.parse::<Decimal>().unwrap_or(Decimal::ZERO);
             let exit  = current_price.as_deref().and_then(|s| s.parse::<Decimal>().ok());
             if entry > Decimal::ZERO && qty > Decimal::ZERO {
-                if market_has_matching_trade(pool, &market, qty).await {
+                if market_has_matching_trade(pool, &market, &side, qty, Some(&ts)).await {
                     // Already booked (strategy close or settlement) — don't double-count.
+                } else if strategy == "ArbitrageStrategy" && market_has_settled_arb_pair(pool, &market, qty).await {
+                    // A leftover leg of a pair booked as one row (see the
+                    // resolution branch above): covered, never a second sale.
+                } else if netted_pair_booked_since(pool, &strategy, &market, qty, &ts).await {
+                    // [B119] A leftover leg of a pair the venue netted and the
+                    // pair pass booked as one row (its delete failed): covered.
                 } else if recent_exit_covers(pool, &strategy, &market, &side, qty).await {
                     // The exit this strategy just made already booked this sale;
                     // the size differs only by the dust the exit left behind.
@@ -6939,20 +7062,326 @@ pub async fn purge_stale_open_positions(
     released_here.sort();
     released_here.dedup();
     for tok in released_here {
-        let left: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM open_positions WHERE token_id = ? AND ghost_mode = 0",
-        )
-        .bind(&tok)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
-        if left == 0 {
-            note_position_released(&tok);
-        } else {
-            info!("🧾 {} still has {} live row(s) after this sweep — not releasing it from memory", tok, left);
-        }
+        release_if_no_live_row(pool, &tok).await;
     }
     purged
+}
+
+/// Publish `token_id`'s release to the venue loops when no live row for it
+/// survives (see the [B99] note in `purge_stale_open_positions`).
+async fn release_if_no_live_row(pool: &SqlitePool, token_id: &str) {
+    let left: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM open_positions WHERE token_id = ? AND ghost_mode = 0",
+    )
+    .bind(token_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    if left == 0 {
+        note_position_released(token_id);
+    } else {
+        info!("🧾 {} still has {} live row(s) after this sweep — not releasing it from memory", token_id, left);
+    }
+}
+
+/// [B119] Has a pair of this strategy on this market been booked as netted at
+/// this size since `since` (RFC 3339, the later leg's open time)? Kalshi hourly
+/// markets repeat the same question text hour after hour and Time Decay the
+/// same size, so a row older than the legs cannot be this pair's.
+async fn netted_pair_booked_since(pool: &SqlitePool, strategy: &str, market: &str, pairs: Decimal, since: &str) -> bool {
+    let share_dust = Decimal::new(1, 3); // 0.001
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT shares FROM trades WHERE strategy = ? AND market = ? AND side = 'YES' AND reason = ? AND ts >= ?",
+    )
+    .bind(strategy)
+    .bind(market)
+    .bind(NETTED_PAIR_REASON)
+    .bind(since)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    rows.iter().any(|b| b.parse::<Decimal>().map(|b| (b - pairs).abs() <= share_dust).unwrap_or(false))
+}
+
+/// The part of a leg's entry fee that belongs to `part` of its `qty` contracts.
+fn fee_share(fee: Decimal, part: Decimal, qty: Decimal) -> Decimal {
+    if qty <= Decimal::ZERO || part >= qty { fee } else { (fee * part / qty).round_dp(6) }
+}
+
+/// [B119] Book every strategy pair the venue netted into cash: a YES row and a
+/// NO row of one strategy, squadron and market, both confirmed by the fill
+/// feed, on a venue that nets ([`venue_pair_netting`]), where at least one leg
+/// is gone from the account, no order is still working on either leg, and both
+/// are past [`NETTED_PAIR_GRACE_SECS`] since their confirmation.
+///
+/// One row covers the pair, as the intl arb settlement books one: side "YES",
+/// shares = pairs, entry = the two legs' combined cost, exit = $1.00, P&L the
+/// spread times the pairs net of the pair's share of both legs' entry fees. The
+/// booking and the row changes land in one transaction, so a busy database
+/// leaves either the whole pair or nothing; both legs are then released to the
+/// loops. While a leg is inside the grace or its order still works (a quote
+/// filling in parts, each part netted as it lands), both legs are kept from the
+/// per-row loop: booking the first part and releasing the leg would leave the
+/// rest of the quote filling with no guard and no row. Until 1.8.7 such a pair
+/// reached the per-row loop as two stale confirmed rows: the first was booked
+/// "closed off-strategy ... booked at entry" with P&L 0 and the second was
+/// dropped as already booked, because the duplicate check matched on market
+/// and size without the side (production trades 546 and 562, 2026-11-17:
+/// +$0.1545 each in cash, $0 in the ledger).
+///
+/// Sizes. Both legs gone: pairs = the smaller count, and a larger leg's
+/// remainder is booked here as an off-strategy exit at its mark (at entry
+/// without one), the per-row loop's own form; a remainder below the minimum
+/// order is dust whose fee folds into the pair row. One leg still held: the
+/// venue netted the absent leg against part of it, so pairs = the smaller of
+/// the absent leg and what every engine row on the held token claims beyond the
+/// account's size, and the held row is written down by the pairs with its fee
+/// prorated. A held token whose rows claim no more than the account holds is
+/// not a netted pair and is left to the per-row loop, as is a pair whose held
+/// size the caller did not pass, and a pair whose legs' own exits are already
+/// booked.
+///
+/// A pair is one strategy in one squadron: the same strategy holding YES in
+/// one squadron and NO in another is two lone legs. Pending rows (quotes not
+/// yet filled) and rows the account sized (not engine-attributed) are not
+/// pairs; a confirmed leg whose partner is still pending is logged, since the
+/// fill feed is the only thing that can promote a netted partner's row.
+/// Returns the rows closed and the tokens of pairs waited on.
+async fn book_venue_netted_pairs(
+    pool: &SqlitePool,
+    live_token_ids: &std::collections::HashSet<String>,
+    held_sizes: &std::collections::HashMap<String, Decimal>,
+    working_orders: &std::collections::HashSet<String>,
+    redeemable_marks: &std::collections::HashMap<String, (Decimal, Decimal)>,
+    defer_tokens: &std::collections::HashSet<String>,
+) -> (usize, std::collections::HashSet<String>) {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    let mut waiting: HashSet<String> = HashSet::new();
+    // id, squadron, strategy, market, side, token, entry, shares, entry_fee, venue, class, underlying, status, ts, current_price
+    type Row = (i64, Option<String>, String, String, String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, String, Option<String>);
+    let rows: Vec<Row> = match sqlx::query_as(
+        "SELECT id, squadron_id, strategy, market, side, token_id, entry_price, shares, entry_fee, venue, market_class, underlying,
+                status, ts, current_price
+           FROM open_positions
+          WHERE ghost_mode = 0 AND COALESCE(engine_attributed, 0) = 1
+          ORDER BY id"
+    )
+    .fetch_all(pool)
+    .await {
+        Ok(r) => r,
+        Err(e) => { error!("❌ DB book_venue_netted_pairs fetch failed: {}", e); return (0, waiting); }
+    };
+    let dec = |s: &str| s.parse::<Decimal>().unwrap_or(Decimal::ZERO);
+    let fee_of = |r: &Row| r.8.as_deref().map(dec).unwrap_or(Decimal::ZERO);
+    let is_confirmed = |r: &Row| r.12.as_deref().unwrap_or("confirmed") == "confirmed";
+    let absent = |r: &Row| !live_token_ids.contains(&r.5) && !defer_tokens.contains(&r.5);
+
+    // What every engine row claims on each token, for the held-leg arithmetic.
+    let mut claimed: HashMap<&str, Decimal> = HashMap::new();
+    for r in &rows {
+        if is_confirmed(r) { *claimed.entry(r.5.as_str()).or_default() += dec(&r.7); }
+    }
+    let mut groups: BTreeMap<(String, String, String), Vec<&Row>> = BTreeMap::new();
+    for r in &rows {
+        groups.entry((r.1.clone().unwrap_or_default(), r.2.clone(), r.3.clone())).or_default().push(r);
+    }
+    let now = std::time::Instant::now();
+    let grace = std::time::Duration::from_secs(NETTED_PAIR_GRACE_SECS);
+    let mut closed = 0usize;
+    for ((_, strategy, market), legs) in groups {
+        // The legs' venue: a legacy row may carry none, so the first that does,
+        // else the shard's.
+        let venue = legs.iter().find_map(|r| r.9.clone().filter(|v| !v.is_empty())).unwrap_or_else(|| venue_for_pool(pool));
+        let yes = legs.iter().copied().find(|r| r.4 == "YES" && is_confirmed(r));
+        let no = legs.iter().copied().find(|r| r.4 == "NO" && is_confirmed(r));
+        let warn_key = format!("netted-pair:{strategy}:{market}");
+        match venue_pair_netting(&venue) {
+            PairNetting::Separate => continue,
+            PairNetting::Unobserved => {
+                // The netting signature: both legs left the account in one sweep
+                // with neither resolved (both would be absent at settlement too)
+                // and neither sale booked by its own exit.
+                if let (Some(y), Some(n)) = (yes, no) {
+                    if absent(y) && absent(n)
+                        && !redeemable_marks.contains_key(&y.5) && !redeemable_marks.contains_key(&n.5)
+                        && !market_has_matching_trade(pool, &market, "YES", dec(&y.7), Some(&y.13)).await
+                        && !market_has_matching_trade(pool, &market, "NO", dec(&n.7), Some(&n.13)).await
+                        && anomaly_warn_due(&warn_key)
+                    {
+                        warn!(
+                            "🧾 {} \"{}\" on {}: both legs of a {} pair left the account in one sweep, the signature of a venue \
+                             that nets YES against NO; booked leg by leg because this venue is not in the netting table \
+                             (`venue_pair_netting`). If the account shows one cash credit of the pair's spread, add the venue.",
+                            strategy, market, venue, strategy
+                        );
+                    }
+                }
+                continue;
+            }
+            PairNetting::Nets => {}
+        }
+        let pending_partner = |side: &str| legs.iter().any(|r| r.4 == side && !is_confirmed(r));
+        match (yes, no) {
+            (Some(y), None) if absent(y) && pending_partner("NO") => {
+                if anomaly_warn_due(&warn_key) {
+                    warn!("🧾 Netted pair? {} \"{}\": the YES leg left the account while the NO leg's row is still pending — \
+                           if the NO quote filled, only the fill feed can confirm it; the YES leg waits its grace and is booked alone",
+                          strategy, market);
+                }
+                continue;
+            }
+            (None, Some(n)) if absent(n) && pending_partner("YES") => {
+                if anomaly_warn_due(&warn_key) {
+                    warn!("🧾 Netted pair? {} \"{}\": the NO leg left the account while the YES leg's row is still pending — \
+                           if the YES quote filled, only the fill feed can confirm it; the NO leg waits its grace and is booked alone",
+                          strategy, market);
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let (Some(yes), Some(no)) = (yes, no) else { continue };
+        let (yes_absent, no_absent) = (absent(yes), absent(no));
+        if !yes_absent && !no_absent { continue; }
+        if working_orders.contains(&yes.5) || working_orders.contains(&no.5) {
+            if anomaly_warn_due(&warn_key) {
+                info!("🧾 Netted pair: waiting on {} \"{}\" — an order still works on a leg; the pair is booked once it is done or pulled",
+                      strategy, market);
+            }
+            waiting.insert(yes.5.clone());
+            waiting.insert(no.5.clone());
+            continue;
+        }
+        if [yes, no].iter().any(|r| confirmed_row_protected(recently_confirmed_at(&r.5), now, grace)) {
+            info!("🧾 Netted pair: waiting on {} \"{}\" — a leg was confirmed within {}s; neither leg is booked this pass",
+                  strategy, market, NETTED_PAIR_GRACE_SECS);
+            waiting.insert(yes.5.clone());
+            waiting.insert(no.5.clone());
+            continue;
+        }
+        let (yes_entry, no_entry) = (dec(&yes.6), dec(&no.6));
+        let (yes_qty, no_qty) = (dec(&yes.7), dec(&no.7));
+        // Legs whose own exits are booked are stale rows, not a netted pair.
+        if market_has_matching_trade(pool, &market, "YES", yes_qty, Some(&yes.13)).await
+            || market_has_matching_trade(pool, &market, "NO", no_qty, Some(&no.13)).await
+        {
+            debug!("🧾 Netted pair: {} \"{}\" — a leg's sale is already booked; left to the per-row sweep", strategy, market);
+            continue;
+        }
+        // What the venue netted. A held token's rows claim more than the account
+        // holds by exactly the contracts netted away.
+        let over_claim = |token: &str| -> Option<Decimal> {
+            let held = held_sizes.get(token)?;
+            Some(claimed.get(token).copied().unwrap_or_default() - held)
+        };
+        let pairs = match (yes_absent, no_absent) {
+            (true, true) => yes_qty.min(no_qty),
+            (true, false) => match over_claim(&no.5) {
+                Some(over) if over >= config::MIN_ORDER_SHARES => yes_qty.min(over),
+                over => { debug!("🧾 Netted pair: {} \"{}\" — the held NO leg claims {:?} beyond the account; not a netted pair", strategy, market, over); continue; }
+            },
+            (false, true) => match over_claim(&yes.5) {
+                Some(over) if over >= config::MIN_ORDER_SHARES => no_qty.min(over),
+                over => { debug!("🧾 Netted pair: {} \"{}\" — the held YES leg claims {:?} beyond the account; not a netted pair", strategy, market, over); continue; }
+            },
+            (false, false) => unreachable!("one leg is absent"),
+        };
+        if pairs < config::MIN_ORDER_SHARES || yes_entry <= Decimal::ZERO || no_entry <= Decimal::ZERO {
+            warn!("🧾 Netted pair: {} \"{}\" cannot be booked as a pair (pairs={} yes={} @ {} no={} @ {}) — its legs go to the per-row sweep",
+                  strategy, market, pairs, yes_qty, yes_entry, no_qty, no_entry);
+            continue;
+        }
+        // What becomes of each leg's row beyond the pair.
+        enum Leg { Delete, Keep(Decimal, Decimal), BookRest(Decimal, Decimal) }
+        let mut fees = Decimal::ZERO;
+        let mut plan: Vec<(&Row, Leg)> = Vec::new();
+        for (row, qty, leg_absent) in [(yes, yes_qty, yes_absent), (no, no_qty, no_absent)] {
+            let fee = fee_of(row);
+            let pair_fee = fee_share(fee, pairs, qty);
+            let rest = qty - pairs;
+            let rest_fee = fee - pair_fee;
+            fees += pair_fee;
+            plan.push((row, if !leg_absent && rest > Decimal::ZERO {
+                Leg::Keep(rest, rest_fee)
+            } else if leg_absent && rest >= config::MIN_ORDER_SHARES {
+                Leg::BookRest(rest, rest_fee)
+            } else {
+                // Gone, with at most dust beyond the pair: its fee rides the pair row.
+                fees += rest_fee;
+                Leg::Delete
+            }));
+        }
+        let cost = yes_entry + no_entry;
+        let pnl = (Decimal::ONE - cost) * pairs - fees;
+        // Filed as the YES leg was filed; both legs carry the same scope.
+        let scope = TradeScope::new("", venue.clone(), yes.10.clone(), yes.11.clone());
+        let filed_venue = resolved_venue_for(&scope, pool);
+        let since = if yes.13 >= no.13 { yes.13.as_str() } else { no.13.as_str() };
+        let already = netted_pair_booked_since(pool, &strategy, &market, pairs, since).await;
+        let now_ts = Utc::now().to_rfc3339();
+
+        let mut tx = match pool.begin().await {
+            Ok(t) => t,
+            Err(e) => { error!("❌ DB book_venue_netted_pairs could not open a transaction: {}", e); continue; }
+        };
+        let mut deleted: Vec<String> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+        let outcome: Result<(), sqlx::Error> = async {
+            if !already {
+                insert_trade_row(&mut tx, &scope, filed_venue.clone(), fees, &strategy, &market, "YES", cost, Decimal::ONE, pairs, pnl, NETTED_PAIR_REASON, &now_ts).await?;
+            }
+            for (row, leg) in &plan {
+                match leg {
+                    Leg::Keep(rest, rest_fee) => {
+                        // The account still holds this much: the row follows it.
+                        sqlx::query("UPDATE open_positions SET shares = ?, entry_fee = ? WHERE id = ?")
+                            .bind(rest.to_string())
+                            .bind((*rest_fee > Decimal::ZERO).then(|| rest_fee.to_string()))
+                            .bind(row.0)
+                            .execute(&mut *tx).await?;
+                        notes.push(format!("{} keeps {} held contracts", row.5, rest));
+                    }
+                    Leg::BookRest(rest, rest_fee) => {
+                        // Gone beyond the pair: an off-strategy exit of the rest, in
+                        // the per-row loop's own form, at the row's mark when it has one.
+                        let entry = dec(&row.6);
+                        let mark = row.14.as_deref().map(dec).filter(|m| *m > Decimal::ZERO);
+                        let (exit, reason) = match mark {
+                            Some(m) => (m, format!("ChainReconcile: closed off-strategy beyond the netted pair (est. @ ${:.4} last mark)", m)),
+                            None => (entry, "ChainReconcile: closed off-strategy beyond the netted pair (exit price unknown: no mark; booked at entry)".to_string()),
+                        };
+                        let rest_pnl = (exit - entry) * rest - rest_fee;
+                        let leg_scope = TradeScope::new("", venue.clone(), row.10.clone(), row.11.clone());
+                        insert_trade_row(&mut tx, &leg_scope, filed_venue.clone(), *rest_fee, &strategy, &market, &row.4, entry, exit, *rest, rest_pnl, &reason, &now_ts).await?;
+                        sqlx::query("DELETE FROM open_positions WHERE id = ?").bind(row.0).execute(&mut *tx).await?;
+                        deleted.push(row.5.clone());
+                        notes.push(format!("{} had {} beyond the pair, booked at ${:.4}", row.5, rest, exit));
+                    }
+                    Leg::Delete => {
+                        sqlx::query("DELETE FROM open_positions WHERE id = ?").bind(row.0).execute(&mut *tx).await?;
+                        deleted.push(row.5.clone());
+                    }
+                }
+            }
+            tx.commit().await
+        }.await;
+        match outcome {
+            Ok(()) => {
+                closed += deleted.len();
+                for tok in &deleted {
+                    release_if_no_live_row(pool, tok).await;
+                }
+                info!(
+                    "🧾 Netted pair: {} \"{}\" — the venue netted {} YES @ {:.4} against {} NO @ {:.4} into cash: {} {} pair(s) at $1.00, pnl ${:.4} (fees ${:.4}){}{}",
+                    strategy, market, yes_qty, yes_entry, no_qty, no_entry,
+                    if already { "already booked" } else { "booked" }, pairs, pnl, fees,
+                    if notes.is_empty() { "" } else { "; " }, notes.join("; "),
+                );
+            }
+            Err(e) => error!("❌ DB book_venue_netted_pairs: {} \"{}\" not booked, rows unchanged: {}", strategy, market, e),
+        }
+    }
+    (closed, waiting)
 }
 
 /// Update an existing open position's share count and avg_price from on-chain data.
@@ -9806,6 +10235,285 @@ mod reconcile_tests {
         let from_entry = filing_scope_for_market(&pool, "Ethereum Up or Down - September 13, 9AM ET").await;
         assert_eq!((from_entry.venue.as_str(), from_entry.market_class.as_deref(), from_entry.underlying.as_deref()),
                    ("polymarket-intl", Some("crypto"), Some("eth")));
+    }
+
+    /// [B119] Production 2026-11-17, trades 546 and 562: Time Decay's YES leg
+    /// filled, its NO leg filled a minute later, and Kalshi netted the pair into
+    /// cash at once (+$0.1545 each). The sweep booked the YES row at entry with
+    /// P&L 0 and dropped the NO row as a duplicate. A netted pair is one row at
+    /// $1.00 on the combined cost, both rows closed and released.
+    #[tokio::test]
+    async fn a_pair_the_venue_netted_is_booked_once_at_a_dollar_and_both_rows_close() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::crypto("kalshi", "kalshi", "btc");
+        let market = "Bitcoin price on Nov 17, 2026? — $63,700 or above";
+        let (yes, no) = ("KXBTCD-26NOV1713-T63699.99#yes", "KXBTCD-26NOV1713-T63699.99#no");
+        record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", yes, market, "YES", dec!(0.47), dec!(5.15), false, "confirmed").await;
+        record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", no, market, "NO", dec!(0.50), dec!(5.15), false, "confirmed").await;
+        forget_confirmation(yes);
+        forget_confirmation(no);
+
+        let purged = purge_stale_open_positions(&pool, &HashSet::new(), &HashMap::new(), &HashSet::new()).await;
+        assert_eq!(purged, 2, "both rows close");
+
+        let rows: Vec<(String, String, String, String, String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT strategy, side, entry_price, exit_price, shares, pnl, reason, venue FROM trades"
+        ).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1, "one row for the pair: {rows:?}");
+        let r = &rows[0];
+        assert_eq!((r.0.as_str(), r.1.as_str(), r.6.as_str(), r.7.as_deref()), ("TimeDecayStrategy", "YES", NETTED_PAIR_REASON, Some("kalshi")));
+        assert_eq!(dec_of(&r.2), dec!(0.97), "entry is the pair's combined cost");
+        assert_eq!(dec_of(&r.3), Decimal::ONE);
+        assert_eq!(dec_of(&r.4), dec!(5.15));
+        assert_eq!(dec_of(&r.5), dec!(0.1545), "the $0.03 spread on 5.15 pairs");
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions").fetch_one(&pool).await.unwrap();
+        assert_eq!(left, 0);
+        let released = released_positions_snapshot();
+        assert!(released.contains_key(yes) && released.contains_key(no), "both legs released to the loops");
+
+        // A second sweep has nothing to book or close.
+        assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &HashMap::new(), &HashSet::new()).await, 0);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// [B119] Both legs' entry fees come off the pair's P&L and land in `fees`.
+    #[tokio::test]
+    async fn a_netted_pair_is_booked_net_of_both_legs_fees() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::crypto("kalshi", "kalshi", "btc");
+        let market = "Bitcoin price on Nov 17, 2026? — $64,900 or above";
+        let (yes, no) = ("KXBTCD-26NOV1701-T64899.99#yes", "KXBTCD-26NOV1701-T64899.99#no");
+        record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", yes, market, "YES", dec!(0.49), dec!(5.15), false, "confirmed").await;
+        record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", no, market, "NO", dec!(0.48), dec!(5.15), false, "confirmed").await;
+        set_open_position_entry_fee_scoped(&pool, "btc-open", "TimeDecayStrategy", yes, dec!(0.02)).await;
+        set_open_position_entry_fee_scoped(&pool, "btc-open", "TimeDecayStrategy", no, dec!(0.01)).await;
+        forget_confirmation(yes);
+        forget_confirmation(no);
+        assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &HashMap::new(), &HashSet::new()).await, 2);
+        let (pnl, fees): (String, Option<String>) = sqlx::query_as("SELECT pnl, fees FROM trades").fetch_one(&pool).await.unwrap();
+        assert_eq!(dec_of(&pnl), dec!(0.1245), "0.1545 less $0.03 of fees");
+        assert_eq!(fees.as_deref().map(dec_of), Some(dec!(0.03)));
+    }
+
+    /// [B119] A leg confirmed moments ago is a fill the positions list may not
+    /// show yet: the pair waits (one minute, not the single-leg ten) and the
+    /// per-row loop's own grace keeps both rows.
+    #[tokio::test]
+    async fn a_freshly_confirmed_pair_is_waited_on_not_booked() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::crypto("kalshi", "kalshi", "btc");
+        let market = "Bitcoin price on Nov 17, 2026? — $63,700 or above";
+        let (yes, no) = ("KXBTCD-26NOV1702-T63699.99#yes", "KXBTCD-26NOV1702-T63699.99#no");
+        record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", yes, market, "YES", dec!(0.47), dec!(5.15), false, "confirmed").await;
+        record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", no, market, "NO", dec!(0.50), dec!(5.15), false, "confirmed").await;
+        forget_confirmation(yes);
+        confirm_position_status_for(&pool, "btc-open", "TimeDecayStrategy", no).await; // the NO leg just filled
+        assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &HashMap::new(), &HashSet::new()).await, 0);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0, "nothing booked while a leg is fresh");
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions").fetch_one(&pool).await.unwrap();
+        assert_eq!(left, 2, "the YES leg waits for its partner instead of being booked alone at entry");
+
+        // The NO leg's grace is up: the pair books as one.
+        forget_confirmation(no);
+        assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &HashMap::new(), &HashSet::new()).await, 2);
+        let rows: Vec<(String, String)> = sqlx::query_as("SELECT pnl, reason FROM trades").fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!((dec_of(&rows[0].0), rows[0].1.as_str()), (dec!(0.1545), NETTED_PAIR_REASON));
+    }
+
+    /// [B119] A leg the account still holds is not half of a netted pair: the
+    /// absent leg is a sale and is booked as before, the held one stays.
+    #[tokio::test]
+    async fn a_pair_with_one_leg_still_held_is_not_netted() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::crypto("kalshi", "kalshi", "btc");
+        let market = "Bitcoin price on Nov 17, 2026? — $63,700 or above";
+        let (yes, no) = ("KXBTCD-26NOV1703-T63699.99#yes", "KXBTCD-26NOV1703-T63699.99#no");
+        record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", yes, market, "YES", dec!(0.47), dec!(5.15), false, "confirmed").await;
+        record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", no, market, "NO", dec!(0.50), dec!(5.15), false, "confirmed").await;
+        sqlx::query("UPDATE open_positions SET current_price = '0.55' WHERE token_id = ?").bind(no).execute(&pool).await.unwrap();
+        forget_confirmation(yes);
+        forget_confirmation(no);
+        let live: HashSet<String> = [yes.to_string()].into_iter().collect();
+        assert_eq!(purge_stale_open_positions(&pool, &live, &HashMap::new(), &HashSet::new()).await, 1);
+        let rows: Vec<(String, String, String)> = sqlx::query_as("SELECT side, shares, reason FROM trades").fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, "NO");
+        assert!(rows[0].2.starts_with("ChainReconcile"), "{}", rows[0].2);
+        let held: Vec<String> = sqlx::query_scalar("SELECT token_id FROM open_positions").fetch_all(&pool).await.unwrap();
+        assert_eq!(held, vec![yes.to_string()]);
+    }
+
+    /// [B119] On a venue that keeps each leg as its own token (intl) a pair that
+    /// left the wallet is two sales, booked leg by leg; the side-aware duplicate
+    /// check no longer drops the second leg because it matches the first's size.
+    #[tokio::test]
+    async fn a_pair_on_a_venue_that_does_not_net_is_booked_leg_by_leg() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::crypto("btc", "polymarket-intl", "btc");
+        let market = "Bitcoin Up or Down - November 17, 1PM ET";
+        record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", "tok-yes", market, "YES", dec!(0.47), dec!(10), false, "confirmed").await;
+        record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", "tok-no", market, "NO", dec!(0.50), dec!(10), false, "confirmed").await;
+        sqlx::query("UPDATE open_positions SET current_price = '0.60'").execute(&pool).await.unwrap();
+        forget_confirmation("tok-yes");
+        forget_confirmation("tok-no");
+        assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &HashMap::new(), &HashSet::new()).await, 2);
+        let rows: Vec<(String, String)> = sqlx::query_as("SELECT side, reason FROM trades ORDER BY id").fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().all(|(_, r)| r.starts_with("ChainReconcile")), "{rows:?}");
+        assert_eq!((rows[0].0.as_str(), rows[1].0.as_str()), ("YES", "NO"));
+    }
+
+    /// [B119] Legs of unequal size: the pair is booked at the smaller count and
+    /// the larger leg's remainder goes to the per-row loop in the same pass.
+    #[tokio::test]
+    async fn a_netted_pair_with_a_larger_leg_books_the_pair_and_leaves_the_rest_to_the_sweep() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::crypto("kalshi", "kalshi", "btc");
+        let market = "Bitcoin price on Nov 17, 2026? — $63,700 or above";
+        let (yes, no) = ("KXBTCD-26NOV1708-T63699.99#yes", "KXBTCD-26NOV1708-T63699.99#no");
+        record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", yes, market, "YES", dec!(0.47), dec!(5.15), false, "confirmed").await;
+        record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", no, market, "NO", dec!(0.50), dec!(3), false, "confirmed").await;
+        forget_confirmation(yes);
+        forget_confirmation(no);
+        assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &HashMap::new(), &HashSet::new()).await, 2);
+        let rows: Vec<(String, String, String)> = sqlx::query_as("SELECT side, shares, reason FROM trades ORDER BY id").fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!((rows[0].0.as_str(), dec_of(&rows[0].1), rows[0].2.as_str()), ("YES", dec!(3), NETTED_PAIR_REASON));
+        assert_eq!((rows[1].0.as_str(), dec_of(&rows[1].1)), ("YES", dec!(2.15)), "the remainder is booked by the per-row loop");
+        assert!(rows[1].2.starts_with("ChainReconcile"), "{}", rows[1].2);
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions").fetch_one(&pool).await.unwrap();
+        assert_eq!(left, 0);
+    }
+
+    /// [B119] The duplicate check reads the side: a YES booking does not cover a
+    /// NO leg of the same size on the same market.
+    #[tokio::test]
+    async fn a_matching_trade_must_match_the_side() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::crypto("kalshi", "kalshi", "btc");
+        let market = "Bitcoin price on Nov 17, 2026? — $63,700 or above";
+        record_trade_db(&pool, &scope, Decimal::ZERO, "TimeDecayStrategy", market, "YES", dec!(0.47), dec!(0.47), dec!(5.15), Decimal::ZERO, "ChainReconcile: test", None).await;
+        assert!(market_has_matching_trade(&pool, market, "YES", dec!(5.15), None).await);
+        assert!(!market_has_matching_trade(&pool, market, "NO", dec!(5.15), None).await);
+        assert!(!market_has_matching_trade(&pool, market, "YES", dec!(5), None).await);
+        // A booking older than the position cannot be its booking.
+        let later = Utc::now().to_rfc3339();
+        assert!(!market_has_matching_trade(&pool, market, "YES", dec!(5.15), Some(&later)).await);
+    }
+
+    /// [B119] Kalshi repeats a market's question text hour after hour and Time
+    /// Decay repeats its size, so the pair dedupe is scoped to rows written at
+    /// or after the later leg opened: two pairs an hour apart are two rows.
+    #[tokio::test]
+    async fn two_netted_pairs_on_the_same_text_and_size_are_two_rows() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::crypto("kalshi", "kalshi", "btc");
+        let market = "Bitcoin price on Nov 17, 2026? — $63,700 or above";
+        let (yes, no) = ("KXBTCD-26NOV1715-T63699.99#yes", "KXBTCD-26NOV1715-T63699.99#no");
+        for (y, n) in [(yes, no), ("KXBTCD-26NOV1716-T63699.99#yes", "KXBTCD-26NOV1716-T63699.99#no")] {
+            record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", y, market, "YES", dec!(0.47), dec!(5.15), false, "confirmed").await;
+            record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", n, market, "NO", dec!(0.50), dec!(5.15), false, "confirmed").await;
+            forget_confirmation(y);
+            forget_confirmation(n);
+            assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &HashMap::new(), &HashSet::new()).await, 2);
+        }
+        let rows: Vec<(String, String)> = sqlx::query_as("SELECT reason, pnl FROM trades ORDER BY id").fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().all(|(r, p)| r == NETTED_PAIR_REASON && dec_of(p) == dec!(0.1545)), "{rows:?}");
+    }
+
+    /// [B119] The NO quote filled 3 of 5.15 and the venue netted those 3 against
+    /// the YES holding: the YES row claims 5.15 while the account holds 2.15.
+    /// The pair is booked at 3, the YES row follows the account with its fee
+    /// prorated, and the NO row closes.
+    #[tokio::test]
+    async fn a_pair_netted_against_part_of_a_held_leg_books_the_pair_and_shrinks_the_held_row() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::crypto("kalshi", "kalshi", "btc");
+        let market = "Bitcoin price on Nov 17, 2026? — $63,700 or above";
+        let (yes, no) = ("KXBTCD-26NOV1706-T63699.99#yes", "KXBTCD-26NOV1706-T63699.99#no");
+        record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", yes, market, "YES", dec!(0.47), dec!(5.15), false, "confirmed").await;
+        record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", no, market, "NO", dec!(0.50), dec!(3), false, "confirmed").await;
+        set_open_position_entry_fee_scoped(&pool, "btc-open", "TimeDecayStrategy", yes, dec!(0.0515)).await;
+        forget_confirmation(yes);
+        forget_confirmation(no);
+        let live: HashSet<String> = [yes.to_string()].into_iter().collect();
+        let held: HashMap<String, Decimal> = [(yes.to_string(), dec!(2.15))].into_iter().collect();
+        assert_eq!(purge_stale_open_positions_with_holdings(&pool, &live, &held, &HashSet::new(), &HashMap::new(), &HashSet::new()).await, 1);
+
+        let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as("SELECT side, shares, pnl, reason, fees FROM trades").fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let r = &rows[0];
+        assert_eq!((r.0.as_str(), dec_of(&r.1), r.3.as_str()), ("YES", dec!(3), NETTED_PAIR_REASON));
+        // (1 − 0.97) × 3 = 0.09, less the YES fee on 3 of 5.15 contracts (0.03).
+        assert_eq!(dec_of(&r.2), dec!(0.06));
+        assert_eq!(r.4.as_deref().map(dec_of), Some(dec!(0.03)));
+        let left: Vec<(String, String, Option<String>)> = sqlx::query_as("SELECT token_id, shares, entry_fee FROM open_positions").fetch_all(&pool).await.unwrap();
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!((left[0].0.as_str(), dec_of(&left[0].1), left[0].2.as_deref().map(dec_of)), (yes, dec!(2.15), Some(dec!(0.0215))));
+        assert!(released_positions_snapshot().contains_key(no), "the NO leg is released; the YES leg is still held");
+    }
+
+    /// [B119] The NO quote filled 2 of 5 and still works for the rest; the venue
+    /// netted those 2. Booking now would release the NO leg while its order
+    /// keeps filling, so nothing is booked and both legs are waited on, and the
+    /// per-row loop leaves them alone too.
+    #[tokio::test]
+    async fn a_pair_whose_leg_still_has_an_order_working_is_waited_on() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::crypto("kalshi", "kalshi", "btc");
+        let market = "Bitcoin price on Nov 17, 2026? — $63,700 or above";
+        let (yes, no) = ("KXBTCD-26NOV1710-T63699.99#yes", "KXBTCD-26NOV1710-T63699.99#no");
+        record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", yes, market, "YES", dec!(0.47), dec!(5), false, "confirmed").await;
+        record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", no, market, "NO", dec!(0.50), dec!(2), false, "confirmed").await;
+        forget_confirmation(yes);
+        forget_confirmation(no);
+        let live: HashSet<String> = [yes.to_string()].into_iter().collect();
+        let held: HashMap<String, Decimal> = [(yes.to_string(), dec!(3))].into_iter().collect();
+        let working: HashSet<String> = [no.to_string()].into_iter().collect();
+        assert_eq!(purge_stale_open_positions_with_holdings(&pool, &live, &held, &working, &HashMap::new(), &HashSet::new()).await, 0);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0, "nothing booked while the quote works");
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions").fetch_one(&pool).await.unwrap();
+        assert_eq!(left, 2);
+
+        // The quote is done: the pair books at the 2 that filled and the YES row follows the account.
+        assert_eq!(purge_stale_open_positions_with_holdings(&pool, &live, &held, &HashSet::new(), &HashMap::new(), &HashSet::new()).await, 1);
+        let rows: Vec<(String, String)> = sqlx::query_as("SELECT shares, reason FROM trades").fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!((dec_of(&rows[0].0), rows[0].1.as_str()), (dec!(2), NETTED_PAIR_REASON));
+        let kept: (String, String) = sqlx::query_as("SELECT token_id, shares FROM open_positions").fetch_one(&pool).await.unwrap();
+        assert_eq!((kept.0.as_str(), dec_of(&kept.1)), (yes, dec!(3)));
+    }
+
+    /// [B119] Both legs gone at unequal sizes: the pair's share of each fee goes
+    /// on the pair row, the rest on the remainder's own booking; nothing twice.
+    #[tokio::test]
+    async fn fees_are_split_between_the_pair_and_the_remainder() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::crypto("kalshi", "kalshi", "btc");
+        let market = "Bitcoin price on Nov 17, 2026? — $63,700 or above";
+        let (yes, no) = ("KXBTCD-26NOV1707-T63699.99#yes", "KXBTCD-26NOV1707-T63699.99#no");
+        record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", yes, market, "YES", dec!(0.47), dec!(5.15), false, "confirmed").await;
+        record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", no, market, "NO", dec!(0.50), dec!(3), false, "confirmed").await;
+        set_open_position_entry_fee_scoped(&pool, "btc-open", "TimeDecayStrategy", yes, dec!(0.0515)).await;
+        set_open_position_entry_fee_scoped(&pool, "btc-open", "TimeDecayStrategy", no, dec!(0.03)).await;
+        sqlx::query("UPDATE open_positions SET current_price = '0.60' WHERE token_id = ?").bind(yes).execute(&pool).await.unwrap();
+        forget_confirmation(yes);
+        forget_confirmation(no);
+        assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &HashMap::new(), &HashSet::new()).await, 2);
+        let rows: Vec<(String, String, String, Option<String>, String)> = sqlx::query_as("SELECT shares, exit_price, pnl, fees, reason FROM trades ORDER BY id").fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        // Pair: 0.09 gross, fees 0.03 (YES) + 0.03 (NO).
+        assert_eq!((dec_of(&rows[0].0), dec_of(&rows[0].2), rows[0].3.as_deref().map(dec_of)), (dec!(3), dec!(0.03), Some(dec!(0.06))));
+        // Remainder: 2.15 YES sold at the 0.60 mark, fee 0.0215: (0.60 − 0.47) × 2.15 − 0.0215.
+        assert_eq!((dec_of(&rows[1].0), dec_of(&rows[1].1), dec_of(&rows[1].2), rows[1].3.as_deref().map(dec_of)), (dec!(2.15), dec!(0.60), dec!(0.258), Some(dec!(0.0215))));
+        assert!(rows[1].4.contains("beyond the netted pair"), "{}", rows[1].4);
+        let total_fees: Decimal = rows.iter().map(|r| r.3.as_deref().map(dec_of).unwrap_or_default()).sum();
+        assert_eq!(total_fees, dec!(0.0815), "every cent of fee booked once");
     }
 
     fn dec_of(s: &str) -> Decimal { s.parse().unwrap() }

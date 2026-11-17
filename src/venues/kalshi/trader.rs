@@ -142,7 +142,7 @@ const KALSHI_FEE_BPS: u16 = 175;
 /// the market's asset. Use `KALSHI_VENUE` / `TradeScope` for that.
 pub const KALSHI_ASSET: &str = "kalshi";
 /// Runtime venue identity persisted on every trade and entry row.
-pub const KALSHI_VENUE: &str = "kalshi";
+pub use crate::state::KALSHI_VENUE;
 
 /// Market cadence: from the market's own open and close when the venue
 /// publishes both (`from_window`), else from the series ticker (`from_ticker`).
@@ -3974,7 +3974,13 @@ async fn sync_dashboard(
     // the intl chain-drift corrector does not run here).
     let mut resolved_marks: HashMap<String, (Decimal, Decimal)> = HashMap::new();
     let mut deferred: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // [B119] Legs with an order still working: a quote filling in parts is
+    // netted part by part, and the pair pass waits for the whole of it.
+    let mut working_orders: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (token, row_ts) in db::confirmed_open_positions(pool).await {
+        if crate::venues::lifecycle::any_lifecycle_tracks_leg(&MarketId::new(token.clone())).await {
+            working_orders.insert(token.clone());
+        }
         if live_ids.contains(&token) {
             // Live again (a portfolio blip that briefly hid it, or re-adopted):
             // clear any backoff so its NEXT stale spell probes immediately.
@@ -4014,7 +4020,10 @@ async fn sync_dashboard(
             }
         }
     }
-    let _ = db::purge_stale_open_positions(pool, &live_ids, &resolved_marks, &deferred).await;
+    // [B119] The account's size per held leg, so a pair netted against part
+    // of a leg the account still holds is recognized.
+    let held_sizes: HashMap<String, Decimal> = positions.iter().map(|p| (p.market.as_str().to_string(), p.shares)).collect();
+    let _ = db::purge_stale_open_positions_with_holdings(pool, &live_ids, &held_sizes, &working_orders, &resolved_marks, &deferred).await;
 
     let total = collateral + positions_value;
     // Same reasoning as the trade loop's session P&L: portfolio value never

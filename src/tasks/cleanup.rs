@@ -1554,7 +1554,7 @@ async fn record_settled_arb_trade(
                 );
                 return;
             }
-            if db::market_has_matching_trade(&pool, &market_title, size).await {
+            if db::market_has_matching_trade(&pool, &market_title, side, size, None).await {
                 debug!(
                     "Auto-settle: single-leg {} settlement for \"{}\" suppressed — already booked \
                      ({} sh) by another path (ledger reconcile or strategy close)",

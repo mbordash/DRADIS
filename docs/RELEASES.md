@@ -4,6 +4,10 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
+## 1.8.7 (unreleased)
+
+- Kalshi: a Time Decay pair whose two legs both fill is netted by the exchange into cash at once (the YES and NO contracts cancel and the $1.00 is paid out), so no position is left on the account. The ledger had no booking for that: the YES leg was recorded as "closed off-strategy, booked at entry" with a P&L of $0 after ten minutes, and the NO leg was dropped as a duplicate because it matched the YES booking's market and size. The two pairs of 2026-11-17 each made $0.15 in cash and showed $0 in the Trade Log. A netted pair is now booked as one settlement row at $1.00 on the combined cost (the same form as an arbitrage pair), both rows are closed within a minute of the second fill, and a leg's booking is matched on its side as well as its size, so an opposite-side leg is never taken for a duplicate.
+
 ## 1.8.6 (2026-11-17)
 
 - Kalshi: the hourly crypto market each squadron trades is now the strike nearest the current price (the at-the-money strike), chosen against the live price feed, instead of the strike with the most volume. The ETH and SOL squadrons had been sitting on far-away strikes for most of the night, so their hourly vipers never fired. When the market drifts two or more strikes away the squadron rotates to the new at-the-money strike; the 15-minute markets are unchanged.

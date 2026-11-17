@@ -35,6 +35,15 @@ use tokio::time::Instant;
 
 // ─── Trade filing dimensions ─────────────────────────────────────────────────
 
+/// Runtime venue identities, persisted on every trade and entry row and read
+/// back by venue-neutral code (filing, the per-venue tables in `helpers::db`).
+/// Defined here, outside the `cfg`-gated venue modules, so a shard built for
+/// one venue can still name the others when it reads their rows; each venue
+/// module re-exports its own.
+pub const INTL_VENUE: &str = "polymarket-intl";
+pub const US_VENUE: &str = "polymarket-us";
+pub const KALSHI_VENUE: &str = "kalshi";
+
 /// The dimensions a trade or entry row is filed under.
 ///
 /// These were historically collapsed into a single `asset: &str` parameter that
