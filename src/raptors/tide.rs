@@ -597,11 +597,40 @@ fn resolve_ticker(s: &str) -> Option<&'static str> {
 }
 
 /// Coerce a JSON number (or numeric string) to `Decimal`.
+///
+/// A JSON number arrives as an `f64` (serde_json has already parsed it), and
+/// `Decimal::from_f64` keeps the binary expansion's noise: `4166.4049` comes
+/// back as `4166.404900000001`. Parsing the f64's shortest round-trip display
+/// instead gives the digits the venue sent. Reported in PR #15.
 fn json_decimal(v: &serde_json::Value) -> Option<Decimal> {
     if let Some(f) = v.as_f64() {
-        return Decimal::from_f64(f);
+        return Decimal::from_str(&f.to_string()).ok().or_else(|| Decimal::from_f64(f));
     }
     v.as_str().and_then(|s| Decimal::from_str(s).ok())
+}
+
+#[cfg(test)]
+mod json_decimal_tests {
+    use super::json_decimal;
+    use rust_decimal_macros::dec;
+
+    fn num(text: &str) -> serde_json::Value { serde_json::from_str(text).unwrap() }
+
+    /// `Decimal::from_f64(4166.4049)` is `4166.404900000001`; the price keeps
+    /// the digits Alpaca sent.
+    #[test]
+    fn a_json_number_keeps_the_digits_the_venue_sent() {
+        assert_eq!(json_decimal(&num("4166.4049")), Some(dec!(4166.4049)));
+        assert_eq!(json_decimal(&num("61.37")), Some(dec!(61.37)));
+        assert_eq!(json_decimal(&num("100")), Some(dec!(100)));
+    }
+
+    #[test]
+    fn a_numeric_string_parses_and_anything_else_is_none() {
+        assert_eq!(json_decimal(&num(r#""61.37""#)), Some(dec!(61.37)));
+        assert_eq!(json_decimal(&num(r#""abc""#)), None);
+        assert_eq!(json_decimal(&num("null")), None);
+    }
 }
 
 #[cfg(test)]
