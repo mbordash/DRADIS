@@ -461,7 +461,7 @@ pub const MAKER_CROSS_BUFFER: Decimal = dec!(0.02);
 /// With this true (the default) the quote is additionally capped at
 /// `best_bid + one tick` — the maker improves the bid rather than crossing to
 /// the ask, which is what a maker is for. Set false to restore the ask-anchored
-/// behaviour.
+/// behavior.
 pub const MAKER_IMPROVE_BID_ONLY: bool = true;
 pub const CROSSES_BOOK_COOLDOWN_SECS: i64 = 30;
 /// Balanced: 5s pause lets the WS snapshot refresh without stalling entries long.

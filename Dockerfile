@@ -24,12 +24,20 @@ WORKDIR /app
 # release build, and cargo rebuilds dependencies whenever the feature set
 # changes, so a three-venue image costs roughly three times the build time.
 ARG DRADIS_VENUES="intl"
-# Parallel rustc jobs for the release builds below; empty keeps cargo's default
+# Parallel rustc jobs for the release builds below; unset keeps cargo's default
 # (one per CPU). A production deploy builds this image on the live instance
 # beside the running engine, and two rustc jobs on a 4 GB box left 143 MB free
 # and took SSH down for forty minutes (B118); `--build-arg CARGO_BUILD_JOBS=1`
 # trades a slower build for a box that stays answerable.
-ARG CARGO_BUILD_JOBS=""
+#
+# No default on purpose [B122]: `CARGO_BUILD_JOBS` is also the environment
+# variable cargo itself reads for `build.jobs`, and an ARG with a default of ""
+# puts an EMPTY variable in every RUN below, which cargo refuses ("could not
+# parse ``. Number of parallel jobs should be `default` or a number") before the
+# `-j` expansion even runs. Without a default an unpassed ARG is unset, so a
+# plain `docker build` (the AMI build, the demo, a customer's own build) uses
+# cargo's default and only a deploy that passes the argument caps the jobs.
+ARG CARGO_BUILD_JOBS
 COPY Cargo.toml Cargo.lock ./
 
 # ── Dependency caching layer ────────────────────────────────────────────────

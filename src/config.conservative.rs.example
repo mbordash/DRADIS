@@ -465,7 +465,7 @@ pub const MAKER_CROSS_BUFFER: Decimal = dec!(0.02);
 /// With this true (the default) the quote is additionally capped at
 /// `best_bid + one tick` — the maker improves the bid rather than crossing to
 /// the ask, which is what a maker is for. Set false to restore the ask-anchored
-/// behaviour.
+/// behavior.
 pub const MAKER_IMPROVE_BID_ONLY: bool = true;
 pub const CROSSES_BOOK_COOLDOWN_SECS: i64 = 60;
 /// Conservative: longer pause before retrying a rejected entry — lets the book
@@ -474,8 +474,13 @@ pub const CROSSES_BOOK_RETRY_PAUSE_SECS: u64 = 8;
 
 /// Won't post maker orders within 45 minutes of expiry.
 pub const MAKER_MIN_SECS_TO_EXPIRY: i64 = 2700;
-/// Conservative horizon — only looks at markets closing within 12 hours.
-pub const MAKER_MAX_SECS_TO_EXPIRY: i64 = 43200;
+/// Maker venue discovery horizon. Was 12 hours (43200) through 1.8.6: the daily
+/// "Up or Down" market closes at noon ET, so from noon to midnight ET the next
+/// one was more than 12 hours out and the squadron had no daily venue at all
+/// (E71, seen on the demo box 2026-11-19 when the hourly strike markets had no
+/// volume either). 2026-11-20: one day, the same as the balanced profile; the
+/// 45-minute floor below still keeps quotes away from the close.
+pub const MAKER_MAX_SECS_TO_EXPIRY: i64 = 86400;
 
 /// Lower max entry price — only post bids on genuinely uncertain markets.
 pub const MAKER_MAX_ENTRY_PRICE: Decimal = dec!(0.48);

@@ -4,9 +4,13 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
-## 1.8.7 (unreleased)
+## 1.8.7 (2026-11-20)
 
 - Kalshi: a Time Decay pair whose two legs both fill is netted by the exchange into cash at once (the YES and NO contracts cancel and the $1.00 is paid out), so no position is left on the account. The ledger had no booking for that: the YES leg was recorded as "closed off-strategy, booked at entry" with a P&L of $0 after ten minutes, and the NO leg was dropped as a duplicate because it matched the YES booking's market and size. The two pairs of 2026-11-17 each made $0.15 in cash and showed $0 in the Trade Log. A netted pair is now booked as one settlement row at $1.00 on the combined cost (the same form as an arbitrage pair), both rows are closed within a minute of the second fill, and a leg's booking is matched on its side as well as its size, so an opposite-side leg is never taken for a duplicate.
+- Polymarket: when no hourly market was tradeable (every strike market at zero volume), the engine kept the daily "Up or Down" market it already held even after that market had closed, so the dashboard reported "Market data has stopped" for a market nobody was trading, for as long as the dry spell lasted, and a new daily market the scan did find was not picked up until an hourly market appeared. The daily venue is now released when it closes and adopted when found, whether or not an hourly market is available.
+- Polymarket, conservative profile: the daily market is now looked for up to one day ahead (was 12 hours), the same as the balanced profile. The daily closes at noon ET, so with a 12-hour horizon the squadron had no daily venue from noon to midnight ET. Quotes still stop 45 minutes before the close.
+- Tide signal (BTC ETF premium): a trade price from the Alpaca feed is now parsed to the digits the feed sent (4166.4049 read as 4166.404900000001 before). No effect on any decision; reported in a community pull request.
+- Building the engine's Docker image from source without the new build-jobs argument (plain `docker build`, as the AMI build and the demo deploy do) failed in the dependency step with "could not parse ``. Number of parallel jobs should be `default` or a number". Introduced with the build-jobs argument on 2026-11-18, after the 1.8.6 image, so no published version carried it. The argument now has no default, and an unpassed one leaves cargo's own job count in place.
 
 ## 1.8.6 (2026-11-17)
 

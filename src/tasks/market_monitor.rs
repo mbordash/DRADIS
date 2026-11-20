@@ -92,6 +92,16 @@ fn carry_held_maker(
     }
 }
 
+/// Whether the maker venue the monitor would publish differs from the held one,
+/// by market identity (the YES token; the patrol restarts on the same key via
+/// `condition_id`, which moves with it). [B121] The no-hourly arm publishes only
+/// when this is true or the hourly is being released, so a dry spell with the
+/// daily kept, or with nothing held and nothing found, publishes nothing and
+/// the patrol is not restarted every 90 s (the churn B60 removed).
+fn maker_venue_changed(held: Option<&MarketCandidate>, next: Option<&MarketCandidate>) -> bool {
+    held.map(|m| &m.yes_token) != next.map(|m| &m.yes_token)
+}
+
 /// Epoch seconds of the last "keeping the held maker venue" line, so a long
 /// run of missed scans says so once every ten minutes rather than every 90 s.
 static LAST_MAKER_KEPT_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -329,28 +339,47 @@ pub async fn run_market_monitor(
         //
         // Releasing publishes the ZERO sentinel, which is the same state the channel is
         // seeded with at startup before any market is found, so every consumer already
-        // handles it. The maker candidate is carried through untouched: the hourly market
-        // expiring says nothing about the maker market, which has its own lifecycle.
+        // handles it.
+        //
+        // The maker venue has its own lifecycle and gets the same treatment here as on
+        // the other two arms (B60's `carry_held_maker`): a scan that found one wins, a
+        // held one is kept while open and released once closed. [B121] This arm used
+        // to carry the held venue through untouched, so with no tradeable hourly market
+        // a closed daily was never released: the demo box sat on "Bitcoin Up or Down on
+        // November 18?" for 42 hours after its noon close while the hourly strike
+        // markets had no volume, the heartbeat kept reporting that closed book as dark,
+        // and a daily that the scan did find could not be adopted until an hourly
+        // appeared.
         if candidate.yes_token == market_id_from_u256(U256::ZERO) {
             let (cur_yes, _, cur_name, cur_close_time, _, _, cur_maker, _) =
                 market_tx.borrow().clone();
+            let now = Utc::now();
             let holding_a_market = cur_yes != market_id_from_u256(U256::ZERO);
-            if should_release_held_market(holding_a_market, cur_close_time, Utc::now()) {
+            let release_hourly = should_release_held_market(holding_a_market, cur_close_time, now);
+            if release_hourly {
                 info!(
                     "🛑 Releasing expired market \"{}\" — no replacement available; \
                      squadron waits rather than holding a market that closed",
                     cur_name,
                 );
-                let _ = market_tx.send((
-                    market_id_from_u256(U256::ZERO),
-                    market_id_from_u256(U256::ZERO),
-                    String::new(),
-                    None,
-                    None,
-                    String::new(),
-                    cur_maker,
-                    String::new(),
-                ));
+            }
+            let (mut maker_candidate, carry) = carry_held_maker(maker_candidate, cur_maker.as_ref(), now);
+            log_maker_carry(&carry, cur_maker.as_ref(), now);
+            let maker_changed = maker_venue_changed(cur_maker.as_ref(), maker_candidate.as_ref());
+            if maker_changed {
+                if let Some(ref mut mk) = maker_candidate {
+                    info!("🏦 Maker market updated: \"{}\"", mk.name);
+                    resolve_maker_strike(&http, &crypto_filter, cur_maker.as_ref(), mk).await;
+                }
+            }
+            if release_hourly || maker_changed {
+                let (y, n, nm, ct, sp, ds, _, cid) = if release_hourly {
+                    (market_id_from_u256(U256::ZERO), market_id_from_u256(U256::ZERO),
+                     String::new(), None, None, String::new(), None, String::new())
+                } else {
+                    market_tx.borrow().clone()
+                };
+                let _ = market_tx.send((y, n, nm, ct, sp, ds, maker_candidate, cid));
             }
             continue;
         }
@@ -619,5 +648,33 @@ mod maker_carry_tests {
         let (out, carry) = carry_held_maker(None, Some(&held), now());
         assert_eq!(carry, MakerCarry::Released);
         assert!(out.is_none());
+    }
+
+    /// [B121] The no-hourly arm's publish decision, composed from the carry:
+    /// a dry spell that keeps the open daily publishes nothing; the daily
+    /// closing with no replacement publishes once (then held and next are both
+    /// None and nothing changes); a daily found while nothing is held publishes
+    /// once and then stays put while the scan keeps finding the same one.
+    #[test]
+    fn the_no_hourly_arm_publishes_only_on_a_real_venue_change() {
+        use super::maker_venue_changed;
+        let held = venue(10, "held", Some(now() + Duration::hours(3)));
+        // Dry spell, scan missed the open daily: kept, no change.
+        let (next, _) = carry_held_maker(None, Some(&held), now());
+        assert!(!maker_venue_changed(Some(&held), next.as_ref()), "a kept venue is not a change");
+        // Scan keeps finding the same daily: same identity, no change.
+        let same = venue(10, "held", Some(now() + Duration::hours(3)));
+        let (next, _) = carry_held_maker(Some(same), Some(&held), now());
+        assert!(!maker_venue_changed(Some(&held), next.as_ref()), "the same venue found again is not a change");
+        // The daily closed and nothing replaces it: released once.
+        let closed = venue(10, "held", Some(now() - Duration::minutes(1)));
+        let (next, _) = carry_held_maker(None, Some(&closed), now());
+        assert!(maker_venue_changed(Some(&closed), next.as_ref()), "a release is a change");
+        assert!(!maker_venue_changed(None, None), "and afterwards nothing held, nothing found, nothing published");
+        // A daily found while nothing is held: adopted once.
+        let found = venue(20, "found", Some(now() + Duration::hours(20)));
+        let (next, _) = carry_held_maker(Some(found.clone()), None, now());
+        assert!(maker_venue_changed(None, next.as_ref()), "a found venue is a change");
+        assert!(!maker_venue_changed(Some(&found), next.as_ref()), "and the next scan finding it again is not");
     }
 }
