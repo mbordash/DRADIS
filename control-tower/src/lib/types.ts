@@ -1274,6 +1274,16 @@ export interface AutoscaleStatus {
 // ── [E86] Build a Viper ─────────────────────────────────────────────────────
 
 /** One scripted viper's switches and values (`DynamicConfig.custom_vipers`). */
+/** [E106] One window of a scripted viper's schedule: the days it starts on
+ *  (1 = Monday .. 7 = Sunday) and its Eastern-time bounds as HH:MM. An end at
+ *  or before the start runs overnight into the next day; "00:00" as the end
+ *  means midnight. */
+export interface ScheduleWindow {
+  days: number[];
+  start: string;
+  end: string;
+}
+
 export interface CustomViperConfig {
   /** Runs at all; on by default. Off stops entries only: exits keep running. */
   enabled?: boolean;
@@ -1289,6 +1299,10 @@ export interface CustomViperConfig {
   /** [E102b] This squadron's share of the script's cap (decimal string);
    *  squadron rows only. */
   max_exposure_here_usdc?: string | number | null;
+  /** [E106] When the viper may open a position: Eastern-time windows on
+   *  chosen days; empty or absent means always. Instance-wide like `live`.
+   *  Entries only: exits keep running. `null` in a patch clears it. */
+  schedule?: ScheduleWindow[] | null;
 }
 
 export type ScriptParamType = 'decimal' | 'int' | 'bool';

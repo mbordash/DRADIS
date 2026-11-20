@@ -493,7 +493,13 @@ function ExportCsvButton({ assets }: { assets: string[] }) {
 /** The filtered rows' money summary. Shown above the table and again below
  *  it, so the operator sees their cash performance without scrolling to the
  *  bottom of a long log. */
-function FilteredPnl({ filtered, edge }: { filtered: LogEntry[]; edge: 'border-t' | 'border-b' }) {
+/** Lifetime realized figures for the active strategy/side filter, from the
+ *  server ([E105]); null while no such filter is set or the read is pending. */
+type FilterLifetime = { count: number; wins: number; losses: number; realized: number } | null;
+
+function FilteredPnl({ filtered, edge, truncated, lifetime }: {
+  filtered: LogEntry[]; edge: 'border-t' | 'border-b'; truncated: boolean; lifetime: FilterLifetime;
+}) {
   // Simulated rows (instance ghost mode, the GBoost and Anchor shadow
   // lanes) stay out of the money figures, matching the lifetime cards
   // above, which the server already scopes to real rows. A live
@@ -542,9 +548,33 @@ function FilteredPnl({ filtered, edge }: { filtered: LogEntry[]; edge: 'border-t
           <span className="text-gray-600"> ({paper.length} closed, not money)</span>
         </span>
       )}
+      {lifetime && (
+        <span
+          className="text-gray-500"
+          title="Every trade this strategy and side ever booked, from the ledger itself, not only the rows loaded here. Rows of the instance's current posture (real, or ghost when ghost mode is on), the same as the cards above; paper rows excluded."
+        >
+          Lifetime: <span className={`font-semibold ${lifetime.realized >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+            {lifetime.realized >= 0 ? '+' : ''}${lifetime.realized.toFixed(4)}
+          </span>
+          <span className="text-gray-600"> ({lifetime.count} trades, {lifetime.wins}W/{lifetime.losses}L)</span>
+        </span>
+      )}
+      {truncated && (
+        <span
+          className="text-gray-600 basis-full"
+          title={`The log loads the ${TRADE_WINDOW_ROWS} most recent trades per coin. Realized, Unrealized and Net cover only the rows that are loaded and match the filters; a viper's older trades are not in them. The cards above are lifetime totals.`}
+        >
+          Realized and Net above: the {TRADE_WINDOW_ROWS} most recent trades per coin only, not lifetime
+        </span>
+      )}
     </div>
   );
 }
+
+/** Rows fetched per asset for the log. The ledger holds more than this on a busy
+ *  instance, so a sum over the loaded rows is a window, not a lifetime figure;
+ *  `FilteredPnl` says so whenever any asset's fetch came back full. */
+const TRADE_WINDOW_ROWS = 200;
 
 export default function TradelogPage({ availableAssets }: Props) {
   // ── Filters ──────────────────────────────────────────────────────────────────
@@ -567,11 +597,57 @@ export default function TradelogPage({ availableAssets }: Props) {
   const { data: tradesData, isLoading: tradesLoading, error: tradesError } = useSWR(
     ['tradelog-trades', assets.join(',')],
     async () => {
-      const results = await Promise.all(assets.map(a => getTrades(200, a).then(rows => rows.map(r => ({ asset: a, ...r })))));
+      const results = await Promise.all(assets.map(a => getTrades(TRADE_WINDOW_ROWS, a).then(rows => rows.map(r => ({ asset: a, ...r })))));
       return results.flat();
     },
     { refreshInterval: 15_000 },
   );
+  // A per-asset fetch that came back full means the ledger has older rows the
+  // log is not showing, so a filtered sum is a window. [E105] The Tradelog
+  // read -$0.69 for a viper whose 282 trades stood at +$0.72: the window held
+  // its last 189 trades and all four of its losses, and nothing said so.
+  const tradeWindowTruncated = useMemo(() => {
+    const rows = tradesData ?? [];
+    return assets.some(a => rows.filter(r => r.asset === a).length >= TRADE_WINDOW_ROWS);
+  }, [tradesData, assets]);
+
+  // [E105] Lifetime figures for the active strategy/side filter, from the
+  // ledger. The strategy pill shows a short name; the ledger needs the exact
+  // string, so every loaded raw name that shortens to the pill is asked for
+  // (normally one) and the answers are summed, per coin in view.
+  const lifetimeStrategies = useMemo(() => {
+    if (strategyFilter === 'all') return [] as string[];
+    const raw = new Set<string>();
+    // Ghost rows are included here; the server answers 0 for a name that has
+    // only ghost rows, so they cost nothing and never widen the figure.
+    for (const r of tradesData ?? []) if (shortStrategy(r.strategy) === strategyFilter) raw.add(r.strategy);
+    // No loaded completed row carries this name (only paper rows, or only an
+    // open position, or every completed trade aged out of the window, which is
+    // the case this figure exists for). The pill is the raw name for scripts
+    // and the raw name minus "Strategy" for built-ins, so invert that; a
+    // strategy filter must never fall through to an unfiltered read.
+    if (raw.size === 0) raw.add(strategyFilter.startsWith('Script:') ? strategyFilter : `${strategyFilter}Strategy`);
+    return Array.from(raw).sort();
+  }, [tradesData, strategyFilter]);
+  const lifetimeWanted = strategyFilter !== 'all' || sideFilter !== 'all';
+  const lifetimeAssets = assetFilter === 'all' ? assets : assets.filter(a => a === assetFilter);
+  const { data: lifetimeData } = useSWR(
+    lifetimeWanted ? ['tradelog-filter-lifetime', lifetimeAssets.join(','), lifetimeStrategies.join('|'), sideFilter] : null,
+    async () => {
+      const side = sideFilter === 'all' ? undefined : sideFilter.toLowerCase();
+      // Side-only filter: one unfiltered-by-strategy read per coin.
+      const strategies = strategyFilter === 'all' ? [undefined] : lifetimeStrategies;
+      const reads = await Promise.all(lifetimeAssets.flatMap(a =>
+        strategies.map(st => getTradeStats(a, undefined, { strategy: st, side }))));
+      return reads.reduce<NonNullable<FilterLifetime>>(
+        (acc, t) => ({ count: acc.count + t.count, wins: acc.wins + t.wins, losses: acc.losses + t.losses, realized: acc.realized + t.realized_pnl }),
+        { count: 0, wins: 0, losses: 0, realized: 0 },
+      );
+    },
+    { refreshInterval: 15_000 },
+  );
+  const filterLifetime: FilterLifetime = lifetimeWanted ? (lifetimeData ?? null) : null;
+
 
   // Lifetime totals per asset for the summary cards. Kept separate from the
   // trade list above, which stays a bounded window for display.
@@ -594,7 +670,7 @@ export default function TradelogPage({ availableAssets }: Props) {
     ['tradelog-paper', assets.join(',')],
     async () => {
       // A failed read leaves paper rows out; it must not blank the real log.
-      const results = await Promise.allSettled(assets.map(a => getPaperTrades(200, a).then(rows => ({ asset: a, rows }))));
+      const results = await Promise.allSettled(assets.map(a => getPaperTrades(TRADE_WINDOW_ROWS, a).then(rows => ({ asset: a, rows }))));
       return results.flatMap(r => (r.status === 'fulfilled' ? [r.value] : []));
     },
     { refreshInterval: 15_000 },
@@ -862,7 +938,7 @@ export default function TradelogPage({ availableAssets }: Props) {
         </div>
 
         {/* Filtered P&L header: the footer's summary, so it is visible without scrolling */}
-        {!isLoading && filtered.length > 0 && <FilteredPnl filtered={filtered} edge="border-b" />}
+        {!isLoading && filtered.length > 0 && <FilteredPnl filtered={filtered} edge="border-b" truncated={tradeWindowTruncated} lifetime={filterLifetime} />}
 
         {isLoading ? (
           <div className="flex items-center justify-center h-40 text-gray-600 text-sm">
@@ -1108,7 +1184,7 @@ export default function TradelogPage({ availableAssets }: Props) {
         )}
 
         {/* Filtered P&L footer (the same summary sits above the table) */}
-        {!isLoading && filtered.length > 0 && <FilteredPnl filtered={filtered} edge="border-t" />}
+        {!isLoading && filtered.length > 0 && <FilteredPnl filtered={filtered} edge="border-t" truncated={tradeWindowTruncated} lifetime={filterLifetime} />}
       </div>
 
       {/* RTB Modal */}

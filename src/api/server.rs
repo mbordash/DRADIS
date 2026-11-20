@@ -595,6 +595,12 @@ async fn enforce_read_only(
 struct AssetQuery {
     asset: Option<String>,
     limit: Option<i64>,
+    /// [E105] `/api/trades/stats` only: narrow the aggregates to one strategy
+    /// (the ledger's exact `strategy` string, e.g. `Script:my_closing_sniper`)
+    /// and/or one side (`yes`/`no`). The Trade Log's filtered view asks for
+    /// the lifetime figure this way, since the rows it loads are a window.
+    strategy: Option<String>,
+    side: Option<String>,
     /// History window in hours for `/api/pnl/history` (default 24, clamped to
     /// `db::PNL_HISTORY_MAX_HOURS`). The portfolio chart's range control sets
     /// it; `limit` points are spread across whatever window is asked for.
@@ -1499,7 +1505,7 @@ async fn get_trades(Query(q): Query<AssetQuery>) -> Response {
     }
 }
 
-/// GET /api/trades/stats?asset=btc[&hours=168]
+/// GET /api/trades/stats?asset=btc[&hours=168][&strategy=Script:x][&side=yes]
 ///
 /// Lifetime aggregates over the shard's entire trade history — count, wins,
 /// losses, realized P&L, fees — or, with `hours`, over the trades booked in
@@ -1517,7 +1523,7 @@ async fn get_trade_stats(Query(q): Query<AssetQuery>) -> Response {
             first_ts: None, last_ts: None,
         };
         for pool in db::pools_for_opt(None) {
-            let s = db::get_trade_stats_window(&pool, q.hours).await;
+            let s = db::get_trade_stats_window_filtered(&pool, q.hours, q.strategy.as_deref(), q.side.as_deref()).await;
             agg.count += s.count;
             agg.wins += s.wins;
             agg.losses += s.losses;
@@ -1536,7 +1542,7 @@ async fn get_trade_stats(Query(q): Query<AssetQuery>) -> Response {
         return Json(agg).into_response();
     }
     match db::pool_for_opt_retry(q.asset.as_deref()).await {
-        Some(pool) => Json(db::get_trade_stats_window(&pool, q.hours).await).into_response(),
+        Some(pool) => Json(db::get_trade_stats_window_filtered(&pool, q.hours, q.strategy.as_deref(), q.side.as_deref()).await).into_response(),
         None => {
             log_pool_unavailable(&format!("GET /api/trades/stats (asset={:?})", q.asset), q.asset.as_deref());
             Json(db::TradeStatsRow {

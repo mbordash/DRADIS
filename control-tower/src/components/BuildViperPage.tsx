@@ -36,7 +36,7 @@ import {
 } from '@/lib/api';
 import type {
   CustomViperConfig, ScriptDryRun, ScriptList, ScriptListItem, ScriptManifest, ScriptParam, ScriptParamType, ScriptTemplate,
-  ViperBundle,
+  ViperBundle, ScheduleWindow,
 } from '@/lib/types';
 import { useConfirm } from './ConfirmDialog';
 import { toast } from './Toast';
@@ -333,7 +333,21 @@ function normalized(d: Draft): { manifest: ScriptManifest; problems: string[] } 
   return { manifest: { ...d.manifest, max_exposure_usdc: Number(d.manifest.max_exposure_usdc), params }, problems };
 }
 
-// ── Settings: switches, cap and parameter values ──────────────────────────────
+// ── Settings: switches, cap, schedule and parameter values ────────────────────
+
+const DAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+/** "Mon-Fri 09:30-16:00, Sat 10:00-12:00 ET": the engine's wording for a schedule ([E106]). */
+function describeSchedule(windows: ScheduleWindow[]): string {
+  const dayRange = (days: number[]) => {
+    const d = Array.from(new Set(days.filter((x) => x >= 1 && x <= 7))).sort((a, b) => a - b);
+    if (d.length === 7) return 'every day';
+    const consecutive = d.length >= 3 && d.every((x, i) => i === 0 || x === d[i - 1] + 1);
+    return consecutive ? `${DAY_LABELS[d[0] - 1]}-${DAY_LABELS[d[d.length - 1] - 1]}` : d.map((x) => DAY_LABELS[x - 1]).join(', ');
+  };
+  const span = (w: ScheduleWindow) => (w.start === '00:00' && (w.end === '00:00' || w.end === '24:00') ? 'all day' : `${w.start}-${w.end}`);
+  return `${windows.map((w) => `${dayRange(w.days)} ${span(w)}`).join(', ')} ET`;
+}
 
 function SettingsPanel({ name, manifest, cfg, instanceGhost, paperCount, paperPnl, onSaved }: {
   name: string; manifest: ScriptManifest; cfg: CustomViperConfig; instanceGhost: boolean;
@@ -342,6 +356,9 @@ function SettingsPanel({ name, manifest, cfg, instanceGhost, paperCount, paperPn
   const [confirm, confirmDialog] = useConfirm();
   const [cap, setCap] = useState(num(cfg.max_exposure_usdc));
   const [values, setValues] = useState<Record<string, string>>({});
+  // [E106] The schedule being edited; saved with its own button because a
+  // half-built window must not be sent along with a parameter change.
+  const [windows, setWindows] = useState<ScheduleWindow[]>(cfg.schedule ?? []);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const enabled = cfg.enabled ?? true;
@@ -359,6 +376,14 @@ function SettingsPanel({ name, manifest, cfg, instanceGhost, paperCount, paperPn
     setValues(v);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [name, cfgKey, paramsKey]);
+  // [E106] The schedule resets only when the saved schedule itself changes:
+  // saving Live, the cap or a parameter refreshes the config, and that must
+  // not wipe windows still being built.
+  const scheduleKey = JSON.stringify(cfg.schedule ?? []);
+  useEffect(() => {
+    setWindows((cfg.schedule ?? []).map((w) => ({ ...w, days: [...w.days] })));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [name, scheduleKey]);
   // The engine enforces the lower of the manifest's cap and the operator's.
   const manifestCap = Number(manifest.max_exposure_usdc);
   const effectiveCap = cfg.max_exposure_usdc != null && cfg.max_exposure_usdc !== ''
@@ -463,6 +488,30 @@ function SettingsPanel({ name, manifest, cfg, instanceGhost, paperCount, paperPn
     await patch(entry, `Saved ${manifest.display_name}'s values. They apply from the next tick.`);
   };
 
+  // [E106] Schedule editing. The engine validates again and refuses a bad
+  // window with its reason; these checks only say it sooner.
+  const scheduleChanged = JSON.stringify(windows) !== JSON.stringify(cfg.schedule ?? []);
+  const scheduleProblems: string[] = windows.flatMap((w, i) => {
+    const out: string[] = [];
+    if (w.days.length === 0) out.push(`window ${i + 1}: pick at least one day`);
+    if (!/^\d\d:\d\d$/.test(w.start) || !/^\d\d:\d\d$/.test(w.end)) out.push(`window ${i + 1}: start and end need a time`);
+    else if (w.start === w.end && w.start !== '00:00') out.push(`window ${i + 1}: start and end are both ${w.start} (00:00 to 00:00 means all day)`);
+    return out;
+  });
+  const saveSchedule = async () => {
+    if (scheduleProblems.length) { setError(scheduleProblems.join('\n')); toast.error('Not saved: fix the schedule first.'); return; }
+    await patch(
+      { schedule: windows.length ? windows : null },
+      windows.length ? `Saved ${manifest.display_name}'s schedule: ${describeSchedule(windows)}.` : `${manifest.display_name} now trades at any time.`,
+    );
+  };
+  const updateWindow = (i: number, w: ScheduleWindow) => setWindows(windows.map((x, j) => (j === i ? w : x)));
+  const toggleDay = (i: number, d: number) => {
+    const w = windows[i];
+    const days = w.days.includes(d) ? w.days.filter((x) => x !== d) : [...w.days, d].sort((a, b) => a - b);
+    updateWindow(i, { ...w, days });
+  };
+
   return (
     <div className="space-y-4">
       {confirmDialog}
@@ -492,6 +541,54 @@ function SettingsPanel({ name, manifest, cfg, instanceGhost, paperCount, paperPn
                 : 'Live: real orders with real money.'
               : 'Paper: trades in its own ledger. Nothing reaches the venue.'}
           </p>
+        </div>
+      </div>
+
+      <div className="card p-3 border border-[#1e1e32] space-y-3">
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-mono text-gray-200">Schedule (Eastern time)</span>
+          <span className="text-[11px] font-mono text-gray-500">
+            {(cfg.schedule ?? []).length ? `Entries allowed ${describeSchedule(cfg.schedule ?? [])}` : 'No schedule: entries at any time'}
+          </span>
+        </div>
+        <p className="text-[10px] font-mono text-gray-500">
+          Outside every window the viper opens nothing and its card says so. Positions it holds keep their exits around the
+          clock. An end at or before the start runs overnight into the next day; 00:00 as the end means midnight, and 00:00 to 00:00 is all day. Daylight
+          saving is applied. The schedule is instance-wide, like Live.
+        </p>
+        {windows.map((w, i) => (
+          <div key={i} className="flex flex-wrap items-center gap-2 rounded border border-[#1e1e32] px-2 py-2">
+            <div className="flex gap-1">
+              {DAY_LABELS.map((label, idx) => {
+                const d = idx + 1;
+                const on = w.days.includes(d);
+                return (
+                  <button key={d} type="button" aria-pressed={on} disabled={busy}
+                          className={`px-1.5 py-0.5 rounded border text-[10px] font-mono ${on ? 'border-teal-500/50 bg-teal-500/10 text-teal-200' : 'border-[#1e1e32] text-gray-500'}`}
+                          onClick={() => toggleDay(i, d)}>{label}</button>
+                );
+              })}
+            </div>
+            <label className="text-[10px] font-mono text-gray-500">from
+              <input type="time" step={60} className={`${inputCls} ml-1 w-28 inline-block`} value={w.start} disabled={busy}
+                     onChange={(e) => updateWindow(i, { ...w, start: e.target.value })} />
+            </label>
+            <label className="text-[10px] font-mono text-gray-500">to
+              <input type="time" step={60} className={`${inputCls} ml-1 w-28 inline-block`} value={w.end} disabled={busy}
+                     onChange={(e) => updateWindow(i, { ...w, end: e.target.value })} />
+            </label>
+            <button type="button" className={btnPlain} disabled={busy} onClick={() => setWindows(windows.filter((_, j) => j !== i))}>Remove</button>
+          </div>
+        ))}
+        <div className="flex flex-wrap items-center gap-2">
+          <button type="button" className={btnPlain} disabled={busy}
+                  onClick={() => setWindows([...windows, { days: [1, 2, 3, 4, 5], start: '09:30', end: '16:00' }])}>Add window</button>
+          <button type="button" className={btnPrimary} disabled={busy || !scheduleChanged} onClick={saveSchedule}>
+            {windows.length ? 'Save schedule' : (cfg.schedule ?? []).length ? 'Save: trade at any time' : 'Save schedule'}
+          </button>
+          {scheduleChanged && scheduleProblems.length > 0 && (
+            <span className="text-[10px] font-mono text-amber-300">{scheduleProblems[0]}</span>
+          )}
         </div>
       </div>
 

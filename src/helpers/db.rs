@@ -7853,10 +7853,28 @@ pub async fn get_trade_stats_for(pool: &SqlitePool, ghost: bool) -> TradeStatsRo
 /// history when `None`. Backs the dashboard's realized P&L over the portfolio
 /// chart's window, so the card and the chart read the same clock.
 pub async fn get_trade_stats_since(pool: &SqlitePool, ghost: bool, since: Option<&str>) -> TradeStatsRow {
+    get_trade_stats_filtered(pool, ghost, since, None, None).await
+}
+
+/// [E105] The same statistics narrowed to one strategy (the ledger's exact
+/// `strategy` string, e.g. `Script:my_closing_sniper`) and/or one side
+/// (`YES`/`NO`, case-insensitive), each optional. Backs the Trade Log's
+/// lifetime figure for a filtered view: the log loads a bounded window of
+/// recent rows, and a sum over that window read -$0.69 for a viper whose
+/// 282 trades stood at +$0.72, because the window held its last 189 trades
+/// and all four of its losses.
+pub async fn get_trade_stats_filtered(
+    pool: &SqlitePool,
+    ghost: bool,
+    since: Option<&str>,
+    strategy: Option<&str>,
+    side: Option<&str>,
+) -> TradeStatsRow {
     let empty = TradeStatsRow {
         count: 0, wins: 0, losses: 0, realized_pnl: 0.0, fees: 0.0,
         first_ts: None, last_ts: None,
     };
+    let side_upper = side.map(|x| x.to_ascii_uppercase());
     match sqlx::query(
         "SELECT COUNT(*),
                 COALESCE(SUM(CASE WHEN CAST(pnl AS REAL) > 0 THEN 1 ELSE 0 END), 0),
@@ -7864,11 +7882,17 @@ pub async fn get_trade_stats_since(pool: &SqlitePool, ghost: bool, since: Option
                 COALESCE(SUM(CAST(pnl AS REAL)), 0.0),
                 COALESCE(SUM(CAST(COALESCE(fees, '0') AS REAL)), 0.0),
                 MIN(ts), MAX(ts)
-         FROM trades WHERE COALESCE(ghost, 0) = ? AND (? IS NULL OR ts >= ?)"
+         FROM trades WHERE COALESCE(ghost, 0) = ? AND (? IS NULL OR ts >= ?)
+           AND (? IS NULL OR strategy = ?)
+           AND (? IS NULL OR UPPER(side) = ?)"
     )
     .bind(ghost as i32)
     .bind(since)
     .bind(since)
+    .bind(strategy)
+    .bind(strategy)
+    .bind(side_upper.as_deref())
+    .bind(side_upper.as_deref())
     .fetch_one(pool)
     .await {
         Ok(r) => TradeStatsRow {
@@ -7932,8 +7956,18 @@ pub async fn get_trade_stats(pool: &SqlitePool) -> TradeStatsRow {
 /// [E88] The current posture's trade statistics over the last `hours` hours
 /// (clamped like the P&L chart's window), or lifetime when `hours` is `None`.
 pub async fn get_trade_stats_window(pool: &SqlitePool, hours: Option<i64>) -> TradeStatsRow {
+    get_trade_stats_window_filtered(pool, hours, None, None).await
+}
+
+/// `get_trade_stats_window` narrowed to a strategy and/or side ([E105]).
+pub async fn get_trade_stats_window_filtered(
+    pool: &SqlitePool,
+    hours: Option<i64>,
+    strategy: Option<&str>,
+    side: Option<&str>,
+) -> TradeStatsRow {
     let since = hours.map(|h| (Utc::now() - chrono::Duration::hours(h.clamp(1, PNL_HISTORY_MAX_HOURS))).to_rfc3339());
-    get_trade_stats_since(pool, crate::helpers::dynamic_config::ghosting_now(), since.as_deref()).await
+    get_trade_stats_filtered(pool, crate::helpers::dynamic_config::ghosting_now(), since.as_deref(), strategy, side).await
 }
 
 /// Every completed trade, oldest first — backs the tradelog CSV export
@@ -11252,6 +11286,43 @@ mod reconcile_tests {
         let edge = (now - chrono::Duration::hours(5)).to_rfc3339();
         let from_edge = get_trade_stats_since(&pool, false, Some(&edge)).await;
         assert_eq!(from_edge.count, 1, "a trade booked exactly at the window start is inside it");
+    }
+
+    /// [E105] A strategy or side filter narrows the lifetime figures to that
+    /// slice of the ledger: the viper's lifetime, not the loaded window's.
+    #[tokio::test]
+    async fn trade_stats_can_be_narrowed_to_a_strategy_and_a_side() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::shard_only("test");
+        let now = Utc::now();
+        // Sniper: three YES wins and one NO loss; another viper: one YES win.
+        let rows = [
+            ("Script:my_closing_sniper", "YES", Decimal::new(15, 2)),
+            ("Script:my_closing_sniper", "YES", Decimal::new(15, 2)),
+            ("Script:my_closing_sniper", "yes", Decimal::new(15, 2)),
+            ("Script:my_closing_sniper", "NO", Decimal::new(-988, 2)),
+            ("AnchorStrategy", "YES", Decimal::new(330, 2)),
+        ];
+        for (i, (strategy, side, pnl)) in rows.iter().enumerate() {
+            record_trade_db(&pool, &scope, Decimal::ZERO, strategy, &format!("M{i}"), side,
+                Decimal::new(98, 2), Decimal::ONE, Decimal::new(10, 0),
+                *pnl, "Settlement", Some(now - chrono::Duration::minutes(i as i64))).await;
+        }
+        let sniper = get_trade_stats_filtered(&pool, false, None, Some("Script:my_closing_sniper"), None).await;
+        assert_eq!((sniper.count, sniper.wins, sniper.losses), (4, 3, 1));
+        assert!((sniper.realized_pnl - (0.45 - 9.88)).abs() < 1e-9, "got {}", sniper.realized_pnl);
+
+        let sniper_yes = get_trade_stats_filtered(&pool, false, None, Some("Script:my_closing_sniper"), Some("yes")).await;
+        assert_eq!(sniper_yes.count, 3, "side matches case-insensitively on both ends");
+        assert!((sniper_yes.realized_pnl - 0.45).abs() < 1e-9, "got {}", sniper_yes.realized_pnl);
+
+        let any_no = get_trade_stats_filtered(&pool, false, None, None, Some("NO")).await;
+        assert_eq!((any_no.count, any_no.losses), (1, 1));
+
+        let all = get_trade_stats_filtered(&pool, false, None, None, None).await;
+        assert_eq!(all.count, 5, "no filter is the whole ledger");
+        let unknown = get_trade_stats_filtered(&pool, false, None, Some("NoSuchStrategy"), None).await;
+        assert_eq!(unknown.count, 0);
     }
 
     /// Exactly-flat trades are neither wins nor losses. Folding them into either

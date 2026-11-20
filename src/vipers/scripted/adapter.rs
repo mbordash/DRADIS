@@ -461,6 +461,11 @@ impl ScriptedStrategy {
         if !live.cfg.enabled {
             return Some(viper_status::DISABLED_IN_CONFIG.into());
         }
+        // [E106] Outside its schedule a viper opens nothing; what it holds
+        // keeps its exits, which never pass through here.
+        if !super::schedule::is_open(&live.cfg.schedule, Utc::now()) {
+            return Some(super::schedule::closed_reason(&live.cfg.schedule));
+        }
         if !live.script.manifest.runs_on(crate::venues::venue_name()) {
             return Some(format!("not declared for venue {}", crate::venues::venue_name()));
         }
@@ -1254,7 +1259,32 @@ mod tests {
         assert!(matches!(strat.evaluate_entry(&ctx(asset, dc.clone())).await.unwrap(), StrategySignal::NoSignal),
             "the operator's lower cap wins");
         dc.custom_vipers.insert(asset.into(), CustomViperConfig { enabled: false, live: true, ..Default::default() });
-        assert!(matches!(strat.evaluate_entry(&ctx(asset, dc)).await.unwrap(), StrategySignal::NoSignal), "switched off");
+        assert!(matches!(strat.evaluate_entry(&ctx(asset, dc.clone())).await.unwrap(), StrategySignal::NoSignal), "switched off");
+
+        // [E106] A schedule that excludes today refuses the entry with its
+        // reason; one that covers every minute of every day lets it through.
+        use crate::vipers::scripted::schedule::ScheduleWindow;
+        use chrono::Datelike;
+        let et_day = || chrono::Utc::now().with_timezone(&chrono_tz::US::Eastern).weekday().number_from_monday() as u8;
+        // The adapter reads the real clock, so the day is taken before and after
+        // the call: a run that straddles ET midnight is retried rather than
+        // asserted against the wrong day.
+        let signal = loop {
+            let today = et_day();
+            let other_days: Vec<u8> = (1..=7u8).filter(|d| *d != today).collect();
+            // Same-day windows only, so a listed day's evening cannot spill into today.
+            dc.custom_vipers.insert(asset.into(), CustomViperConfig {
+                live: true, schedule: vec![ScheduleWindow { days: other_days, start: "00:00".into(), end: "24:00".into() }], ..Default::default()
+            });
+            let sig = strat.evaluate_entry(&ctx(asset, dc.clone())).await.unwrap();
+            if et_day() == today { break sig; }
+        };
+        assert!(matches!(signal, StrategySignal::NoSignal), "outside the schedule");
+        assert!(serde_json::to_string(&viper_status::snapshot(Some(asset))).unwrap().contains("outside the viper's schedule"));
+        dc.custom_vipers.insert(asset.into(), CustomViperConfig {
+            live: true, schedule: vec![ScheduleWindow { days: (1..=7).collect(), start: "00:00".into(), end: "24:00".into() }], ..Default::default()
+        });
+        assert!(matches!(strat.evaluate_entry(&ctx(asset, dc)).await.unwrap(), StrategySignal::Entry { .. }), "inside the schedule");
     }
 
     fn buy(price: Decimal, shares: Decimal, ask: Decimal, depth: Decimal, paper: bool, exposure: Decimal) -> Result<CheckedBuy, String> {

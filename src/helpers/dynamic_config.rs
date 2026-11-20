@@ -645,6 +645,11 @@ pub struct CustomViperConfig {
     /// global row), so BTC cannot use the whole cap before ETH/SOL get a turn.
     #[serde(default)]
     pub max_exposure_here_usdc: Option<Decimal>,
+    /// [E106] When the viper may open a position: Eastern-time windows on
+    /// chosen days, empty for always. Instance-wide like `live` and the cap;
+    /// a squadron row follows the global row. Entries only: exits keep running.
+    #[serde(default)]
+    pub schedule: Vec<crate::vipers::scripted::schedule::ScheduleWindow>,
 }
 
 fn default_true() -> bool { true }
@@ -655,6 +660,11 @@ fn default_true() -> bool { true }
 /// Inside one script's entry the patch's fields replace the current ones
 /// (`params` as a whole), and a `null` entry removes the script's settings.
 fn merge_patch_into(obj: &mut serde_json::Map<String, serde_json::Value>, patch: &serde_json::Map<String, serde_json::Value>) {
+    // [E106] `"schedule": null` means "clear it", and the field is a list, so
+    // the stored value is `[]`.
+    let unnull_schedule = |fv: &serde_json::Value| -> serde_json::Value {
+        if fv.is_null() { serde_json::json!([]) } else { fv.clone() }
+    };
     for (k, v) in patch {
         if k == "custom_vipers" {
             if let (Some(cur), Some(p)) = (obj.get_mut(k).and_then(|c| c.as_object_mut()), v.as_object()) {
@@ -662,9 +672,15 @@ fn merge_patch_into(obj: &mut serde_json::Map<String, serde_json::Value>, patch:
                     match (entry, cur.get_mut(name).and_then(|e| e.as_object_mut())) {
                         (serde_json::Value::Null, _) => { cur.remove(name); }
                         (serde_json::Value::Object(fields), Some(existing)) => {
-                            for (f, fv) in fields { existing.insert(f.clone(), fv.clone()); }
+                            for (f, fv) in fields {
+                                existing.insert(f.clone(), if f == "schedule" { unnull_schedule(fv) } else { fv.clone() });
+                            }
                         }
-                        _ => { cur.insert(name.clone(), entry.clone()); }
+                        _ => {
+                            let mut e = entry.clone();
+                            if let Some(sch) = e.get_mut("schedule") { if sch.is_null() { *sch = serde_json::json!([]); } }
+                            cur.insert(name.clone(), e);
+                        }
                     }
                 }
                 continue;
@@ -676,7 +692,7 @@ fn merge_patch_into(obj: &mut serde_json::Map<String, serde_json::Value>, patch:
 
 impl Default for CustomViperConfig {
     fn default() -> Self {
-        Self { enabled: true, live: false, max_exposure_usdc: None, params: Default::default(), paper_here: false, max_exposure_here_usdc: None }
+        Self { enabled: true, live: false, max_exposure_usdc: None, params: Default::default(), paper_here: false, max_exposure_here_usdc: None, schedule: Vec::new() }
     }
 }
 
@@ -2315,21 +2331,29 @@ pub fn reconcile_global_semantics(
     // parameter values follow the fan-out like any other squadron setting.
     let mut viper_drift = false;
     for (name, c) in cfg.custom_vipers.iter_mut() {
-        let (live, cap) = global.custom_vipers.get(name).map_or((false, None), |g| (g.live, g.max_exposure_usdc));
-        if c.live != live || c.max_exposure_usdc != cap {
+        let (live, cap, schedule) = global.custom_vipers.get(name)
+            .map_or((false, None, Vec::new()), |g| (g.live, g.max_exposure_usdc, g.schedule.clone()));
+        if c.live != live || c.max_exposure_usdc != cap || c.schedule != schedule {
             c.live = live;
             c.max_exposure_usdc = cap;
+            c.schedule = schedule;
             viper_drift = true;
         }
     }
     for (name, g) in &global.custom_vipers {
-        if (g.live || g.max_exposure_usdc.is_some()) && !cfg.custom_vipers.contains_key(name) {
-            cfg.custom_vipers.insert(name.clone(), CustomViperConfig { live: g.live, max_exposure_usdc: g.max_exposure_usdc, ..Default::default() });
+        if (g.live || g.max_exposure_usdc.is_some() || !g.schedule.is_empty()) && !cfg.custom_vipers.contains_key(name) {
+            // [E106 review] `enabled` follows the global row here too: an entry
+            // inserted for its schedule must not switch On a script the
+            // instance has Off (the E96 inherited-off loop below would then
+            // skip it, since the key exists).
+            cfg.custom_vipers.insert(name.clone(), CustomViperConfig {
+                enabled: g.enabled, live: g.live, max_exposure_usdc: g.max_exposure_usdc, schedule: g.schedule.clone(), ..Default::default()
+            });
             viper_drift = true;
         }
     }
     if viper_drift {
-        corrected.push("custom_vipers (live, cap)");
+        corrected.push("custom_vipers (live, cap, schedule)");
     }
     // [E102a] While a squadron is held every script on it is paper here,
     // whatever path created its entry (a script that went live after the held
@@ -2339,7 +2363,7 @@ pub fn reconcile_global_semantics(
         for c in cfg.custom_vipers.values_mut() { c.paper_here = true; }
         for (name, g) in &global.custom_vipers {
             cfg.custom_vipers.entry(name.clone()).or_insert_with(|| CustomViperConfig {
-                enabled: g.enabled, live: g.live, max_exposure_usdc: g.max_exposure_usdc, paper_here: true, ..Default::default()
+                enabled: g.enabled, live: g.live, max_exposure_usdc: g.max_exposure_usdc, schedule: g.schedule.clone(), paper_here: true, ..Default::default()
             });
         }
     }
@@ -2349,7 +2373,7 @@ pub fn reconcile_global_semantics(
     let mut inherited = false;
     for (name, g) in &global.custom_vipers {
         if !g.enabled && !cfg.custom_vipers.contains_key(name) {
-            cfg.custom_vipers.insert(name.clone(), CustomViperConfig { enabled: false, live: g.live, max_exposure_usdc: g.max_exposure_usdc, ..Default::default() });
+            cfg.custom_vipers.insert(name.clone(), CustomViperConfig { enabled: false, live: g.live, max_exposure_usdc: g.max_exposure_usdc, schedule: g.schedule.clone(), ..Default::default() });
             inherited = true;
         }
     }
@@ -2621,6 +2645,23 @@ fn refuse_cap_above(patch: &serde_json::Value, manifest_cap: impl Fn(&str) -> Op
     Ok(())
 }
 
+/// [E106] Refuse a patch whose scripted-viper schedule is malformed, naming
+/// the window and the fault, so a bad window is never stored and quietly read
+/// as "always" or "never". A `null` schedule clears it (always).
+fn refuse_bad_schedule(patch: &serde_json::Value) -> Result<()> {
+    let Some(vipers) = patch.as_object().and_then(|o| o.get("custom_vipers")).and_then(|v| v.as_object()) else {
+        return Ok(());
+    };
+    for (name, entry) in vipers {
+        let Some(v) = entry.get("schedule") else { continue };
+        if v.is_null() { continue; }
+        let windows: Vec<crate::vipers::scripted::schedule::ScheduleWindow> = serde_json::from_value(v.clone())
+            .map_err(|e| anyhow::anyhow!("{name}: schedule must be a list of {{days, start, end}} windows: {e}"))?;
+        crate::vipers::scripted::schedule::validate(&windows).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Refuse a patch that sets `us_taker_fee_rate` below the cheapest tier
 /// (other than zero), which the next load would raise again.
 fn refuse_fee_floor_violations(patch: &serde_json::Value) -> Result<()> {
@@ -2884,6 +2925,7 @@ impl DynamicConfig {
         refuse_fee_floor_violations(&patch)?;
         refuse_negative_drawdown_limit(&patch)?;
         refuse_cap_above_manifest(&patch)?;
+        refuse_bad_schedule(&patch)?;
         // [E102a] This writes the global row; squadron-only switches never
         // travel through it (the squadron route is `apply_squadron_patch_as`).
         refuse_squadron_only_keys(&patch)?;
@@ -3154,6 +3196,7 @@ impl DynamicConfig {
         refuse_negative_drawdown_limit(&patch)?;
         refuse_cap_above_manifest(&patch)?;
         refuse_nonpositive_cap_here(&patch)?;
+        refuse_bad_schedule(&patch)?;
 
         // [E102b review] A squadron row with no entry for a script reads the
         // global entry (`custom_viper`). A patch naming that script here (Off
@@ -3198,10 +3241,10 @@ impl DynamicConfig {
         // intended outcome, not the patch overreaching. Warn only when the
         // patch itself named a script's live switch or cap.
         let named_live_or_cap = patch.get("custom_vipers").and_then(|v| v.as_object()).is_some_and(|m| {
-            m.values().any(|e| e.get("live").is_some() || e.get("max_exposure_usdc").is_some())
+            m.values().any(|e| e.get("live").is_some() || e.get("max_exposure_usdc").is_some() || e.get("schedule").is_some())
         });
         if !named_live_or_cap {
-            overridden.retain(|k| *k != "custom_vipers (live, cap)");
+            overridden.retain(|k| *k != "custom_vipers (live, cap, schedule)");
         }
         if !overridden.is_empty() {
             warn!(
@@ -3288,13 +3331,62 @@ mod custom_viper_patch_tests {
         sq.custom_vipers.insert("alpha".into(), CustomViperConfig { enabled: false, live: true, max_exposure_usdc: Some(Decimal::from(50)), ..Default::default() });
         sq.custom_vipers.insert("ghost".into(), CustomViperConfig { live: true, ..Default::default() });
         let corrected = reconcile_global_semantics(&mut sq, &global);
-        assert!(corrected.contains(&"custom_vipers (live, cap)"), "{corrected:?}");
+        assert!(corrected.contains(&"custom_vipers (live, cap, schedule)"), "{corrected:?}");
         let a = &sq.custom_vipers["alpha"];
         assert!(!a.live && a.max_exposure_usdc == Some(Decimal::from(3)), "global says paper, cap 3");
         assert!(!a.enabled, "the squadron's own Off stays");
         assert!(!sq.custom_vipers["ghost"].live, "a script the global row does not name is not live");
         assert!(sq.custom_vipers["beta"].live, "global live reaches a squadron with no row for it");
         assert!(reconcile_global_semantics(&mut sq, &global).is_empty(), "idempotent");
+    }
+
+    /// [E106] The schedule is instance-wide like the Live switch: a squadron
+    /// row follows the global row's windows, and a script that only has a
+    /// schedule on the global row reaches a squadron with no entry for it.
+    #[test]
+    fn the_schedule_follows_the_global_row() {
+        use crate::vipers::scripted::schedule::ScheduleWindow;
+        let win = vec![ScheduleWindow { days: vec![1, 2, 3, 4, 5], start: "09:30".into(), end: "16:00".into() }];
+        let mut global = DynamicConfig::default();
+        global.custom_vipers.insert("alpha".into(), CustomViperConfig { schedule: win.clone(), ..Default::default() });
+        let mut sq = DynamicConfig::default();
+        sq.custom_vipers.insert("alpha".into(), CustomViperConfig { enabled: false, ..Default::default() });
+        let corrected = reconcile_global_semantics(&mut sq, &global);
+        assert!(corrected.contains(&"custom_vipers (live, cap, schedule)"), "{corrected:?}");
+        assert_eq!(sq.custom_vipers["alpha"].schedule, win, "the squadron row carries the global windows");
+        assert!(!sq.custom_vipers["alpha"].enabled, "its own Off stays");
+        global.custom_vipers.insert("beta".into(), CustomViperConfig { schedule: win.clone(), ..Default::default() });
+        reconcile_global_semantics(&mut sq, &global);
+        assert_eq!(sq.custom_vipers["beta"].schedule, win, "a schedule-only global entry reaches a squadron with no row");
+        assert!(reconcile_global_semantics(&mut sq, &global).is_empty(), "idempotent");
+        // Off on the instance plus a schedule: the squadron row it creates is Off too.
+        global.custom_vipers.insert("gamma".into(), CustomViperConfig { enabled: false, schedule: win.clone(), ..Default::default() });
+        reconcile_global_semantics(&mut sq, &global);
+        let g = &sq.custom_vipers["gamma"];
+        assert!(!g.enabled && g.schedule == win, "a scheduled script the instance has Off stays Off on a squadron with no row");
+    }
+
+    /// [E106] A malformed schedule is refused with the window and the fault;
+    /// a null clears it to the empty list ("always").
+    #[test]
+    fn a_bad_schedule_is_refused_and_null_clears_it() {
+        let bad = serde_json::json!({"custom_vipers": {"s": {"schedule": [{"days": [1], "start": "9:00", "end": "17:00"}]}}});
+        let err = refuse_bad_schedule(&bad).unwrap_err().to_string();
+        assert!(err.contains("s: schedule window 1") && err.contains("not HH:MM"), "{err}");
+        let shape = serde_json::json!({"custom_vipers": {"s": {"schedule": "weekdays"}}});
+        assert!(refuse_bad_schedule(&shape).unwrap_err().to_string().contains("list of"));
+        let ok = serde_json::json!({"custom_vipers": {"s": {"schedule": [{"days": [6, 7], "start": "22:00", "end": "06:00"}]}}});
+        assert!(refuse_bad_schedule(&ok).is_ok());
+        assert!(refuse_bad_schedule(&serde_json::json!({"custom_vipers": {"s": {"schedule": null}}})).is_ok());
+
+        let mut cur = serde_json::json!({"custom_vipers": {"s": {"enabled": true, "schedule": [{"days": [1], "start": "09:00", "end": "17:00"}]}}});
+        let patch = serde_json::json!({"custom_vipers": {"s": {"schedule": null}}});
+        merge_patch_into(cur.as_object_mut().unwrap(), patch.as_object().unwrap());
+        assert_eq!(cur["custom_vipers"]["s"]["schedule"], serde_json::json!([]), "null clears to the empty list");
+        let parsed: CustomViperConfig = serde_json::from_value(cur["custom_vipers"]["s"].clone()).unwrap();
+        assert!(parsed.schedule.is_empty() && parsed.enabled, "the cleared entry still loads, and keeps its other fields");
+        let absent: CustomViperConfig = serde_json::from_value(serde_json::json!({"enabled": true})).unwrap();
+        assert!(absent.schedule.is_empty(), "an entry saved before 1.8.8 has no schedule field and reads as always");
     }
 
     /// [E96] An imported script arrives off on the global row; a squadron

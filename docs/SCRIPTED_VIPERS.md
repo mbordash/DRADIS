@@ -295,6 +295,15 @@ feed is not running.
 - **Live** and **your cap** are instance-wide. A squadron cannot disagree
   with them: the engine re-applies the instance's values whenever a squadron
   loads its config.
+- **Schedule** (Settings tab) is the days and Eastern-time windows in which
+  the viper may open a position, as many windows as you like; no schedule
+  means any time. Outside every window it opens nothing and its card says
+  "outside the viper's schedule". What it holds keeps its exits around the
+  clock, so a position opened at 15:55 inside a 09:30 to 16:00 window is still
+  managed at 16:05. An end at or before the start runs overnight into the next
+  day (22:00 to 06:00 on Friday closes Saturday 06:00); 00:00 as the end means
+  midnight, and 00:00 to 00:00 is the whole day. Daylight saving is applied. Instance-wide, like Live. A script can
+  still read `ctx.et_hour` itself for anything finer.
 
 ## The paper ledger
 
