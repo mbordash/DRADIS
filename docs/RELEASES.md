@@ -4,6 +4,10 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
+## 1.9.1 (unreleased)
+
+- Kalshi: a Time Decay pair the exchange netted into cash could be booked twice. Each squadron runs its own settlement sweep, and two sweeps reaching the same pair in the same second both passed the duplicate check before either had written its row, so the Trade Log showed one $0.15 win as two (2026-11-21). The sweeps now take turns on netted pairs, so the second one finds the first one's row and books nothing.
+
 ## 1.9.0 (2026-11-20)
 
 - Build a Viper: a schedule for each viper on its Settings tab. Check the days, set a start and an end in Eastern time (00:00 to 00:00 for all day), add as many windows as you need. Outside every window the viper opens nothing and its card says so; positions it holds keep their exits around the clock. A window whose end is at or before its start runs overnight. The schedule is instance-wide, like the Live switch, and a malformed window is refused with its reason rather than saved. Requested by a customer who runs some strategies only on quiet days and hours.

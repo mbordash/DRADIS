@@ -7108,6 +7108,10 @@ fn fee_share(fee: Decimal, part: Decimal, qty: Decimal) -> Decimal {
     if qty <= Decimal::ZERO || part >= qty { fee } else { (fee * part / qty).round_dp(6) }
 }
 
+/// [B123] Serializes [`book_venue_netted_pairs`] across the squadrons' sweeps
+/// so a pair's duplicate check and its booking cannot interleave.
+static NETTED_PAIR_SWEEP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// [B119] Book every strategy pair the venue netted into cash: a YES row and a
 /// NO row of one strategy, squadron and market, both confirmed by the fill
 /// feed, on a venue that nets ([`venue_pair_netting`]), where at least one leg
@@ -7147,6 +7151,15 @@ fn fee_share(fee: Decimal, part: Decimal, qty: Decimal) -> Decimal {
 /// pairs; a confirmed leg whose partner is still pending is logged, since the
 /// fill feed is the only thing that can promote a netted partner's row.
 /// Returns the rows closed and the tokens of pairs waited on.
+///
+/// [B123] One sweep at a time. Every squadron runs its own settlement sweep
+/// against the shared database, and the "already booked" check reads the
+/// ledger before the booking transaction opens, so two sweeps reaching the
+/// same pair in the same second both saw nothing and both inserted (production
+/// trades 632 and 633, 2026-11-21: one $0.1545 pair booked twice, 0.7 ms
+/// apart). The sweep now holds [`NETTED_PAIR_SWEEP`] from the check through
+/// the commit, so the second sweep reads the first's row and logs "already
+/// booked".
 async fn book_venue_netted_pairs(
     pool: &SqlitePool,
     live_token_ids: &std::collections::HashSet<String>,
@@ -7156,6 +7169,7 @@ async fn book_venue_netted_pairs(
     defer_tokens: &std::collections::HashSet<String>,
 ) -> (usize, std::collections::HashSet<String>) {
     use std::collections::{BTreeMap, HashMap, HashSet};
+    let _one_sweep = NETTED_PAIR_SWEEP.lock().await;
     let mut waiting: HashSet<String> = HashSet::new();
     // id, squadron, strategy, market, side, token, entry, shares, entry_fee, venue, class, underlying, status, ts, current_price
     type Row = (i64, Option<String>, String, String, String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, String, Option<String>);
@@ -10355,6 +10369,29 @@ mod reconcile_tests {
         let rows: Vec<(String, String)> = sqlx::query_as("SELECT pnl, reason FROM trades").fetch_all(&pool).await.unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!((dec_of(&rows[0].0), rows[0].1.as_str()), (dec!(0.1545), NETTED_PAIR_REASON));
+    }
+
+    /// [B123] Five squadron sweeps reach the same netted pair in the same pass:
+    /// the pair is booked once, not once per sweep (production 632/633).
+    #[tokio::test]
+    async fn concurrent_sweeps_book_a_netted_pair_once() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::crypto("kalshi", "kalshi", "btc");
+        let market = "Bitcoin price on Nov 21, 2026? — $60,200 or above";
+        let (yes, no) = ("KXBTCD-26NOV2115-T60199.99#yes", "KXBTCD-26NOV2115-T60199.99#no");
+        record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", yes, market, "YES", dec!(0.49), dec!(5.15), false, "confirmed").await;
+        record_open_position_with_status(&pool, &scope, "btc-open", "TimeDecayStrategy", no, market, "NO", dec!(0.48), dec!(5.15), false, "confirmed").await;
+        forget_confirmation(yes);
+        forget_confirmation(no);
+        let (none, no_sizes) = (HashSet::new(), HashMap::new());
+        let sweep = || purge_stale_open_positions(&pool, &none, &no_sizes, &none);
+        let closed = tokio::join!(sweep(), sweep(), sweep(), sweep(), sweep());
+        assert_eq!(closed.0 + closed.1 + closed.2 + closed.3 + closed.4, 2, "{closed:?}");
+        let rows: Vec<(String, String)> = sqlx::query_as("SELECT pnl, reason FROM trades").fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1, "one row for the pair, however many sweeps saw it: {rows:?}");
+        assert_eq!((dec_of(&rows[0].0), rows[0].1.as_str()), (dec!(0.1545), NETTED_PAIR_REASON));
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions").fetch_one(&pool).await.unwrap();
+        assert_eq!(left, 0);
     }
 
     /// [B119] A leg the account still holds is not half of a netted pair: the
