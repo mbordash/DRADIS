@@ -1401,18 +1401,24 @@ pub async fn anchor_shadow_open(
     // when the viper could not measure them.
     basis_spread: Option<f64>,
     spot_range: Option<f64>,
+    // [E108] The price raptor's 60- and 10-minute drift of the oracle at the
+    // moment of entry, in the oracle's units (positive for a rise); `None` when
+    // the raptor had no history yet. Recorded on both lanes so a trend rule can
+    // be tested on the ledger instead of joined to exchange candles offline.
+    drift_60m: Option<f64>,
+    drift_10m: Option<f64>,
 ) -> bool {
     match sqlx::query(
         "INSERT INTO anchor_shadow
             (asset, lane, squadron_id, market_key, condition_id, token_id, market, side, close_s, opened_at,
              entry_price, shares, entry_fee, fair, anchor_basis, sigma, z, secs_left, spot, strike, ask_depth, ghost,
-             basis_spread, spot_range)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+             basis_spread, spot_range, drift_60m, drift_10m)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(asset).bind(lane).bind(squadron_id).bind(market_key).bind(condition_id).bind(token_id).bind(market).bind(side)
         .bind(close_s).bind(Utc::now().to_rfc3339())
         .bind(entry_price).bind(shares).bind(entry_fee).bind(fair).bind(anchor_basis).bind(sigma).bind(z)
         .bind(secs_left).bind(spot).bind(strike).bind(ask_depth).bind(ghost.map(|g| g as i32))
-        .bind(basis_spread).bind(spot_range)
+        .bind(basis_spread).bind(spot_range).bind(drift_60m).bind(drift_10m)
         .execute(pool).await
     {
         Ok(_) => true,
@@ -2217,6 +2223,13 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) {
     // and on fills never seen with a bid.
     let _ = sqlx::query("ALTER TABLE anchor_shadow ADD COLUMN peak_bid REAL").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE anchor_shadow ADD COLUMN peak_secs_left INTEGER").execute(pool).await;
+    // [E108] `drift_60m` and `drift_10m`: the oracle's move over the trailing
+    // hour and ten minutes at entry, in its units, from the price raptor (1.9.1).
+    // The drift gate was calibrated offline against exchange candles; the ledger
+    // now carries the measurement so the next rule is tested on rows that were
+    // not used to invent it. NULL on rows written before the columns existed.
+    let _ = sqlx::query("ALTER TABLE anchor_shadow ADD COLUMN drift_60m REAL").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE anchor_shadow ADD COLUMN drift_10m REAL").execute(pool).await;
     let _ = sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_anchor_shadow_live
              ON anchor_shadow(asset, lane, closed_at)"

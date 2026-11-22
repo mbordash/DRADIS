@@ -295,6 +295,11 @@ pub struct Reading {
     /// not by the time to close, so the same offset reads the same at every
     /// point in the hour.
     pub basis_sigmas: f64,
+    /// [E108] The feed's trailing-hour move as a fraction of spot (the price
+    /// raptor's 60-minute drift over the oracle price), positive for a rise.
+    /// Not part of the model: `reading` leaves it at zero and the caller sets
+    /// it, so the drift gate reads the tape and not the anchor.
+    pub drift_frac: f64,
 }
 
 /// `Φ(ln((S − b)/K) / (σ√T))`, `|ln((S − b)/K)| / (σ√T)` and `|b| / (σ√W·S)`,
@@ -304,7 +309,7 @@ pub fn reading(spot: f64, strike: f64, basis: f64, sigma: f64, secs_left: f64, w
     if level <= 0.0 || strike <= 0.0 || sigma <= 0.0 || secs_left <= 0.0 || window_secs <= 0.0 { return None; }
     let d = (level / strike).ln() / (sigma * secs_left.sqrt());
     if !d.is_finite() { return None; }
-    Some(Reading { fair_yes: norm_cdf(d), z: d.abs(), basis_sigmas: basis.abs() / (sigma * window_secs.sqrt() * spot) })
+    Some(Reading { fair_yes: norm_cdf(d), z: d.abs(), basis_sigmas: basis.abs() / (sigma * window_secs.sqrt() * spot), drift_frac: 0.0 })
 }
 
 // ─── Gates ───────────────────────────────────────────────────────────────────
@@ -336,6 +341,11 @@ pub struct Gates {
     pub contracts: f64,
     pub max_exposure: f64,
     pub obi_adverse_block: f64,
+    /// [E108] The trailing-hour drift of the feed, as a fraction of spot,
+    /// beyond which a side the drift ran AGAINST is not bought (YES after a
+    /// fall, NO after a rise); zero disables the gate. See
+    /// `config::ANCHOR_MAX_ADVERSE_DRIFT_PCT`.
+    pub max_adverse_drift: f64,
 }
 
 impl Gates {
@@ -353,8 +363,28 @@ impl Gates {
             contracts: f(dc.anchor_contracts),
             max_exposure: f(dc.anchor_max_exposure_usdc),
             obi_adverse_block: f(dc.anchor_obi_adverse_block),
+            max_adverse_drift: f(dc.anchor_max_adverse_drift_pct),
         }
     }
+}
+
+/// [E108] Whether buying this side fades the hour's drift: the feed's
+/// trailing-hour move as a fraction of spot (`Reading::drift_frac`, from the
+/// price raptor's 60-minute drift) ran against the side by more than
+/// `max_adverse_drift`. YES after a fall and NO after a rise are the fades. A
+/// cap of zero or an unreadable drift disables the gate.
+///
+/// Calibrated on the production ledger 2026-10-21 to 2026-11-20 (110 entries,
+/// 136 control samples, Binance 1-minute closes): entries WITH the drift made
+/// +12.2c per contract (57% won) and entries against it -3.2c (39%); the
+/// control lane, drawn from the same moments, split the same way (+11.5c vs
+/// -7.5c). A symmetric cap on |drift| was tried first and rejected: the
+/// largest-drift buckets were the entry lane's best, so what loses is fading
+/// the move, not the move itself.
+pub fn fades_drift(is_yes: bool, drift_frac: f64, max_adverse_drift: f64) -> bool {
+    if max_adverse_drift <= 0.0 || !drift_frac.is_finite() { return false; }
+    let adverse = if is_yes { -drift_frac } else { drift_frac };
+    adverse > max_adverse_drift
 }
 
 /// The side the rule would buy, and the reading it would buy it on.
@@ -381,6 +411,8 @@ pub enum Refusal {
     AskTooThin,
     ObiAdverse,
     ExposureCap,
+    /// [E108] The cheap side is the one the hour's drift ran against.
+    FadesDrift,
 }
 
 impl Refusal {
@@ -392,6 +424,7 @@ impl Refusal {
             Self::AnchorAdrift     => "anchor adrift: the feed moved inside the sample window",
             Self::NoAsk            => "no ask on either side",
             Self::AskOutsideBand   => "ask outside the entry price band",
+            Self::FadesDrift       => "fades the hour's drift: the feed ran against the cheap side",
             Self::EdgeBelowBar     => "edge below the bar",
             Self::AskTooThin       => "ask too thin for the size",
             Self::ObiAdverse       => "OBI adverse: no bid support on the cheap side",
@@ -440,12 +473,15 @@ pub fn choose_side(
     for (is_yes, q, fair) in [(true, yes, r.fair_yes), (false, no, 1.0 - r.fair_yes)] {
         let Some(ask) = q.ask else { note(0, Refusal::NoAsk); continue };
         if ask < g.min_price || ask >= g.max_price { note(1, Refusal::AskOutsideBand); continue; }
+        // [E108] A cheap side the hour ran against is cheap because the market
+        // expects the move to carry; the record says it mostly does.
+        if fades_drift(is_yes, r.drift_frac, g.max_adverse_drift) { note(2, Refusal::FadesDrift); continue; }
         let fee_at = fee(ask);
         let edge = fair - ask - fee_at;
-        if edge < g.min_edge { note(2, Refusal::EdgeBelowBar); continue; }
-        if q.ask_depth < g.contracts { note(3, Refusal::AskTooThin); continue; }
-        if q.obi < g.obi_adverse_block { note(4, Refusal::ObiAdverse); continue; }
-        if open_notional + ask * g.contracts > g.max_exposure { note(5, Refusal::ExposureCap); continue; }
+        if edge < g.min_edge { note(3, Refusal::EdgeBelowBar); continue; }
+        if q.ask_depth < g.contracts { note(4, Refusal::AskTooThin); continue; }
+        if q.obi < g.obi_adverse_block { note(5, Refusal::ObiAdverse); continue; }
+        if open_notional + ask * g.contracts > g.max_exposure { note(6, Refusal::ExposureCap); continue; }
         let pick = Pick { is_yes, ask, fair, edge, fee: fee_at };
         if best.is_none_or(|b| pick.edge > b.edge) { best = Some(pick); }
     }
@@ -472,6 +508,11 @@ pub fn control_side(r: Reading, secs_left: i64, yes: SideQuote, no: SideQuote, g
     for (is_yes, q, fair) in [(true, yes, r.fair_yes), (false, no, 1.0 - r.fair_yes)] {
         let Some(ask) = q.ask else { continue };
         if ask < g.min_price || ask >= g.max_price || q.ask_depth < g.contracts { continue; }
+        // [E108] The control is the OTHER side of the same moment, so it stands
+        // aside exactly when the entry rule would refuse the side opposite it:
+        // gating each lane on its own side would make them mutually exclusive
+        // in every drifting hour and turn the control into a momentum lane.
+        if fades_drift(!is_yes, r.drift_frac, g.max_adverse_drift) { continue; }
         let edge = fair - ask;
         if edge > -g.min_edge { continue; }
         let pick = Pick { is_yes, ask, fair, edge, fee: 0.0 };
@@ -552,6 +593,9 @@ struct PendingEntry {
     /// window at the moment of entry, for the ledger row.
     basis_spread: f64,
     spot_range: Option<f64>,
+    /// [E108] The raptor's 60- and 10-minute drift at entry, for the ledger row.
+    drift_60m: Option<f64>,
+    drift_10m: Option<f64>,
     /// The mode the order was sent in (`OrderParams::ghost_mode`), stamped on
     /// the ledger row so a switch flipped before the fill is ledgered cannot
     /// change who books the settlement.
@@ -822,7 +866,7 @@ impl AnchorStrategy {
                 &pool, &asset, ANCHOR_LANE_ENTRY, &pe.squadron_id, &pe.market_key, &pe.condition_id, &token,
                 &pe.market_name, pe.side, pe.close_s, price, shares, fee, pe.fair, pe.anchor_basis,
                 pe.sigma, pe.z, pe.secs_left, pe.spot, pe.strike, pe.ask_depth, Some(pe.ghost),
-                Some(pe.basis_spread), pe.spot_range,
+                Some(pe.basis_spread), pe.spot_range, pe.drift_60m, pe.drift_10m,
             ).await;
             if ok {
                 lock(&g.held).insert(key);
@@ -1276,22 +1320,27 @@ impl Strategy for AnchorStrategy {
             });
             return Ok(StrategySignal::NoSignal);
         };
-        let Some(r) = reading(spot, strike, anchor.basis, sigma, secs_left as f64, dc.anchor_max_age_secs as f64) else {
+        let Some(mut r) = reading(spot, strike, anchor.basis, sigma, secs_left as f64, dc.anchor_max_age_secs as f64) else {
             idle("fair value not computable");
             return Ok(StrategySignal::NoSignal);
         };
+        // [E108] The hour's drift, read from the price raptor (zero until it has
+        // an hour of history, which leaves the gate open rather than shut).
+        let drift_60m = ctx.snapshot.oracle_drift_60m.to_f64().filter(|d| *d != 0.0);
+        let drift_10m = ctx.snapshot.oracle_drift_10m.to_f64().filter(|d| *d != 0.0);
+        r.drift_frac = drift_60m.unwrap_or(0.0) / spot;
         // The feed's own range over the anchor's sample window, from the vol
         // sampler's spot series: the context a large offset is read against.
         let spot_range = spot_range_from(&lock(&g.sigma), now_s, dc.anchor_min_age_secs, dc.anchor_max_age_secs);
         let yes = Self::side_quote(&ctx.snapshot, true);
         let no = Self::side_quote(&ctx.snapshot, false);
         crate::helpers::viper_status::report_detail(&ctx.crypto_filter, STRATEGY_NAME, Some(format!(
-            "anchor {:+.0} ({} samples, spread {:.0}, {:.2} window σ) | feed range {} | fair YES {:.3} vs ask {} | z {:.2} | vol {:.0}% | T {}s | {}",
+            "anchor {:+.0} ({} samples, spread {:.0}, {:.2} window σ) | feed range {} | fair YES {:.3} vs ask {} | z {:.2} | vol {:.0}% | drift {:+.2}% | T {}s | {}",
             -anchor.basis, anchor.samples, anchor.spread, r.basis_sigmas,
             spot_range.map_or("n/a".to_string(), |x| format!("{x:.0}")),
             r.fair_yes,
             yes.ask.map_or("n/a".to_string(), |a| format!("{a:.3}")),
-            r.z, vol_ann * 100.0, secs_left, lock(&g.summary).1,
+            r.z, vol_ann * 100.0, r.drift_frac * 100.0, secs_left, lock(&g.summary).1,
         )));
 
         let Some(pool) = crate::helpers::db::pool_for(&asset) else {
@@ -1342,6 +1391,7 @@ impl Strategy for AnchorStrategy {
                     &pool, &asset, ANCHOR_LANE_CONTROL, &ctx.squadron_id, &market_key, &market.condition_id,
                     token.as_str(), &market.market_name, side, close_s, c.ask, gates.contracts, fee_at, c.fair,
                     anchor.basis, sigma, r.z, secs_left, spot, strike, depth, None, Some(anchor.spread), spot_range,
+                    drift_60m, drift_10m,
                 ).await {
                     lock(&g.held).insert(key);
                     info!("⚓ Anchor control on {}: {} at ${:.3} is {:.3} over fair {:.3}; recorded, never taken",
@@ -1354,7 +1404,7 @@ impl Strategy for AnchorStrategy {
             Ok(p) => p,
             Err(why) => {
                 idle(why.label());
-                if matches!(why, Refusal::AskTooThin | Refusal::ObiAdverse | Refusal::ExposureCap | Refusal::AnchorAdrift | Refusal::TooCloseToStrike)
+                if matches!(why, Refusal::AskTooThin | Refusal::ObiAdverse | Refusal::ExposureCap | Refusal::AnchorAdrift | Refusal::TooCloseToStrike | Refusal::FadesDrift)
                     && crate::vipers::gate_log_permitted(STRATEGY_NAME, &asset, why.label(), GATE_LOG_INTERVAL_SECS)
                 {
                     info!("⚓ Anchor hold on {}: {} (fair YES {:.3}, z {:.2}, T {}s)",
@@ -1408,6 +1458,8 @@ impl Strategy for AnchorStrategy {
             ask_depth: depth,
             basis_spread: anchor.spread,
             spot_range,
+            drift_60m,
+            drift_10m,
             ghost: dc.ghost_mode,
             sent_at: Instant::now(),
         });
@@ -1557,10 +1609,50 @@ mod tests {
         Gates {
             min_edge: 0.04, max_z: 1.0, min_z: 0.10, max_basis_sigmas: 1.0, min_price: 0.20, max_price: 0.60,
             min_secs_to_close: 300, max_secs_to_close: 1800, contracts: 10.0, max_exposure: 12.0,
-            obi_adverse_block: -0.60,
+            obi_adverse_block: -0.60, max_adverse_drift: 0.0,
         }
     }
     fn q(ask: f64, depth: f64) -> SideQuote { SideQuote { ask: Some(ask), ask_depth: depth, obi: 0.0 } }
+
+    /// [E108] The drift gate refuses the side the hour ran against, by more than
+    /// the cap, and only that side; a zero cap disables it.
+    #[test]
+    fn the_drift_gate_refuses_only_the_side_the_hour_ran_against() {
+        assert!(fades_drift(true, -0.004, 0.003), "YES after a 0.4% fall");
+        assert!(!fades_drift(true, 0.004, 0.003), "YES after a rise rides the drift");
+        assert!(fades_drift(false, 0.004, 0.003), "NO after a 0.4% rise");
+        assert!(!fades_drift(false, -0.004, 0.003));
+        assert!(!fades_drift(true, -0.002, 0.003), "inside the cap is not a trend");
+        assert!(!fades_drift(true, -0.004, 0.0), "zero cap disables");
+        assert!(!fades_drift(true, f64::NAN, 0.003), "unreadable drift leaves the gate open");
+    }
+
+    /// [E108] Through the entry rule: a cheap YES after a fall is refused with
+    /// its own reason, the same book after a rise is bought, and a NO the drift
+    /// favors is bought while the YES it ran against is skipped. The control
+    /// lane applies the same gate.
+    #[test]
+    fn choose_side_sits_out_a_fade_of_the_hours_drift() {
+        let fee = |_: f64| 0.01;
+        let g = Gates { max_adverse_drift: 0.003, ..gates() };
+        let fell = Reading { fair_yes: 0.40, z: 0.3, basis_sigmas: 0.1, drift_frac: -0.005 };
+        assert_eq!(choose_side(fell, 1200, q(0.30, 50.0), q(0.75, 50.0), &g, 0.0, fee), Err(Refusal::FadesDrift));
+        let rose = Reading { drift_frac: 0.005, ..fell };
+        assert!(matches!(choose_side(rose, 1200, q(0.30, 50.0), q(0.75, 50.0), &g, 0.0, fee), Ok(Pick { is_yes: true, .. })));
+        // Both sides cheap against the reading: the one the drift favors wins.
+        let both = Reading { fair_yes: 0.50, z: 0.3, basis_sigmas: 0.1, drift_frac: -0.005 };
+        assert!(matches!(choose_side(both, 1200, q(0.40, 50.0), q(0.40, 50.0), &g, 0.0, fee), Ok(Pick { is_yes: false, .. })));
+        // The same gates with the cap off buy the YES after the fall as before.
+        assert!(matches!(choose_side(fell, 1200, q(0.30, 50.0), q(0.75, 50.0), &gates(), 0.0, fee), Ok(Pick { is_yes: true, .. })));
+        // Control: the expensive side is NO here (fair NO 0.50 vs ask 0.55), the
+        // other side of a cheap YES. After a fall the entry rule refuses that YES,
+        // so the control stands aside with it; after a rise the YES trades and
+        // the control records, the two lanes drawn from the same moments.
+        let control_fell = Reading { fair_yes: 0.50, z: 0.3, basis_sigmas: 0.1, drift_frac: -0.005 };
+        assert!(control_side(control_fell, 1200, q(0.30, 50.0), q(0.55, 50.0), &g).is_none());
+        let control_rose = Reading { drift_frac: 0.005, ..control_fell };
+        assert!(control_side(control_rose, 1200, q(0.30, 50.0), q(0.55, 50.0), &g).is_some_and(|p| !p.is_yes));
+    }
 
     /// A fill the ledger already holds is counted from the ledger, not twice;
     /// a provisional or not-yet-ledgered position is counted here; another
@@ -1596,13 +1688,13 @@ mod tests {
     /// cents net of fee, while NO at 0.58 against 0.48 fair does not.
     #[test]
     fn the_rule_buys_the_cheap_side_and_only_inside_its_gates() {
-        let r = Reading { fair_yes: 0.52, z: 0.3, basis_sigmas: 0.1 };
+        let r = Reading { fair_yes: 0.52, z: 0.3, basis_sigmas: 0.1, drift_frac: 0.0 };
         let p = choose_side(r, 1200, q(0.44, 50.0), q(0.58, 50.0), &gates(), 0.0, fee).unwrap();
         assert!(p.is_yes);
         assert!((p.edge - (0.52 - 0.44 - fee(0.44))).abs() < 1e-12);
         // The same book one minute from the close, or far from the strike, is refused before pricing.
         assert_eq!(choose_side(r, 60, q(0.44, 50.0), q(0.58, 50.0), &gates(), 0.0, fee), Err(Refusal::OutsideWindow));
-        assert_eq!(choose_side(Reading { fair_yes: 0.52, z: 1.5, basis_sigmas: 0.1 }, 1200, q(0.44, 50.0), q(0.58, 50.0), &gates(), 0.0, fee),
+        assert_eq!(choose_side(Reading { fair_yes: 0.52, z: 1.5, basis_sigmas: 0.1, drift_frac: 0.0 }, 1200, q(0.44, 50.0), q(0.58, 50.0), &gates(), 0.0, fee),
                    Err(Refusal::TooFarFromStrike));
         // A thin ask, an all-offer book, and a full lane each stop the side that otherwise qualified.
         assert_eq!(choose_side(r, 1200, q(0.44, 4.0), q(0.58, 50.0), &gates(), 0.0, fee), Err(Refusal::AskTooThin));
@@ -1610,7 +1702,7 @@ mod tests {
         assert_eq!(choose_side(r, 1200, toxic, q(0.58, 50.0), &gates(), 0.0, fee), Err(Refusal::ObiAdverse));
         assert_eq!(choose_side(r, 1200, q(0.44, 50.0), q(0.58, 50.0), &gates(), 9.0, fee), Err(Refusal::ExposureCap));
         // Outside the price band the edge is never computed.
-        assert_eq!(choose_side(Reading { fair_yes: 0.80, z: 0.8, basis_sigmas: 0.1 }, 1200, q(0.70, 50.0), q(0.32, 50.0), &gates(), 0.0, fee),
+        assert_eq!(choose_side(Reading { fair_yes: 0.80, z: 0.8, basis_sigmas: 0.1, drift_frac: 0.0 }, 1200, q(0.70, 50.0), q(0.32, 50.0), &gates(), 0.0, fee),
                    Err(Refusal::EdgeBelowBar), "NO at 0.32 against fair 0.20 is dear; YES at 0.70 is outside the band");
         // No ask at all on either side.
         let none = SideQuote { ask: None, ask_depth: 0.0, obi: -1.0 };
@@ -1620,7 +1712,7 @@ mod tests {
     /// The reported refusal is the gate the best side reached, not the first in the list.
     #[test]
     fn the_refusal_names_the_binding_gate() {
-        let r = Reading { fair_yes: 0.52, z: 0.3, basis_sigmas: 0.1 };
+        let r = Reading { fair_yes: 0.52, z: 0.3, basis_sigmas: 0.1, drift_frac: 0.0 };
         // YES has the edge but no depth; NO fails earlier on price. The answer is depth.
         assert_eq!(choose_side(r, 1200, q(0.44, 1.0), q(0.70, 50.0), &gates(), 0.0, fee), Err(Refusal::AskTooThin));
     }
@@ -1629,7 +1721,7 @@ mod tests {
     /// market's view, and both lanes stand aside. Zero disables the gate.
     #[test]
     fn the_rule_stands_aside_at_the_strike_on_both_lanes() {
-        let at_strike = Reading { fair_yes: 0.47, z: 0.05, basis_sigmas: 0.1 };
+        let at_strike = Reading { fair_yes: 0.47, z: 0.05, basis_sigmas: 0.1, drift_frac: 0.0 };
         assert_eq!(choose_side(at_strike, 1796, q(0.40, 400.0), q(0.62, 400.0), &gates(), 0.0, fee),
                    Err(Refusal::TooCloseToStrike), "YES at 0.40 against 0.47 is the 2026-10-22 7 PM loss");
         assert!(control_side(at_strike, 1796, q(0.40, 400.0), q(0.62, 400.0), &gates()).is_none(),
@@ -1638,7 +1730,7 @@ mod tests {
         open.min_z = 0.0;
         assert!(choose_side(at_strike, 1796, q(0.40, 400.0), q(0.62, 400.0), &open, 0.0, fee).is_ok(), "zero disables the gate");
         // Just past the bound the rule prices as before.
-        let near = Reading { fair_yes: 0.549, z: 0.12, basis_sigmas: 0.1 };
+        let near = Reading { fair_yes: 0.549, z: 0.12, basis_sigmas: 0.1, drift_frac: 0.0 };
         assert!(choose_side(near, 1226, q(0.46, 60.0), q(0.56, 60.0), &gates(), 0.0, fee).unwrap().is_yes,
                 "the 2026-10-22 6 AM win at z 0.12 still trades");
     }
@@ -1709,7 +1801,7 @@ mod tests {
         let close_s = Utc::now().timestamp() + 900;
         assert!(db::anchor_shadow_open(
             &p, "btc", db::ANCHOR_LANE_ENTRY, "btc-open", "cid-1", "cid-1", "tok-yes", "Bitcoin price at 3PM", "YES", close_s,
-            0.44, 10.0, fee(0.44), 0.52, 93.0, 4.0e-5, 0.3, 900, 83_200.0, 83_100.0, 50.0, Some(true), Some(12.0), Some(40.0),
+            0.44, 10.0, fee(0.44), 0.52, 93.0, 4.0e-5, 0.3, 900, 83_200.0, 83_100.0, 50.0, Some(true), Some(12.0), Some(40.0), None, None,
         ).await);
         assert!(db::anchor_shadow_holds(&p, "btc", db::ANCHOR_LANE_ENTRY, "cid-1", "YES").await);
         assert!(!db::anchor_shadow_holds(&p, "btc", db::ANCHOR_LANE_ENTRY, "cid-1", "NO").await, "the other side is still free");
@@ -1790,7 +1882,7 @@ mod tests {
         let close_s = Utc::now().timestamp() + 900;
         assert!(db::anchor_shadow_open(
             &p, "btc", db::ANCHOR_LANE_ENTRY, "btc-open", "cid-1", "cid-1", "tok-no", "Bitcoin price at 3PM", "NO", close_s,
-            0.34, 5.0, fee(0.34), 0.42, 20.0, 4.0e-5, 0.3, 1200, 83_200.0, 83_100.0, 50.0, Some(false), None, None,
+            0.34, 5.0, fee(0.34), 0.42, 20.0, 4.0e-5, 0.3, 1200, 83_200.0, 83_100.0, 50.0, Some(false), None, None, None, None,
         ).await);
         let row = db::anchor_shadow_open_rows(&p, "btc").await.unwrap().remove(0);
         assert_eq!(row.peak_bid, None);
@@ -1828,7 +1920,7 @@ mod tests {
     /// inside the same band and window, and nothing else.
     #[test]
     fn the_control_lane_records_the_expensive_side_only() {
-        let r = Reading { fair_yes: 0.40, z: 0.3, basis_sigmas: 0.1 };
+        let r = Reading { fair_yes: 0.40, z: 0.3, basis_sigmas: 0.1, drift_frac: 0.0 };
         // YES at 0.46 is six cents dear; NO at 0.56 against fair 0.60 is cheap, not a control.
         let c = control_side(r, 1200, q(0.46, 50.0), q(0.56, 50.0), &gates()).expect("a control");
         assert!(c.is_yes);
@@ -1864,7 +1956,7 @@ mod tests {
         db::run_migrations(&p).await;
         assert!(db::anchor_shadow_open(
             &p, "btc", db::ANCHOR_LANE_ENTRY, "btc-open", "cid-9", "cid-9", "tok-no", "m", "NO", 1, 0.30, 10.0, fee(0.30), 0.36, -20.0, 4.0e-5, 0.5, 600,
-            1.0, 1.0, 20.0, None, None, None,
+            1.0, 1.0, 20.0, None, None, None, None, None,
         ).await);
         let id = db::anchor_shadow_open_rows(&p, "btc").await.unwrap()[0].id;
         assert!(db::anchor_shadow_abandon(&p, id, "unresolved").await);

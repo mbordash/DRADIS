@@ -1328,6 +1328,12 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
                  above it the model was noise on Polymarket International and inverted on Kalshi, because a fast tape is \
                  repriced by the market faster than a one-to-ten-minute anchor can follow. This is the number that makes \
                  Anchor a sideways-regime viper.").range(0.05, 2.0).step(0.05).classes(&["crypto"]));
+            v.push(F::new(g, e, "anchor_max_adverse_drift_pct", "Max Adverse Drift", "decimal", false,
+                "A drift gate, off by default (0). The oracle's move over the trailing hour as a fraction of its price \
+                 (0.0030 = 0.30%), beyond which the viper does not buy the side that move ran against: no YES after a \
+                 fall of more than this, no NO after a rise. On the production record the rule paid in October and lost \
+                 in November, so it ships as a dial with the drift written to every ledger row for a later test. The \
+                 drift reads zero for the first ten minutes after an engine start, which leaves the gate open.").range(0.0, 0.05).step(0.0005).classes(&["crypto"]));
             v.push(F::new(g, e, "anchor_exit_enabled", "Take Profit Exit", "bool", false,
                 "Off: every fill is held to settlement, the posture the research chose (a resting take-profit erased \
                  the backtest's edge). On: a held position is sold at the bid, as a taker, when either trigger below \

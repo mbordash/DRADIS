@@ -231,3 +231,29 @@ Go to Phase 1 when all of these hold on the ledger:
 - Bitcoin implied volatility index and variance risk premia (Alexander and Imeraj): https://sro.sussex.ac.uk/id/eprint/91094/
 - Binance public data endpoint (`data-api.binance.vision`, 1s and 1h klines); Coinbase Exchange public candles (BTC-USD, 60s).
 - Production recorder store `/opt/dradis/logs/gboost_planb/kalshi/btc/markets/` (75 closed hours with tapes as of 2026-10-21 00:00 ET).
+
+## 7. Addendum 2026-11-22: a drift gate proposed, calibrated, reviewed, and shipped off (E108)
+
+Live record at this date: 108 settled entries, +$25.43, but 10 trades since 2026-11-10 with 8 losses (-$5.94), six of them YES bought while BTC fell from $76k to $60k over the month. The 35% regime gate (3.6) measures sigma over the trailing hour of 5-second samples, which a trending day with calm hours passes. The question was whether the hour's direction, not its speed, is what the model cannot see.
+
+Method: every `anchor_shadow` row with a settled P&L (110 entry-lane, 136 control-lane, BTC, Kalshi) joined to Binance 1-minute closes; drift = close at entry minus close 60 minutes earlier, as a fraction of spot. A symmetric cap on |drift| was tried first and rejected: the 0.50 to 1.00% buckets were the entry lane's best (+$5.93 on 8). The directional split looked decisive pooled:
+
+| Entries | n | Per contract |
+|---|---|---|
+| With the hour's drift (YES after a rise, NO after a fall) | 54 | +12.2c, 57% won |
+| Against it | 56 | -3.2c, 39% won |
+
+The independent review split it by month and it did not hold:
+
+| Entry lane | n | Won | Per contract |
+|---|---|---|---|
+| October, with the drift | 27 | 63% | +25.2c |
+| October, against | 32 | 28% | -11.1c |
+| November, with the drift | 27 | 52% | -0.8c |
+| November, against | 24 | 54% | +7.2c |
+
+Permutation test on the difference: October p = 0.003, November p = 0.77 with the sign reversed, pooled p = 0.035 before correcting for the twenty-odd cuts tried; the bootstrap 95% interval for the pooled difference is [-0.015, +0.318] and crosses zero. The control lane does not confirm anything: it is the other side of the same hours (YES and NO settle to exactly one), so "control with the drift wins" and "entry against the drift loses" are one observation. What October actually says is that the trailing hour's sign predicted settlement whichever side the model called cheap, meaning the model's fair value contributed nothing in those hours. Strike mechanics are not the explanation: corr(drift, moneyness) = 0.09 with the at-the-money pick (B114). And the gate does not touch the symptom: the six November YES losses had hour drifts of -0.03% to -0.30%, flat hours inside a multi-day fall that a 60-minute window cannot see; a 0.30% cap would have refused exactly two trades since 11-10, one win and one loss, for -$1.49.
+
+Lifetime, the record is a coin flip: +4.3c per contract with a standard error of 4.25c (t = 1.0); resolving a 4c edge at two standard errors needs about 430 trades. Side and month both flip sign.
+
+Decision: the key `anchor_max_adverse_drift_pct` ships with a default of zero (off), the gate stands aside on the control lane exactly when it would refuse the side opposite (so the lanes stay drawn from the same moments), and every ledger row now carries `drift_60m` and `drift_10m` from the price raptor. The next rule, if any, is pre-registered here before it is tested, and is more likely a multi-hour trend or 24-hour realized vol than an hourly figure, since that is what differed in November. Anchor stays on at 2.5 contracts: the worst case is $0.75 a trade and the record, though weak, is the only thing that will settle the question.

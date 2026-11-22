@@ -1024,6 +1024,19 @@ pub const ANCHOR_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.60);
 /// (Polymarket) or inverted (Kalshi). The market reprices a fast tape faster
 /// than a one-to-ten-minute anchor can follow.
 pub const ANCHOR_MAX_VOL_ANNUALIZED: Decimal = dec!(0.35);
+/// [E108] The drift gate, shipped OFF. The feed's trailing-hour move (the price
+/// raptor's 60-minute drift) as a fraction of spot, beyond which the side it ran
+/// against is not bought: no YES after a fall, no NO after a rise. Calibrated on
+/// the production ledger 2026-10-21 to 2026-11-20 (110 entries): pooled, entries
+/// with the drift made +12.2c per contract and entries against it -3.2c, but the
+/// split is October's (p 0.003) and REVERSES in November (p 0.77, against-drift
+/// entries +7.2c); the pooled confidence interval crosses zero and the control
+/// lane, being the other side of the same hours, is not an independent check.
+/// The six November losses that prompted the gate were bought in flat hours
+/// (|drift| under 0.30%) it would not have stopped. Zero disables the gate; the
+/// ledger now records the drift so a rule can be tested on data that did not
+/// invent it. The independent review of 2026-11-22 set the default to zero.
+pub const ANCHOR_MAX_ADVERSE_DRIFT_PCT: Decimal = dec!(0);
 /// The exit dial. Off, every fill rides to settlement (the research posture: a
 /// resting take-profit erased the backtest's edge). On, a held position is sold
 /// at the bid, as a taker, when either trigger fires and the sale is a profit

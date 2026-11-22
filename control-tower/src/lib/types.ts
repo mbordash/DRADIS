@@ -300,6 +300,8 @@ export interface DynamicConfig {
   anchor_min_span_secs?: number;
   anchor_obi_adverse_block?: string;
   anchor_max_vol_annualized?: string;
+  /** [E108] Max adverse trailing-hour drift, fraction of spot; "0" disables. */
+  anchor_max_adverse_drift_pct?: string;
   anchor_exit_enabled?: boolean;
   /** [E95] Fly a 15-minute market in each crypto squadron. */
   ultra_short_market_enabled?: boolean;

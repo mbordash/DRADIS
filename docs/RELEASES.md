@@ -6,6 +6,7 @@ version's release notes field; the detail below it is the full account.
 
 ## 1.9.1 (unreleased)
 
+- Anchor: a drift dial, `anchor_max_adverse_drift_pct` (Setup, Anchor group), shipped off. Set above zero, the viper stops buying the side the trailing hour's move ran against: no YES after a fall of more than the cap, no NO after a rise. It ships off because the record does not yet support it: on the production ledger the rule paid in October and lost in November, and the losses that prompted it were bought in flat hours it would not have stopped. Every Anchor ledger row now records the oracle's 60-minute and 10-minute drift at entry, on both the entry and control lanes, so the next trend rule can be tested on rows that were not used to design it. The card's detail line shows the hour's drift and a refusal reads "fades the hour's drift".
 - Kalshi: a Time Decay pair the exchange netted into cash could be booked twice. Each squadron runs its own settlement sweep, and two sweeps reaching the same pair in the same second both passed the duplicate check before either had written its row, so the Trade Log showed one $0.15 win as two (2026-11-21). The sweeps now take turns on netted pairs, so the second one finds the first one's row and books nothing.
 
 ## 1.9.0 (2026-11-20)
