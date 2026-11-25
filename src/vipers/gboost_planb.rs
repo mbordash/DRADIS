@@ -1054,6 +1054,7 @@ pub fn gate_from_stamp(
         trees, &stats,
         crate::config::GBOOST_PLANB_GATE_MIN_TRADES.max(0) as usize,
         crate::config::GBOOST_PLANB_GATE_MIN_WIN_RATE.to_f64().unwrap_or(0.53),
+        None,
     ).passed
 }
 
@@ -1827,7 +1828,14 @@ fn sample_live_mids(g: &'static PlanBGlobals, key: &str, now_s: i64, yes: (Decim
     let minute = now_s.div_euclid(60) * 60;
     let mut all = lock(&g.live_mids);
     let m = all.entry(key.to_string()).or_default();
-    if m.last_minute == Some(minute) { return; }
+    if m.last_minute == Some(minute) {
+        // The minute's sample is its latest tick (as the recorder keeps it and as
+        // a venue's candle closing at the minute holds it), so the series read at
+        // a decision minute is the book an instant before it, not a minute old.
+        if let Some(a) = m.series[0].last_mut() { *a = (now_s, y); }
+        if let Some(b) = m.series[1].last_mut() { *b = (now_s, n); }
+        return;
+    }
     m.series[0].push((now_s, y));
     m.series[1].push((now_s, n));
     m.last_minute = Some(minute);
@@ -3627,15 +3635,15 @@ mod live_mids_tests {
         let g = globals("test-live-mids");
         let key = "k#yes";
         sample_live_mids(g, key, 3601, q("0.44", "0.46"), q("0.54", "0.56"));
-        sample_live_mids(g, key, 3630, q("0.47", "0.49"), q("0.51", "0.53")); // same minute: ignored
+        sample_live_mids(g, key, 3630, q("0.47", "0.49"), q("0.51", "0.53")); // same minute: the later tick is the sample
         sample_live_mids(g, key, 3661, q("0", "0.49"), q("0.51", "0.53"));    // one-sided: no sample
         sample_live_mids(g, key, 3662, q("0.48", "0.50"), q("0.50", "0.52"));
         let h = live_history(g, key);
-        assert_eq!(h[0], vec![(3601, 0.45), (3662, 0.49)]);
-        assert_eq!(h[1], vec![(3601, 0.55), (3662, 0.51)]);
+        assert_eq!(h[0], vec![(3630, 0.48), (3662, 0.49)]);
+        assert_eq!(h[1], vec![(3630, 0.52), (3662, 0.51)]);
         let at = |side: usize, t: i64| crate::vipers::gboost_planb_train::history_mid_at(&h[side], t);
         assert_eq!(at(0, 3720), Some(0.49), "the minute's decision reads the last sample at or before it");
-        assert_eq!(at(0, 3660), Some(0.45));
+        assert_eq!(at(0, 3660), Some(0.48), "the book an instant before the minute, as a candle closing at it holds");
         assert_eq!(at(1, 3600), None, "nothing before the first sample");
         assert!(live_history(g, "other").iter().all(|s| s.is_empty()));
     }

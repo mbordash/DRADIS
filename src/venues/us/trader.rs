@@ -1621,8 +1621,10 @@ async fn trade_one_market(
         // (arbitrage/maker) don't read them.
         let snapshot = build_snapshot(&long_rx, raptors.as_ref(), &market_cfg);
         if let Some(r) = recorder.as_mut() {
-            let mid = |bid: Decimal, ask: Decimal| (bid > Decimal::ZERO && ask > Decimal::ZERO).then(|| ((bid + ask) / dec!(2)).to_f64()).flatten();
-            r.sample(Utc::now().timestamp(), mid(snapshot.yes_bid, snapshot.yes_ask), mid(snapshot.no_bid, snapshot.no_ask));
+            let quote = |bid: Decimal, ask: Decimal| {
+                (bid > Decimal::ZERO && ask > Decimal::ZERO).then(|| Some((bid.to_f64()?, ask.to_f64()?))).flatten()
+            };
+            r.sample_quotes(Utc::now().timestamp(), quote(snapshot.yes_bid, snapshot.yes_ask), quote(snapshot.no_bid, snapshot.no_ask));
         }
 
         // Maker snapshot from the secondary market's own feed. Falls back to the

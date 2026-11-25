@@ -187,6 +187,23 @@ const VENUE_META: Record<VenueId, { label: string; missing: string }> = {
  * the switch. `bool` persists "true"/"false"; `bool01` persists "1"/"0",
  * matching what each key's reader parses.
  */
+/** The side of a yes/no key its saved value names, in the words the switch uses. */
+function boolSideLabel(c: CredentialInfo, v: string): string {
+  if (c.kind === 'bool01') return v === '1' ? 'Demo' : 'Live';
+  return v === 'true' ? 'On' : 'Off';
+}
+
+/**
+ * The status beside a key's label. A secret says it is set and shows its tail
+ * ("set …cdef · managed"); a yes/no key says which side is saved ("On · managed"),
+ * because its hint IS its value and "set ••• · managed" told the operator nothing.
+ */
+function credentialStatus(c: CredentialInfo): string {
+  if (!c.set) return 'not set';
+  if (c.kind === 'bool' || c.kind === 'bool01') return `${boolSideLabel(c, c.hint)} · ${c.source}`;
+  return `set ${c.hint} · ${c.source}`;
+}
+
 function BoolCredential({
   c, value, onDraft,
 }: {
@@ -196,8 +213,11 @@ function BoolCredential({
 }) {
   const [on, off] = c.kind === 'bool01' ? ['1', '0'] : ['true', 'false'];
   // Nothing is selected until the operator chooses or a value is already set,
-  // so an unset key cannot look like a deliberate "false".
-  const current = value ?? (c.set ? c.hint.replace(/^set\s*/, '') : undefined);
+  // so an unset key cannot look like a deliberate "false". The saved value is
+  // the hint itself: the backend shows a switch's value whole, as it does a
+  // setting's, rather than masking it like a secret (it used to, and the saved
+  // side then never lit up).
+  const current = value ?? (c.set ? c.hint : undefined);
   const pick = (v: string) =>
     `px-3 py-1 text-xs font-mono rounded border transition-colors ${
       current === v
@@ -1003,7 +1023,7 @@ function CredentialGroup({
             <div className="flex items-center justify-between mb-1">
               <label className="text-xs font-mono text-gray-400">{c.label}</label>
               <span className={`text-[10px] font-mono ${c.set ? 'text-emerald-400' : 'text-gray-600'}`}>
-                {c.set ? `set ${c.hint} · ${c.source}` : 'not set'}
+                {credentialStatus(c)}
               </span>
             </div>
             {c.kind === 'bool' || c.kind === 'bool01' ? (
@@ -1386,7 +1406,7 @@ function RaptorCard({
               <div className="flex items-center justify-between mb-1">
                 <label className="text-xs font-mono text-gray-400">{c.label}</label>
                 <span className={`text-[10px] font-mono ${c.set ? 'text-emerald-400' : 'text-gray-600'}`}>
-                  {c.set ? `set ${c.hint} · ${c.source}` : 'not set'}
+                  {credentialStatus(c)}
                 </span>
               </div>
               {c.kind === 'bool' || c.kind === 'bool01' ? (

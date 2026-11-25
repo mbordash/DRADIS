@@ -131,6 +131,9 @@ const HALF_SPREAD: f64 = 0.005;
 const MIN_PRINT_SHARES: f64 = 5.0;
 /// A price-history point older than this is not a usable mid.
 const MID_STALE_SECS: i64 = 180;
+/// A recorded ask this close before the decision minute is the ask at the minute:
+/// a candle closing at it, or the recorder's last tick before it.
+const ENTRY_QUOTE_LOOKBACK_SECS: i64 = 10;
 /// Price-history points each side needs before a market is used.
 const MIN_HIST_POINTS: usize = 20;
 /// The floor for a live-recorded hour: its gaps are minutes with no two-sided
@@ -243,6 +246,12 @@ pub struct Print {
 pub struct HistPoint {
     pub t: i64,
     pub p: f64,
+    /// The side's ask at `t`, where the record carries one: a venue's quote
+    /// history, or a recorder that samples the book's asks. Absent in older
+    /// records, whose rows take the mid plus `HALF_SPREAD` instead, half a cent
+    /// where Kalshi's hourly books in the band were 2 to 6 cents wide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -278,9 +287,20 @@ pub struct MarketRecord {
     /// fallback. A FETCHED record with no tape is a dead market and builds nothing.
     #[serde(default)]
     pub recorded_live: bool,
+    /// A live-recorded record the pipeline has already asked the venue's quotes
+    /// for (`merge_quotes`), whether or not any matched, so it is not asked again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quotes_checked: bool,
 }
 
 impl MarketRecord {
+    /// Whether the record carries the asks themselves (`HistPoint::a`), as a
+    /// venue's quote history or a quote-sampling recorder writes them. Such a
+    /// record needs no tape to build rows: the ask is the entry.
+    pub fn has_quotes(&self) -> bool {
+        self.hist.values().any(|h| h.iter().any(|p| p.a.is_some()))
+    }
+
     /// `Some(up_won)` when Gamma has published a 0/1 resolution.
     pub fn up_won(&self) -> Option<bool> {
         let raw = self.outcome_prices.as_deref()?;
@@ -723,7 +743,9 @@ pub fn build_market_rows(
     plan: &Plan,
 ) -> Vec<TrainingRow> {
     let mut out = Vec::new();
-    if rec.missing || (rec.tape.is_empty() && !rec.recorded_live) {
+    // A fetched Gamma record with no tape is a dead market. A record written live,
+    // or one carrying the venue's own quotes, builds from its minutes.
+    if rec.missing || (rec.tape.is_empty() && !rec.recorded_live && !rec.has_quotes()) {
         return out;
     }
     let Some(up_won) = rec.up_won() else { return out };
@@ -737,11 +759,14 @@ pub fn build_market_rows(
     tape.sort_by_key(|x| x.ts); // stable, as the harness's `sorted`
     let tape_ts: Vec<i64> = tape.iter().map(|x| x.ts).collect();
     let mut hist: [Vec<(i64, f64)>; 2] = [Vec::new(), Vec::new()];
+    // The asks the record carries at the same points, where it carries any.
+    let mut asks: [Vec<(i64, Option<f64>)>; 2] = [Vec::new(), Vec::new()];
     for side in 0..2 {
         let Some(h) = rec.hist.get(&side.to_string()) else { return out };
-        let mut v: Vec<(i64, f64)> = h.iter().map(|p| (p.t, p.p)).collect();
-        v.sort_by_key(|x| x.0);
-        hist[side] = v;
+        let mut pts: Vec<&HistPoint> = h.iter().collect();
+        pts.sort_by_key(|p| p.t);
+        hist[side] = pts.iter().map(|p| (p.t, p.p)).collect();
+        asks[side] = pts.iter().map(|p| (p.t, p.a)).collect();
     }
     // A fetched history this sparse is a dead market. A recorded hour is sparse
     // when the book was one-sided for most of it (a deep in-the-money hour has no
@@ -752,6 +777,11 @@ pub fn build_market_rows(
         return out;
     }
     let mid_at = |side: usize, t: i64| history_mid_at(&hist[side], t);
+    // The recorded ask at or before `t`, under the same staleness rule as the mid.
+    let ask_at = |side: usize, t: i64| -> Option<f64> {
+        let (i, a) = last_at(&asks[side], t)?;
+        if t - asks[side][i].0 > MID_STALE_SECS { None } else { a }
+    };
 
     for k in plan.first_minute..=plan.last_minute {
         let t = w + 60 * k;
@@ -780,13 +810,24 @@ pub fn build_market_rows(
                         if x.o as usize == other && x.side == "SELL" { ask_ev = Some(1.0 - x.p); break; }
                         jj -= 1;
                     }
+                    // The record's own ask at the minute where it has one; the
+                    // mid plus half a spread is the older records' only estimate.
+                    let quoted = ask_at(side, t).filter(|a| a.is_finite()).unwrap_or(mid_s + HALF_SPREAD);
                     let a = match ask_ev {
-                        Some(ev) => (mid_s + HALF_SPREAD).max(ev),
-                        None => mid_s + HALF_SPREAD,
+                        Some(ev) => quoted.max(ev),
+                        None => quoted,
                     };
                     entry[side] = Some((t, a));
                 }
                 EntryRule::FirstAfter => {
+                    // A record that carries the book's asks has the price at the
+                    // minute itself: the candle closing at `t`, or the recorder's
+                    // last tick before it. That is what a live decision at `t` pays.
+                    if let Some(a) = ask_at(side, t).filter(|a| a.is_finite()) {
+                        if let Some((i, _)) = last_at(&asks[side], t) {
+                            if t - asks[side][i].0 <= ENTRY_QUOTE_LOOKBACK_SECS { entry[side] = Some((t, a)); }
+                        }
+                    }
                     // A taker print soon after the minute is an ask someone paid.
                     for x in &tape[j_hi..] {
                         if x.ts > t + ENTRY_PRINT_SECS || x.ts >= w_end { break; }
@@ -797,16 +838,21 @@ pub fn build_market_rows(
                         } else {
                             continue;
                         };
-                        entry[side] = Some((x.ts, px));
+                        if entry[side].is_none_or(|(et, _)| x.ts < et) { entry[side] = Some((x.ts, px)); }
                         break;
                     }
                     // Otherwise the first history sample after the minute, plus half a
                     // spread, but only while a live decision could still have acted:
                     // a feature vector at t paired with an entry minutes later (0.38%
                     // of side-minutes, history gaps) is not a trade anyone could take.
-                    if let Some(&(ts, p)) = hist[side].iter().find(|(ts, _)| *ts > t) {
+                    if let Some(j) = hist[side].iter().position(|(ts, _)| *ts > t) {
+                        let (ts, p) = hist[side][j];
                         if ts < w_end && ts <= t + ENTRY_LATEST_SECS && entry[side].is_none_or(|(et, _)| ts < et) {
-                            entry[side] = Some((ts, p + HALF_SPREAD));
+                            // The ask the record carries at that sample where it has
+                            // one; the mid plus half a spread is the older records'
+                            // only estimate, and it understated Kalshi's hourly
+                            // spreads by 1.5 to 5.5 cents.
+                            entry[side] = Some((ts, asks[side][j].1.filter(|a| a.is_finite()).unwrap_or(p + HALF_SPREAD)));
                         }
                     }
                 }
@@ -1061,8 +1107,42 @@ pub struct FoldStats {
     /// 0.1. `gate` requires this to be positive; `serve_decision` compares on it.
     #[serde(default)]
     pub market_skill: f64,
+    /// 90% market-bootstrap interval on `market_skill` (5th and 95th percentiles
+    /// over `BOOTSTRAP_RESAMPLES` resamples of the fold's markets). A 10-day
+    /// fold of ~220 markets puts a skill of 0.003 well inside its own noise, so
+    /// the interval, not the point, says whether the model knows anything the
+    /// price does not. `None` on a fold with fewer than two markets.
+    #[serde(default)]
+    pub market_skill_lo: Option<f64>,
+    #[serde(default)]
+    pub market_skill_hi: Option<f64>,
     pub auc: f64,
     pub rule: RuleStats,
+}
+
+/// The 90% market-bootstrap interval of `1 - logloss(p) / logloss(mid)` over the
+/// fold's markets: each resample draws markets with replacement and scores all
+/// their rows, so rows of one hour (near-duplicates) move together.
+pub fn market_skill_interval(rows: &[&TrainingRow], p: &[f64]) -> Option<(f64, f64)> {
+    let mut by_market: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+    for (i, r) in rows.iter().enumerate() { by_market.entry(r.w).or_default().push(i); }
+    let markets: Vec<&Vec<usize>> = by_market.values().collect();
+    if markets.len() < 2 { return None; }
+    let mut rng = SplitMix(7);
+    let mut boots: Vec<f64> = Vec::with_capacity(BOOTSTRAP_RESAMPLES);
+    let (mut y, mut pm, mut mm) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..BOOTSTRAP_RESAMPLES {
+        y.clear(); pm.clear(); mm.clear();
+        for _ in 0..markets.len() {
+            for &i in markets[rng.below(markets.len())] {
+                y.push(rows[i].y); pm.push(p[i]); mm.push(rows[i].features[MID_COLUMN]);
+            }
+        }
+        let llm = log_loss(&y, &mm);
+        boots.push(if llm > 0.0 { 1.0 - log_loss(&y, &pm) / llm } else { 0.0 });
+    }
+    boots.sort_by(|a, b| a.total_cmp(b));
+    Some((percentile(&boots, 5.0), percentile(&boots, 95.0)))
 }
 
 /// First qualifying minute per (market, side): calibrated `p` at or above break-even
@@ -1071,10 +1151,10 @@ pub fn rule_stats(rows: &[&TrainingRow], p: &[f64], plan: &Plan) -> RuleStats {
     let mut order: Vec<usize> = (0..rows.len()).filter(|&i| {
         let r = rows[i];
         // [B108] The live rule never enters a side whose ask is below the scored
-        // mid, so neither does the rule the gate measures. An approximation of
-        // live: a recorded Kalshi/US row's ask is the next sample plus half a cent,
-        // so this trips on a drop over half a cent where live trips on one over
-        // the real half-spread, the conservative side.
+        // mid, so neither does the rule the gate measures. A row with the book's
+        // own ask (venue history, or a recorder that keeps asks) trips exactly
+        // where live does; an older recorded row's ask is the next sample plus
+        // half a cent, which trips on a drop over half a cent, the conservative side.
         p[i] >= plan.break_even(r.ask) + plan.margin
             && !crate::vipers::gboost_planb::ask_below_scored_mid(r.ask, r.features[MID_COLUMN])
     }).collect();
@@ -1129,6 +1209,7 @@ pub fn fold_stats(rows: &[&TrainingRow], p: &[f64], base_rate: f64, plan: &Plan)
     let market: Vec<f64> = rows.iter().map(|r| r.features[MID_COLUMN]).collect();
     let llm = log_loss(&y, &market);
     let markets: HashSet<i64> = rows.iter().map(|r| r.w).collect();
+    let interval = market_skill_interval(rows, p);
     FoldStats {
         n_rows: rows.len(),
         n_markets: markets.len(),
@@ -1138,6 +1219,8 @@ pub fn fold_stats(rows: &[&TrainingRow], p: &[f64], base_rate: f64, plan: &Plan)
         skill: 1.0 - ll / ll0,
         market_logloss: llm,
         market_skill: 1.0 - ll / llm,
+        market_skill_lo: interval.map(|x| x.0),
+        market_skill_hi: interval.map(|x| x.1),
         auc: auc(&y, p),
         rule: rule_stats(rows, p, plan),
     }
@@ -1252,22 +1335,54 @@ pub struct Calibration {
     pub platt_a: f64,
     pub platt_b: f64,
     pub residual_shrink: f64,
+    /// 90% market-bootstrap interval on `residual_shrink` over the calibration
+    /// slice's markets (1 and 1 for the log-loss form). The slope is fit on about
+    /// a hundred markets whose minutes are near-duplicate rows, so its noise is
+    /// tenths: a point at 0.00 with an interval reaching 0.3 is "undecided",
+    /// not "no signal".
+    pub residual_shrink_lo: f64,
+    pub residual_shrink_hi: f64,
 }
 
-/// Fit the form's calibration on the calibration slice.
-pub fn calibrate_candidate(b: &PerpetualBooster, xc: &[[f64; N_FEATURES]], yc: &[bool], zeroed: &[usize], form: ModelForm) -> Result<Calibration, String> {
+/// Fit the form's calibration on the calibration slice. `wc` is each row's
+/// market (window start), for the interval; an empty `wc` yields none.
+pub fn calibrate_candidate(b: &PerpetualBooster, xc: &[[f64; N_FEATURES]], yc: &[bool], wc: &[i64], zeroed: &[usize], form: ModelForm) -> Result<Calibration, String> {
     match form {
         ModelForm::Logit => {
             let pc = predict_raw(b, xc, zeroed, form, 1.0);
             let (platt_a, platt_b) = fit_platt(&pc, yc).ok_or_else(|| "Platt calibration did not converge".to_string())?;
-            Ok(Calibration { platt_a, platt_b, residual_shrink: 1.0 })
+            Ok(Calibration { platt_a, platt_b, residual_shrink: 1.0, residual_shrink_lo: 1.0, residual_shrink_hi: 1.0 })
         }
         ModelForm::ResidualMid => {
             let dev = predict_deviation(b, xc, zeroed);
             let mid: Vec<f64> = xc.iter().map(|r| r[MID_COLUMN]).collect();
-            Ok(Calibration { platt_a: 1.0, platt_b: 0.0, residual_shrink: fit_residual_shrink(&dev, yc, &mid) })
+            let shrink = fit_residual_shrink(&dev, yc, &mid);
+            let (lo, hi) = residual_shrink_interval(&dev, yc, &mid, wc).unwrap_or((shrink, shrink));
+            Ok(Calibration { platt_a: 1.0, platt_b: 0.0, residual_shrink: shrink, residual_shrink_lo: lo, residual_shrink_hi: hi })
         }
     }
+}
+
+/// The 90% market-bootstrap interval of `fit_residual_shrink` over the
+/// calibration markets. `None` with fewer than two markets or mismatched lengths.
+pub fn residual_shrink_interval(deviation: &[f64], y: &[bool], mid: &[f64], w: &[i64]) -> Option<(f64, f64)> {
+    if w.len() != deviation.len() || y.len() != deviation.len() || mid.len() != deviation.len() { return None; }
+    let mut by_market: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+    for (i, &ww) in w.iter().enumerate() { by_market.entry(ww).or_default().push(i); }
+    let markets: Vec<&Vec<usize>> = by_market.values().collect();
+    if markets.len() < 2 { return None; }
+    let mut rng = SplitMix(11);
+    let mut boots: Vec<f64> = Vec::with_capacity(BOOTSTRAP_RESAMPLES);
+    let (mut d, mut yy, mut m) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..BOOTSTRAP_RESAMPLES {
+        d.clear(); yy.clear(); m.clear();
+        for _ in 0..markets.len() {
+            for &i in markets[rng.below(markets.len())] { d.push(deviation[i]); yy.push(y[i]); m.push(mid[i]); }
+        }
+        boots.push(fit_residual_shrink(&d, &yy, &m));
+    }
+    boots.sort_by(|a, b| a.total_cmp(b));
+    Some((percentile(&boots, 5.0), percentile(&boots, 95.0)))
 }
 
 /// Columns with no value anywhere in the fit rows carry nothing and are zeroed in
@@ -1303,8 +1418,11 @@ pub struct GateResult {
     pub reasons: Vec<String>,
 }
 
-/// The absolute bar a candidate must clear on its holdout fold.
-pub fn gate(trees: usize, stats: &FoldStats, min_trades: usize, min_win: f64) -> GateResult {
+/// The absolute bar a candidate must clear on its holdout fold. `shrink` is the
+/// residual form's believed deviation (`None` for the log-loss form): at zero the
+/// model returns the price and the rule cannot take a trade, which is one
+/// finding, not three.
+pub fn gate(trees: usize, stats: &FoldStats, min_trades: usize, min_win: f64, shrink: Option<f64>) -> GateResult {
     let mut reasons = Vec::new();
     if trees < STRUCTURAL_MIN_TREES {
         reasons.push(format!("{trees} trees, below the structural minimum {STRUCTURAL_MIN_TREES}"));
@@ -1313,7 +1431,15 @@ pub fn gate(trees: usize, stats: &FoldStats, min_trades: usize, min_win: f64) ->
         reasons.push(format!("log-loss skill {:+.4} is not above the base rate", stats.skill));
     }
     if !(stats.market_skill > 0.0) {
-        reasons.push(format!("log-loss skill over the market mid {:+.4} is not positive: the model knows less than the price", stats.market_skill));
+        let interval = match (stats.market_skill_lo, stats.market_skill_hi) {
+            (Some(lo), Some(hi)) => format!(" (90% interval {lo:+.4} to {hi:+.4})"),
+            _ => String::new(),
+        };
+        reasons.push(format!("log-loss skill over the market mid {:+.4}{interval} is not positive: the model knows less than the price", stats.market_skill));
+    }
+    if shrink.is_some_and(|s| !(s > 0.0)) {
+        reasons.push("no deviation signal: the residual over the market mid is believed at 0.00, so the model returns the price and the rule takes no trade".to_string());
+        return GateResult { passed: false, reasons };
     }
     if stats.rule.trades < min_trades {
         reasons.push(format!("{} holdout trades, fewer than the {min_trades} required", stats.rule.trades));
@@ -1587,6 +1713,12 @@ pub struct CycleReport {
     /// The residual form's deviation shrink (`fit_residual_shrink`); 1 for the log-loss form.
     #[serde(default)]
     pub residual_shrink: f64,
+    /// Its 90% market-bootstrap interval (`residual_shrink_interval`); both 0 in
+    /// a report from before the interval existed.
+    #[serde(default)]
+    pub residual_shrink_lo: f64,
+    #[serde(default)]
+    pub residual_shrink_hi: f64,
     pub zeroed_features: Vec<String>,
     pub candidate: Option<FoldStats>,
     pub incumbent: Option<FoldStats>,
@@ -1724,7 +1856,7 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
     // a migration) cannot afford the configured fold: with fourteen holdout days
     // and three days of records every market is in the fold and nothing is left
     // to fit. A backfilled store keeps the operator's fold.
-    let holdout_days = if has_public_history() { inputs.holdout_days.max(1) } else { effective_holdout_days(inputs.holdout_days, markets) };
+    let holdout_days = if store_source() != StoreSource::Recorder { inputs.holdout_days.max(1) } else { effective_holdout_days(inputs.holdout_days, markets) };
     if holdout_days != inputs.holdout_days {
         rep.holdout_days = holdout_days;
         info!(
@@ -1782,7 +1914,8 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
     rep.trees = booster.get_prediction_trees().len();
     let xc: Vec<[f64; N_FEATURES]> = cal.iter().map(|r| r.features).collect();
     let yc: Vec<bool> = cal.iter().map(|r| r.y).collect();
-    let calib = match calibrate_candidate(&booster, &xc, &yc, &zeroed, TRAINED_FORM) {
+    let wc: Vec<i64> = cal.iter().map(|r| r.w).collect();
+    let calib = match calibrate_candidate(&booster, &xc, &yc, &wc, &zeroed, TRAINED_FORM) {
         Ok(c) => c,
         Err(e) => return finish(rep, "error", e),
     };
@@ -1790,11 +1923,14 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
     rep.platt_a = a;
     rep.platt_b = b;
     rep.residual_shrink = calib.residual_shrink;
+    rep.residual_shrink_lo = calib.residual_shrink_lo;
+    rep.residual_shrink_hi = calib.residual_shrink_hi;
     let xt: Vec<[f64; N_FEATURES]> = test.iter().map(|r| r.features).collect();
     let pt: Vec<f64> = predict_raw(&booster, &xt, &zeroed, TRAINED_FORM, calib.residual_shrink).into_iter().map(|raw| calibrate(raw, a, b)).collect();
     let base_rate = train.iter().filter(|r| r.y).count() as f64 / train.len() as f64;
     let cand = fold_stats(&test, &pt, base_rate, &inputs.plan);
-    rep.gate = gate(rep.trees, &cand, inputs.min_trades, inputs.min_win);
+    let shrink = matches!(TRAINED_FORM, ModelForm::ResidualMid).then_some(calib.residual_shrink);
+    rep.gate = gate(rep.trees, &cand, inputs.min_trades, inputs.min_win, shrink);
     rep.candidate = Some(cand.clone());
 
     // The incumbent on the same fold.
@@ -2063,22 +2199,29 @@ pub fn run_cycle_blocking(inputs: &CycleInputs) -> CycleReport {
     };
     let form_note = match TRAINED_FORM {
         ModelForm::Logit => String::new(),
-        ModelForm::ResidualMid => format!(", a residual over the market mid believed at {:.2}", calib.residual_shrink),
+        ModelForm::ResidualMid => format!(
+            ", a residual over the market mid believed at {:.2} (90% interval {:.2} to {:.2})",
+            calib.residual_shrink, calib.residual_shrink_lo, calib.residual_shrink_hi,
+        ),
+    };
+    let mid_skill = match (cand.market_skill_lo, cand.market_skill_hi) {
+        (Some(lo), Some(hi)) => format!("{:+.4} over the market mid (90% interval {lo:+.4} to {hi:+.4})", cand.market_skill),
+        _ => format!("{:+.4} over the market mid", cand.market_skill),
     };
     let summary = if shadow_only {
         format!(
             "serving {version} in the shadow lane: {} trees{form_note}, holdout {} trades at {:+.2}% per trade, win {:.3}, \
-             skill {:+.4} over the base rate and {:+.4} over the market mid; it did not clear the gate ({}), so it \
+             skill {:+.4} over the base rate and {}; it did not clear the gate ({}), so it \
              trades simulated until this instance's own record earns real money{}{bypassed}",
-            rep.trees, cand.rule.trades, cand.rule.mean_ret * 100.0, cand.rule.win, cand.skill, cand.market_skill,
+            rep.trees, cand.rule.trades, cand.rule.mean_ret * 100.0, cand.rule.win, cand.skill, mid_skill,
             rep.gate.reasons.join("; "),
             rep.comparison.as_deref().map(|c| format!("; {c}")).unwrap_or_default(),
         )
     } else {
         format!(
             "adopted {version}: {} trees{form_note}, holdout {} trades at {:+.2}% per trade, win {:.3}, skill {:+.4} over the base rate \
-             and {:+.4} over the market mid{}{bypassed}",
-            rep.trees, cand.rule.trades, cand.rule.mean_ret * 100.0, cand.rule.win, cand.skill, cand.market_skill,
+             and {}{}{bypassed}",
+            rep.trees, cand.rule.trades, cand.rule.mean_ret * 100.0, cand.rule.win, cand.skill, mid_skill,
             rep.comparison.as_deref().map(|c| format!("; {c}")).unwrap_or_default(),
         )
     };
@@ -2225,6 +2368,7 @@ async fn fetch_market(w: i64, now: i64) -> Result<Fetched, String> {
         hist: HashMap::new(),
         strike: None,
         recorded_live: false,
+        quotes_checked: false,
     };
     if rec.up_won().is_none() && now < w + 3600 + UNRESOLVED_GIVE_UP_SECS {
         return Ok(Fetched::NotResolved);
@@ -2255,7 +2399,7 @@ async fn fetch_market(w: i64, now: i64) -> Result<Fetched, String> {
     }
     for (i, tok) in rec.tokens.iter().enumerate() {
         let h = get_json(&format!("{CLOB}/prices-history?market={tok}&startTs={}&endTs={}&fidelity=1", w - 3600, w + 3900)).await?;
-        let pts: Vec<HistPoint> = h["history"].as_array().map(|a| a.iter().filter_map(|p| Some(HistPoint { t: num(&p["t"])? as i64, p: num(&p["p"])? })).collect()).unwrap_or_default();
+        let pts: Vec<HistPoint> = h["history"].as_array().map(|a| a.iter().filter_map(|p| Some(HistPoint { t: num(&p["t"])? as i64, p: num(&p["p"])?, a: None })).collect()).unwrap_or_default();
         rec.hist.insert(i.to_string(), pts);
     }
     Ok(Fetched::Record(rec))
@@ -2711,7 +2855,8 @@ async fn catch_up(asset: &str, dir: &DataDir, knobs: &TrainingKnobs, now: i64) -
     let last_resolved = floor_hour(now - 3600 - RESOLUTION_GRACE_SECS);
     let _ = std::fs::create_dir_all(dir.markets());
     let _ = std::fs::create_dir_all(dir.klines());
-    if !has_public_history() {
+    let source = store_source();
+    if source == StoreSource::Recorder {
         // Say so from the first pass: the bars and funding below take minutes to
         // fetch and the card would otherwise keep the previous phase's text.
         update_status(asset, |s| {
@@ -2844,12 +2989,12 @@ async fn catch_up(asset: &str, dir: &DataDir, knobs: &TrainingKnobs, now: i64) -
     });
     let mut unresolved = 0usize;
     let mut fetched_this_pass = 0usize;
-    if !has_public_history() {
-        // This venue publishes no history: the records on disk were written live
-        // by the venue loop's recorder (`gboost_planb_record`), one per hourly
-        // market it flew, and windows with no record are hours it did not fly.
-        // The only thing left to fetch is each closed market's settlement, and
-        // that comes from the venue through its installed resolver.
+    if source != StoreSource::Gamma {
+        // Records written live by the venue loop's recorder (`gboost_planb_record`),
+        // one per hourly market it flew, are settled here from the venue through
+        // its installed resolver. On a venue without public history that is all
+        // there is to fetch; on one with it, the windows the squadron did not fly
+        // are fetched below.
         let now_s = Utc::now().timestamp();
         for &w in &windows {
             let path = dir.market(w);
@@ -2881,14 +3026,48 @@ async fn catch_up(asset: &str, dir: &DataDir, knobs: &TrainingKnobs, now: i64) -
         if fetched_this_pass > 0 {
             info!("GBoost plan-B pipeline [{asset}]: {fetched_this_pass} recorded market(s) settled; {done} window(s) on disk of {total} in the training window");
         }
-        update_status(asset, |s| { s.backfill_done = done; s.backfill_missing = missing; s.backfill_unresolved = unresolved; s.phase = "recording".into(); });
-        // Nothing to backfill: the store is as complete as the hours this instance flew.
-        return true;
+        if source == StoreSource::Recorder {
+            update_status(asset, |s| { s.backfill_done = done; s.backfill_missing = missing; s.backfill_unresolved = unresolved; s.phase = "recording".into(); });
+            // Nothing to backfill: the store is as complete as the hours this instance flew.
+            return true;
+        }
+        // Records the loop wrote before it kept asks take them from the venue's
+        // quotes, once, so the fold is not a mix of real asks and mid plus half a
+        // cent for as long as those records are in it. A record whose minutes
+        // have no candle keeps its estimate, and is not asked about again.
+        let mut given_quotes = 0usize;
+        for &w in &windows {
+            if !training_knobs().enabled { break; }
+            let path = dir.market(w);
+            let Ok(mut rec) = read_json::<MarketRecord>(&path) else { continue };
+            if !rec.recorded_live || rec.missing || rec.quotes_checked || rec.has_quotes() || rec.hist.values().all(|h| h.is_empty()) { continue; }
+            match crate::venues::fetch_hourly_quotes(asset, &rec.slug, w).await {
+                Ok(quotes) => {
+                    let added = merge_quotes(&mut rec, &quotes);
+                    // Asked once, matched or not.
+                    rec.quotes_checked = true;
+                    if let Err(e) = write_json_atomically(&path, &rec) {
+                        warn!("GBoost plan-B pipeline [{asset}]: cannot write market {w}: {e}");
+                        break;
+                    }
+                    if added { given_quotes += 1; }
+                }
+                Err(e) => {
+                    warn!("GBoost plan-B pipeline [{asset}]: quotes for recorded market {} ({w}) not fetched: {e}", rec.slug);
+                    update_status(asset, |s| s.note_error(&format!("quotes:{w}"), format!("{}: {e}", rec.slug)));
+                }
+            }
+        }
+        if given_quotes > 0 {
+            info!("GBoost plan-B pipeline [{asset}]: {given_quotes} recorded market(s) given the venue's asks");
+        }
+        fetched_this_pass = 0;
+        update_status(asset, |s| { s.backfill_done = done; s.backfill_missing = missing; s.backfill_unresolved = unresolved; });
     }
     for w in todo {
         // The operator can stop a long backfill from the Control Tower.
         if !training_knobs().enabled { break; }
-        match fetch_market(w, Utc::now().timestamp()).await {
+        match fetch_window(source, dir, asset, w, Utc::now().timestamp()).await {
             Ok(Fetched::Record(rec)) => {
                 if rec.missing { missing += 1; }
                 if let Err(e) = write_json_atomically(&dir.market(w), &rec) {
@@ -2902,8 +3081,8 @@ async fn catch_up(asset: &str, dir: &DataDir, knobs: &TrainingKnobs, now: i64) -
             }
             Ok(Fetched::NotResolved) => unresolved += 1,
             Err(e) => {
-                warn!("GBoost plan-B pipeline [{asset}]: market {} ({w}) not fetched: {e}", slug_for(w));
-                update_status(asset, |s| s.note_error(&format!("market:{w}"), format!("{}: {e}", slug_for(w))));
+                warn!("GBoost plan-B pipeline [{asset}]: market {} ({w}) not fetched: {e}", window_name(source, w));
+                update_status(asset, |s| s.note_error(&format!("market:{w}"), format!("{}: {e}", window_name(source, w))));
             }
         }
         update_status(asset, |s| { s.backfill_done = done; s.backfill_missing = missing; s.backfill_unresolved = unresolved; });
@@ -2926,11 +3105,110 @@ async fn catch_up(asset: &str, dir: &DataDir, knobs: &TrainingKnobs, now: i64) -
     done + unresolved >= total
 }
 
-/// Does this build's venue publish the history the fetcher backfills from?
-/// Polymarket International does (Gamma, the data API, the CLOB); the others do
-/// not, and their store is written live by the venue loop's recorder.
+/// Does this build's venue publish the history THIS MODULE'S fetcher reads
+/// (Gamma, the data API, the CLOB)? Only Polymarket International. The flag also
+/// decides where the live viper takes its market price from (the CLOB price
+/// history there, its own minute samples elsewhere), so it stays about that
+/// venue; which store a venue backfills from is [`store_source`].
 pub fn has_public_history() -> bool {
     crate::venues::ledger_venue() == TRAINED_VENUE
+}
+
+/// Where this venue's training store comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreSource {
+    /// Polymarket International: Gamma, the data API and the CLOB, fetched here.
+    Gamma,
+    /// The venue's own public history of settled hourly markets and their
+    /// per-minute quotes, through `venues::fetch_hourly_history` (Kalshi).
+    /// Hours the squadron flew keep the recorder's own record, prints included;
+    /// the rest of the window is fetched.
+    VenueHistory,
+    /// Written live by the venue loop's recorder, nothing to backfill
+    /// (Polymarket US).
+    Recorder,
+}
+
+pub fn store_source() -> StoreSource {
+    if has_public_history() { StoreSource::Gamma }
+    else if crate::venues::publishes_hourly_history() { StoreSource::VenueHistory }
+    else { StoreSource::Recorder }
+}
+
+/// A venue's history as the store's record: the mids and asks of its two-sided
+/// minutes (the NO leg is the complement), the venue's leg ids, strike and
+/// settlement, no tape. `recorded_live` is false: this is fetched history, held
+/// to the fetched records' 20-point floor.
+pub fn record_from_history(w: i64, h: &crate::venues::core::HourlyHistory) -> MarketRecord {
+    let yes: Vec<HistPoint> = h.quotes.iter()
+        .map(|q| HistPoint { t: q.t, p: (q.yes_bid + q.yes_ask) / 2.0, a: Some(q.yes_ask) }).collect();
+    let no: Vec<HistPoint> = h.quotes.iter()
+        .map(|q| HistPoint { t: q.t, p: 1.0 - (q.yes_bid + q.yes_ask) / 2.0, a: Some(1.0 - q.yes_bid) }).collect();
+    MarketRecord {
+        slug: h.ticker.clone(),
+        missing: false,
+        window_start: rfc3339(w),
+        condition_id: None,
+        tokens: vec![h.yes_token.clone(), h.no_token.clone()],
+        outcome_prices: h.up_won.map(crate::vipers::gboost_planb_record::outcome_prices),
+        closed: Some(true),
+        end_date: Some(rfc3339(w + 3600)),
+        tape: Vec::new(),
+        hist: HashMap::from([("0".to_string(), yes), ("1".to_string(), no)]),
+        strike: h.strike,
+        recorded_live: false,
+        quotes_checked: false,
+    }
+}
+
+/// The underlying's price at the window's open, from the bars on disk (the
+/// window's own bar, in the venue's settlement currency), for picking the
+/// at-the-money strike the squadron would have flown.
+fn spot_at_open(dir: &DataDir, w: i64) -> Option<f64> {
+    let day: KlineDay = read_json(&dir.kline_day(utc_day(w))).ok()?;
+    day.bars.iter().find(|b| b[0] as i64 == w).map(|b| b[1]).filter(|p| p.is_finite() && *p > 0.0)
+}
+
+/// Give a record written live before the recorder kept asks the venue's own
+/// quotes: each sampled point takes the ask of the candle closing at or just
+/// before it (the recorder's sample is the first tick of a minute, the candle
+/// closing at that minute's start is the book an instant earlier). Returns
+/// whether anything was added.
+pub fn merge_quotes(rec: &mut MarketRecord, quotes: &[crate::venues::core::HistoryQuote]) -> bool {
+    if quotes.is_empty() { return false; }
+    let by_t: Vec<(i64, (f64, f64))> = quotes.iter().map(|q| (q.t, (q.yes_bid, q.yes_ask))).collect();
+    let mut added = false;
+    for (side, h) in [("0", 0usize), ("1", 1usize)] {
+        let Some(pts) = rec.hist.get_mut(side) else { continue };
+        for p in pts.iter_mut().filter(|p| p.a.is_none()) {
+            let Some((i, (bid, ask))) = last_at(&by_t, p.t) else { continue };
+            if p.t - by_t[i].0 > MID_STALE_SECS { continue; }
+            p.a = Some(if h == 0 { ask } else { 1.0 - bid });
+            added = true;
+        }
+    }
+    added
+}
+
+/// One window from wherever this venue's store is backfilled.
+async fn fetch_window(source: StoreSource, dir: &DataDir, underlying: &str, w: i64, now: i64) -> Result<Fetched, String> {
+    use crate::venues::core::HistoryFetch;
+    match source {
+        StoreSource::Gamma => fetch_market(w, now).await,
+        StoreSource::VenueHistory => Ok(match crate::venues::fetch_hourly_history(underlying, w, now, spot_at_open(dir, w)).await? {
+            HistoryFetch::Market(h) => Fetched::Record(record_from_history(w, &h)),
+            HistoryFetch::NotResolved => Fetched::NotResolved,
+            // The venue ran no hourly market that hour: a missing record, as the
+            // Gamma fetch writes one, so the hour is not asked for again.
+            HistoryFetch::NoMarket => Fetched::Record(MarketRecord { slug: format!("{underlying}-{w}"), missing: true, window_start: rfc3339(w), ..Default::default() }),
+        }),
+        StoreSource::Recorder => Ok(Fetched::NotResolved),
+    }
+}
+
+/// The name a window goes by in a log line.
+fn window_name(source: StoreSource, w: i64) -> String {
+    match source { StoreSource::Gamma => slug_for(w), _ => rfc3339(w) }
 }
 
 /// How many settled recorded markets a venue without public history needs on disk
@@ -3011,7 +3289,7 @@ pub async fn run_pipeline(asset: String) {
         update_status(&asset, |s| s.squadron_id = Some(squadron_id.clone()));
         let now = Utc::now().timestamp();
         let complete = catch_up(&asset, &dir, &knobs, now).await;
-        if !has_public_history() {
+        if store_source() == StoreSource::Recorder {
             let settled = settled_records(&dir, floor_hour(now) - knobs.window_days * 86400);
             if settled < MIN_RECORDED_MARKETS {
                 // Status, not an error: the store fills one hourly market at a time
@@ -3310,7 +3588,7 @@ mod tests {
         assert!(booster.get_prediction_trees().len() >= STRUCTURAL_MIN_TREES);
         let xc: Vec<[f64; N_FEATURES]> = cal.iter().map(|r| r.features).collect();
         let yc: Vec<bool> = cal.iter().map(|r| r.y).collect();
-        let calib = calibrate_candidate(&booster, &xc, &yc, &[], TRAINED_FORM).expect("calibrates");
+        let calib = calibrate_candidate(&booster, &xc, &yc, &[], &[], TRAINED_FORM).expect("calibrates");
         let (a, b) = (calib.platt_a, calib.platt_b);
         for (k, v) in [
             ("feature_layout", "column_major".to_string()), ("feature_names", FEATURE_NAMES.join(",")),
@@ -3539,7 +3817,7 @@ mod tests {
             let booster = fit_booster(&xf, &yf, &[], 0.5, 1, 8.0, ModelForm::ResidualMid).expect("fits");
             let xc: Vec<[f64; N_FEATURES]> = cal.iter().map(|r| r.features).collect();
             let yc: Vec<bool> = cal.iter().map(|r| r.y).collect();
-            let calib = calibrate_candidate(&booster, &xc, &yc, &[], ModelForm::ResidualMid).expect("calibrates");
+            let calib = calibrate_candidate(&booster, &xc, &yc, &[], &[], ModelForm::ResidualMid).expect("calibrates");
             assert_eq!((calib.platt_a, calib.platt_b), (1.0, 0.0), "the residual form's Platt is the identity");
             let xt: Vec<[f64; N_FEATURES]> = test.iter().map(|r| r.features).collect();
             let unshrunk = predict_raw(&booster, &xt, &[], ModelForm::ResidualMid, 1.0);
@@ -3604,18 +3882,18 @@ mod tests {
     #[test]
     fn the_gate_names_every_failure_and_the_comparison_is_by_return_then_skill() {
         let good = FoldStats { skill: 0.05, market_skill: 0.02, rule: RuleStats { trades: 40, mean_ret: 0.03, win: 0.60, ..Default::default() }, ..Default::default() };
-        assert!(gate(300, &good, 30, 0.53).passed);
-        let g = gate(3, &FoldStats { skill: -0.01, market_skill: -0.01, rule: RuleStats { trades: 10, mean_ret: -0.02, win: 0.40, ..Default::default() }, ..Default::default() }, 30, 0.53);
+        assert!(gate(300, &good, 30, 0.53, None).passed);
+        let g = gate(3, &FoldStats { skill: -0.01, market_skill: -0.01, rule: RuleStats { trades: 10, mean_ret: -0.02, win: 0.40, ..Default::default() }, ..Default::default() }, 30, 0.53, None);
         assert!(!g.passed);
         assert_eq!(g.reasons.len(), 6, "{:?}", g.reasons);
         // The production shape of 2026-10-11: skill over the base rate, none over the price.
         let price_knows_more = FoldStats { skill: 0.083, market_skill: -0.006, rule: RuleStats { trades: 468, mean_ret: 0.01, win: 0.60, ..Default::default() }, ..Default::default() };
-        let g = gate(359, &price_knows_more, 30, 0.53);
+        let g = gate(359, &price_knows_more, 30, 0.53, None);
         assert!(!g.passed);
         assert_eq!(g.reasons, vec!["log-loss skill over the market mid -0.0060 is not positive: the model knows less than the price".to_string()]);
         let unmeasured = FoldStats { skill: 0.083, market_skill: 0.0, ..good.clone() };
-        assert!(!gate(359, &unmeasured, 30, 0.53).passed, "a report that never measured the market reads as zero and fails");
-        let nan = gate(300, &FoldStats { skill: f64::NAN, rule: RuleStats { trades: 0, mean_ret: f64::NAN, win: f64::NAN, ..Default::default() }, ..Default::default() }, 30, 0.53);
+        assert!(!gate(359, &unmeasured, 30, 0.53, None).passed, "a report that never measured the market reads as zero and fails");
+        let nan = gate(300, &FoldStats { skill: f64::NAN, rule: RuleStats { trades: 0, mean_ret: f64::NAN, win: f64::NAN, ..Default::default() }, ..Default::default() }, 30, 0.53, None);
         assert!(!nan.passed, "a fold with no trades cannot pass");
         let worse = FoldStats { skill: 0.09, market_skill: 0.04, rule: RuleStats { trades: 40, mean_ret: 0.04, win: 0.6, ..Default::default() }, ..Default::default() };
         assert!(!beats_incumbent(&good, &worse, 30).0, "a lower return loses even with lower skill on the incumbent's side");
@@ -3675,7 +3953,7 @@ mod tests {
         let bars: Vec<Bar> = (0..125)
             .map(|i| { let o = w - 62 * 60 + 60 * i; Bar { open_s: o, open: 100.0, high: 100.0, low: 100.0, close: 100.0 } })
             .collect();
-        let samples: Vec<HistPoint> = (0..50).map(|i| HistPoint { t: w + 60 * i + 9, p: 0.50 }).collect();
+        let samples: Vec<HistPoint> = (0..50).map(|i| HistPoint { t: w + 60 * i + 9, p: 0.50, a: None }).collect();
         let mut rec = MarketRecord {
             outcome_prices: Some("[\"1\", \"0\"]".into()), // Up won
             hist: HashMap::from([("0".to_string(), samples.clone()), ("1".to_string(), samples)]),
@@ -3727,7 +4005,7 @@ mod tests {
         let bars: Vec<Bar> = (0..125)
             .map(|i| { let o = w - 62 * 60 + 60 * i; Bar { open_s: o, open: 100.0, high: 100.0, low: 100.0, close: 100.0 } })
             .collect();
-        let samples: Vec<HistPoint> = (0..50).map(|i| HistPoint { t: w + 60 * i + 9, p: 0.50 }).collect();
+        let samples: Vec<HistPoint> = (0..50).map(|i| HistPoint { t: w + 60 * i + 9, p: 0.50, a: None }).collect();
         let rec = MarketRecord {
             outcome_prices: Some("[\"1\", \"0\"]".into()), // Up won
             hist: HashMap::from([("0".to_string(), samples.clone()), ("1".to_string(), samples)]),
@@ -4472,5 +4750,165 @@ mod kline_denomination_tests {
         assert!(!kline_day_matches(&usd, "usdt"));
         assert_eq!(kline_denomination_tag(crate::raptors::price::MarkDenomination::QuoteAsset), "usdt");
         assert_eq!(kline_denomination_tag(crate::raptors::price::MarkDenomination::Usd), "usd");
+    }
+}
+
+#[cfg(test)]
+mod venue_history_tests {
+    use super::*;
+    use crate::venues::core::{HistoryQuote, HourlyHistory};
+    use crate::vipers::gboost_planb::Bar;
+
+    fn history(w: i64, up_won: Option<bool>, minutes: std::ops::Range<i64>) -> HourlyHistory {
+        HourlyHistory {
+            ticker: "KXBTCD-T".into(), yes_token: "KXBTCD-T#yes".into(), no_token: "KXBTCD-T#no".into(),
+            strike: Some(100.0), up_won,
+            // A 2-cent-wide book drifting up through the hour.
+            quotes: minutes.map(|m| HistoryQuote { t: w + 60 * m, yes_bid: 0.44 + m as f64 * 0.002, yes_ask: 0.46 + m as f64 * 0.002 }).collect(),
+        }
+    }
+
+    fn bars(w: i64) -> Vec<Bar> {
+        ((w - 62 * 60)..(w + 3600)).step_by(60)
+            .map(|o| { let px = 100.0 + ((o - w) as f64) / 36_000.0; Bar { open_s: o, open: px, high: px + 0.1, low: px - 0.1, close: px + 0.01 } })
+            .collect()
+    }
+
+    /// A venue's history becomes the store's record: mids and asks for both legs
+    /// (the NO leg the complement), the venue's leg ids, strike, settlement, no
+    /// tape, and the record builds rows whose entry is the ASK the book showed,
+    /// not the mid plus half a cent.
+    #[test]
+    fn venue_history_builds_rows_at_the_quoted_ask() {
+        let w = 1_792_000_800i64;
+        let rec = record_from_history(w, &history(w, Some(true), 0..60));
+        assert_eq!(rec.tokens, vec!["KXBTCD-T#yes", "KXBTCD-T#no"]);
+        assert_eq!((rec.strike, rec.up_won(), rec.recorded_live, rec.tape.len()), (Some(100.0), Some(true), false, 0));
+        assert!(rec.has_quotes());
+        let y0 = &rec.hist["0"][0]; let n0 = &rec.hist["1"][0];
+        assert!((y0.p - 0.45).abs() < 1e-12 && y0.a == Some(0.46), "YES mid and ask: {y0:?}");
+        assert!((n0.p - 0.55).abs() < 1e-12 && (n0.a.unwrap() - 0.56).abs() < 1e-12, "NO is the complement: {n0:?}");
+        let plan = Plan::from_config(&DynamicConfig::default(), 0.07);
+        let rows = build_market_rows(w, &rec, &bars(w), &[], (&[], &[]), &plan);
+        assert!(!rows.is_empty(), "a fetched record with quotes needs no tape");
+        for r in &rows {
+            // The entry is the ask AT the decision minute (the candle closing at it):
+            // at minute k the YES ask is 0.46 + 0.002 k, the NO ask 1 - (0.44 + 0.002 k).
+            let m = r.k as f64;
+            let expect = if r.side == 0 { 0.46 + 0.002 * m } else { 1.0 - (0.44 + 0.002 * m) };
+            assert!((r.ask - expect).abs() < 1e-9, "side {} minute {}: ask {} expected {expect}", r.side, r.k, r.ask);
+        }
+        // A record without asks (an older store) still falls back to mid + HALF_SPREAD.
+        let mut old = rec.clone();
+        for h in old.hist.values_mut() { for p in h.iter_mut() { p.a = None; } }
+        assert!(!old.has_quotes());
+        assert!(build_market_rows(w, &old, &bars(w), &[], (&[], &[]), &plan).is_empty(), "fetched, no tape, no quotes: a dead market as before");
+        old.recorded_live = true;
+        let rows = build_market_rows(w, &old, &bars(w), &[], (&[], &[]), &plan);
+        let r = rows.iter().find(|r| r.side == 0).unwrap();
+        assert!((r.ask - (0.45 + 0.002 * (r.k + 1) as f64 + HALF_SPREAD)).abs() < 1e-9, "mid plus half a spread: {}", r.ask);
+    }
+
+    /// A record written live before asks were kept takes them from the venue's
+    /// quotes: each first-tick sample gets the ask of the candle closing at that
+    /// minute's start; a point with no candle within the staleness bound keeps
+    /// none. Nothing to merge reports false.
+    #[test]
+    fn old_live_records_take_their_asks_from_the_venues_quotes() {
+        let w = 1_792_000_800i64;
+        let mut rec = MarketRecord { recorded_live: true, ..Default::default() };
+        // Samples at the first tick of minutes 5, 6 and 40.
+        rec.hist.insert("0".into(), vec![HistPoint { t: w + 301, p: 0.45, a: None }, HistPoint { t: w + 362, p: 0.46, a: None }, HistPoint { t: w + 2401, p: 0.50, a: None }]);
+        rec.hist.insert("1".into(), vec![HistPoint { t: w + 301, p: 0.55, a: None }, HistPoint { t: w + 362, p: 0.54, a: None }, HistPoint { t: w + 2401, p: 0.50, a: None }]);
+        // Candles closing at minutes 5 and 6 only.
+        let quotes = vec![HistoryQuote { t: w + 300, yes_bid: 0.44, yes_ask: 0.46 }, HistoryQuote { t: w + 360, yes_bid: 0.45, yes_ask: 0.47 }];
+        assert!(merge_quotes(&mut rec, &quotes));
+        assert_eq!(rec.hist["0"].iter().map(|p| p.a).collect::<Vec<_>>(), vec![Some(0.46), Some(0.47), None], "minute 40 has no candle within 180 s");
+        assert!((rec.hist["1"][0].a.unwrap() - 0.56).abs() < 1e-12, "the NO ask is one minus the YES bid");
+        assert!(rec.has_quotes());
+        assert!(!merge_quotes(&mut rec, &quotes), "nothing left to add");
+        let mut none = MarketRecord { recorded_live: true, ..Default::default() };
+        none.hist.insert("0".into(), vec![HistPoint { t: w + 2401, p: 0.5, a: None }]);
+        assert!(!merge_quotes(&mut none, &quotes));
+        assert!(!merge_quotes(&mut none, &[]));
+    }
+
+    /// Too few two-sided minutes is a far strike or a dead hour: the fetched floor
+    /// applies, and an unsettled history has no rows.
+    #[test]
+    fn a_thin_or_unsettled_history_builds_nothing() {
+        let w = 1_792_000_800i64;
+        let plan = Plan::from_config(&DynamicConfig::default(), 0.07);
+        let thin = record_from_history(w, &history(w, Some(false), 20..30));
+        assert!(build_market_rows(w, &thin, &bars(w), &[], (&[], &[]), &plan).is_empty(), "10 minutes is under the 20-point floor");
+        let open = record_from_history(w, &history(w, None, 0..60));
+        assert_eq!(open.up_won(), None);
+        assert!(build_market_rows(w, &open, &bars(w), &[], (&[], &[]), &plan).is_empty());
+    }
+
+    /// The store's source follows the build: Gamma on Polymarket International, the
+    /// venue's own history on Kalshi, the recorder alone on Polymarket US. The
+    /// live viper's price source (`has_public_history`) is a separate question.
+    #[test]
+    fn the_store_source_follows_the_venue() {
+        let expected = match crate::venues::venue_name() {
+            "intl_clob" => StoreSource::Gamma,
+            "kalshi" => StoreSource::VenueHistory,
+            _ => StoreSource::Recorder,
+        };
+        assert_eq!(store_source(), expected);
+        assert_eq!(has_public_history(), crate::venues::venue_name() == "intl_clob");
+    }
+
+    /// At a believed deviation of zero the gate says so once, instead of three
+    /// NaN-shaped complaints about trades it could never have taken.
+    #[test]
+    fn a_zero_shrink_is_one_finding() {
+        let stats = FoldStats { skill: 0.09, market_skill: 0.0, market_skill_lo: Some(-0.01), market_skill_hi: Some(0.012),
+            rule: RuleStats { trades: 0, mean_ret: f64::NAN, win: f64::NAN, ..Default::default() }, ..Default::default() };
+        let g = gate(400, &stats, 30, 0.53, Some(0.0));
+        assert!(!g.passed);
+        assert_eq!(g.reasons.len(), 2, "{:?}", g.reasons);
+        assert!(g.reasons[0].contains("90% interval -0.0100 to +0.0120"), "{}", g.reasons[0]);
+        assert!(g.reasons[1].starts_with("no deviation signal"));
+        let g = gate(400, &stats, 30, 0.53, Some(0.4));
+        assert_eq!(g.reasons.len(), 4, "a believed deviation keeps the rule's own reasons: {:?}", g.reasons);
+        assert_eq!(gate(400, &stats, 30, 0.53, None).reasons.len(), 4);
+    }
+
+    /// The intervals are market bootstraps: a model that IS the mid has a skill
+    /// interval around zero; a model closer to the truth than the mid on every
+    /// market has an interval above zero; a deviation with no slope has a shrink
+    /// interval at zero and one with a real slope an interval away from it.
+    #[test]
+    fn the_intervals_bracket_what_the_point_estimates_say() {
+        let mut rows: Vec<TrainingRow> = Vec::new();
+        let mut rng = SplitMix(3);
+        for m in 0..60i64 {
+            let up = rng.below(2) == 0;
+            for k in 0..20i64 {
+                let mut f = [0.0; N_FEATURES];
+                f[MID_COLUMN] = 0.5 + (rng.below(21) as f64 - 10.0) / 100.0;
+                rows.push(TrainingRow { w: m * 3600, k, side: 0, ask: f[MID_COLUMN] + 0.01, features: f, y: up, ret: 0.0, exit: ExitKind::Settle, exit_t: 0, elig: true });
+            }
+        }
+        let refs: Vec<&TrainingRow> = rows.iter().collect();
+        let as_mid: Vec<f64> = refs.iter().map(|r| r.features[MID_COLUMN]).collect();
+        let (lo, hi) = market_skill_interval(&refs, &as_mid).unwrap();
+        assert!(lo.abs() < 1e-9 && hi.abs() < 1e-9, "the mid against itself: {lo} {hi}");
+        let better: Vec<f64> = refs.iter().map(|r| if r.y { (r.features[MID_COLUMN] + 0.08).min(0.99) } else { (r.features[MID_COLUMN] - 0.08).max(0.01) }).collect();
+        let (lo, hi) = market_skill_interval(&refs, &better).unwrap();
+        assert!(lo > 0.0 && hi > lo, "better than the mid on every market: {lo} {hi}");
+        assert!(market_skill_interval(&refs[..20], &as_mid[..20]).is_none(), "one market is no interval");
+
+        let w: Vec<i64> = refs.iter().map(|r| r.w).collect();
+        let y: Vec<bool> = refs.iter().map(|r| r.y).collect();
+        let noise: Vec<f64> = (0..refs.len()).map(|_| (rng.below(201) as f64 - 100.0) / 1000.0).collect();
+        let (lo, hi) = residual_shrink_interval(&noise, &y, &as_mid, &w).unwrap();
+        assert!(lo == 0.0 && hi < 0.6, "noise has no slope: {lo} {hi}");
+        let signal: Vec<f64> = refs.iter().map(|r| if r.y { 0.2 } else { -0.2 }).collect();
+        let (lo, hi) = residual_shrink_interval(&signal, &y, &as_mid, &w).unwrap();
+        assert!(lo > 0.5 && hi <= 1.0, "a real slope is believed: {lo} {hi}");
+        assert!(residual_shrink_interval(&signal, &y, &as_mid, &w[..5]).is_none(), "mismatched lengths");
     }
 }

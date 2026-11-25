@@ -32,6 +32,7 @@
 //! * `KALSHI_BASE_URL` / `KALSHI_WS_URL` → explicit overrides (rare)
 
 pub mod auth;
+pub mod history;
 pub mod orders;
 pub mod sports;
 pub mod trader;

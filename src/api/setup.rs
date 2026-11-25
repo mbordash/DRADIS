@@ -808,6 +808,21 @@ async fn acknowledge_alpha() -> Response {
     Json(json!({"ok": true, "already_acknowledged": false, "record": record})).into_response()
 }
 
+/// What the Setup page may show of a saved value. A secret shows its last four
+/// characters for recognition and nothing else. A `setting` ([E102]) is not a
+/// secret and shows whole, so the operator can read what is configured. A
+/// yes/no key (`bool`, `bool01`) shows its value too: it is the switch's own
+/// state, and masked to "•••" or "…alse" the page could not tell which side
+/// was saved, so Community Updates showed neither On nor Off after a save and
+/// a floating "set ••• · managed" (2026-11-25).
+fn masked_hint(kind: &str, v: &str) -> String {
+    match kind {
+        "setting" | "bool" | "bool01" => v.to_string(),
+        _ if v.len() > 4 => format!("…{}", &v[v.len() - 4..]),
+        _ => "•••".to_string(),
+    }
+}
+
 /// GET /api/setup/credentials — masked inventory of managed keys. Never returns
 /// secret values; only whether each is set plus a last-4 hint for recognition.
 async fn get_credentials() -> Response {
@@ -819,10 +834,7 @@ async fn get_credentials() -> Response {
             .or_else(|| std::env::var(key).ok().filter(|v| !v.is_empty()));
         let (set, hint, source) = match val {
             Some(v) => {
-                // [E102] A "setting" is not a secret: show it whole so the
-                // operator can read what is configured.
-                let hint = if *kind == "setting" { v.clone() }
-                    else if v.len() > 4 { format!("…{}", &v[v.len() - 4..]) } else { "•••".to_string() };
+                let hint = masked_hint(kind, &v);
                 let source = if secrets.contains_key(*key) { "managed" } else { "env" };
                 (true, hint, source)
             }
@@ -1881,6 +1893,13 @@ mod tests {
     #[test]
     fn the_community_update_switch_needs_no_restart() {
         assert!(!super::needs_restart(&["COMMUNITY_UPDATE_CHECK".into()]));
+        // A switch shows its own state; a secret shows its tail; a setting shows whole.
+        assert_eq!(super::masked_hint("bool", "true"), "true");
+        assert_eq!(super::masked_hint("bool", "false"), "false");
+        assert_eq!(super::masked_hint("bool01", "1"), "1");
+        assert_eq!(super::masked_hint("setting", "btc,eth,sol"), "btc,eth,sol");
+        assert_eq!(super::masked_hint("text", "sk-live-abcdef"), "…cdef");
+        assert_eq!(super::masked_hint("text", "abc"), "•••");
         assert!(!super::needs_restart(&["COMMUNITY_UPDATE_CHECK (removed)".into()]));
         assert!(super::needs_restart(&["COMMUNITY_UPDATE_CHECK".into(), "TELEGRAM_CHAT_ID".into()]));
         assert!(super::needs_restart(&["KALSHI_API_KEY_ID".into()]));

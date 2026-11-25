@@ -17,14 +17,17 @@
 //! The hourly market recorder: GBoost plan B's training store, written live.
 //!
 //! On Polymarket International the plan-B pipeline backfills its store from the
-//! venue's public history (`gboost_planb_train::catch_up`). Kalshi publishes no
-//! price history, so a Kalshi instance has to write its own: while the venue loop
-//! flies a one-hour market, this samples both legs' mids once a minute from the
-//! book it is already streaming, and at the close fetches the hour's prints and
-//! writes one [`MarketRecord`] in exactly the shape the fetcher writes, into the
-//! same directory, under the same window key. The pipeline then fills the
-//! outcome from the venue's settlement (`venues::core::resolve_leg`) and trains
-//! from the records once there are enough of them.
+//! venue's public history (`gboost_planb_train::catch_up`); on Kalshi it
+//! backfills the hours the squadron did not fly from the venue's public
+//! candlesticks (`venues::kalshi::history`); Polymarket US publishes nothing.
+//! Whatever the venue, the hours the loop flies are recorded here, from the book
+//! it is already streaming: both legs' mids and asks once a minute, and at the
+//! close the hour's prints, written as one [`MarketRecord`] in exactly the shape
+//! the fetcher writes, into the same directory, under the same window key. A
+//! recorded hour carries what a fetched one cannot: the tape, and the book as
+//! this instance saw it. The pipeline then fills the outcome from the venue's
+//! settlement (`venues::core::resolve_leg`) and trains from the records once
+//! there are enough of them.
 //!
 //! Venue-neutral by construction: it reads a `MarketSnapshot`'s mids and the
 //! `Execution::recent_prints` tape, so any venue loop can own one.
@@ -88,17 +91,38 @@ impl HourlyRecorder {
     /// Minutes sampled so far.
     pub fn samples(&self) -> usize { self.hist[0].len() }
 
-    /// Record both legs' mids for the minute containing `now_s`, once per minute:
-    /// the first tick of each minute is the sample, as a one-minute price history
-    /// would publish it. A leg with no two-sided quote contributes nothing that
-    /// minute (never a zero), and the minute is left open for a later tick.
+    /// Record both legs' mids for the minute containing `now_s`, one sample per
+    /// minute: the LATEST tick of the minute, replacing the earlier one, so the
+    /// sample at or before a decision minute is the book an instant before it,
+    /// which is what a venue's one-minute candle closing at that minute holds
+    /// and what the training rows and the live viper then read alike. (The first
+    /// tick, kept until 1.9.1, put the sample a minute behind the candles.) A leg
+    /// with no two-sided quote contributes nothing that tick (never a zero).
+    /// Mids only; a sample from the book itself goes through [`Self::sample_quotes`].
     pub fn sample(&mut self, now_s: i64, mid_yes: Option<f64>, mid_no: Option<f64>) {
+        self.sample_point(now_s, mid_yes.map(|m| (m, None)), mid_no.map(|m| (m, None)));
+    }
+
+    /// Record both legs' quotes `(bid, ask)` for the minute: the mid as
+    /// [`Self::sample`] does, and the ask itself, so the training rows take the
+    /// price the book showed rather than the mid plus half a cent.
+    pub fn sample_quotes(&mut self, now_s: i64, yes: Option<(f64, f64)>, no: Option<(f64, f64)>) {
+        let point = |q: Option<(f64, f64)>| q.filter(|(b, a)| *b > 0.0 && *a < 1.0 && a >= b).map(|(b, a)| ((b + a) / 2.0, Some(a)));
+        self.sample_point(now_s, point(yes), point(no));
+    }
+
+    fn sample_point(&mut self, now_s: i64, yes: Option<(f64, Option<f64>)>, no: Option<(f64, Option<f64>)>) {
         let minute = now_s.div_euclid(60) * 60;
-        if self.last_minute == Some(minute) { return; }
-        let (Some(y), Some(n)) = (mid_yes, mid_no) else { return };
+        let (Some((y, ya)), Some((n, na))) = (yes, no) else { return };
         if !(y > 0.0 && y < 1.0 && n > 0.0 && n < 1.0) { return; }
-        self.hist[0].push(HistPoint { t: now_s, p: y });
-        self.hist[1].push(HistPoint { t: now_s, p: n });
+        if self.last_minute == Some(minute) {
+            // The same minute again: the later tick is the sample.
+            if let Some(p0) = self.hist[0].last_mut() { *p0 = HistPoint { t: now_s, p: y, a: ya }; }
+            if let Some(p1) = self.hist[1].last_mut() { *p1 = HistPoint { t: now_s, p: n, a: na }; }
+            return;
+        }
+        self.hist[0].push(HistPoint { t: now_s, p: y, a: ya });
+        self.hist[1].push(HistPoint { t: now_s, p: n, a: na });
         self.last_minute = Some(minute);
     }
 
@@ -123,6 +147,7 @@ impl HourlyRecorder {
             hist,
             strike: self.strike,
             recorded_live: true,
+            quotes_checked: false,
         }
     }
 }
@@ -157,21 +182,35 @@ mod tests {
         }
     }
 
-    /// One sample per minute, from the first tick that has both mids; a one-sided
-    /// book leaves the minute open rather than recording a zero.
+    /// One sample per minute, the latest two-sided tick of it; a one-sided book
+    /// or a zero mid is not a sample and does not disturb the one kept.
     #[test]
     fn samples_once_a_minute_and_never_a_zero() {
         let mut r = HourlyRecorder::new("KXBTCD-26OCT1719-T91299.99", "k#yes", "k#no", 7200, Some(91_299.99));
         assert_eq!(r.window_start(), 3600);
         r.sample(3600, None, Some(0.55));          // one-sided: nothing yet
-        r.sample(3601, Some(0.45), Some(0.55));    // the minute's sample
-        r.sample(3630, Some(0.46), Some(0.54));    // same minute: ignored
-        r.sample(3660, Some(0.0), Some(0.54));     // a zero mid is not a price
+        r.sample(3601, Some(0.45), Some(0.55));    // the minute's first sample
+        r.sample(3630, Some(0.46), Some(0.54));    // same minute: the later tick replaces it
+        r.sample(3659, Some(0.0), Some(0.54));     // a zero mid is not a price
         r.sample(3661, Some(0.47), Some(0.53));
         assert_eq!(r.samples(), 2);
         let rec = r.finish(&[]);
-        assert_eq!(rec.hist["0"].iter().map(|p| p.p).collect::<Vec<_>>(), vec![0.45, 0.47]);
-        assert_eq!(rec.hist["1"][0].t, 3601);
+        assert_eq!(rec.hist["0"].iter().map(|p| p.p).collect::<Vec<_>>(), vec![0.46, 0.47]);
+        assert_eq!(rec.hist["1"][0].t, 3630, "the minute's sample is its latest tick");
+    }
+
+    /// A sample from the book keeps the ask beside the mid; a one-sided or crossed
+    /// quote records nothing that minute.
+    #[test]
+    fn a_quote_sample_keeps_the_ask() {
+        let mut r = HourlyRecorder::new("KXBTCD-T", "k#yes", "k#no", 7200, Some(100.0));
+        r.sample_quotes(3601, Some((0.44, 0.46)), Some((0.54, 0.56)));
+        r.sample_quotes(3661, Some((0.0, 0.46)), Some((0.54, 0.56)));   // no YES bid
+        r.sample_quotes(3721, Some((0.47, 0.49)), Some((0.51, 0.53)));
+        let rec = r.finish(&[]);
+        assert_eq!(rec.hist["0"].iter().map(|p| (p.p, p.a)).collect::<Vec<_>>(), vec![(0.45, Some(0.46)), (0.48, Some(0.49))]);
+        assert_eq!(rec.hist["1"][0].a, Some(0.56));
+        assert!(rec.has_quotes());
     }
 
     /// The record is the fetcher's shape: window key, tokens, a sorted tape with the

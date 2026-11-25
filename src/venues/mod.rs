@@ -393,6 +393,44 @@ pub const SUB_CENT_TAKER_PRICES: bool = true;
 #[cfg(not(feature = "kalshi"))]
 pub const SUB_CENT_TAKER_PRICES: bool = false;
 
+/// Whether this venue publishes the hourly crypto markets' history (settled
+/// results and per-minute quotes) that GBoost plan B's training store can be
+/// backfilled from through [`fetch_hourly_history`]. Kalshi does (public
+/// candlesticks, `kalshi::history`). Polymarket International's history comes
+/// through the trainer's own Gamma and CLOB fetch, which predates this and is
+/// not routed here; Polymarket US publishes none, so its store is written live
+/// by the venue loop's recorder.
+#[cfg(feature = "kalshi")]
+pub fn publishes_hourly_history() -> bool { true }
+#[cfg(not(feature = "kalshi"))]
+pub fn publishes_hourly_history() -> bool { false }
+
+/// The hourly market of `underlying` that opened at `window_start` (unix
+/// seconds), from the venue's public history, as of `now`. `spot_at_open` is
+/// the underlying's price at the open where the caller has it: the market is
+/// then the strike nearest it, the at-the-money market the squadron flies
+/// ([B114]); without it, the hour's most-traded strike.
+#[cfg(feature = "kalshi")]
+pub async fn fetch_hourly_history(underlying: &str, window_start: i64, now: i64, spot_at_open: Option<f64>) -> Result<core::HistoryFetch, String> {
+    kalshi::history::fetch_hourly_history(underlying, window_start, now, spot_at_open).await
+}
+#[cfg(not(feature = "kalshi"))]
+pub async fn fetch_hourly_history(_underlying: &str, _window_start: i64, _now: i64, _spot_at_open: Option<f64>) -> Result<core::HistoryFetch, String> {
+    Ok(core::HistoryFetch::NoMarket)
+}
+
+/// The per-minute quotes of one known market (`market_ref` is the venue's own
+/// name for it, the record's slug) over the hour from `window_start`, so a record
+/// written live before asks were recorded can be given them.
+#[cfg(feature = "kalshi")]
+pub async fn fetch_hourly_quotes(underlying: &str, market_ref: &str, window_start: i64) -> Result<Vec<core::HistoryQuote>, String> {
+    kalshi::history::fetch_quotes(underlying, market_ref, window_start).await
+}
+#[cfg(not(feature = "kalshi"))]
+pub async fn fetch_hourly_quotes(_underlying: &str, _market_ref: &str, _window_start: i64) -> Result<Vec<core::HistoryQuote>, String> {
+    Ok(Vec::new())
+}
+
 /// The price grid a taker order on a crypto market is accepted on around
 /// `price`, and so the finest limit the order path can send there.
 ///

@@ -772,6 +772,42 @@ pub struct PricePoint {
     pub price: Decimal,
 }
 
+/// One minute of an hourly market's public quote history: the YES bid and ask at
+/// the minute's close, in dollars. The NO leg is the complement.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoryQuote {
+    pub t: i64,
+    pub yes_bid: f64,
+    pub yes_ask: f64,
+}
+
+/// One settled hourly market as a venue's public history tells it, in terms no
+/// venue owns: GBoost plan B's training store is backfilled from these where the
+/// venue publishes them (`crate::venues::fetch_hourly_history`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HourlyHistory {
+    /// The venue's own name for the market, kept as the record's slug.
+    pub ticker: String,
+    pub yes_token: String,
+    pub no_token: String,
+    /// The strike, where the venue publishes one.
+    pub strike: Option<f64>,
+    /// `Some(true)` when YES won; `None` while unsettled.
+    pub up_won: Option<bool>,
+    /// Two-sided minutes only, sorted by time.
+    pub quotes: Vec<HistoryQuote>,
+}
+
+/// What a venue's history says about one hour.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HistoryFetch {
+    Market(HourlyHistory),
+    /// Closed, but the venue has not published a result yet; ask again later.
+    NotResolved,
+    /// The venue ran no hourly market that hour (or publishes none for this underlying).
+    NoMarket,
+}
+
 /// What a venue can say about one market, in terms no venue owns.
 ///
 /// Deliberately the minimum Helm's posture validator needs rather than a general

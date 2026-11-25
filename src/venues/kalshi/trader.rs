@@ -1808,10 +1808,11 @@ async fn trade_one_market(
     let _fill_listener = lifecycle.spawn_fill_listener(Arc::clone(venue), Arc::clone(&positions));
     let market_started_at = Utc::now();
 
-    // GBoost plan B's training store for this venue is written live: Kalshi
-    // publishes no price history, so a one-hour BTC market is recorded while it
-    // is flown (mids once a minute, the tape at the close) and settled by the
-    // pipeline afterwards. See `vipers::gboost_planb_record`.
+    // GBoost plan B's training store: a one-hour BTC market is recorded while it
+    // is flown (mids and asks once a minute, the tape at the close) and settled
+    // by the pipeline afterwards; the hours this instance did not fly are
+    // backfilled from Kalshi's public candlesticks (`venues::kalshi::history`).
+    // See `vipers::gboost_planb_record`.
     let mut recorder = match (pair.cadence, pair.underlying, pair.close_time) {
         (Some(Cadence::Hourly), "btc", Some(close)) => Some(crate::vipers::gboost_planb_record::HourlyRecorder::new(
             &pair.ticker, pair.long.as_str(), pair.short.as_str(), close.timestamp(), pair.strike.and_then(|k| k.to_f64()),
@@ -2451,8 +2452,10 @@ async fn trade_one_market(
             continue;
         };
         if let Some(r) = recorder.as_mut() {
-            let mid = |bid: Decimal, ask: Decimal| (bid > Decimal::ZERO && ask > Decimal::ZERO).then(|| ((bid + ask) / dec!(2)).to_f64()).flatten();
-            r.sample(Utc::now().timestamp(), mid(snapshot.yes_bid, snapshot.yes_ask), mid(snapshot.no_bid, snapshot.no_ask));
+            let quote = |bid: Decimal, ask: Decimal| {
+                (bid > Decimal::ZERO && ask > Decimal::ZERO).then(|| Some((bid.to_f64()?, ask.to_f64()?))).flatten()
+            };
+            r.sample_quotes(Utc::now().timestamp(), quote(snapshot.yes_bid, snapshot.yes_ask), quote(snapshot.no_bid, snapshot.no_ask));
         }
 
         // Build maker snapshot from the daily market (if available).
