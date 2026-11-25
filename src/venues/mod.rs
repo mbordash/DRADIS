@@ -393,6 +393,21 @@ pub const SUB_CENT_TAKER_PRICES: bool = true;
 #[cfg(not(feature = "kalshi"))]
 pub const SUB_CENT_TAKER_PRICES: bool = false;
 
+/// The price grid a taker order on a crypto market is accepted on around
+/// `price`, and so the finest limit the order path can send there.
+///
+/// Kalshi's crypto markets quote the `tapered_deci_cent` ladder: the
+/// `price_ranges` record on KXBTC15M-26NOV250830-30 (read 2026-11-25) is step
+/// 0.0010 from 0 to 0.10, 0.0100 from 0.10 to 0.90 and 0.0010 from 0.90 to 1.
+/// A limit rounded past the venue's step fills whatever arrives up to it: the
+/// closing sniper's buys at 0.980-0.985 went out at the next whole cent, 0.99,
+/// and 9 of 145 fills landed at 0.9853-0.9872, above the script's cap
+/// (2026-11-20..25). Polymarket International and Polymarket US price orders
+/// in whole cents everywhere (see `SUB_CENT_TAKER_PRICES`).
+pub fn taker_price_step(price: Decimal) -> Decimal {
+    if SUB_CENT_TAKER_PRICES && (price < dec!(0.10) || price > dec!(0.90)) { dec!(0.001) } else { dec!(0.01) }
+}
+
 /// The price grid the venue's sports game markets quote on.
 ///
 /// Distinct from `helpers::price`'s hard-coded cent grid, which is the crypto

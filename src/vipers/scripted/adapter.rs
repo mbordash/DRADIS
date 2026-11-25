@@ -124,29 +124,28 @@ pub fn check_buy(
     if let Some(h) = held {
         return Err(format!("already holds {} on this market", h.as_str().to_uppercase()));
     }
-    let mut price_r = crate::helpers::price::round_to_tick_size(price);
+    // The limit is the script's price on the venue's grid at the ask
+    // (`taker_price_step`: a whole cent, or a tenth of a cent where Kalshi
+    // quotes one), capped at `MAX_SLIPPAGE` over the ask below.
+    //
     // A venue that quotes finer than a cent (Kalshi: $0.9720) puts the ask
-    // between ticks. A script buying AT that ask must not be rounded below it
+    // between cents. A script buying AT that ask must not be rounded below it
     // and refused as unfillable (production 2026-11-08 00:41 ET: "buy price
-    // 0.97 is below the NO ask 0.9720"): its limit is the ask rounded up to
-    // the next tick, still inside `MAX_SLIPPAGE`, and the venue fills at the
-    // price offered.
-    // A price from 0.995 to just under $1 rounds to $1 on the cent grid; it is
-    // a buy at the ask like any other, so it takes the same path. A price of
-    // $1 or more is refused below.
+    // 0.97 is below the NO ask 0.9720"); and it must not be sent out at the
+    // next whole cent either, because a FAK at that cent fills whatever has
+    // arrived up to it: with a 0.99 limit the closing sniper's 0.985 cap let 9
+    // of 145 fills land at 0.9853-0.9872 (2026-11-20..25). On the venue's own
+    // grid the limit is the ask's level, which fills at the ask or not at all,
+    // and the script asks again next tick.
+    // A price from 0.995 to just under $1 rounds to $1 on a cent grid; it is
+    // a buy at the ask like any other, so it takes the same path. [B106] Where
+    // the grid is a tenth of a cent the limit stays under $1; elsewhere the
+    // refusal below stands, because the order would go out at a whole cent. A
+    // price of $1 or more is refused below.
+    let step = crate::venues::taker_price_step(ask);
+    let mut price_r = (price / step).round() * step;
     if price >= ask && price < Decimal::ONE && (price_r < ask || price_r >= Decimal::ONE) {
-        let tick = rust_decimal_macros::dec!(0.01);
-        price_r = (ask / tick).ceil() * tick;
-        // [B106] Above $0.99 the next whole cent is $1, which no venue takes.
-        // Where the order path prices at a tenth of a cent near the extremes
-        // (Kalshi's tapered deci-cent ladder), the limit is the script's price
-        // at a tenth of a cent, never below the ask it buys at. Elsewhere the
-        // refusal below stands: the order would go out at a whole cent.
-        if price_r >= Decimal::ONE && crate::venues::SUB_CENT_TAKER_PRICES {
-            let milli = rust_decimal_macros::dec!(0.001);
-            price_r = (price.min(Decimal::ONE - milli) / milli).floor() * milli;
-            price_r = price_r.max(ask);
-        }
+        price_r = (ask / step).ceil() * step;
     }
     if price_r <= Decimal::ZERO || price_r >= Decimal::ONE {
         return Err(format!("buy price {price} is not inside (0, 1)"));
@@ -163,7 +162,9 @@ pub fn check_buy(
     // to its limit, which is never more than `MAX_SLIPPAGE` over the ask: a
     // script asking 0.95 against an ask of 0.42 would otherwise sweep the book,
     // and the paper ledger (filling at the ask) would flatter it.
-    let limit = price_r.min(ask + MAX_SLIPPAGE);
+    // The cap itself sits on the venue's grid where it lands: two ticks over
+    // an ask of 0.095 is 0.115, which is between whole cents.
+    let limit = price_r.min(on_grid_down(ask + MAX_SLIPPAGE));
     let fill_price = if paper { ask } else { limit };
     if paper && ask_depth > Decimal::ZERO && shares > ask_depth {
         shares = if whole_contracts { ask_depth.floor() } else { ask_depth.round_dp(2) };
@@ -884,11 +885,13 @@ impl ScriptedStrategy {
 /// A taker sale's limit: inside (0, 1), at or under the bid, and never more
 /// than `MAX_SLIPPAGE` under it.
 pub fn check_sell(price: Decimal, bid: Decimal) -> Result<Decimal, String> {
-    let mut p = crate::helpers::price::round_to_tick_size(price);
+    let step = crate::venues::taker_price_step(bid);
+    let mut p = (price / step).round() * step;
     // The mirror of `check_buy`: a sale AT a bid between ticks ($0.975) must
-    // not round above it and be refused; its limit is the bid rounded down.
+    // not round above it and be refused; its limit is the bid's level on the
+    // venue's grid, rounded down.
     if p > bid && price <= bid {
-        p = crate::helpers::price::floor_to_tick_size(bid);
+        p = (bid / step).floor() * step;
     }
     if p <= Decimal::ZERO || p >= Decimal::ONE {
         return Err(format!("sell price {price} is not inside (0, 1)"));
@@ -899,7 +902,19 @@ pub fn check_sell(price: Decimal, bid: Decimal) -> Result<Decimal, String> {
     if p > bid {
         return Err(format!("sell at {p} is above the bid {bid}: a taker order would not fill"));
     }
-    Ok(p.max(bid - MAX_SLIPPAGE))
+    Ok(p.max(on_grid_up(bid - MAX_SLIPPAGE)))
+}
+
+/// `price` on the venue's grid where it sits, rounded down (a buy limit never
+/// rises past what was asked) or up (a sale limit never falls under it).
+fn on_grid_down(price: Decimal) -> Decimal {
+    let step = crate::venues::taker_price_step(price);
+    (price / step).floor() * step
+}
+
+fn on_grid_up(price: Decimal) -> Decimal {
+    let step = crate::venues::taker_price_step(price);
+    (price / step).ceil() * step
 }
 
 #[async_trait::async_trait]
@@ -1325,21 +1340,53 @@ mod tests {
 
     /// [production 2026-11-08 00:41 ET] Kalshi quotes to a tenth of a cent. A
     /// buy at an ask of 0.972 was rounded to 0.97 and refused as below the
-    /// ask; its limit is now 0.98, and paper fills at the ask itself. A sale at
-    /// a bid of 0.975 sells with a 0.97 limit instead of being refused.
+    /// ask. Its limit is the ask's own level where the venue prices tenths of
+    /// a cent (0.972) and the next cent elsewhere (0.98); paper fills at the
+    /// ask itself. A sale at a bid of 0.975 sells with a 0.975 or 0.97 limit
+    /// instead of being refused.
     #[test]
     fn a_price_between_ticks_is_rounded_toward_a_fill() {
+        let sub = crate::venues::SUB_CENT_TAKER_PRICES;
         let live = check_buy(Side::No, dec!(0.972), dec!(5), None, dec!(0.972), dec!(100), false,
             dec!(0), dec!(10), None, Some(dec!(100)), true, dec!(1)).unwrap();
-        assert_eq!(live.price, dec!(0.98), "the limit is the ask rounded up");
+        assert_eq!(live.price, if sub { dec!(0.972) } else { dec!(0.98) }, "the limit is the ask on the venue's grid");
         let paper = check_buy(Side::No, dec!(0.972), dec!(5), None, dec!(0.972), dec!(100), true,
             dec!(0), dec!(10), None, Some(dec!(100)), true, dec!(1)).unwrap();
         assert_eq!(paper.price, dec!(0.972), "paper fills at the ask itself");
         assert!(check_buy(Side::No, dec!(0.96), dec!(5), None, dec!(0.972), dec!(100), false,
             dec!(0), dec!(10), None, Some(dec!(100)), true, dec!(1)).unwrap_err().contains("below the NO ask"),
             "a price under the ask is still refused");
-        assert_eq!(check_sell(dec!(0.975), dec!(0.975)), Ok(dec!(0.97)));
+        assert_eq!(check_sell(dec!(0.975), dec!(0.975)), Ok(if sub { dec!(0.975) } else { dec!(0.97) }));
         assert_eq!(check_sell(dec!(0.42), dec!(0.42)), Ok(dec!(0.42)));
+    }
+
+    /// A taker limit is the script's price on the venue's grid at the touch,
+    /// never rounded past the venue's step. The closing sniper buying at an
+    /// ask of 0.985 went out at 0.99 and filled at 0.9853-0.9872 when the book
+    /// moved between the read and the order (9 of 145 fills, 2026-11-20..25);
+    /// on Kalshi it now goes out at 0.985 and misses instead. Whole cents
+    /// between 0.10 and 0.90 on every venue, and everywhere on Polymarket.
+    #[test]
+    fn a_limit_at_the_ask_stays_on_the_venues_grid() {
+        let buy = |price, ask| check_buy(Side::No, price, dec!(20), None, ask, dec!(500), false,
+            dec!(0), dec!(60), None, Some(dec!(100)), true, dec!(1)).map(|b| b.price);
+        let sub = crate::venues::SUB_CENT_TAKER_PRICES;
+        assert_eq!(crate::venues::taker_price_step(dec!(0.985)), if sub { dec!(0.001) } else { dec!(0.01) });
+        assert_eq!(crate::venues::taker_price_step(dec!(0.055)), if sub { dec!(0.001) } else { dec!(0.01) });
+        assert_eq!(crate::venues::taker_price_step(dec!(0.90)), dec!(0.01), "0.90 is the last whole-cent level");
+        assert_eq!(crate::venues::taker_price_step(dec!(0.50)), dec!(0.01));
+        assert_eq!(buy(dec!(0.985), dec!(0.985)), Ok(if sub { dec!(0.985) } else { dec!(0.99) }), "the sniper's buy at the ask");
+        assert_eq!(buy(dec!(0.98), dec!(0.98)), Ok(dec!(0.98)), "a whole-cent ask is its own limit everywhere");
+        assert_eq!(buy(dec!(0.986), dec!(0.9853)), Ok(if sub { dec!(0.986) } else { dec!(0.99) }), "a price over an off-cent ask");
+        assert!(buy(dec!(0.985), dec!(0.9853)).unwrap_err().contains("below the NO ask"), "the ask moved past the script's price: no order");
+        assert_eq!(buy(dec!(0.055), dec!(0.055)), Ok(if sub { dec!(0.055) } else { dec!(0.06) }), "the low end of the ladder");
+        assert_eq!(buy(dec!(0.42), dec!(0.42)), Ok(dec!(0.42)));
+        assert_eq!(buy(dec!(0.45), dec!(0.42)), Ok(dec!(0.44)), "two cents over the touch at most");
+        assert_eq!(check_sell(dec!(0.82), dec!(0.82)), Ok(dec!(0.82)));
+        assert_eq!(check_sell(dec!(0.905), dec!(0.905)), Ok(if sub { dec!(0.905) } else { dec!(0.90) }));
+        // The two-tick cap stays on the ladder where it lands: 0.115 is not a level.
+        assert_eq!(buy(dec!(0.12), dec!(0.095)), Ok(dec!(0.11)), "0.115 is not a level on either grid");
+        assert_eq!(check_sell(dec!(0.80), dec!(0.905)), Ok(dec!(0.89)));
     }
 
     /// [B106] An ask of 0.991-0.999 used to round up to $1 and be refused as
@@ -1352,11 +1399,12 @@ mod tests {
             dec!(0), dec!(20), None, Some(dec!(100)), true, dec!(1));
         if crate::venues::SUB_CENT_TAKER_PRICES {
             assert_eq!(buy(dec!(0.995), dec!(0.995)).unwrap().price, dec!(0.995));
-            assert_eq!(buy(dec!(0.9987), dec!(0.991)).unwrap().price, dec!(0.998), "the script's price, floored to a tenth of a cent");
+            assert_eq!(buy(dec!(0.9987), dec!(0.991)).unwrap().price, dec!(0.999), "the script's price, rounded to a tenth of a cent");
             assert_eq!(buy(dec!(0.9999), dec!(0.999)).unwrap().price, dec!(0.999), "never $1");
             assert!(buy(dec!(1), dec!(0.999)).unwrap_err().contains("not inside (0, 1)"), "a script asking $1 is still refused");
             assert!(buy(dec!(0.99), dec!(0.991)).unwrap_err().contains("below the YES ask"), "a price under the ask is still refused");
-            assert_eq!(buy(dec!(0.972), dec!(0.972)).unwrap().price, dec!(0.98), "below 0.99 the cent rule is unchanged");
+            assert_eq!(buy(dec!(0.972), dec!(0.972)).unwrap().price, dec!(0.972), "above 0.90 the ask's own level is the limit");
+            assert_eq!(buy(dec!(0.42), dec!(0.42)).unwrap().price, dec!(0.42), "between 0.10 and 0.90 the cent rule is unchanged");
         } else {
             assert!(buy(dec!(0.995), dec!(0.995)).unwrap_err().contains("not inside (0, 1)"));
             assert_eq!(buy(dec!(0.995), dec!(0.99)).unwrap().price, dec!(0.99), "0.995 against a 0.99 ask buys at the ask's cent");
