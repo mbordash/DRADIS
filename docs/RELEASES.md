@@ -4,7 +4,7 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
-## 1.9.1 (unreleased)
+## 1.9.1 (2026-11-26)
 
 - Setup: a yes/no setting (Community Updates, Run the LLM Advisor, Kalshi Demo) now shows which side is saved. The page masked every saved value as if it were a secret, so a saved "true" came back as three dots and the On/Off switch, which compares the saved word, lit neither side after a save; the status beside the label read "set ... managed". The switch now shows the saved side and the status reads "On · managed" or "Off · managed". Secrets still show only their last four characters.
 - GBoost on Kalshi: the training store is now backfilled from Kalshi's public history. The recorder was written on the premise that Kalshi publishes no price history, so an instance could only train on the hours its own squadron had flown (769 hours on production since 2026-10-19). Kalshi does publish it: every settled hourly market with its result, and per-minute candlesticks with the YES bid and ask, back to late September. The pipeline now fetches the hours the squadron did not fly (the hour's most-traded strike, which is the at-the-money market the squadron would have held), keeps the squadron's own records for the hours it did fly, and so trains on about twice the markets with the configured 14-day holdout instead of the 10 days a young store was clipped to. The first run after the upgrade fetches the whole 120-day window at a few requests a second, with no key and outside the trading client's rate budget; the GBoost card shows the progress.
