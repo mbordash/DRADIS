@@ -4,6 +4,10 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
+## 1.9.2 (unreleased)
+
+- Kalshi: the engine now reads the exchange's own trading flag. Kalshi closes every Thursday from 03:00 to 05:00 ET and can pause trading at other times; while it is closed, resting orders leave the books and no new hourly or 15-minute markets open, which the dashboard reported as "Market data has stopped" for a closure the venue had published (2026-11-26). The engine now checks the public status route every 30 seconds. While trading is paused it holds every entry, live and paper (a viper whose entry is held shows "venue trading paused" as its idle reason), keeps evaluating exits and lets a resting order be pulled, and the dashboard shows an amber notice with the reason and the time trading is expected back, read from the exchange's schedule or its own estimate, in place of the dark-feed warning. A pause the engine has not been able to re-read for ten minutes is no longer believed, so a failing probe cannot hold entries on its own. Polymarket International and Polymarket US publish no such flag and are unchanged.
+
 ## 1.9.1 (2026-11-26)
 
 - Setup: a yes/no setting (Community Updates, Run the LLM Advisor, Kalshi Demo) now shows which side is saved. The page masked every saved value as if it were a secret, so a saved "true" came back as three dots and the On/Off switch, which compares the saved word, lit neither side after a save; the status beside the label read "set ... managed". The switch now shows the saved side and the status reads "On · managed" or "Off · managed". Secrets still show only their last four characters.

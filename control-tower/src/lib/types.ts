@@ -696,9 +696,28 @@ export interface StatusResponse {
   /** Per-asset Binance Raptor connection health. Key = asset symbol (e.g. "btc"). */
   raptors?: Record<string, AssetRaptorHealth>;
   /** Markets whose order-book feed has gone dark. Empty is the healthy case. */
-  dark_market_feeds?: { market: string; dark_for_secs: number }[];
+  dark_market_feeds?: { market: string; market_name?: string; dark_for_secs: number }[];
+  /** [E109] The venue's own pause, while it holds: its scheduled closing hours
+   *  or a halt. Entries are held for as long as it lasts. Absent when the venue
+   *  is open, and on a venue that publishes no trading flag, and on engines
+   *  before 1.9.2. */
+  venue_trading_paused?: VenueTradingPause;
   /** The bookmaker feed (The Odds API). Absent on engines before 1.5.3. */
   odds_feed?: OddsFeedHealth;
+}
+
+/** [E109] A venue pause as GET /api/status reports it. */
+export interface VenueTradingPause {
+  /** The venue, as the operator reads it ("Kalshi"). */
+  venue: string;
+  /** When the engine first read the pause (RFC 3339). */
+  since: string;
+  paused_for_secs: number;
+  /** Why, in the venue's terms ("the exchange's scheduled closing hours"). */
+  detail: string;
+  /** When trading is expected back, when the venue or its schedule says. */
+  resumes_at?: string | null;
+  resumes_in_secs?: number | null;
 }
 
 /**

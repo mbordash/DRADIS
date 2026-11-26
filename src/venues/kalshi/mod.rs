@@ -34,6 +34,7 @@
 pub mod auth;
 pub mod history;
 pub mod orders;
+pub mod status;
 pub mod sports;
 pub mod trader;
 pub mod types;

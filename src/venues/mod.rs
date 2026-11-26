@@ -254,6 +254,32 @@ pub fn venue_name() -> &'static str { "us_retail" }
 #[cfg(feature = "kalshi")]
 pub fn venue_name() -> &'static str { "kalshi" }
 
+/// The venue's name as an operator reads it, for banners and log lines.
+#[cfg(feature = "intl_clob")]
+pub fn venue_display_name() -> &'static str { "Polymarket International" }
+#[cfg(feature = "us_retail")]
+pub fn venue_display_name() -> &'static str { "Polymarket US" }
+#[cfg(feature = "kalshi")]
+pub fn venue_display_name() -> &'static str { "Kalshi" }
+
+/// [E109] Whether the venue publishes a trading-active flag the engine can
+/// read ([`fetch_trading_status`]). Kalshi does; the Polymarket venues do not,
+/// and the probe that would read it is not started on their builds.
+#[cfg(feature = "kalshi")]
+pub fn publishes_trading_status() -> bool { true }
+#[cfg(not(feature = "kalshi"))]
+pub fn publishes_trading_status() -> bool { false }
+
+/// [E109] The venue's trading state as of `now`, from its public status route.
+#[cfg(feature = "kalshi")]
+pub async fn fetch_trading_status(now: chrono::DateTime<chrono::Utc>) -> Result<core::VenueTrading, String> {
+    kalshi::status::fetch(now).await
+}
+#[cfg(not(feature = "kalshi"))]
+pub async fn fetch_trading_status(_now: chrono::DateTime<chrono::Utc>) -> Result<core::VenueTrading, String> {
+    Ok(core::VenueTrading::open())
+}
+
 /// [B105] Is a squadron's live session P&L the whole account's? On Kalshi and
 /// Polymarket US it is portfolio value against the starting value, one account
 /// whatever the squadron; on Polymarket International each coin runs its own

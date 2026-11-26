@@ -642,6 +642,13 @@ impl ScriptedStrategy {
                 return StrategySignal::NoSignal;
             }
         };
+        // [E109] The venue is not taking orders: no live order can be sent and a
+        // paper row against a closed venue would score nothing real. The
+        // executor holds live entries too; this stops the side effects first.
+        if crate::helpers::venue_status::paused() {
+            self.reason(ctx, crate::helpers::venue_status::PAUSED_REASON);
+            return StrategySignal::NoSignal;
+        }
         let (token, _bid, ask, ask_depth, fee_bps) = Self::book(ctx, side);
         let checked = check_buy(
             side, price, shares, tp, ask, ask_depth, paper, exposure, live.max_exposure, held,

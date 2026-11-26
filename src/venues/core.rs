@@ -808,6 +808,30 @@ pub enum HistoryFetch {
     NoMarket,
 }
 
+/// [E109] Whether the venue is taking orders, from a venue that says so.
+///
+/// Kalshi publishes a trading-active flag and its closing hours (Thursday
+/// 03:00 to 05:00 ET every week) and can pause trading at any time; while it
+/// is paused, resting orders leave the public books and nothing new opens.
+/// The Polymarket venues publish no such flag and read as always open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VenueTrading {
+    /// Orders are being accepted.
+    pub active: bool,
+    /// Why not, in the venue's terms, for the operator ("the exchange's
+    /// scheduled closing hours"). Empty while active.
+    pub detail: String,
+    /// When trading is expected back (unix seconds), when the venue or its
+    /// schedule says.
+    pub resumes_at: Option<i64>,
+}
+
+impl VenueTrading {
+    pub fn open() -> Self {
+        VenueTrading { active: true, detail: String::new(), resumes_at: None }
+    }
+}
+
 /// What a venue can say about one market, in terms no venue owns.
 ///
 /// Deliberately the minimum Helm's posture validator needs rather than a general

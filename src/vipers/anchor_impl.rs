@@ -1437,6 +1437,12 @@ impl Strategy for AnchorStrategy {
             idle("entry sent, awaiting the fill");
             return Ok(StrategySignal::NoSignal);
         }
+        // [E109] The venue is not taking orders; the executor would hold the
+        // entry, and the pending stash and ENTRY line must not pretend otherwise.
+        if crate::helpers::venue_status::paused() {
+            idle(crate::helpers::venue_status::PAUSED_REASON);
+            return Ok(StrategySignal::NoSignal);
+        }
         // The venue's own quote, not the f64 the rule priced from.
         let ask_dec = if pick.is_yes { ctx.snapshot.yes_ask } else { ctx.snapshot.no_ask };
         let fee_bps = (if pick.is_yes { market.yes_fee_bps } else { market.no_fee_bps }) as u16;

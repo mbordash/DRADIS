@@ -176,11 +176,15 @@ export async function buildSupportBundle(now = new Date()): Promise<SupportBundl
       const dark = s.dark_market_feeds?.length
         ? s.dark_market_feeds.map(d => `  ${d.market}: dark for ${d.dark_for_secs}s`).join('\n')
         : '  none';
+      const pause = s.venue_trading_paused
+        ? `${s.venue_trading_paused.venue}: ${s.venue_trading_paused.detail}, since ${s.venue_trading_paused.since}, back ${s.venue_trading_paused.resumes_at ?? 'unannounced'}`
+        : 'none';
       return [
         `session_started_at: ${s.session_started_at ?? 'n/a'}`,
         `llm_advisor_enabled: ${s.llm_advisor_enabled ?? 'n/a'}`,
         'raptors:', raptors,
         'dark market feeds:', dark,
+        `venue trading paused: ${pause}`,
       ].join('\n');
     }),
     section('Squadrons', getSquadrons, rows => rows.length === 0

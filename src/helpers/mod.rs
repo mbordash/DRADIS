@@ -48,6 +48,7 @@ pub mod watchdog;
 pub mod rotation;
 pub mod logbuf;
 pub mod latency;
+pub mod venue_status;
 pub mod viper_status;
 pub mod autoscale;
 pub mod redact;

@@ -38,6 +38,32 @@ pub struct StrategyEvaluationResult {
     pub exit_signals: Vec<(String, StrategySignal)>,
 }
 
+/// [E109] An entry that would open exposure is held while the venue says it
+/// is not taking orders (`venue_status`): the viper is recorded idle with that
+/// reason instead of the signal it produced, and the signal is dropped. A
+/// signal that opens nothing (Helm's `MakerCancel`, which pulls a resting bid)
+/// passes, and exits are not held.
+///
+/// Held here rather than in each viper because every viper, scripted ones
+/// included, would otherwise need the same check, and because a venue that is
+/// closed accepts nothing from any of them. The venue loop never sees the
+/// signal, so no order or cooldown comes of it; the cap reservation a script
+/// took for the order is released here, as the venue loops release it when
+/// they drop an entry. (The scripted adapter and Anchor also check the pause
+/// before their own side effects, a paper row or a pending-entry stash.)
+fn hold_entry_for_pause(ctx: &StrategyContext, strategy_name: &str, signal: &StrategySignal) -> bool {
+    if !signal.opens_exposure() || !crate::helpers::venue_status::paused() {
+        return false;
+    }
+    for t in signal.tokens_opened() {
+        crate::vipers::scripted::adapter::release_reservation(strategy_name, &ctx.squadron_id, t.as_str());
+    }
+    crate::helpers::viper_status::record_idle(
+        &ctx.crypto_filter, strategy_name, crate::helpers::venue_status::PAUSED_REASON);
+    debug!("⏸️ {} entry held: {}", strategy_name, crate::helpers::venue_status::PAUSED_REASON);
+    true
+}
+
 /// Evaluate all strategies for entry/exit signals
 pub async fn evaluate_strategies(
     strategies: &[Box<dyn Strategy>],
@@ -51,6 +77,7 @@ pub async fn evaluate_strategies(
 
         // Evaluate entry
         match strategy.evaluate_entry(ctx).await {
+            Ok(signal) if hold_entry_for_pause(ctx, &strategy_name, &signal) => {}
             Ok(signal) => {
                 crate::helpers::viper_status::record_eval(
                     &ctx.crypto_filter,
@@ -305,6 +332,9 @@ pub async fn execute_strategies_concurrent(
 
         // Handle entry result
         match entry_result {
+            Ok(signal) if hold_entry_for_pause(ctx, &strategy_name, &signal) => {
+                entry_tag = "⏸️";
+            }
             Ok(signal) => {
                 // "Why aren't we trading?" registry: record liveness + outcome
                 // for every viper every tick (GET /api/vipers/status).

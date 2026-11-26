@@ -72,7 +72,7 @@ fn client() -> &'static reqwest::Client {
 
 /// GET with pacing and exponential backoff on 429 and 5xx. No credentials: these
 /// are public routes, and the authenticated client's rate bucket is left alone.
-async fn get_json(url: &str) -> Result<serde_json::Value, String> {
+pub(super) async fn get_json(url: &str) -> Result<serde_json::Value, String> {
     let mut last = String::new();
     for attempt in 0..HTTP_ATTEMPTS {
         match client().get(url).header("Accept", "application/json").send().await {

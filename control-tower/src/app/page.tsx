@@ -47,7 +47,7 @@ import {
 } from '@/lib/pnlRange';
 import { DEMO_MODE } from '@/lib/demo';
 import { getSetupStatus } from '@/lib/setupApi';
-import type { DynamicConfig, SquadronSummary, PortfolioValue, VenueIncome, AvailableMarket, OddsFeedHealth } from '@/lib/types';
+import type { DynamicConfig, SquadronSummary, PortfolioValue, VenueIncome, AvailableMarket, OddsFeedHealth, VenueTradingPause } from '@/lib/types';
 
 // Recharts must be loaded client-side only
 // Loading states are explicit: without one these render nothing at all while
@@ -251,8 +251,47 @@ function StalledLoopBanner({ loops }: { loops?: Record<string, number> }) {
   );
 }
 
-function DarkFeedBanner({ feeds }: { feeds?: { market: string; market_name?: string; dark_for_secs: number }[] }) {
-  if (!feeds || feeds.length === 0) return null;
+/**
+ * [E109] The venue is not taking orders and has said so: Kalshi's Thursday
+ * 03:00 to 05:00 ET closing hours, or a halt. The engine holds entries for as
+ * long as it lasts and evaluates exits as before. Shown in place of the
+ * dark-feed warning, which this condition produced on 2026-11-26 for a closure
+ * the venue had published.
+ */
+function VenueHaltBanner({ pause }: { pause?: VenueTradingPause }) {
+  if (!pause) return null;
+  const mins = Math.floor(pause.paused_for_secs / 60);
+  const back = pause.resumes_at ? new Date(pause.resumes_at) : null;
+  const backText = back && !Number.isNaN(back.getTime())
+    ? `${back.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} (${back.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/New_York' })} ET)`
+    : null;
+  return (
+    <div className="card px-4 py-3 border border-amber-500/30 bg-amber-500/10">
+      <div className="flex items-start gap-3">
+        <span className="text-lg leading-none">⏸️</span>
+        <div className="min-w-0">
+          <p className="text-sm font-mono text-amber-300">
+            {pause.venue} trading is paused — {pause.detail}
+          </p>
+          <p className="text-[11px] text-gray-400 mt-1 leading-relaxed">
+            The venue is not taking orders, so the engine holds every entry until it reopens and keeps
+            evaluating exits. Resting orders leave the books while a pause holds, and no new markets open,
+            so empty order books during this time are the pause, not a fault.
+          </p>
+          <p className="text-[11px] font-mono text-amber-200/90 mt-2">
+            paused for {mins}m {pause.paused_for_secs % 60}s
+            {backText ? ` — expected back ${backText}` : ' — no end announced'}
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DarkFeedBanner({ feeds, paused }: { feeds?: { market: string; market_name?: string; dark_for_secs: number }[]; paused?: boolean }) {
+  // While the venue says it is paused, a dark book is the pause (the halt
+  // banner above says so); the warning would only contradict it.
+  if (paused || !feeds || feeds.length === 0) return null;
   return (
     <div className="card px-4 py-3 border border-red-500/30 bg-red-500/10">
       <div className="flex items-start gap-3">
@@ -1026,7 +1065,8 @@ export default function DashboardPage() {
 
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
           {config?.ghost_mode && <GhostBanner ghost />}
-          <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <VenueHaltBanner pause={status?.venue_trading_paused} />
+          <DarkFeedBanner feeds={status?.dark_market_feeds} paused={!!status?.venue_trading_paused} />
           <StalledLoopBanner loops={status?.rotation_loops} />
           <OddsFeedBanner feed={status?.odds_feed} />
           <SquadronDetailView squadron={focusedSquadron} onBack={handleBackToCag} onOpenMarket={selectMarket} />
@@ -1100,7 +1140,8 @@ export default function DashboardPage() {
       {activeView === 'tradelog' && (
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
-          <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <VenueHaltBanner pause={status?.venue_trading_paused} />
+          <DarkFeedBanner feeds={status?.dark_market_feeds} paused={!!status?.venue_trading_paused} />
           <StalledLoopBanner loops={status?.rotation_loops} />
           <OddsFeedBanner feed={status?.odds_feed} />
           <TradelogPage availableAssets={availableAssets} />
@@ -1123,7 +1164,8 @@ export default function DashboardPage() {
       {activeView === 'helm' && (
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
-          <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <VenueHaltBanner pause={status?.venue_trading_paused} />
+          <DarkFeedBanner feeds={status?.dark_market_feeds} paused={!!status?.venue_trading_paused} />
           <StalledLoopBanner loops={status?.rotation_loops} />
           <OddsFeedBanner feed={status?.odds_feed} />
           <ErrorBoundary label="Helm">
@@ -1137,7 +1179,8 @@ export default function DashboardPage() {
       {activeView === 'telemetry' && (
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
-          <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <VenueHaltBanner pause={status?.venue_trading_paused} />
+          <DarkFeedBanner feeds={status?.dark_market_feeds} paused={!!status?.venue_trading_paused} />
           <StalledLoopBanner loops={status?.rotation_loops} />
           <OddsFeedBanner feed={status?.odds_feed} />
           <ErrorBoundary label="Telemetry">
@@ -1153,7 +1196,8 @@ export default function DashboardPage() {
       {activeView === 'markets' && (
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
-          <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <VenueHaltBanner pause={status?.venue_trading_paused} />
+          <DarkFeedBanner feeds={status?.dark_market_feeds} paused={!!status?.venue_trading_paused} />
           <StalledLoopBanner loops={status?.rotation_loops} />
           <OddsFeedBanner feed={status?.odds_feed} />
           <ErrorBoundary label="Markets">
@@ -1180,7 +1224,8 @@ export default function DashboardPage() {
       {activeView === 'ai' && (
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
-          <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <VenueHaltBanner pause={status?.venue_trading_paused} />
+          <DarkFeedBanner feeds={status?.dark_market_feeds} paused={!!status?.venue_trading_paused} />
           <StalledLoopBanner loops={status?.rotation_loops} />
           <OddsFeedBanner feed={status?.odds_feed} />
           <ErrorBoundary label="AI Actions">
@@ -1217,7 +1262,8 @@ export default function DashboardPage() {
         {/* Ghost mode banner */}
         {config?.ghost_mode && <GhostBanner ghost />}
           <CommunityUpdatesBanner notices={communityUpdates?.notices} onOpen={() => navigate('vipers')} />
-          <DarkFeedBanner feeds={status?.dark_market_feeds} />
+          <VenueHaltBanner pause={status?.venue_trading_paused} />
+          <DarkFeedBanner feeds={status?.dark_market_feeds} paused={!!status?.venue_trading_paused} />
           <StalledLoopBanner loops={status?.rotation_loops} />
           <OddsFeedBanner feed={status?.odds_feed} />
 

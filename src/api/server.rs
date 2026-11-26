@@ -1325,6 +1325,12 @@ struct StatusResponse {
     /// "✅ Maker quoting" — every gate correctly declined to trade an empty
     /// book, and declining quietly is indistinguishable from a quiet market.
     dark_market_feeds: Vec<DarkFeed>,
+    /// [E109] The venue's own pause, when it publishes one and it holds:
+    /// Kalshi's Thursday closing hours or an exchange halt. While it holds the
+    /// engine evaluates no entries, and a dark book is the pause, not a fault.
+    /// `None` is the open case, and the only case on a venue without a flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    venue_trading_paused: Option<crate::helpers::venue_status::Pause>,
     /// The bookmaker feed (The Odds API): last success, failing since, the last
     /// error. A box whose key was cancelled sat for five days with an idle
     /// sports slot and no other sign (2026-10-18 to 10-23).
@@ -1387,6 +1393,7 @@ async fn get_status(State(s): State<ApiState>) -> Response {
         llm_advisor_enabled: crate::helpers::llm_advisor::advisor_enabled_setting(),
         llm_advisor: crate::helpers::llm_advisor::advisor_health(),
         session_started_at, raptors, dark_market_feeds,
+        venue_trading_paused: crate::helpers::venue_status::snapshot(),
         odds_feed: crate::raptors::sports_ledger::odds_feed_health(),
     }).into_response()
 }
@@ -4938,6 +4945,11 @@ pub async fn run_api_server(
 
     // Venue latency probe — feeds GET /api/latency (Control Tower footer meter).
     tokio::spawn(crate::helpers::latency::run_latency_probe());
+
+    // [E109] Venue trading flag — holds entries and names the pause in
+    // GET /api/status while the venue says it is closed. Returns at once on a
+    // venue that publishes no flag.
+    tokio::spawn(crate::helpers::venue_status::run_venue_status_probe());
 
     // /api/health is intentionally public — no API key required.
     // Docker HEALTHCHECK, load balancers, and uptime monitors all probe this
