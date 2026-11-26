@@ -407,13 +407,10 @@ fn raptor_stack_for(
 /// never matches inside `"whether"` nor `"sol"` inside `"resolution"`.
 fn detect_underlying(pair: &super::markets::UsMarketPair) -> Option<&'static str> {
     let text = format!("{} {}", pair.slug, pair.question).to_ascii_lowercase();
-    for token in text.split(|c: char| !c.is_ascii_alphanumeric()) {
-        match token {
-            "btc" | "bitcoin" => return Some("btc"),
-            "eth" | "ethereum" => return Some("eth"),
-            "sol" | "solana" => return Some("sol"),
-            "xrp" | "ripple" => return Some("xrp"),
-            _ => {}
+    // [E110] Every word of every coin in the table.
+    for token in text.split(|c: char| !c.is_ascii_alphanumeric()).filter(|t| !t.is_empty()) {
+        if let Some(coin) = crate::helpers::coins::by_title_word(token) {
+            return Some(coin.slug);
         }
     }
     None

@@ -259,7 +259,7 @@ function groupsForVenue(venue: VenueId) {
   // has nothing to add there.
   if (venue === 'intl' || venue === 'kalshi') {
     groups.push(
-      { title: 'Coins to Trade', onVenueTab: true, blurb: 'Which coins to trade, one squadron each, e.g. btc,eth,sol (supported: btc, eth, sol). The first is your main coin. A squadron for a coin you add starts held: its vipers evaluate and your scripts paper-trade, but nothing real opens until you press Arm on its page. Blank keeps trading your current single coin. Applies on restart.', keys: ['TRADE_COINS'] },
+      { title: 'Coins to Trade', onVenueTab: true, blurb: 'Which coins to trade, one squadron each, e.g. btc,eth,sol (supported: btc, eth, sol, xrp, doge). The first is your main coin. A squadron for a coin you add starts held: its vipers evaluate and your scripts paper-trade, but nothing real opens until you press Arm on its page. Blank keeps trading your current single coin. Applies on restart.', keys: ['TRADE_COINS'] },
     );
   }
   // Raptor signal keys (Alpaca, The Odds API, …) deliberately do NOT appear

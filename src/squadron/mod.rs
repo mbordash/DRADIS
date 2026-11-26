@@ -137,6 +137,8 @@ pub enum CryptoAsset {
     Btc,
     Eth,
     Sol,
+    Xrp,
+    Doge,
     /// Any asset not yet enumerated.  `symbol` should be upper-case, e.g. "MATIC".
     Custom(String),
 }
@@ -175,7 +177,8 @@ pub(crate) fn classification_category<'a>(
     match venue_category.filter(|c| !c.is_empty()) {
         Some(c) => c,
         None => match asset {
-            CryptoAsset::Btc | CryptoAsset::Eth | CryptoAsset::Sol => "crypto",
+            CryptoAsset::Btc | CryptoAsset::Eth | CryptoAsset::Sol
+            | CryptoAsset::Xrp | CryptoAsset::Doge => "crypto",
             CryptoAsset::Custom(name) => name.as_str(),
         },
     }
@@ -207,7 +210,7 @@ mod classification_category_tests {
         assert_eq!(u(""), None);
     }
 
-    /// Substring matching labelled ordinary words as crypto underlyings.
+    /// Substring matching labeled ordinary words as crypto underlyings.
     ///
     /// The first version of this helper used plain `contains`, so a politics or
     /// sports squadron was given a crypto underlying and shown that chain's
@@ -243,6 +246,19 @@ mod classification_category_tests {
         use super::underlying_from_market_name as u;
         assert_eq!(u("Will Bitcoin beat Solana?"), None);
         assert_eq!(u("Ethereum or Bitcoin first to $100k?"), None);
+    }
+
+    #[test]
+    fn whole_words_name_the_underlying() {
+        use super::underlying_from_market_name as u;
+        assert_eq!(u("Ripple price at Nov 26, 2026 at 7pm EST?"), Some("xrp"));
+        assert_eq!(u("XRP Up or Down - November 26, 6:00PM-6:15PM ET"), Some("xrp"));
+        assert_eq!(u("Dogecoin price on Nov 26, 2026?"), Some("doge"));
+        assert_eq!(u("Will DOGE cut $1T in 2026?"), None, "the department, not the coin");
+        assert_eq!(u("Bitcoin price on Nov 26, 2026?"), Some("btc"));
+        assert_eq!(u("Will ETH exceed $5,000?"), Some("eth"));
+        assert_eq!(u("Will the Netherlands win? Resolved by console"), None);
+        assert_eq!(u("Will the Chiefs win"), None);
     }
 
     use super::{classification_category, CryptoAsset};
@@ -304,54 +320,15 @@ mod classification_category_tests {
 /// Matching is on WHOLE WORDS, and the first version of this was not. Plain
 /// substring matching read "N**eth**erlands" and "**Eth**iopia" as Ethereum, and
 /// "re**sol**ved", "**sol**ar" and "con**sol**e" as Solana — so a politics
-/// squadron would have been labelled a crypto underlying and shown that chain's
+/// squadron would have been labeled a crypto underlying and shown that chain's
 /// raptor health. The ticker aliases are also checked only in upper case, because
 /// a bare lowercase "sol" or "eth" inside ordinary prose is far more often a
 /// coincidence than a ticker.
 pub fn underlying_from_market_name(market_name: &str) -> Option<&'static str> {
-    // Split on anything that is not a letter or digit, so "BTC/USDT" and
-    // "(Bitcoin)" both tokenize.
-    let words: Vec<&str> = market_name
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .collect();
-    let has_word = |want: &str| {
-        words.iter().any(|w| w.eq_ignore_ascii_case(want))
-    };
-    let has_ticker = |want: &str| {
-        // Case-sensitive: "SOL" is a ticker, "sol" usually is not.
-        words.iter().any(|w| *w == want)
-    };
-
-    // Full names first, and each checked across ALL candidates before any
-    // ticker, so "Bitcoin beat Solana?" cannot resolve to the one that happens
-    // to be tested first. A market naming two underlyings has no single one, so
-    // it is `None` rather than a coin flip.
-    let named: Vec<&'static str> = [
-        ("ethereum", "eth"),
-        ("solana", "sol"),
-        ("bitcoin", "btc"),
-    ]
-    .iter()
-    .filter(|(name, _)| has_word(name))
-    .map(|(_, slug)| *slug)
-    .collect();
-    if named.len() == 1 {
-        return Some(named[0]);
-    }
-    if named.len() > 1 {
-        return None;
-    }
-
-    let tickers: Vec<&'static str> = [("ETH", "eth"), ("SOL", "sol"), ("BTC", "btc")]
-        .iter()
-        .filter(|(t, _)| has_ticker(t))
-        .map(|(_, slug)| *slug)
-        .collect();
-    if tickers.len() == 1 {
-        return Some(tickers[0]);
-    }
-    None
+    // [E110] One detector for every venue, over the coin table: names and
+    // aliases first across all coins, then upper-case tickers of coins whose
+    // ticker names them (a bare "DOGE" is a government department).
+    crate::helpers::coins::detect_in_title(market_name)
 }
 
 impl CryptoAsset {
@@ -369,6 +346,8 @@ impl CryptoAsset {
             Self::Btc          => "BTC".to_string(),
             Self::Eth          => "ETH".to_string(),
             Self::Sol          => "SOL".to_string(),
+            Self::Xrp          => "XRP".to_string(),
+            Self::Doge         => "DOGE".to_string(),
             Self::Custom(sym)  => sym.to_uppercase(),
         }
     }
@@ -393,6 +372,8 @@ impl std::str::FromStr for CryptoAsset {
             "btc" => Self::Btc,
             "eth" => Self::Eth,
             "sol" => Self::Sol,
+            "xrp" => Self::Xrp,
+            "doge" => Self::Doge,
             other => Self::Custom(other.to_uppercase()),
         })
     }

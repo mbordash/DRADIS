@@ -79,16 +79,12 @@ pub async fn run_derivatives_raptor(
     deriv_tx: watch::Sender<DerivativesSnapshot>,
     raptor_health_tx: Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
 ) {
-    let symbol = match crypto_filter.as_str() {
-        "eth" => "ETHUSDT",
-        "sol" => "SOLUSDT",
-        _     => "BTCUSDT",
-    };
-    let (okx_inst, okx_ccy) = match crypto_filter.as_str() {
-        "eth" => ("ETH-USDT-SWAP", "ETH"),
-        "sol" => ("SOL-USDT-SWAP", "SOL"),
-        _     => ("BTC-USDT-SWAP", "BTC"),
-    };
+    // [E110] Every instrument comes from the coin table; an unknown filter keeps Bitcoin's.
+    let coin = crate::helpers::coins::by_slug(&crypto_filter)
+        .or_else(|| crate::helpers::coins::by_slug("btc"))
+        .expect("the coin table has a btc row");
+    let symbol = coin.binance_pair;
+    let (okx_inst, okx_ccy) = (coin.okx_swap, coin.symbol);
     // Open interest — Binance FAPI primary, OKX fallback (US-reachable).
     let oi_primary  = format!("https://fapi.binance.com/fapi/v1/openInterest?symbol={}", symbol);
     let oi_fallback = format!("https://www.okx.com/api/v5/public/open-interest?instId={}", okx_inst);

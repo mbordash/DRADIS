@@ -903,7 +903,7 @@ impl Squadron {
         let mut ultra_job: Option<UltraJob> = None;
         let mut ultra_checked_at: Option<Instant> = None;
         let mut ultra_closed_at: Option<Instant> = Some(Instant::now());
-        let ultra_asset_ok = !single_market && matches!(asset_lc.as_str(), "btc" | "eth" | "sol" | "xrp");
+        let ultra_asset_ok = !single_market && crate::helpers::coins::is_slug(&asset_lc);
 
         // ── Core tick loop: 3 arms ────────────────────────────────────────────
         let mut ticker = interval(config::main_ticker_interval());

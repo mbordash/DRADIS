@@ -152,11 +152,11 @@ pub fn validate_market(
     if is_bad_market(&combined) { return (false, MarketValidationStatus::Blocked, format!("Blocked: '{}'", combined)); }
 
     let lower = market_name.to_lowercase();
-    let match_crypto = match ctx.crypto_filter.as_str() {
-        "btc" | "bitcoin" => lower.contains("bitcoin") || lower.contains("btc"),
-        "eth" | "ethereum" => lower.contains("ethereum") || lower.contains("eth"),
-        "sol" | "solana" => lower.contains("solana") || lower.contains("sol"),
-        _ => true,
+    // [E110] A filter the coin table knows must appear in the name by one of
+    // its words; any other filter accepts every market, as before.
+    let match_crypto = match crate::helpers::coins::find(&ctx.crypto_filter) {
+        Some(coin) => coin.title_words().any(|w| lower.contains(&w)),
+        None => true,
     };
     if !match_crypto { return (false, MarketValidationStatus::WrongCrypto, "Crypto mismatch".to_string()); }
 
@@ -224,6 +224,12 @@ pub async fn fetch_specific_window_daily_market(
             let name = m.get("question").and_then(|v| v.as_str()).unwrap_or_default().to_string();
             // Use the imported function directly
             if is_bad_market(&name) || !get_enable_orderbook(m) { continue; }
+            // [E110] The slug came from the filter's own coin, but a hit is
+            // accepted only if its name says so too: a coin with no Polymarket
+            // daily market must never adopt another coin's.
+            let names_the_coin = crate::helpers::coins::find(crypto_filter)
+                .is_none_or(|c| { let n = name.to_ascii_lowercase(); c.title_words().any(|w| n.contains(&w)) });
+            if !names_the_coin { continue; }
             let tokens = extract_token_ids_u256(m);
             if tokens.len() < 2 { continue; }
             // Use the event's endDate as authoritative close time (market-level endDate is identical)
@@ -266,7 +272,7 @@ pub async fn fetch_ultra_short_candidate(
     min_secs_left: i64,
 ) -> Option<MarketCandidate> {
     let asset = asset.to_ascii_lowercase();
-    if !matches!(asset.as_str(), "btc" | "eth" | "sol" | "xrp") { return None; }
+    if !crate::helpers::coins::is_slug(&asset) { return None; }
     let t = now.timestamp();
     let start = t - t.rem_euclid(900);
     for window in [start, start + 900] {
@@ -321,11 +327,15 @@ const HOURLY_SLUG_LOOKAHEAD_HOURS: i64 = 1;
 /// The assets that have hourly "Up or Down" markets, as discovery filters.
 /// `"all"` (the single-asset `CRYPTO_FILTER` fallback) probes every one.
 fn hourly_assets_for(filter: &str) -> Vec<&'static str> {
-    match filter {
-        "btc" | "bitcoin" => vec!["btc"],
-        "eth" | "ethereum" => vec!["eth"],
-        "sol" | "solana" => vec!["sol"],
-        _ => vec!["btc", "eth", "sol"],
+    match crate::helpers::coins::find(filter) {
+        Some(coin) if coin.polymarket_hourly_slug.is_some() => vec![coin.slug],
+        // A coin Polymarket lists no hourly market on (Dogecoin): nothing to probe.
+        Some(_) => Vec::new(),
+        None => crate::helpers::coins::COINS
+            .iter()
+            .filter(|c| c.polymarket_hourly_slug.is_some())
+            .map(|c| c.slug)
+            .collect(),
     }
 }
 
@@ -1509,10 +1519,12 @@ mod hourly_slug_discovery_tests {
     /// that has hourly markets; a named asset probes only itself.
     #[test]
     fn the_all_filter_probes_every_hourly_asset() {
-        assert_eq!(hourly_assets_for("all"), vec!["btc", "eth", "sol"]);
+        assert_eq!(hourly_assets_for("all"), vec!["btc", "eth", "sol", "xrp"], "doge has no Polymarket hourly market");
         assert_eq!(hourly_assets_for("btc"), vec!["btc"]);
         assert_eq!(hourly_assets_for("ethereum"), vec!["eth"]);
         assert_eq!(hourly_assets_for("sol"), vec!["sol"]);
+        assert_eq!(hourly_assets_for("xrp"), vec!["xrp"]);
+        assert!(hourly_assets_for("doge").is_empty(), "no Polymarket hourly market to probe");
     }
 }
 

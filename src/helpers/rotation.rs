@@ -23,10 +23,13 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// The underlyings a rotation may fly. Anything else is refused at startup
-/// with a warning: an unsupported one would register as a BTC squadron
-/// (`register_kalshi_squadron`) or open a feed for a symbol with no market.
-pub const SUPPORTED_UNDERLYINGS: &[&str] = &["btc", "eth", "sol"];
+/// The underlyings a rotation may fly: the rows of [`crate::helpers::coins`].
+/// Anything else is refused at startup with a warning: an unsupported one
+/// would register as a BTC squadron (`register_kalshi_squadron`) or open a
+/// feed for a symbol with no market.
+pub fn supported_underlyings() -> Vec<&'static str> {
+    crate::helpers::coins::slugs()
+}
 
 /// The environment variable naming the underlyings, in order; the first is the
 /// instance's primary one (see `dynamic_config::starts_held`).
@@ -38,7 +41,7 @@ pub fn parse_underlyings(raw: &str) -> (Vec<String>, Vec<String>) {
     let mut ok: Vec<String> = Vec::new();
     let mut refused = Vec::new();
     for u in raw.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()) {
-        if !SUPPORTED_UNDERLYINGS.contains(&u.as_str()) {
+        if !crate::helpers::coins::is_slug(&u) {
             refused.push(u);
         } else if !ok.contains(&u) {
             ok.push(u);
@@ -54,7 +57,8 @@ pub fn configured_underlyings() -> Option<Vec<String>> {
     let (ok, refused) = parse_underlyings(&raw);
     if !refused.is_empty() {
         tracing::warn!(
-            "⚠️ {ENV_TRADE_COINS}: ignoring {refused:?}; supported underlyings are {SUPPORTED_UNDERLYINGS:?}"
+            "⚠️ {ENV_TRADE_COINS}: ignoring {refused:?}; supported underlyings are {:?}",
+            supported_underlyings()
         );
     }
     (!ok.is_empty()).then_some(ok)
@@ -157,9 +161,9 @@ mod tests {
 
     #[test]
     fn parses_validates_and_keeps_order() {
-        let (ok, refused) = parse_underlyings(" BTC, eth ,xrp,sol,eth,, doge");
-        assert_eq!(ok, vec!["btc", "eth", "sol"]);
-        assert_eq!(refused, vec!["xrp", "doge"]);
+        let (ok, refused) = parse_underlyings(" BTC, eth ,xrp,sol,eth,, doge, ada");
+        assert_eq!(ok, vec!["btc", "eth", "xrp", "sol", "doge"]);
+        assert_eq!(refused, vec!["ada"]);
         assert_eq!(parse_underlyings("").0, Vec::<String>::new());
     }
 

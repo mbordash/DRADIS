@@ -144,7 +144,7 @@ const MANAGED_KEYS: &[(&str, &str, &str, &str, &str)] = &[
     // squadron each (`btc,eth,sol`; the first is the primary one). Read at
     // startup, so a change asks for a restart. Squadrons for new underlyings
     // start held: nothing opens there until the operator arms them.
-    ("TRADE_COINS",              "Coins to trade (btc, eth, sol; the first is your main coin)", "shared", "venue", "setting"),
+    ("TRADE_COINS",              "Coins to trade (btc, eth, sol, xrp, doge; the first is your main coin)", "shared", "venue", "setting"),
 ];
 
 /// Managed keys the engine reads from the process environment each time it

@@ -1023,18 +1023,26 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
         ("potus",     "symbol_token", "politics", 20),
         ("senate",    "symbol_token", "politics", 20),
         ("president", "slug",         "politics", 30),
-        // crypto tickers
-        ("btc", "symbol_token", "crypto", 20),
-        ("eth", "symbol_token", "crypto", 20),
-        ("sol", "symbol_token", "crypto", 20),
-        // crypto names in the market title/slug (Kalshi symbols tokenize as
-        // "kxbtcd"/"kxbtc15m" — no bare "btc" token — but titles name the coin)
-        ("bitcoin",  "slug", "crypto", 30),
-        ("ethereum", "slug", "crypto", 30),
-        ("solana",   "slug", "crypto", 30),
-        ("xrp",      "slug", "crypto", 30),
-        ("dogecoin", "slug", "crypto", 30),
     ];
+    // [E110] Crypto rules come from the coin table: the ticker as a symbol
+    // token, and the name and aliases as title/slug words (Kalshi symbols
+    // tokenize as "kxbtcd"/"kxbtc15m" with no bare "btc" token, but titles
+    // name the coin: "Bitcoin price on ...", "Ripple price at ...").
+    let coin_rules: Vec<(String, &str, &str, i64)> = crate::helpers::coins::COINS
+        .iter()
+        .flat_map(|c| {
+            // A ticker that is also something else ("DOGE") seeds no token rule.
+            c.ticker_names_it
+                .then(|| (c.slug.to_string(), "symbol_token", "crypto", 20))
+                .into_iter()
+                .chain(std::iter::once((c.name.to_ascii_lowercase(), "slug", "crypto", 30)))
+                .chain(c.aliases.iter().map(|a| (a.to_string(), "slug", "crypto", 30)))
+        })
+        .collect();
+    let rules = rules
+        .iter()
+        .map(|(p, k, c, n)| (p.to_string(), *k, *c, *n))
+        .chain(coin_rules);
     for (pattern, kind, class, prio) in rules {
         sqlx::query(
             "INSERT OR IGNORE INTO market_class_rule (pattern, match_kind, market_class, priority)
@@ -5354,7 +5362,8 @@ impl AdoptionKind {
     pub fn of_squadron(squadron_id: &str) -> Self {
         let asset = squadron_id.split("-open").next().unwrap_or(squadron_id);
         match asset {
-            "btc" | "eth" | "sol" | "xrp" | "doge" => Self::Crypto(Some(asset.to_string())),
+            // [E110] Any coin the table knows is that underlying.
+            a if crate::helpers::coins::is_slug(a) => Self::Crypto(Some(a.to_string())),
             // An operator-deployed crypto market (`crypto-open[-name]`) or a
             // Polymarket US wing over every coin.
             "crypto" | "us-crypto" => Self::Crypto(None),

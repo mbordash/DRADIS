@@ -262,7 +262,7 @@ async fn flown_markets(s: &ApiState) -> Vec<(String, String, String)> {
         }
         let class = if !q.market_class.is_empty() {
             q.market_class.to_lowercase()
-        } else if matches!(q.asset.to_ascii_lowercase().as_str(), "btc" | "eth" | "sol") {
+        } else if crate::helpers::coins::is_slug(&q.asset) {
             "crypto".to_string()
         } else {
             continue;

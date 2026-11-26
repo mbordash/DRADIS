@@ -592,7 +592,7 @@ export default function TradelogPage({ availableAssets }: Props) {
   const [rtbLoading, setRtbLoading] = useState(false);
 
   // ── Fetch all assets in parallel ─────────────────────────────────────────────
-  const assets = availableAssets.length > 0 ? availableAssets : ['btc', 'eth', 'sol'];
+  const assets = availableAssets.length > 0 ? availableAssets : ['btc', 'eth', 'sol', 'xrp', 'doge'];
 
   const { data: tradesData, isLoading: tradesLoading, error: tradesError } = useSWR(
     ['tradelog-trades', assets.join(',')],

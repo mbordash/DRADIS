@@ -3232,7 +3232,7 @@ async fn enrich_taxonomy(summary: &mut crate::cag::SquadronSummary) {
             // No DB row (read-only mode) or empty/unknown class — infer from asset.
             // BTC/ETH/SOL are always crypto; custom assets fall back to classification.
             let asset_lower = summary.asset.to_ascii_lowercase();
-            if matches!(asset_lower.as_str(), "btc" | "eth" | "sol") {
+            if crate::helpers::coins::is_slug(&asset_lower) {
                 "crypto".to_string()
             } else {
                 // For custom assets, attempt classification from the market name.

@@ -51,12 +51,7 @@ const USER_AGENT: &str = "Mozilla/5.0 (compatible; dradis-engine/1.0)";
 
 /// The hourly series for an underlying, where Kalshi lists one.
 pub fn hourly_series(underlying: &str) -> Option<&'static str> {
-    match underlying.to_ascii_lowercase().as_str() {
-        "btc" => Some("KXBTCD"),
-        "eth" => Some("KXETHD"),
-        "sol" => Some("KXSOLD"),
-        _ => None,
-    }
+    crate::helpers::coins::by_slug(underlying).map(|c| c.kalshi_hourly)
 }
 
 fn client() -> &'static reqwest::Client {
@@ -272,6 +267,7 @@ mod tests {
         assert_eq!((h.yes_token.as_str(), h.no_token.as_str()), ("KXBTCD-26NOV2011-T59299.99#yes", "KXBTCD-26NOV2011-T59299.99#no"));
         assert_eq!((h.strike, h.up_won), (Some(59299.99), Some(true)));
         assert_eq!(hourly_series("ETH"), Some("KXETHD"));
-        assert_eq!(hourly_series("doge"), None);
+        assert_eq!(hourly_series("doge"), Some("KXDOGED"));
+        assert_eq!(hourly_series("ada"), None);
     }
 }

@@ -505,11 +505,9 @@ pub async fn run_price_raptor(
     drift_tx: watch::Sender<(Decimal, Decimal, Decimal)>,
     raptor_health_tx: Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
 ) {
-    let binance_pair = match crypto_filter.as_str() {
-        "eth" => "ethusdt",
-        "sol" => "solusdt",
-        _     => "btcusdt",
-    };
+    // [E110] The pair is the coin table's; an unknown filter keeps Bitcoin's.
+    let binance_pair = crate::helpers::coins::by_slug(&crypto_filter)
+        .map_or("btcusdt".to_string(), |c| c.binance_pair.to_ascii_lowercase());
     // Host rotation: binance.com is geo-blocked (HTTP 451) from US IPs; the
     // data-only mirror data-stream.binance.vision serves the same ticker
     // stream without restriction. Rotate hosts on each failed connect.

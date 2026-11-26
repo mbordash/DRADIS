@@ -573,7 +573,11 @@ impl UsRetailVenue {
     /// filter on `/v1/markets`, so a second fetch would return random sports
     /// markets (2026-08-08: 200 raw, "World Series Champion", zero crypto).
     pub async fn discover_crypto_markets_via_search(&self) -> Result<Vec<markets::UsMarketPair>> {
-        self.discover_via_search(&["bitcoin", "ethereum", "solana", "xrp", "crypto"], "crypto").await
+        // [E110] One query per coin name in the table, plus the class word.
+        let mut queries: Vec<String> = crate::helpers::coins::COINS.iter().map(|c| c.name.to_ascii_lowercase()).collect();
+        queries.push("crypto".to_string());
+        let queries: Vec<&str> = queries.iter().map(String::as_str).collect();
+        self.discover_via_search(&queries, "crypto").await
     }
 
     /// Politics markets, via the same search path and for the same reason.

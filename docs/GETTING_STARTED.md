@@ -235,7 +235,7 @@ cargo test            --no-default-features --features kalshi
 ### Multi-asset mode
 
 ```bash
-# .env — run BTC, ETH, and SOL loops concurrently
+# .env — run BTC, ETH, and SOL loops concurrently (supported: btc, eth, sol, xrp, doge)
 ASSETS=btc,eth,sol
 
 # Each asset gets its own SQLite DB file:

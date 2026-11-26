@@ -47,16 +47,12 @@ pub async fn run_funding_raptor(
     funding_tx: watch::Sender<Decimal>,
     raptor_health_tx: Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
 ) {
-    let symbol = match crypto_filter.as_str() {
-        "eth" => "ETHUSDT",
-        "sol" => "SOLUSDT",
-        _     => "BTCUSDT",
-    };
-    let okx_inst = match crypto_filter.as_str() {
-        "eth" => "ETH-USDT-SWAP",
-        "sol" => "SOL-USDT-SWAP",
-        _     => "BTC-USDT-SWAP",
-    };
+    // [E110] Both instruments come from the coin table; an unknown filter keeps Bitcoin's.
+    let coin = crate::helpers::coins::by_slug(&crypto_filter)
+        .or_else(|| crate::helpers::coins::by_slug("btc"))
+        .expect("the coin table has a btc row");
+    let symbol = coin.binance_pair;
+    let okx_inst = coin.okx_swap;
     // Primary: Binance FAPI (futures). Fallback: OKX (US-reachable).
     let url_primary  = format!("https://fapi.binance.com/fapi/v1/premiumIndex?symbol={}", symbol);
     let url_fallback = format!("https://www.okx.com/api/v5/public/funding-rate?instId={}", okx_inst);

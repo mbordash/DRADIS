@@ -530,7 +530,7 @@ pub fn holds_existing_row(asset: &str, rotation: bool) -> bool {
 /// suffix), if it is one.
 fn rotation_underlying(squadron_id: &str) -> Option<&str> {
     let u = squadron_id.strip_suffix("-open")?;
-    matches!(u, "btc" | "eth" | "sol" | "xrp" | "doge").then_some(u)
+    crate::helpers::coins::is_slug(u).then_some(u)
 }
 
 /// Whether a venue-chosen (rotation) squadron for `asset` starts held, decided

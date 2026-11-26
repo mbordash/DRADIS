@@ -22,9 +22,10 @@
 /// Infer the underlying asset from a market title, by whole word.
 ///
 /// "Bitcoin Up or Down on June 7?" is btc, "Will ETH exceed ..." is eth. Only
-/// bitcoin, ethereum and solana are recognized; anything else is `None`, which
-/// callers treat as "not a crypto market" rather than guessing. Whole-word
-/// matching keeps "Netherlands" from reading as eth.
+/// the coins in `helpers::coins` are recognized, by their title words (a bare
+/// "DOGE" is not Dogecoin); anything else is `None`, which callers treat as
+/// "not a crypto market" rather than guessing. Whole-word matching keeps
+/// "Netherlands" from reading as eth.
 pub fn infer_asset_from_title(title: &str) -> Option<&'static str> {
     let normalized: String = title
         .chars()
@@ -32,15 +33,11 @@ pub fn infer_asset_from_title(title: &str) -> Option<&'static str> {
         .collect();
     let has_word = |needle: &str| normalized.split_whitespace().any(|w| w == needle);
 
-    if has_word("btc") || has_word("bitcoin") {
-        Some("btc")
-    } else if has_word("eth") || has_word("ethereum") {
-        Some("eth")
-    } else if has_word("sol") || has_word("solana") {
-        Some("sol")
-    } else {
-        None
-    }
+    // [E110] Table order decides when a title names several coins' words.
+    crate::helpers::coins::COINS
+        .iter()
+        .find(|c| c.title_words().any(|w| has_word(&w)))
+        .map(|c| c.slug)
 }
 
 #[cfg(test)]
@@ -54,5 +51,9 @@ mod tests {
         assert_eq!(infer_asset_from_title("Solana Up or Down on June 7?"), Some("sol"));
         assert_eq!(infer_asset_from_title("Will the Netherlands win?"), None, "a substring is not a word");
         assert_eq!(infer_asset_from_title("Lakers vs Celtics"), None);
+        assert_eq!(infer_asset_from_title("Ripple price at Nov 26, 2026 at 7pm EST?"), Some("xrp"));
+        assert_eq!(infer_asset_from_title("XRP Up or Down - November 26, 6:00PM-6:15PM ET"), Some("xrp"));
+        assert_eq!(infer_asset_from_title("Dogecoin price on Nov 26, 2026?"), Some("doge"));
+        assert_eq!(infer_asset_from_title("Will DOGE cut $1T in 2026?"), None, "the department, not the coin");
     }
 }

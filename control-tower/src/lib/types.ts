@@ -454,7 +454,7 @@ export interface TradeRow {
   /** 'crypto' | 'sports' | 'politics' | 'unknown'. Null on legacy rows. */
   market_class?: string | null;
   /**
-   * Underlying symbol ('btc', 'eth', 'sol'). Null is meaningful, not missing:
+   * Underlying symbol ('btc', 'eth', 'sol', 'xrp', 'doge'). Null is meaningful, not missing:
    * sports and politics markets have no underlying instrument.
    */
   underlying?:   string | null;

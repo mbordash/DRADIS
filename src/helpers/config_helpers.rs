@@ -176,10 +176,7 @@ pub fn is_high_priority_text(s: &str) -> bool {
 
 /// Crypto market detection by coin name
 pub fn is_crypto_market(name: &str) -> bool {
-    let n = name.to_lowercase();
-    n.contains("btc") || n.contains("bitcoin") ||
-        n.contains("eth") || n.contains("ethereum") ||
-        n.contains("sol") || n.contains("solana")
+    crate::helpers::coins::mentioned_in(name)
 }
 
 /// Ultra-short time window market detection (15-minute windows only).

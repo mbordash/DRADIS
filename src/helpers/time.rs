@@ -104,11 +104,7 @@ pub async fn fetch_window_open(
     filter: &str,
     at: DateTime<Utc>,
 ) -> Option<Decimal> {
-    let binance_symbol = match filter {
-        "eth" => "ETHUSDT",
-        "sol" => "SOLUSDT",
-        _ => "BTCUSDT",
-    };
+    let binance_symbol = crate::helpers::coins::by_slug(filter).map_or("BTCUSDT", |c| c.binance_pair);
     for host in KLINE_HOSTS {
         let url = format!(
             "{host}/api/v3/klines?symbol={}&interval=1m&startTime={}&limit=1",
@@ -260,12 +256,7 @@ pub fn generate_hourly_market_names(crypto_filter: &str, current_time_utc: DateT
     let mut names = Vec::new();
     let eastern_time = current_time_utc.with_timezone(&Eastern);
 
-    let crypto_name_long = match crypto_filter {
-        "btc" => "Bitcoin",
-        "eth" => "Ethereum",
-        "sol" => "Solana",
-        _ => "Crypto",
-    };
+    let crypto_name_long = crate::helpers::coins::by_slug(crypto_filter).map_or("Crypto", |c| c.name);
     let crypto_name_short = crypto_filter.to_uppercase();
 
     // Generate names for current hour and next hour
@@ -303,18 +294,16 @@ pub fn generate_hourly_market_names(crypto_filter: &str, current_time_utc: DateT
 /// scans in `helpers::market` are ordered views of a catalogue that has outgrown
 /// them (see `fetch_hourly_candidates_by_slug`), and the training pipeline has
 /// used this slug for its own market fetches since it was written.
-pub fn hourly_market_slug(crypto_filter: &str, window_start_utc: DateTime<Utc>) -> String {
-    let crypto_slug = match crypto_filter {
-        "btc" => "bitcoin",
-        "eth" => "ethereum",
-        "sol" => "solana",
-        _ => "bitcoin",
-    };
+///
+/// `None` for a coin Polymarket lists no hourly market on (Dogecoin); a filter
+/// the coin table does not know keeps the Bitcoin slug, as before E110.
+pub fn hourly_market_slug(crypto_filter: &str, window_start_utc: DateTime<Utc>) -> Option<String> {
+    let crypto_slug = polymarket_hourly_stem(crypto_filter)?;
     let et = window_start_utc.with_timezone(&Eastern);
     let h = et.hour();
     let ampm = if h < 12 { "am" } else { "pm" };
     let h12 = if h % 12 == 0 { 12 } else { h % 12 };
-    format!(
+    Some(format!(
         "{}-up-or-down-{}-{}-{}-{}{}-et",
         crypto_slug,
         et.format("%B").to_string().to_ascii_lowercase(),
@@ -322,7 +311,18 @@ pub fn hourly_market_slug(crypto_filter: &str, window_start_utc: DateTime<Utc>) 
         et.year(),
         h12,
         ampm,
-    )
+    ))
+}
+
+/// [E110] Polymarket's "Up or Down" slug stem for a filter: the coin's own
+/// where the table has one, `None` for a coin Polymarket lists no hourly or
+/// daily market on, and Bitcoin's for a filter the table does not know (the
+/// pre-E110 fallback, kept for `all` and custom filters).
+fn polymarket_hourly_stem(crypto_filter: &str) -> Option<&'static str> {
+    match crate::helpers::coins::by_slug(crypto_filter) {
+        Some(c) => c.polymarket_hourly_slug,
+        None => Some("bitcoin"),
+    }
 }
 
 /// Slugs of the hourly markets the squadron can need right now: the one whose
@@ -343,7 +343,7 @@ pub fn generate_hourly_market_slugs(
         .unwrap_or(now);
     let mut slugs: Vec<String> = Vec::new();
     for i in 0..=lookahead_hours.max(0) {
-        let slug = hourly_market_slug(crypto_filter, window_start + chrono::Duration::hours(i));
+        let Some(slug) = hourly_market_slug(crypto_filter, window_start + chrono::Duration::hours(i)) else { break };
         if !slugs.contains(&slug) {
             slugs.push(slug);
         }
@@ -366,11 +366,7 @@ pub fn generate_hourly_market_slugs(
 /// with $6.4k of 24h volume sat beyond it on 2026-10-13, so the maker venue
 /// came and went with the scan and every change restarted the patrol (B60).
 pub fn window_market_slug(crypto_filter: &str, window_start_utc: DateTime<Utc>) -> String {
-    let asset = match crypto_filter {
-        "eth" | "ethereum" => "eth",
-        "sol" | "solana" => "sol",
-        _ => "btc",
-    };
+    let asset = crate::helpers::coins::find(crypto_filter).map_or("btc", |c| c.slug);
     format!("{}-updown-4h-{}", asset, window_start_utc.timestamp())
 }
 
@@ -424,12 +420,9 @@ pub fn generate_window_market_slugs(
 pub fn generate_daily_event_slugs(crypto_filter: &str, current_time_utc: DateTime<Utc>) -> Vec<String> {
     let eastern_time = current_time_utc.with_timezone(&Eastern);
 
-    let crypto_slug = match crypto_filter {
-        "btc" => "bitcoin",
-        "eth" => "ethereum",
-        "sol" => "solana",
-        _ => "bitcoin",
-    };
+    // [E110] A coin Polymarket lists no daily market on has no slugs: the old
+    // Bitcoin fallback would have handed a Dogecoin squadron Bitcoin's market.
+    let Some(crypto_slug) = polymarket_hourly_stem(crypto_filter) else { return Vec::new() };
 
     let mut slugs = Vec::new();
     for day_offset in 0..=1i64 {
@@ -450,12 +443,7 @@ pub fn generate_daily_market_names(crypto_filter: &str, current_time_utc: DateTi
     let mut names = Vec::new();
     let eastern_time = current_time_utc.with_timezone(&Eastern);
 
-    let crypto_name_long = match crypto_filter {
-        "btc" => "Bitcoin",
-        "eth" => "Ethereum",
-        "sol" => "Solana",
-        _ => "Crypto",
-    };
+    let crypto_name_long = crate::helpers::coins::by_slug(crypto_filter).map_or("Crypto", |c| c.name);
     let crypto_name_short = crypto_filter.to_uppercase();
 
     // Today and tomorrow in ET so overnight sessions always find the right market
@@ -589,6 +577,21 @@ mod hourly_slug_tests {
     fn dst_fall_back_dedupes_the_repeated_hour() {
         let slugs = generate_hourly_market_slugs("btc", utc("2026-11-01T05:30:00Z"), 1);
         assert_eq!(slugs, vec!["bitcoin-up-or-down-november-1-2026-1am-et"]);
+    }
+
+    /// [E110] A coin Polymarket lists no hourly or daily market on gets no
+    /// slug at all, never Bitcoin's; XRP gets its own; an unknown filter keeps
+    /// the Bitcoin fallback.
+    #[test]
+    fn a_coin_without_polymarket_markets_gets_no_slug() {
+        let at = utc("2026-11-26T23:30:00Z");
+        assert_eq!(hourly_market_slug("doge", at), None);
+        assert!(generate_hourly_market_slugs("doge", at, 1).is_empty());
+        assert!(generate_daily_event_slugs("doge", at).is_empty());
+        assert_eq!(hourly_market_slug("xrp", at).as_deref(), Some("xrp-up-or-down-november-26-2026-6pm-et"));
+        assert!(generate_daily_event_slugs("xrp", at).iter().all(|s| s.starts_with("xrp-up-or-down-on-")));
+        assert_eq!(hourly_market_slug("btc", at).as_deref(), Some("bitcoin-up-or-down-november-26-2026-6pm-et"));
+        assert!(hourly_market_slug("all", at).unwrap().starts_with("bitcoin-"), "the pre-E110 fallback");
     }
 }
 

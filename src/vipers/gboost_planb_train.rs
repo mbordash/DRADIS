@@ -549,6 +549,7 @@ pub fn slug_for(w: i64) -> String {
     // string in `helpers::time`, so a format drift there would show up in the
     // test below rather than only in a training fetch.
     crate::helpers::time::hourly_market_slug("btc", Utc.timestamp_opt(w, 0).single().unwrap_or_default())
+        .unwrap_or_default()
 }
 
 fn floor_hour(t: i64) -> i64 { t.div_euclid(3600) * 3600 }

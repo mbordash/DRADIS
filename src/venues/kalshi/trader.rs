@@ -322,19 +322,7 @@ enum MarketMandate {
 
 /// Crypto underlying from a Kalshi series/market ticker prefix.
 fn detect_underlying(ticker: &str) -> Option<&'static str> {
-    let t = ticker.to_ascii_uppercase();
-    for (needle, u) in [
-        ("KXBTC", "btc"),
-        ("KXETH", "eth"),
-        ("KXSOL", "sol"),
-        ("KXXRP", "xrp"),
-        ("KXDOGE", "doge"),
-    ] {
-        if t.starts_with(needle) {
-            return Some(u);
-        }
-    }
-    None
+    crate::helpers::coins::by_kalshi_ticker(ticker).map(|c| c.slug)
 }
 
 /// [B84] The series the rotation loop hunts: those of ONE underlying, the
@@ -774,8 +762,11 @@ fn rotation_plan(underlyings: Option<Vec<String>>, series: Vec<String>) -> (Vec<
     for u in &us {
         let mine: Vec<String> = series.iter().filter(|s| detect_underlying(s) == Some(u.as_str())).cloned().collect();
         let mine = if mine.is_empty() {
-            let up = u.to_ascii_uppercase();
-            vec![format!("KX{up}15M"), format!("KX{up}D")]
+            // [E110] The coin's 15-minute and hourly series, from the coin table.
+            match crate::helpers::coins::by_slug(u) {
+                Some(c) => vec![format!("{}15M", c.kalshi_prefix), c.kalshi_hourly.to_string()],
+                None => { let up = u.to_ascii_uppercase(); vec![format!("KX{up}15M"), format!("KX{up}D")] }
+            }
         } else { mine };
         plan.push((u.clone(), mine));
     }
@@ -4130,8 +4121,8 @@ fn register_kalshi_squadron(
     // class's vipers rather than inheriting crypto's.
     let crypto_asset = match (deployed_as, pair.underlying) {
         (Some(class), _) => CryptoAsset::Custom(class.to_string()),
-        (None, "eth") => CryptoAsset::Eth,
-        (None, "sol") => CryptoAsset::Sol,
+        // [E110] Any coin the table knows; an empty or unknown underlying stays BTC.
+        (None, u) if crate::helpers::coins::is_slug(u) => u.parse().expect("infallible"),
         (None, _)     => CryptoAsset::Btc,
     };
     // What the operator sees. Their own name wins when they gave one.
@@ -4263,6 +4254,13 @@ mod tests {
             ("sol".to_string(), vec!["KXSOL15M".to_string(), "KXSOLD".to_string()]),
         ], "configured series where given, the defaults otherwise");
         assert_eq!(ignored, vec!["KXDOGE15M".to_string()]);
+        // [E110] The new coins default to their own series from the coin table.
+        let (plan, ignored) = rotation_plan(Some(vec!["xrp".into(), "doge".into()]), vec![]);
+        assert_eq!(plan, vec![
+            ("xrp".to_string(), vec!["KXXRP15M".to_string(), "KXXRPD".to_string()]),
+            ("doge".to_string(), vec!["KXDOGE15M".to_string(), "KXDOGED".to_string()]),
+        ]);
+        assert!(ignored.is_empty());
         // [B112] A holding's adoption kind follows its series.
         assert_eq!(holding_kind("KXETH15M-26NOV141015-15#yes"), db::AdoptionKind::Crypto(Some("eth".into())));
         assert_eq!(holding_kind("KXSOL15M-26NOV141015-15#no"), db::AdoptionKind::Crypto(Some("sol".into())));
