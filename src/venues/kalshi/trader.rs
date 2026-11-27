@@ -27,9 +27,13 @@
 //!   4. each tick, build a venue-neutral [`StrategyContext`] and dispatch
 //!      signals through the shared lifecycle engine.
 //!
-//! Fees: Kalshi charges quadratic taker fees, `ceil(7¢ · P·(1−P) · N)` —
-//! worst case 1.75¢/contract at P=0.50. We surface a conservative 175 bps on
-//! both legs so viper edge thresholds price the worst case in.
+//! Fees: Kalshi charges quadratic taker fees, `7¢ · P·(1−P) · N`, each fill's
+//! fee rounded up to the nearest $0.000001 with the overpayment carried across
+//! the order's fills (docs.kalshi.com, getting_started/fee_rounding; it is not
+//! rounded to the cent), so the unrounded figure the ledger books is what the
+//! venue bills to within a micro-dollar. Worst case 1.75¢/contract at P=0.50.
+//! We surface a conservative 175 bps on both legs so viper edge thresholds
+//! price the worst case in.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};

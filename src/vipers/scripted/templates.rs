@@ -52,6 +52,11 @@ fn exit(ctx, pos) {
 
 pub const MOMENTUM: &str = r#"// Plain momentum: buy the side the oracle is moving toward when the
 // five-second move passes a threshold, with a take-profit and a stop.
+//
+// A worked example of the API, not an edge. Mind the fees: a taker pays
+// rate x price x (1 - price) per contract on each leg, which peaks in the
+// middle of the book where this buys, so a round trip here costs about 7% of
+// the stake and a 0.20 bracket needs roughly 58% winners just to break even.
 fn entry(ctx) {
     if ctx.velocity == () { return #{ hold: "no price from the feed (none on this squadron, or not printed yet)" }; }
     if ctx.secs_to_close == () || ctx.secs_to_close < ctx.params.min_secs_to_close {
