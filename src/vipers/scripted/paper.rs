@@ -151,8 +151,25 @@ pub async fn recent(pool: &SqlitePool, script: &str, limit: i64) -> Vec<PaperRow
 /// The most recent rows of every script, deleted ones included, newest first,
 /// for the Trade Log. Open rows come first in time order like the rest.
 pub async fn recent_all(pool: &SqlitePool, limit: i64) -> Vec<PaperRow> {
-    sqlx::query("SELECT * FROM script_paper ORDER BY id DESC LIMIT ?")
-        .bind(limit.clamp(1, 1000))
+    recent_where(pool, None, None, limit).await
+}
+
+/// [B126] The newest `per_window` rows OF EACH SCRIPT ON EACH ASSET, newest
+/// first, narrowed in SQL to one script and/or one asset (the ledger's own
+/// `asset` column: the coin or class the squadron flew). The window is per
+/// script and coin because the Trade Log used to take the newest N rows of
+/// the whole ledger: three busy scripts writing ~150 rows a day pushed a quiet
+/// one out of view within a day, and it looked as if a deploy had lost its
+/// paper trades. Nothing was lost; the ledger keeps every row.
+pub async fn recent_where(pool: &SqlitePool, script: Option<&str>, asset: Option<&str>, per_window: i64) -> Vec<PaperRow> {
+    sqlx::query(
+        "SELECT * FROM (
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY script, asset ORDER BY id DESC) AS rn
+              FROM script_paper
+             WHERE (?1 IS NULL OR script = ?1) AND (?2 IS NULL OR asset = ?2)
+         ) WHERE rn <= ?3 ORDER BY id DESC"
+    )
+        .bind(script).bind(asset).bind(per_window.clamp(1, 1000))
         .fetch_all(pool).await.unwrap_or_default().iter().map(row).collect()
 }
 

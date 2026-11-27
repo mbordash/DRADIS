@@ -564,7 +564,7 @@ function FilteredPnl({ filtered, edge, truncated, lifetime }: {
       {truncated && (
         <span
           className="text-gray-600 basis-full"
-          title={`The log loads the ${TRADE_WINDOW_ROWS} most recent trades per coin. Realized, Unrealized and Net cover only the rows that are loaded and match the filters; a viper's older trades are not in them. The cards above are lifetime totals.`}
+          title={`The log loads the ${TRADE_WINDOW_ROWS} most recent trades per coin, and the ${PAPER_WINDOW_ROWS} most recent paper trades of each script on each coin. Realized, Unrealized and Net cover only the rows that are loaded and match the filters; a viper's older trades are not in them. The cards above are lifetime totals.`}
         >
           Realized and Net above: the {TRADE_WINDOW_ROWS} most recent trades per coin only, not lifetime
         </span>
@@ -577,6 +577,7 @@ function FilteredPnl({ filtered, edge, truncated, lifetime }: {
  *  instance, so a sum over the loaded rows is a window, not a lifetime figure;
  *  `FilteredPnl` says so whenever any asset's fetch came back full. */
 const TRADE_WINDOW_ROWS = 200;
+const PAPER_WINDOW_ROWS = 50;
 
 export default function TradelogPage({ availableAssets }: Props) {
   // ── Filters ──────────────────────────────────────────────────────────────────
@@ -672,7 +673,10 @@ export default function TradelogPage({ availableAssets }: Props) {
     ['tradelog-paper', assets.join(',')],
     async () => {
       // A failed read leaves paper rows out; it must not blank the real log.
-      const results = await Promise.allSettled(assets.map(a => getPaperTrades(TRADE_WINDOW_ROWS, a).then(rows => ({ asset: a, rows }))));
+      // [B126] The paper window is per script per coin on the server, so a
+      // quiet script keeps weeks of rows beside the busy ones; 50 per window
+      // keeps the answer small (scripts x coins x 50 at most).
+      const results = await Promise.allSettled(assets.map(a => getPaperTrades(PAPER_WINDOW_ROWS, a).then(rows => ({ asset: a, rows }))));
       return results.flatMap(r => (r.status === 'fulfilled' ? [r.value] : []));
     },
     { refreshInterval: 15_000 },

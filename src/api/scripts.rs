@@ -133,7 +133,7 @@ async fn list() -> Response {
 #[derive(Deserialize)]
 struct LimitQuery { limit: Option<i64> }
 
-/// GET /api/vipers/paper-trades?limit=200
+/// GET /api/vipers/paper-trades?limit=200[&asset=sol][&script=late_favorite]
 ///
 /// Every script's paper trades, newest first, for the Trade Log. A route of its
 /// own, never folded into `/api/trades`: that endpoint feeds the dashboard's
@@ -141,18 +141,30 @@ struct LimitQuery { limit: Option<i64> }
 ///
 /// Scoped by `asset` exactly as `/api/trades` is, so the Trade Log files each
 /// paper row under the same shard as the real trades it reads beside it.
+///
+/// [B126] `limit` is a window PER SCRIPT PER COIN, not over the whole ledger:
+/// the old read took the newest 200 rows of everything, so three busy scripts
+/// writing ~150 rows a day pushed a quiet script out of the Trade Log within a
+/// day, and it looked as if a deploy had lost its paper trades (nothing was
+/// lost). The Trade Log asks for 50, which is weeks of a quiet script.
+/// `script` narrows the answer to one script. When `asset` is an alias into a
+/// shared database (a coin on Kalshi, a class on Polymarket), the rows are
+/// narrowed to that asset's own; when it names the database itself (`kalshi`,
+/// as the Trade Log asks on that venue), every script's window comes back.
 async fn paper_trades(Query(q): Query<PaperQuery>) -> Response {
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
-    let pools = match q.asset.as_deref() {
+    let asset = q.asset.as_deref().map(|a| a.trim().to_ascii_lowercase()).filter(|a| !a.is_empty());
+    let script = q.script.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let pools = match asset.as_deref() {
         Some(a) => db::pool_for_opt_retry(Some(a)).await.into_iter().collect::<Vec<_>>(),
         None => db::all_pools(),
     };
+    let scope = asset.as_deref().filter(|a| db::is_pool_alias(a));
     let mut rows = Vec::new();
     for pool in pools {
-        rows.extend(paper::recent_all(&pool, limit).await);
+        rows.extend(paper::recent_where(&pool, script, scope, limit).await);
     }
     rows.sort_by(|a, b| b.opened_at.cmp(&a.opened_at));
-    rows.truncate(limit as usize);
     // The Trade Log files every row by venue, class and underlying. The paper
     // ledger stores none of them, and none needs storing: the ledger lives in
     // this engine's database, so the venue is this build's; the class is the
@@ -209,7 +221,7 @@ struct PaperTradeOut {
 }
 
 #[derive(Deserialize)]
-struct PaperQuery { limit: Option<i64>, asset: Option<String> }
+struct PaperQuery { limit: Option<i64>, asset: Option<String>, script: Option<String> }
 
 async fn read(Path(name): Path<String>, Query(q): Query<LimitQuery>) -> Response {
     let Some(s) = store::get(&name) else {

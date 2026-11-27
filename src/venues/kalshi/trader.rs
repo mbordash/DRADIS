@@ -4149,8 +4149,7 @@ fn register_kalshi_squadron(
     );
     cag.register_with_cancel(&squadron, cancel.clone());
     // [B112] What this squadron flies, from the market itself: the id does not
-    // say it for an operator's crypto deployment (`crypto-open`) or an XRP or
-    // DOGE rotation (which registers as `btc-open`).
+    // say it for an operator's crypto deployment (`crypto-open`).
     db::set_adoption_kind(&squadron.id, if pair.is_crypto() {
         db::AdoptionKind::Crypto(Some(pair.underlying.to_string()))
     } else {

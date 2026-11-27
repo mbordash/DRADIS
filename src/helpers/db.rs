@@ -315,6 +315,16 @@ pub fn pools_for_opt(asset: Option<&str>) -> Vec<SqlitePool> {
 /// Return the lowercase asset names for all initialized pools, sorted
 /// alphabetically.  Used by `GET /api/assets` to tell the Control Tower
 /// which asset views are available.
+/// [B126] Whether `asset` reaches its database through an alias (a coin on
+/// Kalshi, a class aliased into the primary shard on Polymarket) rather than
+/// naming a database of its own. A reader scoping rows by asset narrows only
+/// for an alias: the database's own name means all of it.
+pub fn is_pool_alias(asset: &str) -> bool {
+    let a = asset.to_lowercase();
+    let owns_pool = pools_map().lock().map(|m| m.contains_key(&a)).unwrap_or(false);
+    !owns_pool && pool_aliases().lock().map(|m| m.contains_key(&a)).unwrap_or(false)
+}
+
 pub fn available_assets() -> Vec<String> {
     let guard = pools_map().lock().unwrap();
     let mut v: Vec<String> = guard.keys().cloned().collect();

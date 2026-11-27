@@ -106,9 +106,12 @@ export async function getPnlSpan(): Promise<PnlSpan> {
 }
 
 /** A shard's script paper trades, newest first. Its own route: never part of
- *  `/api/trades`, which feeds the money totals. */
-export async function getPaperTrades(limit = 200, asset?: string): Promise<PaperTradeRow[]> {
-  const url = withAsset(`${BASE}/api/vipers/paper-trades?limit=${limit}`, asset);
+ *  `/api/trades`, which feeds the money totals. [B126] `limit` is a window per
+ *  script, so a quiet script is not pushed out by the busy ones; `script`
+ *  narrows the answer to one script. */
+export async function getPaperTrades(limit = 200, asset?: string, script?: string): Promise<PaperTradeRow[]> {
+  const q = script ? `&script=${encodeURIComponent(script)}` : '';
+  const url = withAsset(`${BASE}/api/vipers/paper-trades?limit=${limit}${q}`, asset);
   const res = await fetch(url, { cache: 'no-store' });
   if (!res.ok) throw new Error(`GET /api/vipers/paper-trades → ${res.status}`);
   return res.json();
