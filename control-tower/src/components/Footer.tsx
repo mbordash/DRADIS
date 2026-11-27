@@ -82,7 +82,9 @@ function LoadMeter() {
   // Hidden until two samples exist (and on a platform without /proc).
   if (!data || !data.probed || data.machine_cpu_pct === null) return null;
 
-  const cpu = data.machine_cpu_pct;
+  // One rounded figure drives both the label and its color, so 79.6 is not an
+  // amber "80%".
+  const cpu = Math.round(data.machine_cpu_pct);
   const memTight = data.mem_total_mb !== null && data.mem_available_mb !== null
     && data.mem_available_mb < data.mem_total_mb * 0.1;
 
@@ -109,7 +111,7 @@ function LoadMeter() {
       title={`${parts.join(' · ')}. Sampled on the DRADIS server every ${data.interval_secs} s from the kernel's counters, not from your browser.`}
     >
       <span>🖥</span>
-      <span>{`Machine ${Math.round(cpu)}%${memTight ? ' ⚠' : ''}`}</span>
+      <span>{`Machine ${cpu}%${memTight ? ' ⚠' : ''}`}</span>
     </span>
   );
 }
