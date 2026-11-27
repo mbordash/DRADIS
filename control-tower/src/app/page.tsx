@@ -372,6 +372,8 @@ const ASSET_EMOJI: Record<string, string> = {
   btc: '₿',
   eth: 'Ξ',
   sol: '◎',
+  xrp: '✕',
+  doge: 'Ð',
 };
 
 function AssetTabs({

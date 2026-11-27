@@ -12368,7 +12368,6 @@ mod squadron_column_migration_tests {
 mod pnl_history_window_tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
-    use rust_decimal_macros::dec;
 
     /// The chart must see a full day, whatever the snapshot cadence.
     ///

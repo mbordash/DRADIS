@@ -157,15 +157,46 @@ async fn paper_trades(Query(q): Query<PaperQuery>) -> Response {
     // ledger stores none of them, and none needs storing: the ledger lives in
     // this engine's database, so the venue is this build's; the class is the
     // running squadron's, or crypto when the market names an underlying; the
-    // underlying reads from the market's name as the squadrons' own does.
+    // underlying is the squadron's own coin, or reads from the market's name
+    // for a squadron that is not a coin's.
     let loops = store::running_loops();
     let out: Vec<_> = rows.into_iter().map(|r| {
-        let underlying = crate::squadron::underlying_from_market_name(&r.market);
+        let underlying = paper_underlying(&r.squadron_id, &r.market);
         let class = loops.iter().find(|l| l.squadron == r.squadron_id).map(|l| l.class.clone())
             .or_else(|| underlying.map(|_| "crypto".to_string()));
         PaperTradeOut { venue: crate::venues::ledger_venue(), market_class: class, underlying, row: r }
     }).collect();
     Json(out).into_response()
+}
+
+/// The underlying a paper row is filed under: the coin squadron's own coin
+/// first, the market's name otherwise.
+///
+/// [B125] The name alone missed Kalshi's 15-minute Dogecoin market ("DOGE
+/// price up in next 15 mins?"): a bare "DOGE" is also the government
+/// department, so the title reader does not take it as the coin (E110), and
+/// the Trade Log filed the row under a generic crypto badge. The squadron id
+/// (`doge-open`) says which coin it was.
+fn paper_underlying(squadron_id: &str, market: &str) -> Option<&'static str> {
+    squadron_id.split("-open").next()
+        .and_then(crate::helpers::coins::by_slug)
+        .map(|c| c.slug)
+        .or_else(|| crate::squadron::underlying_from_market_name(market))
+}
+
+#[cfg(test)]
+mod paper_underlying_tests {
+    use super::paper_underlying;
+
+    #[test]
+    fn a_coin_squadron_files_its_paper_rows_under_its_coin() {
+        assert_eq!(paper_underlying("doge-open", "DOGE price up in next 15 mins? — Target Price: $0.0581877"), Some("doge"));
+        assert_eq!(paper_underlying("xrp-open", "XRP price up in next 15 mins? — Target Price: $0.9770"), Some("xrp"));
+        assert_eq!(paper_underlying("btc-open-second", "Bitcoin price on Nov 27, 2026?"), Some("btc"));
+        // A deployed market's squadron is not a coin's; the name decides.
+        assert_eq!(paper_underlying("crypto-open-mine", "Solana price at Nov 27, 2026 at 5pm EST?"), Some("sol"));
+        assert_eq!(paper_underlying("politics-open", "Will Trump buy Greenland?"), None);
+    }
 }
 
 #[derive(serde::Serialize)]

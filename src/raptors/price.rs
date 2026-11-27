@@ -395,6 +395,12 @@ pub fn usd_per_quote(usdc_usdt_last: Decimal) -> Option<Decimal> {
 /// dollars-per-quote factor, provided that factor is no older than `max_age`.
 /// `None` when no factor has arrived yet or the last one has gone stale; the
 /// caller publishes "not connected" for that tick rather than a guess.
+///
+/// [B125] Rounded to [`MARK_SIGNIFICANT_FIGURES`], not to cents: a cent is a
+/// fifth of a Dogecoin at $0.058 and one percent of XRP at $0.98, wider than
+/// any 15-minute move on either, so the level rounded to cents told the
+/// vipers nothing about where spot sat against the strike (2026-11-27, the
+/// first Dogecoin squadron saw "$0.06" against a $0.0581877 target all window).
 pub fn usd_mark(
     quote_price: Decimal,
     basis: Option<(Instant, Decimal)>,
@@ -405,8 +411,13 @@ pub fn usd_mark(
     if now.saturating_duration_since(at) > max_age {
         return None;
     }
-    Some((quote_price * factor).round_dp(2))
+    let level = quote_price * factor;
+    Some(level.round_sf(MARK_SIGNIFICANT_FIGURES).unwrap_or(level).normalize())
 }
+
+/// Significant figures kept on a published dollar level: cents and a bit on
+/// Bitcoin, a hundred-thousandth of a cent on Dogecoin.
+const MARK_SIGNIFICANT_FIGURES: u32 = 8;
 
 /// USDC/USDT ticker feed: publishes `(when, dollars per USDT)` on every print
 /// that passes [`usd_per_quote`]. Same host rotation and stall handling as the
@@ -1114,7 +1125,21 @@ mod usd_mark_tests {
         assert_eq!(publish_level(MarkDenomination::QuoteAsset, dec!(81083.53), None, now, max), Some(dec!(81083.53)));
         assert_eq!(publish_level(MarkDenomination::QuoteAsset, dec!(81083.53), Some((now, dec!(0.9987))), now, max), Some(dec!(81083.53)));
         assert_eq!(publish_level(MarkDenomination::Usd, dec!(81083.53), None, now, max), None);
-        assert_eq!(publish_level(MarkDenomination::Usd, dec!(81083.53), Some((now, dec!(0.9987))), now, max), Some(dec!(80978.12)));
+        assert_eq!(publish_level(MarkDenomination::Usd, dec!(81083.53), Some((now, dec!(0.9987))), now, max), Some(dec!(80978.121)));
+    }
+
+    /// [B125] A coin priced in cents keeps its precision through the dollar
+    /// conversion; rounding to cents made Dogecoin read $0.06 all window.
+    #[test]
+    fn a_cent_priced_coin_keeps_its_precision() {
+        let now = Instant::now();
+        let max = Duration::from_secs(BASIS_MAX_AGE_SECS);
+        let doge = publish_level(MarkDenomination::Usd, dec!(0.05818), Some((now, dec!(0.9987))), now, max).unwrap();
+        assert_eq!(doge, dec!(0.058104366));
+        let xrp = publish_level(MarkDenomination::Usd, dec!(0.9801), Some((now, dec!(0.9987))), now, max).unwrap();
+        assert_eq!(xrp, dec!(0.97882587));
+        // At par the level is the quote price, whatever the coin.
+        assert_eq!(usd_mark(dec!(0.05818), Some((now, dec!(1))), now, max), Some(dec!(0.05818)));
     }
 
     /// The sane band is inclusive at both edges.

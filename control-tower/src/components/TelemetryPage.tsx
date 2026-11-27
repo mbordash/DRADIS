@@ -29,7 +29,7 @@ import type { VenueId } from '@/lib/setupApi';
 const POLL_MS = 2000;            // server samples at 2s — match it while live
 const SAMPLES_PER_MIN = 30;      // 60s / 2s
 
-const ASSET_EMOJI: Record<string, string> = { btc: '₿', eth: 'Ξ', sol: '◎' };
+const ASSET_EMOJI: Record<string, string> = { btc: '₿', eth: 'Ξ', sol: '◎', xrp: '✕', doge: 'Ð' };
 
 const WINDOWS: { mins: number; label: string }[] = [
   { mins: 5,  label: '5m' },

@@ -593,8 +593,10 @@ fn note_inner(label: &str, market: &str, has_book: bool) {
         // reads as a dead price feed rather than as "not applicable" — which is
         // exactly the wrong impression on a politics or sports squadron whose
         // Raptor stack is neutral by design.
+        // [B125] Printed at the level's own precision: "$0.06" for Dogecoin
+        // at $0.05818 read as a feed four percent off, when it was the print.
         let mark = if oracle > Decimal::ZERO {
-            format!("${oracle:.2}")
+            format!("${}", oracle.normalize())
         } else {
             "n/a".to_string()
         };

@@ -252,6 +252,10 @@ fn pair_from_market(m: &KalshiMarket) -> Option<KalshiPair> {
     } else {
         format!("{} — {}", m.title, m.yes_sub_title)
     };
+    // [B125] A crypto ladder listed `custom` with no strike fields (Dogecoin
+    // hourly) still spells its threshold in the ticker. Crypto only: an
+    // operator-deployed market keeps the listing's own reading.
+    let strike = m.strike().or_else(|| super::types::ticker_threshold(&m.ticker));
     Some(KalshiPair {
         long: MarketId::new(leg_id(&m.ticker, true)),
         short: MarketId::new(leg_id(&m.ticker, false)),
@@ -259,7 +263,7 @@ fn pair_from_market(m: &KalshiMarket) -> Option<KalshiPair> {
         volume: super::types::fp(&m.volume_fp)
             .and_then(|d| f64::try_from(d).ok())
             .unwrap_or(0.0),
-        strike: m.strike().and_then(|s| Decimal::try_from(s).ok()),
+        strike: strike.and_then(|s| Decimal::try_from(s).ok()),
         ticker: m.ticker.clone(),
         cadence: window_of(m).and_then(Cadence::from_window).or_else(|| Cadence::from_ticker(&m.ticker)),
         window_secs: window_of(m),
@@ -2014,7 +2018,7 @@ async fn trade_one_market(
                             Some((n, way)) if n >= ROTATION_MIN_RUNGS_OFF => {
                                 pin_logged = true;
                                 info!(
-                                    "📌 Kalshi hourly held: staying on \"{}\" to its close; it is {} rung(s) {} spot ${:.2}, but the strike settled {}s into the window",
+                                    "📌 Kalshi hourly held: staying on \"{}\" to its close; it is {} rung(s) {} spot ${:.4}, but the strike settled {}s into the window",
                                     pair.question, n, way, reference.unwrap_or(0.0), HOURLY_SETTLE_SECS,
                                 );
                             }
@@ -2033,7 +2037,7 @@ async fn trade_one_market(
                     {
                         match rungs_off_the_money(&pair, &candidates, reference).filter(|_| best.cadence == pair.cadence && best.strike.is_some()) {
                             Some((n, way)) => info!(
-                                "🔍 Strike drift: \"{}\" is {} rung(s) {} spot ${:.2} — moving to \"{}\" (strike {:?})",
+                                "🔍 Strike drift: \"{}\" is {} rung(s) {} spot ${:.4} — moving to \"{}\" (strike {:?})",
                                 pair.question, n, way, reference.unwrap_or(0.0), best.question, best.strike
                             ),
                             None => info!(
@@ -4227,6 +4231,27 @@ mod tests {
         assert_eq!(p.strike, Some(rust_decimal_macros::dec!(65000)));
         assert!(p.close_time.is_some());
         assert_eq!(p.cadence, Some(Cadence::FifteenMin));
+    }
+
+    /// [B125] The Dogecoin hourly ladder is listed `custom` with no strike
+    /// fields; the pair reads the threshold from the ticker.
+    #[test]
+    fn a_custom_strike_ladder_reads_its_threshold_from_the_ticker() {
+        let m = KalshiMarket {
+            strike_type: "custom".to_string(),
+            floor_strike: None,
+            ..mkt("KXDOGED-26NOV2705-T0.2349999", "Dogecoin price on Nov 27, 2026?", "$0.235 or above", "10")
+        };
+        let p = pair_from_market(&m).unwrap();
+        assert_eq!(p.underlying, "doge");
+        assert_eq!(p.strike, Some(rust_decimal_macros::dec!(0.2349999)));
+        // A 15-minute window listed the same way has no threshold to read.
+        let w = KalshiMarket {
+            strike_type: "custom".to_string(),
+            floor_strike: None,
+            ..mkt("KXDOGE15M-26NOV270445-45", "DOGE price up in next 15 mins?", "Target Price: $0.0581877", "10")
+        };
+        assert_eq!(pair_from_market(&w).unwrap().strike, None);
     }
 
     #[test]

@@ -1205,7 +1205,7 @@ impl Strategy for MomentumStrategyImpl {
         if velocity.abs() <= threshold {
             report_gate(asset, "velocity below trigger", "velocity below trigger",
                 config::MOMENTUM_GATE_LOG_INTERVAL_SECS, || format!(
-                "velocity below trigger | vel={:.2} trigger=±{:.2} (5s, oracle ${:.2})",
+                "velocity below trigger | vel={:.2} trigger=±{:.2} (5s, oracle ${:.4})",
                 velocity, threshold, binance_price));
             return Ok(StrategySignal::NoSignal);
         }

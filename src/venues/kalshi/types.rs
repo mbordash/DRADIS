@@ -112,7 +112,9 @@ pub struct KalshiMarket {
     pub result: String,
     #[serde(default)]
     pub market_type: String,
-    /// `greater` | `less` | `between` (strike semantics).
+    /// `greater` | `less` | `between` (strike semantics), or `custom`: no
+    /// strike fields at all, the threshold spelled only in the ticker (the
+    /// Dogecoin hourly ladder; see [`ticker_threshold`]).
     #[serde(default)]
     pub strike_type: String,
     #[serde(default)]
@@ -166,6 +168,9 @@ impl KalshiMarket {
 
     /// The strike price for above/below markets (floor for `greater*`,
     /// cap for `less*`); `between` markets return the floor (range low).
+    ///
+    /// `None` for a `custom` listing with neither field; a crypto ladder falls
+    /// back to [`ticker_threshold`] (see `pair_from_market`).
     pub fn strike(&self) -> Option<f64> {
         // Live values include `greater_or_equal` / `less_or_equal` variants.
         if self.strike_type.starts_with("greater") {
@@ -176,6 +181,22 @@ impl KalshiMarket {
             self.floor_strike.or(self.cap_strike)
         }
     }
+}
+
+/// The threshold a Kalshi ticker spells in its last segment (`…-T0.2349999`
+/// → 0.2349999). `None` for a ticker whose last segment is not a `T` price,
+/// such as a 15-minute `…-45` window or a `B` range.
+///
+/// [B125] Some crypto ladders are listed with `strike_type: "custom"` and
+/// neither strike field (the Dogecoin hourly `KXDOGED` series, checked live
+/// 2026-11-27: `KXDOGED-26NOV2705-T0.2349999` carried only its subtitle
+/// "$0.235 or above" and the rules text). The ticker still spells the
+/// threshold, so the crypto rotation reads it from there; without it the loop
+/// could not read the ladder and sat on a strike four times the spot price.
+pub fn ticker_threshold(ticker: &str) -> Option<f64> {
+    let tail = ticker.rsplit('-').next()?;
+    let price = tail.strip_prefix('T')?;
+    price.parse::<f64>().ok().filter(|p| p.is_finite() && *p > 0.0)
 }
 
 // ─── Series (GET /series) ─────────────────────────────────────────────────────
@@ -712,6 +733,24 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(below.strike(), Some(55200.0));
+    }
+
+    /// [B125] The live Dogecoin hourly listing on 2026-11-27: `custom` strike
+    /// type, no floor or cap, threshold only in the ticker.
+    #[test]
+    fn a_custom_strike_market_reads_its_threshold_from_the_ticker() {
+        let doge = KalshiMarket {
+            ticker: "KXDOGED-26NOV2705-T0.2349999".into(),
+            strike_type: "custom".into(),
+            ..Default::default()
+        };
+        assert_eq!(doge.strike(), None, "the listing itself carries no strike");
+        assert_eq!(ticker_threshold(&doge.ticker), Some(0.2349999));
+        // A window ticker has no threshold to fall back on.
+        assert_eq!(ticker_threshold("KXDOGE15M-26NOV270445-45"), None);
+        assert_eq!(ticker_threshold("KXBTCD-26NOV2011-T59299.99"), Some(59299.99));
+        assert_eq!(ticker_threshold("KXBTC-26NOV27-B59299.99"), None);
+        assert_eq!(ticker_threshold("KXBTCD-26NOV2011-T"), None);
     }
 
     #[test]

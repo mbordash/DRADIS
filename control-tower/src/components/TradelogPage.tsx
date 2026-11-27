@@ -74,9 +74,11 @@ const ASSET_COLOR: Record<string, string> = {
   btc: 'bg-orange-500/10 text-orange-300 border-orange-500/20',
   eth: 'bg-blue-500/10 text-blue-300 border-blue-500/20',
   sol: 'bg-purple-500/10 text-purple-300 border-purple-500/20',
+  xrp: 'bg-slate-500/10 text-slate-300 border-slate-500/20',
+  doge: 'bg-yellow-500/10 text-yellow-300 border-yellow-500/20',
 };
 
-const ASSET_EMOJI: Record<string, string> = { btc: '₿', eth: 'Ξ', sol: '◎' };
+const ASSET_EMOJI: Record<string, string> = { btc: '₿', eth: 'Ξ', sol: '◎', xrp: '✕', doge: 'Ð' };
 
 const VENUE_LABEL: Record<string, string> = {
   'kalshi':          'Kalshi',
