@@ -170,6 +170,28 @@ export async function getLatency(): Promise<LatencySnapshot> {
   return res.json();
 }
 
+/** [E111] The machine the engine runs on, sampled server-side from the kernel's counters. */
+export interface LoadSnapshot {
+  probed: boolean;
+  cores: number;
+  /** CPU in use across all cores together, percent (100 = every core busy). */
+  machine_cpu_pct: number | null;
+  /** The engine's own share, same scale. */
+  engine_cpu_pct: number | null;
+  load_1m: number | null;
+  engine_rss_mb: number | null;
+  mem_total_mb: number | null;
+  mem_available_mb: number | null;
+  interval_secs: number;
+}
+
+/** Machine load (footer meter). */
+export async function getLoad(): Promise<LoadSnapshot> {
+  const res = await fetch(`${BASE}/api/load`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/load → ${res.status}`);
+  return res.json();
+}
+
 export interface ViperStatusRow {
   asset: string;
   strategy: string;

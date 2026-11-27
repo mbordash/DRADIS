@@ -49,6 +49,7 @@ pub mod rotation;
 pub mod coins;
 pub mod logbuf;
 pub mod latency;
+pub mod machine;
 pub mod venue_status;
 pub mod viper_status;
 pub mod autoscale;

@@ -17,7 +17,7 @@
 // with this program. If not, see <https://www.gnu.org/licenses/>.
 
 import useSWR from 'swr';
-import { getLatency } from '@/lib/api';
+import { getLatency, getLoad } from '@/lib/api';
 import { getSetupStatus } from '@/lib/setupApi';
 import { DEMO_MODE } from '@/lib/demo';
 
@@ -65,6 +65,56 @@ function LatencyMeter() {
 }
 
 /**
+ * [E111] Machine load pill — what the box the engine runs on is doing, from
+ * the kernel's own counters, sampled server-side beside the latency probe.
+ *
+ * The headline is CPU in use across every core together, so 100% means the
+ * whole machine is busy whatever its core count. The hover carries the
+ * engine's own share, the load average and memory. Green under half, amber
+ * to four fifths, red above; memory running out turns it amber too.
+ */
+function LoadMeter() {
+  const { data } = useSWR('load', getLoad, {
+    refreshInterval: 10_000,
+    revalidateOnFocus: false,
+  });
+
+  // Hidden until two samples exist (and on a platform without /proc).
+  if (!data || !data.probed || data.machine_cpu_pct === null) return null;
+
+  const cpu = data.machine_cpu_pct;
+  const memTight = data.mem_total_mb !== null && data.mem_available_mb !== null
+    && data.mem_available_mb < data.mem_total_mb * 0.1;
+
+  const color = cpu >= 80
+    ? 'text-red-400 border-red-500/30 bg-red-500/10'
+    : cpu >= 50 || memTight
+      ? 'text-amber-300 border-amber-500/30 bg-amber-500/10'
+      : 'text-emerald-400 border-emerald-500/30 bg-emerald-500/10';
+
+  const gb = (mb: number) => (mb / 1024).toFixed(1);
+  const parts = [
+    `Machine CPU ${cpu}% across ${data.cores} core${data.cores === 1 ? '' : 's'}` +
+      (data.engine_cpu_pct !== null ? ` (this engine ${data.engine_cpu_pct}%)` : ''),
+    data.load_1m !== null ? `load ${data.load_1m}` : null,
+    data.mem_total_mb !== null && data.mem_available_mb !== null
+      ? `memory ${gb(data.mem_total_mb - data.mem_available_mb)} GB used of ${gb(data.mem_total_mb)} GB` +
+        (data.engine_rss_mb !== null ? ` (engine ${data.engine_rss_mb} MB)` : '')
+      : null,
+  ].filter(Boolean);
+
+  return (
+    <span
+      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded border text-[10px] font-mono ${color}`}
+      title={`${parts.join(' · ')}. Sampled on the DRADIS server every ${data.interval_secs} s from the kernel's counters, not from your browser.`}
+    >
+      <span>🖥</span>
+      <span>{`Machine ${Math.round(cpu)}%${memTight ? ' ⚠' : ''}`}</span>
+    </span>
+  );
+}
+
+/**
  * Running engine version, e.g. "v1.0.4".
  *
  * The instance itself carries no version label an operator can see: AWS
@@ -97,14 +147,15 @@ function EngineVersion() {
   );
 }
 
-/** Shared page footer: branding line + venue latency meter + engine version.
+/** Shared page footer: branding line + venue latency and machine load meters + engine version.
  * The branding is venue-neutral: the same Control Tower fronts every venue build,
  * and the latency pill beside it names the venue this engine trades. */
 export default function Footer() {
   return (
     <footer className="text-center text-xs text-gray-700 pb-4 font-mono space-y-2">
-      <div>
+      <div className="inline-flex items-center gap-2">
         <LatencyMeter />
+        <LoadMeter />
       </div>
       <div>
         DRADIS Trading Automation Control Tower{' '}

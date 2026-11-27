@@ -908,6 +908,15 @@ async fn get_latency() -> Response {
     Json(crate::helpers::latency::snapshot()).into_response()
 }
 
+/// GET /api/load
+///
+/// [E111] The machine's CPU, load average and memory, with the engine's own
+/// share, sampled from the kernel's counters every few seconds; the Control
+/// Tower footer meter beside the venue latency. See helpers::machine.
+async fn get_load() -> Response {
+    Json(crate::helpers::machine::snapshot()).into_response()
+}
+
 /// GET /api/vipers/status?asset=btc
 ///
 /// Per-viper "why aren't we trading?" registry, keyed by (squadron asset,
@@ -4946,6 +4955,9 @@ pub async fn run_api_server(
     // Venue latency probe — feeds GET /api/latency (Control Tower footer meter).
     tokio::spawn(crate::helpers::latency::run_latency_probe());
 
+    // [E111] Machine load sampler — feeds GET /api/load (footer meter).
+    tokio::spawn(crate::helpers::machine::run_load_sampler());
+
     // [E109] Venue trading flag — holds entries and names the pause in
     // GET /api/status while the venue says it is closed. Returns at once on a
     // venue that publishes no flag.
@@ -4974,6 +4986,7 @@ pub async fn run_api_server(
         .route("/api/trades/export",         get(export_trades))
         .route("/api/logs",                  get(get_logs))
         .route("/api/latency",               get(get_latency))
+        .route("/api/load",                  get(get_load))
         .route("/api/vipers/status",         get(get_vipers_status))
         .route("/api/bookline/record",       get(get_bookline_record))
         .route("/api/gboost/planb/status",   get(get_gboost_planb_status))
