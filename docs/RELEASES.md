@@ -4,7 +4,7 @@ Customer-facing notes, one entry per Marketplace version, newest first. The
 short form at the top of each entry is what goes in the AWS Marketplace
 version's release notes field; the detail below it is the full account.
 
-## 1.9.2 (unreleased)
+## 1.9.2 (2026-11-27)
 
 - Trade Log: each script now keeps its own window of the 50 newest paper trades on each coin. The log used to load the 200 newest paper rows of the whole ledger, so three busy scripts writing about 150 rows a day pushed a quiet script out of view within a day, which looked like a deploy had lost its paper trades. Nothing was lost; the ledger keeps every row.
 - Control Tower: the footer shows the machine's load beside the venue latency. The badge is CPU in use across every core together; hovering it adds the engine's own share, the load average and memory. It is sampled on the server every 5 seconds from the kernel's counters, so it describes the box the engine runs on, not your browser. Hidden on a machine without /proc.
