@@ -390,6 +390,11 @@ export interface PositionQuote {
   age_secs: number;
   /** The venue answered; false when the read failed or timed out. Absent on engines before 1.5.3. */
   fetched?: boolean;
+  /** The price the venue has resolved this leg at when its market is over but
+   *  the payout has not been booked yet (Kalshi holds an hourly market for 30
+   *  minutes after it is determined). Null or absent while the market is open
+   *  or the venue could not say. Absent on engines before 1.9.3. */
+  settled?: string | null;
 }
 
 export interface PnlSnapshotRow {

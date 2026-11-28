@@ -618,8 +618,17 @@ pub fn unledgered_notional(positions: &crate::state::PositionMap, squadron: &str
 /// Who booked a filled entry's settlement. See `AnchorStrategy::book_settlement`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Booked {
-    /// A real position: the venue's settlement sweep writes the trade.
+    /// A real position whose settlement the venue's sweep has written to the
+    /// trade list.
     Venue,
+    /// A real position the venue has decided but not paid out yet: its row is
+    /// still open and no settlement trade exists. Kalshi runs a 30-minute
+    /// settlement timer after an hourly market is determined, and the trade
+    /// list books only when the payout lands. The ledger waits for it. [B128]
+    Pending,
+    /// A real position whose row is gone without a settlement trade: the venue
+    /// closed it some other way, and the ledger scores the resolution alone.
+    VenueUnrecorded,
     /// A simulated position still in the map, booked through the shared path.
     Simulated,
     /// A simulated position the loop had already dropped, booked from the ledger.
@@ -676,6 +685,9 @@ struct Globals {
     attempted: Mutex<HashMap<(String, String), i64>>,
     shadow_resolved: Mutex<HashMap<String, f64>>,
     shadow_probed: Mutex<HashMap<String, Instant>>,
+    /// Tokens whose venue payout is pending and has been logged once, so the
+    /// ten-second sweep does not repeat the line for the half hour it waits.
+    payout_pending_logged: Mutex<HashSet<String>>,
     last_sweep: Mutex<Option<Instant>>,
     summary: Mutex<(Option<Instant>, String)>,
     /// Token → (ledger row id, best bid written to it) for the entry lane's
@@ -913,16 +925,41 @@ impl AnchorStrategy {
         pnl: f64,
     ) -> Booked {
         use crate::helpers::db;
-        if row.ghost == Some(false) {
-            return Booked::Venue;
-        }
-        match db::open_row_claims_token_in(pool, &row.token_id).await {
-            Ok(true) => return Booked::Venue,
-            Ok(false) => {}
-            Err(e) => {
-                warn!("⚓ Anchor could not tell whether {} is a real position ({e}); settlement deferred", row.token_id);
-                return Booked::Deferred;
+        // A real position: the venue's own settlement sweep writes the trade
+        // and closes the position's row, in that order, when the payout lands.
+        // The ledger follows the trade list rather than leading it: booked
+        // once the trade is there, waiting while the row is still open (the
+        // venue has decided the market and not paid it out yet), scored on
+        // its own only when both are gone. Until 1.9.3 a real position was
+        // labeled "booked by the venue sweep" the moment the market was
+        // determined, half an hour before the sweep booked anything. [B128]
+        let real = match row.ghost {
+            Some(false) => true,
+            _ => match db::open_row_claims_token_in(pool, &row.token_id).await {
+                Ok(claims) => claims,
+                Err(e) => {
+                    warn!("⚓ Anchor could not tell whether {} is a real position ({e}); settlement deferred", row.token_id);
+                    return Booked::Deferred;
+                }
+            },
+        };
+        if real {
+            match db::anchor_settlement_booked(pool, STRATEGY_NAME, &row.market, &row.side, false, &row.opened_at).await {
+                Ok(true) => return Booked::Venue,
+                Ok(false) => {}
+                Err(e) => {
+                    warn!("⚓ Anchor could not read the trade list for {} {} ({e}); settlement deferred", row.market, row.side);
+                    return Booked::Deferred;
+                }
             }
+            return match db::open_row_claims_token_in(pool, &row.token_id).await {
+                Ok(true) => Booked::Pending,
+                Ok(false) => Booked::VenueUnrecorded,
+                Err(e) => {
+                    warn!("⚓ Anchor could not read the position row for {} ({e}); settlement deferred", row.token_id);
+                    Booked::Deferred
+                }
+            };
         }
         match db::anchor_settlement_booked(pool, STRATEGY_NAME, &row.market, &row.side, true, &row.opened_at).await {
             // Written by an earlier pass whose ledger close did not land.
@@ -1083,6 +1120,12 @@ impl AnchorStrategy {
             *lock(&g.held) = rows.iter().map(|r| held_key(&r.lane, &r.market_key, &r.side)).collect();
             let entries = rows.iter().filter(|r| r.lane == ANCHOR_LANE_ENTRY);
             *lock(&g.ledgered) = entries.clone().map(|r| r.token_id.clone()).collect();
+            {
+                // A row that left the ledger another way (an exit, an abandon)
+                // takes its payout-pending mark with it.
+                let ledgered = lock(&g.ledgered);
+                lock(&g.payout_pending_logged).retain(|t| ledgered.contains(t));
+            }
             *lock(&g.open_notional) = entries.clone().map(|r| r.entry_price * r.shares).sum();
             {
                 // Keep a higher peak the database has not caught up with.
@@ -1178,17 +1221,50 @@ impl AnchorStrategy {
                     }
                     let booked = Self::book_settlement(&positions_c, &pool_c, &asset_c, class_c.as_deref(), &row, px, pnl).await;
                     let pnl = pnl + sold_pnl;
+                    let suffix = if sold.is_some() { ", after a partial exit" } else { "" };
                     let reason = match booked {
                         Booked::Deferred => {
                             // Resolved but not booked: the next sweep asks the
                             // resolver again and lands here with the answer.
                             return;
                         }
+                        Booked::Pending => {
+                            // Decided at the venue, payout not booked yet. The
+                            // row stays open (its collateral is still held, so
+                            // it still counts against the exposure figure), the
+                            // resolution is kept so the next sweep does not ask
+                            // the venue again, and the trade list books first.
+                            let g = globals(&asset_c);
+                            lock(&g.shadow_resolved).insert(row.token_id.clone(), px);
+                            if Utc::now().timestamp() >= row.close_s + SHADOW_GIVE_UP_SECS {
+                                // A payout the venue has not shown in a day is
+                                // scored from the resolution rather than left
+                                // pinning the exposure figure for good.
+                                let reason = format!("settlement (venue payout not booked within 24h){suffix}");
+                                if crate::helpers::db::anchor_shadow_close(&pool_c, row.id, px, &reason, pnl).await {
+                                    lock(&g.payout_pending_logged).remove(&row.token_id);
+                                    warn!(
+                                        "⚓ Anchor settled [{}] {} bought at ${:.3}, resolved ${:.2}: {:+.2} USD ({})",
+                                        row.market, row.side, row.entry_price, px, pnl, reason,
+                                    );
+                                }
+                                return;
+                            }
+                            if lock(&g.payout_pending_logged).insert(row.token_id.clone()) {
+                                info!(
+                                    "⚓ Anchor resolved at the venue [{}] {} bought at ${:.3}, resolved ${:.2}: {:+.2} USD, payout pending; the ledger books it when the venue does",
+                                    row.market, row.side, row.entry_price, px, pnl,
+                                );
+                            }
+                            return;
+                        }
                         Booked::Venue => "settlement (booked by the venue sweep)",
+                        Booked::VenueUnrecorded => "settlement (venue closed the position, no trade on the list)",
                         Booked::Simulated => "settlement (simulated)",
                         Booked::Ledger => "settlement (simulated, booked from the ledger)",
                     };
-                    let reason = if sold.is_some() { format!("{reason}, after a partial exit") } else { reason.to_string() };
+                    lock(&globals(&asset_c).payout_pending_logged).remove(&row.token_id);
+                    let reason = format!("{reason}{suffix}");
                     let reason = reason.as_str();
                     if !crate::helpers::db::anchor_shadow_close(&pool_c, row.id, px, reason, pnl).await {
                         return;
@@ -1920,6 +1996,45 @@ mod tests {
         assert!((x.pnl - 2.05).abs() < 1e-12);
         assert!((x.avg_price - (0.80 * 2.0 + 0.78 * 3.0) / 5.0).abs() < 1e-12);
         assert_eq!(x.reason, "AnchorTP: rest");
+    }
+
+    /// A real position's settlement is the venue's to book. The ledger waits
+    /// while the position row is open with no settlement trade (the venue has
+    /// decided the market and not paid it out yet), follows the trade list
+    /// once the sweep has written the trade, and scores the resolution alone
+    /// only when the row is gone with no trade behind it. [B128]
+    #[tokio::test]
+    async fn a_real_settlement_waits_for_the_venue_to_book_it() {
+        use crate::helpers::db;
+        use sqlx::sqlite::SqlitePoolOptions;
+        let p = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        db::init_schema(&p).await.unwrap();
+        db::run_migrations(&p).await;
+        let close_s = Utc::now().timestamp() - 60;
+        let (token, market) = ("KXXRPD-T1#yes", "Ripple price at 6am");
+        assert!(db::anchor_shadow_open(
+            &p, "xrp", db::ANCHOR_LANE_ENTRY, "xrp-open", "KXXRPD-T1", "KXXRPD-T1", token, market, "YES", close_s,
+            0.40, 5.0, fee(0.40), 0.46, 0.0, 5.0e-5, 0.1, 958, 0.9395, 0.9399, 542.0, Some(false), None, None, None, None,
+        ).await);
+        let row = db::anchor_shadow_open_rows(&p, "xrp").await.unwrap().remove(0);
+        let positions = std::sync::Arc::new(tokio::sync::Mutex::new(crate::state::PositionMap::new()));
+        let scope = crate::state::TradeScope::crypto("xrp", "", "xrp");
+        db::record_open_position(&p, &scope, "xrp-open", STRATEGY_NAME, token, market, "YES",
+                                 Decimal::new(40, 2), Decimal::from(5), false).await;
+        let pnl = (0.0 - 0.40 - fee(0.40)) * 5.0;
+        let book = |p: sqlx::SqlitePool, positions: std::sync::Arc<tokio::sync::Mutex<crate::state::PositionMap>>, row: db::AnchorShadow| async move {
+            AnchorStrategy::book_settlement(&positions, &p, "xrp", Some("crypto"), &row, 0.0, pnl).await
+        };
+        assert_eq!(book(p.clone(), positions.clone(), row.clone()).await, Booked::Pending,
+                   "decided at the venue, not paid out: the row is open and no trade exists");
+        sqlx::query("INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason)
+                     VALUES (?, ?, ?, 'YES', '0.40', '0', '5', '-2.084', 'Settlement (lost — cash settled)')")
+            .bind(Utc::now().to_rfc3339()).bind(STRATEGY_NAME).bind(market).execute(&p).await.unwrap();
+        assert_eq!(book(p.clone(), positions.clone(), row.clone()).await, Booked::Venue, "the venue sweep wrote the trade");
+        sqlx::query("DELETE FROM trades").execute(&p).await.unwrap();
+        db::close_open_position(&p, STRATEGY_NAME, token).await;
+        assert_eq!(book(p.clone(), positions.clone(), row.clone()).await, Booked::VenueUnrecorded,
+                   "row gone, no trade: scored from the resolution alone");
     }
 
     /// The control lane takes the side the model calls dear by the entry margin,

@@ -1707,10 +1707,25 @@ async fn get_position_quotes(State(s): State<ApiState>, Query(q): Query<AssetQue
         /// The venue answered. False when the read failed or timed out, in
         /// which case the empty sides mean "unknown", not "no bid".
         fetched: bool,
+        /// What the venue has resolved this leg at, when its market has
+        /// closed and been determined but the payout has not been booked yet
+        /// (Kalshi runs a 30-minute settlement timer after an hourly market
+        /// is determined). Asked only when the venue answered with an empty
+        /// book, which is the one case the operator cannot read: an open
+        /// market nobody is quoting looks the same as a closed one. `null`
+        /// when the market is open, the venue could not say, or no resolver
+        /// is installed. [B128]
+        settled: Option<String>,
     }
 
     static CACHE: OnceLock<StdMutex<StdHashMap<String, (Quote, Instant)>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| StdMutex::new(StdHashMap::new()));
+    // A venue's resolution is final, so it is asked for once per token: the
+    // quote cache is 2 s by default against a 4 s poll, and a settled hourly
+    // position would otherwise cost a market read every poll for the half
+    // hour its payout takes. Pruned to the open positions on every pass.
+    static SETTLED: OnceLock<StdMutex<StdHashMap<String, String>>> = OnceLock::new();
+    let settled_memo = SETTLED.get_or_init(|| StdMutex::new(StdHashMap::new()));
 
     let Some(asset) = q.asset.clone() else {
         return (StatusCode::BAD_REQUEST, "asset query parameter is required").into_response();
@@ -1802,6 +1817,29 @@ async fn get_position_quotes(State(s): State<ApiState>, Query(q): Query<AssetQue
             (Some(b), Some(a)) => Some((b + a) / Decimal::TWO),
             _ => None,
         };
+        // An empty book the venue vouched for: ask the settlement resolver
+        // whether the market is over. Kalshi and Polymarket US resolve from
+        // the leg alone; Polymarket International needs the condition id,
+        // which the position row does not carry, and answers Unknown, so its
+        // caption stays as before. Bounded like the quote, cached with it.
+        let known = settled_memo.lock().ok().and_then(|m| m.get(&pos.token_id).cloned());
+        let settled = if known.is_some() {
+            known
+        } else if fetched && bid.is_none() && ask.is_none() {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                crate::venues::core::resolve_leg("", &leg),
+            ).await {
+                Ok(Some(crate::venues::core::TokenResolution::Resolved(px))) => {
+                    let px = px.to_string();
+                    if let Ok(mut m) = settled_memo.lock() { m.insert(pos.token_id.clone(), px.clone()); }
+                    Some(px)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         // Write the mid through so every DB-derived consumer inherits the
         // freshness instead of waiting for the next 300s sweep.
@@ -1824,6 +1862,7 @@ async fn get_position_quotes(State(s): State<ApiState>, Query(q): Query<AssetQue
             mid: mid.map(|d| d.to_string()),
             age_secs: 0,
             fetched,
+            settled,
         };
         if let Ok(mut guard) = cache.lock() {
             guard.insert(pos.token_id.clone(), (quote.clone(), Instant::now()));
@@ -1832,6 +1871,9 @@ async fn get_position_quotes(State(s): State<ApiState>, Query(q): Query<AssetQue
             guard.retain(|_, (_, at)| at.elapsed().as_secs() < 3600);
         }
         out.push(quote);
+    }
+    if let Ok(mut m) = settled_memo.lock() {
+        m.retain(|t, _| out.iter().any(|q| q.token_id == *t));
     }
 
     Json(out).into_response()

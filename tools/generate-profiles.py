@@ -110,12 +110,22 @@ def const_values(path: Path) -> dict[str, object]:
 # volume since 2026-11-06), an account fact rather than risk appetite: applying
 # a profile must not reset it. The daily drawdown limit is the operator's own
 # loss tolerance, likewise never moved by a profile.
+# Keep this set and NON_PROFILE_PREFIXES identical to NOT_IN_PROFILES and
+# NOT_IN_PROFILES_PREFIXES in `embedded_profiles_match_config_schema`
+# (src/api/setup.rs); that test refuses a generated file that declares any of
+# them. Helm's live switch and fee-verdict enforcement, the custom viper list,
+# the ultra-short market switch, whether a squadron is held and the capital
+# auto-scaler are all the operator's own decisions, never a profile's. [B129]
 NON_PROFILE_FIELDS = {
-    "ghost_mode", "collateral_sweep_enabled", "us_taker_fee_rate", "max_daily_drawdown_usdc",
+    "ghost_mode", "collateral_sweep_enabled", "helm_live_enabled", "custom_vipers",
+    "helm_fee_verdict_enforce",
     "sports_ledger_enabled", "sports_ledger_leagues", "sports_ledger_snapshot_offsets_mins",
     "sports_ledger_credit_reserve", "sports_ledger_quota_reset_day",
+    "ultra_short_market_enabled",
+    "us_taker_fee_rate", "max_daily_drawdown_usdc",
+    "squadron_held", "held_reviewed",
 }
-NON_PROFILE_PREFIXES = ("bookline_board_",)
+NON_PROFILE_PREFIXES = ("bookline_board_", "autoscale_")
 
 
 def is_profile_field(name: str) -> bool:

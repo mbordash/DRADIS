@@ -54,6 +54,10 @@ interface LogEntry {
   quoteSeen: boolean;
   /** Live best ask when the venue has one, for the "no bid" caption. */
   liveAsk: number | null;
+  /** The venue has resolved this position's market at this price and has not
+   *  paid it out yet. Nothing can be sold; Close Now is not offered. Null while
+   *  the market is open or the venue has not said. */
+  settledAt: number | null;
   shares:    number;
   pnl:       number | null; // realized for completed; unrealized for open
   reason:    string;
@@ -193,6 +197,7 @@ function assetToEntries(
       priceIsLiveBid: false,
       quoteSeen:  false,
       liveAsk:    null,
+      settledAt:  null,
       shares:     parseFloat(t.shares),
       pnl:        parseFloat(t.pnl),
       reason:     t.reason,
@@ -244,6 +249,7 @@ function assetToEntries(
       // with empty sides, and that is "unknown", not "no bid".
       quoteSeen: liveQuote?.fetched === true,
       liveAsk,
+      settledAt: liveQuote?.settled != null ? parseFloat(liveQuote.settled) : null,
       priceAgeSecs: liveBid !== null
         ? (liveQuote?.age_secs ?? null)
         : p.price_updated_at
@@ -290,6 +296,7 @@ function paperToEntries(shard: string, rows: PaperTradeRow[]): LogEntry[] {
       priceIsLiveBid: false,
       quoteSeen:   false,
       liveAsk:     null,
+      settledAt:   null,
       shares:      parseFloat(r.shares),
       pnl:         closed ? num(r.pnl) : null,
       reason:      closed ? (r.exit_reason ?? '') : '',
@@ -1047,7 +1054,20 @@ export default function TradelogPage({ availableAssets }: Props) {
                         <span className="mx-1 text-gray-600">@</span>
                         <span className="text-gray-300">{e.entry.toFixed(4)}</span>
                         <span className="mx-1 text-gray-600">→</span>
-                        {e.curOrExit !== null ? (() => {
+                        {isOpen && e.settledAt !== null ? (
+                          /* The market is over and the venue has decided it, but the
+                             payout has not landed: Kalshi holds an hourly market for 30
+                             minutes after it is determined, and the position stays on
+                             the books until then. Ahead of the stored mark, which a row
+                             marked before the close still carries. "no bid, no ask" here
+                             read as an unfilled order (2026-11-28, an Anchor hold). */
+                          <span
+                            className="text-amber-400/80 text-[10px]"
+                            title="The venue has resolved this market and will pay the position out shortly; the trade is booked when the payout lands. Nothing can be sold and nothing is stuck."
+                          >
+                            {`settled at ${e.settledAt.toFixed(2)} · payout pending`}
+                          </span>
+                        ) : e.curOrExit !== null ? (() => {
                           const delta = e.curOrExit - e.entry;
                           const color = delta > 0 ? 'text-green-400' : delta < 0 ? 'text-red-400' : 'text-gray-300';
                           return (
@@ -1171,7 +1191,7 @@ export default function TradelogPage({ availableAssets }: Props) {
 
                       {/* Actions — pinned right */}
                       <td className="sticky right-0 z-10 bg-[#13131f] group-hover:bg-[#1a1a2e] transition-colors border-l border-[#1e1e32] px-3 py-2">
-                        {e.status === 'inflight' && e.rawPosition && !DEMO_MODE && (
+                        {e.status === 'inflight' && e.rawPosition && !DEMO_MODE && e.settledAt === null && (
                           <button
                             onClick={() => setRtbEntry(e)}
                             className="px-2 py-0.5 text-[10px] rounded bg-orange-500/10 text-orange-300 border border-orange-500/30 hover:bg-orange-500/20 transition-colors"

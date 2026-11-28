@@ -47,6 +47,7 @@
 
 use serde::{Serialize, Deserialize};
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use anyhow::Result;
 use tracing::{info, warn};
 use std::sync::{Arc, RwLock, Mutex, OnceLock};
@@ -2669,6 +2670,59 @@ fn refuse_bad_schedule(patch: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// The `config` table key under which the loader records that
+/// [`migrate_moved_anchor_defaults`] has run. Set once, so an operator who later
+/// puts a field back to its old value keeps it. [B129]
+pub const ANCHOR_DEFAULTS_MIGRATED_KEY: &str = "anchor_defaults_migrated";
+
+/// Move the global row's Anchor fields that 1.8.6 (E103) re-defaulted from the
+/// old default to the compiled one, where the stored value is still the old
+/// default. Returns the names of the fields it moved. [B129]
+///
+/// The stored row carries every field, so a changed compile-time default
+/// never reaches an instance that has a row; E103 accepted that for squadrons
+/// already deployed but expected a NEW squadron to get the shipped profile.
+/// It did not: `init_for_squadron` seeds a new squadron from the global row
+/// (so a chosen profile is honored), and the global row still said 300 s. On
+/// production every squadron created after 1.8.6 (sol-open 11-14, xrp-open
+/// 11-27) came up with the 300 s floor, the 0.02 fair trigger and the 1.00
+/// take-profit, and on 2026-11-28 three Anchor entries under 1200 s on those
+/// squadrons lost; the ledger has entries under 1200 s at 37% winners over 38
+/// trades against 55% over 82 above it.
+///
+/// Only a value equal to the old default moves: an operator who set 300 by
+/// hand cannot be told apart from one who never looked, and the compiled
+/// default is what the release notes said they were running. Squadron rows
+/// are left as they are, on E103's stated terms: they are the operator's and
+/// the Setup profile fan-out rewrites them on request.
+pub fn migrate_moved_anchor_defaults(cfg: &mut DynamicConfig) -> Vec<&'static str> {
+    // The defaults as they were before 1.8.6.
+    const OLD_MIN_SECS_TO_CLOSE: i64 = 300;
+    const OLD_TAKE_PROFIT_PCT: Decimal = dec!(1.00);
+    const OLD_EXIT_FAIR_EDGE: Decimal = dec!(0.02);
+    let mut moved = Vec::new();
+    if cfg.anchor_min_secs_to_close == OLD_MIN_SECS_TO_CLOSE
+        && config::ANCHOR_MIN_SECS_TO_CLOSE != OLD_MIN_SECS_TO_CLOSE
+    {
+        cfg.anchor_min_secs_to_close = config::ANCHOR_MIN_SECS_TO_CLOSE;
+        moved.push("anchor_min_secs_to_close");
+    }
+    if cfg.anchor_take_profit_pct == OLD_TAKE_PROFIT_PCT
+        && config::ANCHOR_TAKE_PROFIT_PCT != OLD_TAKE_PROFIT_PCT
+    {
+        cfg.anchor_take_profit_pct = config::ANCHOR_TAKE_PROFIT_PCT;
+        moved.push("anchor_take_profit_pct");
+    }
+    if cfg.anchor_exit_fair_edge == OLD_EXIT_FAIR_EDGE
+        && config::ANCHOR_EXIT_FAIR_EDGE != OLD_EXIT_FAIR_EDGE
+    {
+        cfg.anchor_exit_fair_edge = config::ANCHOR_EXIT_FAIR_EDGE;
+        moved.push("anchor_exit_fair_edge");
+    }
+    moved
+}
+
+
 /// Refuse a patch that sets `us_taker_fee_rate` below the cheapest tier
 /// (other than zero), which the next load would raise again.
 fn refuse_fee_floor_violations(patch: &serde_json::Value) -> Result<()> {
@@ -2821,6 +2875,28 @@ impl DynamicConfig {
                         if fee_raised.is_some() && record_session_snapshot {
                             cfg.save_as("fee_floor").await;
                         }
+                        // [B129] Once per instance: the Anchor defaults 1.8.6
+                        // moved reach a global row written before it, so a
+                        // squadron seeded from the row gets the shipped
+                        // profile. Startup only, and persisted with its own
+                        // marker so a later operator choice of the old value
+                        // stands.
+                        if record_session_snapshot
+                            && db::config_get(pool, ANCHOR_DEFAULTS_MIGRATED_KEY).await.is_none()
+                        {
+                            let moved = migrate_moved_anchor_defaults(&mut cfg);
+                            if !moved.is_empty() {
+                                info!(
+                                    "⚙️  global config: Anchor {:?} moved from the pre-1.8.6 defaults to the \
+                                     shipped ones (min secs to close {}, take-profit {}, exit fair edge {}); \
+                                     squadrons already deployed keep their own rows",
+                                    moved, config::ANCHOR_MIN_SECS_TO_CLOSE,
+                                    config::ANCHOR_TAKE_PROFIT_PCT, config::ANCHOR_EXIT_FAIR_EDGE,
+                                );
+                                cfg.save_as("anchor_defaults_migration").await;
+                            }
+                            db::config_set(pool, ANCHOR_DEFAULTS_MIGRATED_KEY, &chrono::Utc::now().to_rfc3339()).await;
+                        }
 
                         info!("⚙️  DynamicConfig loaded from SQLite (safety floors applied)");
 
@@ -2882,7 +2958,7 @@ impl DynamicConfig {
     async fn save_as(&self, changed_by: &str) {
         // A save by anyone but the loader means the operator (or the advisor)
         // has looked at the config: the "seeded" notice has done its job.
-        if !matches!(changed_by, "startup_dynamic" | "seeded_from_shard" | "fee_floor")
+        if !matches!(changed_by, "startup_dynamic" | "seeded_from_shard" | "fee_floor" | "anchor_defaults_migration")
             && matches!(config_origin(), ConfigOrigin::Seeded { .. })
         {
             set_config_origin(ConfigOrigin::Shard);
@@ -3542,6 +3618,54 @@ mod custom_viper_patch_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [B129] A global row written before 1.8.6 carries the old Anchor
+    /// defaults; the loader moves exactly those three to the compiled ones and
+    /// leaves anything the operator set by hand.
+    #[test]
+    fn pre_1_8_6_anchor_defaults_move_to_the_shipped_ones_and_hand_set_values_stay() {
+        let mut cfg = DynamicConfig::default();
+        cfg.anchor_min_secs_to_close = 300;
+        cfg.anchor_take_profit_pct = dec!(1.00);
+        cfg.anchor_exit_fair_edge = dec!(0.02);
+        let moved = migrate_moved_anchor_defaults(&mut cfg);
+        assert_eq!(moved, vec!["anchor_min_secs_to_close", "anchor_take_profit_pct", "anchor_exit_fair_edge"]);
+        assert_eq!(cfg.anchor_min_secs_to_close, config::ANCHOR_MIN_SECS_TO_CLOSE);
+        assert_eq!(cfg.anchor_take_profit_pct, config::ANCHOR_TAKE_PROFIT_PCT);
+        assert_eq!(cfg.anchor_exit_fair_edge, config::ANCHOR_EXIT_FAIR_EDGE);
+
+        // Already on the shipped defaults: nothing to do.
+        assert!(migrate_moved_anchor_defaults(&mut cfg).is_empty());
+
+        // Hand-set values are not the old defaults and stay, while the one
+        // field still at its old default moves on its own.
+        let mut cfg = DynamicConfig::default();
+        cfg.anchor_min_secs_to_close = 900;
+        cfg.anchor_take_profit_pct = dec!(0.70);
+        cfg.anchor_exit_fair_edge = dec!(0.02);
+        assert_eq!(migrate_moved_anchor_defaults(&mut cfg), vec!["anchor_exit_fair_edge"]);
+        assert_eq!(cfg.anchor_min_secs_to_close, 900);
+        assert_eq!(cfg.anchor_take_profit_pct, dec!(0.70));
+        assert_eq!(cfg.anchor_exit_fair_edge, config::ANCHOR_EXIT_FAIR_EDGE);
+
+        // A stored row spells the old defaults at whatever scale it was saved
+        // with ("1", "1.000000", "0.020"): the compare is numeric. The exit
+        // switch itself is never touched, as the release note promises.
+        let mut row = serde_json::to_value(DynamicConfig::default()).unwrap();
+        for (k, v) in [
+            ("anchor_min_secs_to_close", serde_json::json!(300)),
+            ("anchor_take_profit_pct", serde_json::json!("1")),
+            ("anchor_exit_fair_edge", serde_json::json!("0.020")),
+            ("anchor_exit_enabled", serde_json::json!(true)),
+        ] {
+            row[k] = v;
+        }
+        let mut cfg: DynamicConfig = serde_json::from_value(row).unwrap();
+        assert_eq!(migrate_moved_anchor_defaults(&mut cfg).len(), 3);
+        assert_eq!(cfg.anchor_take_profit_pct, config::ANCHOR_TAKE_PROFIT_PCT);
+        assert_eq!(cfg.anchor_exit_fair_edge, config::ANCHOR_EXIT_FAIR_EDGE);
+        assert!(cfg.anchor_exit_enabled);
+    }
 
     /// Config rows persist in SQLite across deploys, so every row written before
     /// a field existed must still deserialize — `apply_patch` and the loader at
